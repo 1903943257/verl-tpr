@@ -1,5 +1,12 @@
 # TPR tests
 
+This VERL branch is the development source for TPR code and tests. The
+`/workspace/bridge` pull and `rsync` instructions below record earlier
+experiments; do not use them to update this checkout. Fetch TPR changes through
+the VERL Git remote once it is configured. See
+`docs/tpr_development_baseline.md` for the source commits and server migration
+status.
+
 - `unit/`: CPU-friendly component contracts and scheduler behavior.
 - `equivalence/`: NPU forward/backward equivalence through attention, model, and engine layers.
 - `correctness/`: full-result and multi-step optimizer comparisons.
