@@ -482,6 +482,11 @@ class MegatronEngine(BaseEngine):
         )
         override_ddp_config = self._resolve_override_ddp_config()
 
+        if self.engine_config.tpr_enabled:
+            from verl.models.mcore.tpr.megatron_adapter import install_tpr_module_spec
+
+            install_tpr_module_spec(self.provider, bridge=self.bridge)
+
         module, updated_tf_config = make_megatron_module(
             wrap_config=wrap_config,
             tf_config=self.tf_config,
@@ -859,6 +864,16 @@ class MegatronEngine(BaseEngine):
                     routed_num_tokens, op=torch.distributed.ReduceOp.SUM, group=self.get_data_parallel_group()
                 )
             tu.assign_non_tensor(data, routed_num_tokens=routed_num_tokens.item())
+
+        # TPR PPO: keep all logical trajectories together for Forest execution.
+        # Native batch_num_tokens / dp_size have already been attached.
+        # Must run before native prepare_micro_batches or DCP scheduling.
+        if self.engine_config.tpr_enabled and not forward_only:
+            from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
+
+            return run_tpr_forward_backward_batch(
+                self, data, loss_function, forward_only=forward_only
+            )
 
         # BSHD path only: pad every micro-batch to the mini-batch's global max seq_len so the
         # padded `s_q` is shared -> cuDNN plan built once per shape. Raw (unaligned)

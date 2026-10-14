@@ -1,0 +1,314 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Per-forward context for model-side external KV attention."""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Protocol
+
+from torch import Tensor
+
+if TYPE_CHECKING:
+    from .prefix_state import GDNLayerState
+
+KVPair = tuple[Tensor, Tensor]
+RotaryPosEmb = Tensor | tuple[Tensor, Tensor]
+
+
+class TPRAttentionBackend(Protocol):
+    """Per-forward backend for one sharded TPR attention execution."""
+
+    @property
+    def global_prefix_length(self) -> int: ...
+
+    @property
+    def global_suffix_length(self) -> int: ...
+
+    @property
+    def local_suffix_length(self) -> int: ...
+
+    @property
+    def parallel_size(self) -> int: ...
+
+    def attention(
+        self,
+        layer_number: int,
+        query: Tensor,
+        new_key: Tensor,
+        new_value: Tensor,
+        *,
+        softmax_scale: float | None,
+    ) -> Tensor: ...
+
+
+def _validate_layer_number(layer_number: int) -> None:
+    if not isinstance(layer_number, int) or isinstance(layer_number, bool) or layer_number <= 0:
+        raise ValueError(f"layer_number must be a positive integer, got {layer_number!r}")
+
+
+def _validate_kv_pair(
+    layer_number: int,
+    key: Tensor,
+    value: Tensor,
+    *,
+    expected_sequence_length: int,
+    kind: str,
+) -> None:
+    if not isinstance(key, Tensor) or not isinstance(value, Tensor):
+        raise TypeError(f"layer {layer_number} {kind} K/V must be torch tensors")
+    if key.ndim != 4 or value.ndim != 4:
+        raise ValueError(
+            f"layer {layer_number} {kind} K/V must have shape [sequence, batch, heads, head_dim], "
+            f"got K={key.shape}, V={value.shape}"
+        )
+    if key.shape != value.shape:
+        raise ValueError(
+            f"layer {layer_number} {kind} K/V shapes must match, got K={key.shape}, V={value.shape}"
+        )
+    if key.shape[0] != expected_sequence_length:
+        raise ValueError(
+            f"layer {layer_number} {kind} KV sequence length must be {expected_sequence_length}, "
+            f"got {key.shape[0]}"
+        )
+    if key.shape[1] != 1:
+        raise ValueError(f"layer {layer_number} {kind} KV batch size must be 1, got {key.shape[1]}")
+    if key.device != value.device or key.dtype != value.dtype:
+        raise ValueError(
+            f"layer {layer_number} {kind} K/V device and dtype must match, "
+            f"got K=({key.device}, {key.dtype}), V=({value.device}, {value.dtype})"
+        )
+
+
+@dataclass(slots=True)
+class TPRAttentionContext:
+    """External prefix state scoped to one segment model forward.
+
+    Tensor references are stored unchanged. In particular, this class never
+    detaches or clones KV/GDN tensors, so an external prefix remains connected
+    to the autograd graph used by a suffix backward pass.
+    """
+
+    prefix_length: int
+    suffix_length: int
+    past_key_values: Mapping[int, KVPair] = field(default_factory=dict)
+    suffix_rotary_pos_emb: RotaryPosEmb | None = None
+    attention_backend: TPRAttentionBackend | None = None
+    initial_gdn_states: Mapping[int, GDNLayerState] = field(default_factory=dict)
+    capture_gdn_final_state: bool = True
+    _new_key_values: dict[int, KVPair] = field(default_factory=dict, init=False, repr=False)
+    _new_gdn_states: dict[int, GDNLayerState] = field(default_factory=dict, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.prefix_length, int) or isinstance(self.prefix_length, bool) or self.prefix_length < 0:
+            raise ValueError(f"prefix_length must be a non-negative integer, got {self.prefix_length!r}")
+        if not isinstance(self.suffix_length, int) or isinstance(self.suffix_length, bool) or self.suffix_length <= 0:
+            raise ValueError(f"suffix_length must be a positive integer, got {self.suffix_length!r}")
+        if not isinstance(self.capture_gdn_final_state, bool):
+            raise TypeError(
+                "capture_gdn_final_state must be a bool, "
+                f"got {type(self.capture_gdn_final_state).__name__}"
+            )
+        if self.prefix_length == 0 and self.past_key_values:
+            raise ValueError("past_key_values must be empty when prefix_length is 0")
+        if self.prefix_length == 0 and self.initial_gdn_states:
+            raise ValueError("initial_gdn_states must be empty when prefix_length is 0")
+        if self.attention_backend is not None:
+            missing = [
+                name
+                for name in (
+                    "global_prefix_length",
+                    "global_suffix_length",
+                    "local_suffix_length",
+                    "parallel_size",
+                    "attention",
+                )
+                if not hasattr(self.attention_backend, name)
+            ]
+            if missing or not callable(getattr(self.attention_backend, "attention", None)):
+                raise TypeError(
+                    "attention_backend must implement TPRAttentionBackend; "
+                    f"missing={missing}, got {type(self.attention_backend).__name__}"
+                )
+            if self.past_key_values:
+                raise ValueError("past_key_values must be empty when an attention_backend is active")
+            if self.attention_backend.global_prefix_length != self.prefix_length:
+                raise ValueError(
+                    "attention backend prefix length must match TPRAttentionContext: "
+                    f"backend={self.attention_backend.global_prefix_length}, context={self.prefix_length}"
+                )
+            if self.attention_backend.global_suffix_length != self.suffix_length:
+                raise ValueError(
+                    "attention backend suffix length must match TPRAttentionContext: "
+                    f"backend={self.attention_backend.global_suffix_length}, context={self.suffix_length}"
+                )
+            if self.attention_backend.local_suffix_length <= 0:
+                raise ValueError("attention backend local suffix length must be positive")
+
+        normalized_past: dict[int, KVPair] = {}
+        for layer_number, pair in self.past_key_values.items():
+            _validate_layer_number(layer_number)
+            if not isinstance(pair, tuple) or len(pair) != 2:
+                raise TypeError(f"layer {layer_number} past KV must be a (key, value) tuple")
+            key, value = pair
+            _validate_kv_pair(
+                layer_number,
+                key,
+                value,
+                expected_sequence_length=self.prefix_length,
+                kind="past",
+            )
+            normalized_past[layer_number] = pair
+
+        self.past_key_values = MappingProxyType(normalized_past)
+
+        normalized_gdn = {}
+        for layer_number, state in self.initial_gdn_states.items():
+            _validate_layer_number(layer_number)
+            _validate_gdn_layer_state(layer_number, state, kind="initial")
+            normalized_gdn[layer_number] = state
+        self.initial_gdn_states = MappingProxyType(dict(sorted(normalized_gdn.items())))
+
+    @property
+    def new_key_values(self) -> Mapping[int, KVPair]:
+        """A read-only view of KV tensors produced by the current segment."""
+
+        return MappingProxyType(self._new_key_values)
+
+    @property
+    def new_gdn_states(self) -> Mapping[int, GDNLayerState]:
+        """A read-only view of GDN final states produced by this segment."""
+
+        return MappingProxyType(self._new_gdn_states)
+
+    @property
+    def local_suffix_length(self) -> int:
+        """Sequence length physically executed by this rank."""
+
+        if self.attention_backend is None:
+            return self.suffix_length
+        return self.attention_backend.local_suffix_length
+
+    def get_past_kv(self, layer_number: int) -> KVPair | None:
+        """Return this layer's prefix KV, or ``None`` for a zero-length prefix."""
+
+        _validate_layer_number(layer_number)
+        if self.attention_backend is not None:
+            raise RuntimeError("sharded attention must obtain prefix state from its attention backend")
+        if self.prefix_length == 0:
+            return None
+        try:
+            return self.past_key_values[layer_number]
+        except KeyError as exc:
+            raise KeyError(f"missing past KV for layer {layer_number}") from exc
+
+    def set_new_kv(self, layer_number: int, key: Tensor, value: Tensor) -> None:
+        """Record this layer's post-RoPE new key and raw new value."""
+
+        _validate_layer_number(layer_number)
+        if layer_number in self._new_key_values:
+            raise RuntimeError(f"new KV for layer {layer_number} was already recorded")
+        _validate_kv_pair(
+            layer_number,
+            key,
+            value,
+            expected_sequence_length=self.local_suffix_length,
+            kind="new",
+        )
+        self._new_key_values[layer_number] = (key, value)
+
+    def get_initial_gdn_state(self, layer_number: int) -> GDNLayerState | None:
+        """Return this layer's direct-parent GDN state, or ``None`` at the root."""
+
+        _validate_layer_number(layer_number)
+        if self.prefix_length == 0:
+            return None
+        try:
+            return self.initial_gdn_states[layer_number]
+        except KeyError as exc:
+            raise KeyError(f"missing initial GDN state for layer {layer_number}") from exc
+
+    def set_new_gdn_state(self, layer_number: int, state: GDNLayerState) -> None:
+        """Record one GDN layer's continuation state for the current segment."""
+
+        _validate_layer_number(layer_number)
+        if layer_number in self._new_gdn_states:
+            raise RuntimeError(f"new GDN state for layer {layer_number} was already recorded")
+        _validate_gdn_layer_state(layer_number, state, kind="new")
+        self._new_gdn_states[layer_number] = state
+
+    def assert_new_kv_layers(self, expected_layer_numbers: Iterable[int]) -> None:
+        """Fail if the collector does not contain exactly the expected layers."""
+
+        expected = set(expected_layer_numbers)
+        for layer_number in expected:
+            _validate_layer_number(layer_number)
+        actual = set(self._new_key_values)
+        if actual != expected:
+            missing = sorted(expected - actual)
+            unexpected = sorted(actual - expected)
+            raise RuntimeError(f"new KV layer mismatch: missing={missing}, unexpected={unexpected}")
+
+    def assert_new_gdn_layers(self, expected_layer_numbers: Iterable[int]) -> None:
+        """Fail if the GDN collector does not contain exactly the expected layers."""
+
+        expected = set(expected_layer_numbers)
+        for layer_number in expected:
+            _validate_layer_number(layer_number)
+        actual = set(self._new_gdn_states)
+        if actual != expected:
+            missing = sorted(expected - actual)
+            unexpected = sorted(actual - expected)
+            raise RuntimeError(f"new GDN layer mismatch: missing={missing}, unexpected={unexpected}")
+
+
+def _validate_gdn_layer_state(layer_number: int, state: GDNLayerState, *, kind: str) -> None:
+    # Local import avoids a module cycle: prefix_state imports KVPair from here.
+    from .prefix_state import GDNLayerState
+
+    if not isinstance(state, GDNLayerState):
+        raise TypeError(
+            f"layer {layer_number} {kind} GDN state must be GDNLayerState, "
+            f"got {type(state).__name__}"
+        )
+
+
+_TPR_ATTENTION_CONTEXT: ContextVar[TPRAttentionContext | None] = ContextVar(
+    "tpr_attention_context",
+    default=None,
+)
+
+
+def get_tpr_attention_context() -> TPRAttentionContext | None:
+    """Return the context for the current model forward, if one is active."""
+
+    return _TPR_ATTENTION_CONTEXT.get()
+
+
+@contextmanager
+def use_tpr_attention_context(context: TPRAttentionContext) -> Iterator[TPRAttentionContext]:
+    """Activate ``context`` and reliably restore the previous context."""
+
+    if not isinstance(context, TPRAttentionContext):
+        raise TypeError(f"context must be a TPRAttentionContext, got {type(context).__name__}")
+    token = _TPR_ATTENTION_CONTEXT.set(context)
+    try:
+        yield context
+    finally:
+        _TPR_ATTENTION_CONTEXT.reset(token)

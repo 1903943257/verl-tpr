@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# P0 *weak* offline Qwen3-1.7B actor optimizer smoke.
+# Run from a working VERL/bridge training runtime. This script does NOT
+# invoke UniAgent, ClaudeCode, or require old uni-agent rollout scripts.
+# Reads a pre-existing real TQ dump; PPO history is diagnostic/recomputed.
+set -euo pipefail
+
+: "${TPR_REAL_TQ_BATCH:?Set TPR_REAL_TQ_BATCH to real uniagent-cc tq_batch.pt}"
+: "${TPR_QWEN_1_7B_PATH:?Set TPR_QWEN_1_7B_PATH to real Qwen3-1.7B checkpoint}"
+if [[ ! -f "$TPR_REAL_TQ_BATCH" ]]; then
+  echo "Real TQ file missing: $TPR_REAL_TQ_BATCH" >&2
+  exit 2
+fi
+if [[ ! -d "$TPR_QWEN_1_7B_PATH" ]]; then
+  echo "Real Qwen3-1.7B checkpoint missing: $TPR_QWEN_1_7B_PATH" >&2
+  exit 2
+fi
+
+export TPR_RUN_QWEN17_WEAK_E2E=1
+export TPR_QWEN_PROFILE_SIZE=1.7B
+export TPR_QWEN17_WEAK_E2E_PROMPT="${TPR_QWEN17_WEAK_E2E_PROMPT:-128}"
+export TPR_QWEN17_WEAK_E2E_RESPONSE="${TPR_QWEN17_WEAK_E2E_RESPONSE:-64}"
+export TPR_QWEN17_WEAK_E2E_LR="${TPR_QWEN17_WEAK_E2E_LR:-0.0001}"
+export TPR_QWEN17_WEAK_E2E_MASTER_DEVICE="${TPR_QWEN17_WEAK_E2E_MASTER_DEVICE:-npu}"
+
+# Fail explicitly rather than hiding left-over numerical interventions.
+for knob in \
+  TPR_QWEN17_PPO_TILE_GEMM \
+  TPR_QWEN17_GPT_FP32_GEMM \
+  TPR_QWEN17_PPO_FC2_FIXED_M \
+  TPR_QWEN17_SPLIT_FP32_DW_BACKWARD; do
+  if [[ -n "${!knob:-}" ]]; then
+    echo "Unset diagnostic knob $knob before the default-BF16 training test" >&2
+    exit 2
+  fi
+done
+
+log_dir="${TPR_QWEN17_WEAK_E2E_LOG_DIR:-$(mktemp -d /tmp/tpr_qwen17_weak_e2e.XXXXXX)}"
+mkdir -p "$log_dir"
+# Sampling is only a diagnostic, NEVER a prerequisite for the real
+# optimizer-step correctness gate. Set SAMPLE=0 to isolate a sampling
+# kernel error while retaining Native and TPR AdamW step validation.
+if [[ "${TPR_QWEN17_WEAK_E2E_SAMPLE:-1}" == "1" ]]; then
+  export TPR_QWEN17_WEAK_E2E_SIGNATURE_DIR="$log_dir"
+else
+  unset TPR_QWEN17_WEAK_E2E_SIGNATURE_DIR
+fi
+if [[ "${TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE:-0}" == "1" ]]; then
+  export TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE_DIR="$log_dir"
+  echo "P0 WEAK_TQ WARNING: token capture synchronizes Segment logprobs; timing is NOT a benchmark"
+else
+  unset TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE_DIR
+fi
+test_path="tests/models/mcore/tpr/correctness/test_qwen3_1_7b_real_tq_weak_e2e_npu.py"
+if [[ ! -f "$test_path" ]]; then
+  echo "Run from the bridge/VERL root where $test_path exists" >&2
+  exit 2
+fi
+echo "P0 WEAK_TQ START checkpoint=$TPR_QWEN_1_7B_PATH"
+echo "P0 WEAK_TQ START tq=$TPR_REAL_TQ_BATCH"
+echo "P0 WEAK_TQ START master_device=$TPR_QWEN17_WEAK_E2E_MASTER_DEVICE"
+echo "P0 WEAK_TQ START log_dir=$log_dir"
+
+# Select "tpr" alone after the Native gate has already passed.
+# Default remains both modes for same-run numerical comparisons.
+read -r -a modes <<< "${TPR_QWEN17_WEAK_E2E_MODES:-native tpr}"
+if [[ "${#modes[@]}" -eq 0 ]]; then
+  echo "Set TPR_QWEN17_WEAK_E2E_MODES to native, tpr or 'native tpr'" >&2
+  exit 2
+fi
+run_native=0
+run_tpr=0
+run_cutoff=0
+run_core=0
+run_trace=0
+for mode in "${modes[@]}"; do
+  case "$mode" in
+    native)
+      if [[ "$run_native" == 1 ]]; then echo "Duplicate mode: native" >&2; exit 2; fi
+      run_native=1 ;;
+    tpr)
+      if [[ "$run_tpr" == 1 ]]; then echo "Duplicate mode: tpr" >&2; exit 2; fi
+      run_tpr=1 ;;
+    cutoff)
+      if [[ "$run_cutoff" == 1 ]]; then echo "Duplicate mode: cutoff" >&2; exit 2; fi
+      run_cutoff=1 ;;
+    core)
+      if [[ "$run_core" == 1 ]]; then echo "Duplicate mode: core" >&2; exit 2; fi
+      run_core=1 ;;
+    trace)
+      if [[ "$run_trace" == 1 ]]; then echo "Duplicate mode: trace" >&2; exit 2; fi
+      run_trace=1 ;;
+    *)
+      echo "Unsupported mode: $mode (valid: native, tpr, cutoff, core, trace)" >&2
+      exit 2 ;;
+  esac
+done
+if [[ "$run_cutoff" == 1 && "${TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE:-0}" != "1" ]]; then
+  echo "cutoff oracle requires TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE=1" >&2
+  exit 2
+fi
+
+for mode in "${modes[@]}"; do
+  logfile="$log_dir/${mode}.log"
+  echo "===== $mode default BF16 training with real TQ tokens ====="
+  TPR_QWEN17_WEAK_E2E_EXECUTION="$mode" \
+    python -m pytest -x -s -q --tb=long "$test_path" > "$logfile" 2>&1 || {
+      echo "$mode weak training step FAILED; log=$logfile" >&2
+      tail -120 "$logfile" >&2
+      exit 1
+    }
+  if [[ "$mode" == "core" ]]; then
+    # The core oracle reports real per-layer/per-shape errors without the
+    # P0 WEAK_TQ prefix. The original grep silently hid the only useful
+    # numerical diagnostic while still reporting CORE status=PASS.
+    grep -E 'P0 WEAK_TQ (CONFIG|CORE_GEOMETRY|CORE_SUMMARY|RESULT)|CORE SHAPE ORACLE|CORE TOKEN' "$logfile"
+    if ! grep -q '^CORE SHAPE ORACLE layer=' "$logfile" || \
+       ! grep -q 'rect=3x192' "$logfile" || \
+       ! grep -q 'P0 WEAK_TQ CORE_SUMMARY' "$logfile"; then
+      echo "CORE: missing same-QKV shape evidence (including 3x192); see $logfile" >&2
+      exit 1
+    fi
+  elif [[ "$mode" == "trace" ]]; then
+    # All 308 module-stage records are retained in trace.log. Keep the
+    # console short and show the first 4 layers + summary only.
+    grep -E '^P0 WEAK_TQ (CONFIG|TRACE_GEOMETRY|TRACE_SUMMARY|KV_SUMMARY|FA_REPLAY|ROOT_PROVENANCE|RESULT)' "$logfile"
+    grep -E '^P0 WEAK_TQ TRACE layer=0[0-3] ' "$logfile"
+    # Prefix KV is the remaining unisolated input to real Forest FA.
+    # Show layers 1-2 broken down by actual ancestor segment, preserving
+    # full details for all six selected layers in trace.log.
+    grep -E '^P0 WEAK_TQ KV_TRACE layer=0[12] ' "$logfile"
+    if ! grep -q '^P0 WEAK_TQ KV_SUMMARY ' "$logfile"; then
+      echo "TRACE: actual leaf Prefix KV oracle did not run; see $logfile" >&2
+      exit 1
+    fi
+    if ! grep -q '^P0 WEAK_TQ FA_REPLAY_SUMMARY ' "$logfile"; then
+      echo "TRACE: first-layer actual-QKV Attention replay missing; see $logfile" >&2
+      exit 1
+    fi
+    if ! grep -q '^P0 WEAK_TQ ROOT_PROVENANCE_SUMMARY ' "$logfile"; then
+      echo "TRACE: first-layer root V full/cutoff/tree provenance incomplete; see $logfile" >&2
+      exit 1
+    fi
+    if ! grep -q '^P0 WEAK_TQ TRACE_SUMMARY compared_stages=308' "$logfile"; then
+      echo "TRACE: missing all 28x11 module-stage comparisons; see $logfile" >&2
+      exit 1
+    fi
+    echo "P0 WEAK_TQ TRACE_FULL_LOG=$logfile"
+  else
+    grep -E 'P0 WEAK_TQ (CONFIG|BACKWARD|OPTIMIZER_STEP|RESULT)' "$logfile"
+  fi
+  if ! grep -q "P0 WEAK_TQ RESULT status=PASS execution=$(echo "$mode" | tr '[:lower:]' '[:upper:]')" "$logfile"; then
+    echo "$mode: missing explicit PASS; inspect $logfile" >&2
+    exit 1
+  fi
+done
+
+if [[ "$run_cutoff" == 1 ]]; then
+  if [[ -f "$log_dir/native_ppo_tokens.pt" && -f "$log_dir/tpr_ppo_tokens.pt" ]]; then
+    python tests/models/mcore/tpr/correctness/_qwen17_weak_e2e_token_capture.py \
+      "$log_dir/native_ppo_tokens.pt" "$log_dir/tpr_ppo_tokens.pt" \
+      --cutoff "$log_dir/cutoff_ppo_tokens.pt" \
+      --owners "$log_dir/cutoff_segment_owners.pt"
+  else
+    echo "P0 WEAK_TQ CUTOFF saved, but Native+TPR token traces not in $log_dir"
+    echo "Run full Native/TPR with TOKEN_CAPTURE=1 in the same log directory to compare."
+  fi
+fi
+if [[ "$run_native" != 1 || "$run_tpr" != 1 ]]; then
+  echo "P0 WEAK_TQ selected modes: ${modes[*]}; skipping full Native-vs-TPR optimizer comparison"
+  exit 0
+fi
+
+python - "$log_dir/native.log" "$log_dir/tpr.log" <<'PY'
+import re, sys
+data = {}
+for name, path in zip(("native", "tpr"), sys.argv[1:]):
+    content = open(path, encoding="utf-8").read()
+    line = next((v for v in content.splitlines()
+                 if "P0 WEAK_TQ RESULT status=PASS" in v), None)
+    loss_line = next((v for v in content.splitlines()
+                      if "P0 WEAK_TQ BACKWARD status=PASS" in v), None)
+    if line is None or loss_line is None:
+        raise SystemExit(f"{name}: missing final PASS")
+    def metric(text, key):
+        found = re.search(r"(?:^| )" + re.escape(key) + r"=([+-]?[0-9.eE+-]+)", text)
+        if not found:
+            raise SystemExit(f"{name}: missing {key}")
+        return float(found.group(1))
+    data[name] = dict(
+        loss=metric(loss_line, "loss"),
+        fb=metric(line, "forward_backward_seconds"),
+        opt=metric(line, "optimizer_seconds"),
+        peak=metric(line, "npu_peak_alloc_mib"),
+    )
+native, tpr = data["native"], data["tpr"]
+print("P0 WEAK_TQ COMPARISON (CONTROLLED CANN, CROPPED REAL TQ, NOT PRODUCTION)")
+print(f"  loss_native={native['loss']:.9g}, loss_tpr={tpr['loss']:.9g}, abs_delta={abs(native['loss']-tpr['loss']):.9g}")
+print(f"  fwd_bwd_native={native['fb']:.5f}s, tpr={tpr['fb']:.5f}s, speedup={native['fb']/max(tpr['fb'],1e-12):.4f}x")
+print(f"  optimizer_total_native={native['opt']:.5f}s, tpr={tpr['opt']:.5f}s")
+print(f"  peak_alloc_native={native['peak']:.3f}MiB, tpr={tpr['peak']:.3f}MiB")
+import os
+if os.environ.get("TPR_QWEN17_WEAK_E2E_SAMPLE", "1") != "1":
+    print("  sampled_grad_update=SKIPPED (optimizer step still executed)")
+    sys.exit(0)
+import torch
+native_sample = torch.load(
+    sys.argv[1].replace("native.log", "native_optimizer_sample.pt"),
+    map_location="cpu", weights_only=True,
+)
+tpr_sample = torch.load(
+    sys.argv[2].replace("tpr.log", "tpr_optimizer_sample.pt"),
+    map_location="cpu", weights_only=True,
+)
+if set(native_sample) != set(tpr_sample):
+    raise SystemExit("Native/TPR sampled trainable parameter names disagree")
+for metric_name in ("grad", "update"):
+    delta2 = ref2 = cand2 = dot = 0.0
+    sign_flips = nonzero = entries = 0
+    for name in native_sample:
+        a = native_sample[name][metric_name].float()
+        b = tpr_sample[name][metric_name].float()
+        if not torch.equal(
+            native_sample[name]["indices"], tpr_sample[name]["indices"]
+        ):
+            raise SystemExit(f"{name}: sampled indices do not align")
+        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+            raise SystemExit(f"{name}: sampled {metric_name} nonfinite")
+        delta2 += float(((a - b) ** 2).sum())
+        ref2 += float((a ** 2).sum())
+        cand2 += float((b ** 2).sum())
+        dot += float((a * b).sum())
+        common = (a != 0) & (b != 0)
+        sign_flips += int(((a * b < 0) & common).sum())
+        nonzero += int(common.sum())
+        entries += a.numel()
+    print(
+        f"  sampled_{metric_name}_rel_l2={(delta2/max(ref2,1e-24))**0.5:.9g}, "
+        f"cosine={dot/max((ref2*cand2)**0.5,1e-24):.9g}, "
+        f"sign_flips={sign_flips}/{nonzero}, "
+        f"sampled_entries={entries} trainable_tensors={len(native_sample)}"
+    )
+print("  all_parameter_update_parity=UNVERIFIED true_rollout_old_logprobs=UNVERIFIED")
+PY
+
+if [[ "${TPR_QWEN17_WEAK_E2E_TOKEN_CAPTURE:-0}" == "1" ]]; then
+  python tests/models/mcore/tpr/correctness/_qwen17_weak_e2e_token_capture.py \
+    "$log_dir/native_ppo_tokens.pt" "$log_dir/tpr_ppo_tokens.pt"
+fi

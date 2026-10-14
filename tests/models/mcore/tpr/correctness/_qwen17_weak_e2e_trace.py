@@ -1,0 +1,405 @@
+"""Opt-in per-physical-Segment trace: Native cutoff vs real Forest leaf.
+
+No GEMM, Attention, or training operator is replaced. Module forward hooks
+capture a single logical query's inputs and outputs in FP32 on CPU. The Forest
+hook MUST be gated by the exact Segment ID, not just the [start:end] shape:
+sibling nodes can share the same physical length and absolute positions.
+This is a heavy synchronizing numerical diagnostic, never a performance test.
+"""
+from __future__ import annotations
+
+from contextlib import contextmanager
+
+import torch
+
+
+STAGES = (
+    "input_norm", "qkv", "q_norm", "k_norm", "attn_proj",
+    "attention", "pre_mlp_norm", "mlp_fc1", "mlp_fc2", "mlp", "layer",
+)
+
+
+def _as_tensor(value):
+    """Unwrap a Megatron module's first tensor output or positional input."""
+    if isinstance(value, torch.Tensor):
+        return value
+    if isinstance(value, (tuple, list)):
+        return next((item for item in value if isinstance(item, torch.Tensor)), None)
+    return None
+
+
+def _first_input_tensor(args, kwargs):
+    """Handle TransformerLayer.forward(hidden_states=...) and positional calls.
+
+    Megatron TransformerBlock calls TransformerLayer with keyword-only
+    hidden_states in some versions. For those calls, forward-hook args is
+    empty even though the input tensor is present in kwargs. The former
+    positional-only trace raised during an otherwise healthy Native run.
+    """
+    from_args = _as_tensor(args)
+    if from_args is not None:
+        return from_args
+    for name in ("hidden_states", "input", "x"):
+        value = _as_tensor(kwargs.get(name))
+        if value is not None:
+            return value
+    # Only use a generic fallback when the input is unambiguous. Silently
+    # choosing a mask or position tensor would invalidate the comparison.
+    tensors = [value for value in kwargs.values()
+               if isinstance(value, torch.Tensor)]
+    return tensors[0] if len(tensors) == 1 else None
+
+
+@contextmanager
+def capture_query_stages(model, *, query_position: int, get_active_span):
+    """Capture stage tensors at one *absolute* query position, by segment.
+
+    get_active_span() returns (start, end) for only the intended active
+    Segment (or None to suppress a hook). For Native, return (0, full_S).
+    Multiple passes at the same layer/stage are rejected, since silently
+    overwriting a sibling's snapshot invalidates the numerical attribution.
+    """
+    output = {}
+    handles = []
+    try:
+        for i, layer in enumerate(model.decoder.layers):
+            modules = {
+                "input_norm": layer.input_layernorm,
+                "qkv": layer.self_attention.linear_qkv,
+                "q_norm": layer.self_attention.q_layernorm,
+                "k_norm": layer.self_attention.k_layernorm,
+                "attn_proj": layer.self_attention.linear_proj,
+                "attention": layer.self_attention,
+                "pre_mlp_norm": layer.pre_mlp_layernorm,
+                "mlp_fc1": layer.mlp.linear_fc1,
+                "mlp_fc2": layer.mlp.linear_fc2,
+                "mlp": layer.mlp,
+                "layer": layer,
+            }
+            for stage, module in modules.items():
+                def hook(_module, args, kwargs, result, *, layer_index=i, stage_name=stage):
+                    span = get_active_span()
+                    if span is None:
+                        return
+                    start, end = span
+                    if not start <= query_position < end:
+                        return
+                    pos = query_position - start
+                    x = _first_input_tensor(args, kwargs)
+                    y = _as_tensor(result)
+                    if x is None or y is None:
+                        raise AssertionError(
+                            f"trace layer={layer_index} stage={stage_name} has no tensor I/O "
+                            f"(args={len(args)}, kwargs={tuple(kwargs)})"
+                        )
+                    if not (x.ndim >= 1 and y.ndim >= 1 and
+                            pos < x.shape[0] and pos < y.shape[0]):
+                        raise AssertionError(
+                            f"trace invalid position pos={pos}, span={span}, "
+                            f"layer={layer_index}, stage={stage_name}, "
+                            f"input={tuple(x.shape)} output={tuple(y.shape)}"
+                        )
+                    key = (layer_index, stage_name)
+                    if key in output:
+                        raise AssertionError(
+                            f"trace duplicate capture at {key}; verify Segment-ID gating"
+                        )
+                    output[key] = (
+                        x[pos].detach().float().cpu().clone(),
+                        y[pos].detach().float().cpu().clone(),
+                    )
+                handles.append(module.register_forward_hook(hook, with_kwargs=True))
+        yield output
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
+def _metric(ref: torch.Tensor, value: torch.Tensor):
+    if ref.shape != value.shape:
+        raise AssertionError(
+            f"mismatched stage tensors: native={tuple(ref.shape)}, "
+            f"tpr={tuple(value.shape)}"
+        )
+    if not bool(torch.isfinite(ref).all() and torch.isfinite(value).all()):
+        raise AssertionError("nonfinite trace tensor")
+    delta = (ref.double() - value.double()).abs()
+    return float(delta.max()), float(
+        torch.linalg.vector_norm(delta) /
+        torch.linalg.vector_norm(ref.double()).clamp_min(1e-24)
+    )
+
+
+def describe_trace(native, tpr, *, layers: int) -> list[str]:
+    expected = {(i, stage) for i in range(layers) for stage in STAGES}
+    if set(native) != expected or set(tpr) != expected:
+        raise AssertionError(
+            "incomplete Native/TPR layer trace: "
+            f"missing_native={sorted(expected-set(native))[:15]} "
+            f"missing_tpr={sorted(expected-set(tpr))[:15]} "
+            f"extra_native={sorted(set(native)-expected)[:15]} "
+            f"extra_tpr={sorted(set(tpr)-expected)[:15]}"
+        )
+    reports = []
+    first = None
+    first_material = None
+    # Elide tiny float32 GEMM layout rounding (~1e-7) from the
+    # "first material deviation" diagnostic; raw per-stage diffs
+    # remain fully printed, including the first nonzero ULP.
+    absolute_floor = 1e-6
+    relative_floor = 1e-5
+    for layer in range(layers):
+        for stage in STAGES:
+            nx, ny = native[layer, stage]
+            tx, ty = tpr[layer, stage]
+            in_max, in_rel = _metric(nx, tx)
+            out_max, out_rel = _metric(ny, ty)
+            reports.append(
+                f"P0 WEAK_TQ TRACE layer={layer:02d} stage={stage} "
+                f"input_max={in_max:.9g} input_rel={in_rel:.9g} "
+                f"output_max={out_max:.9g} output_rel={out_rel:.9g}"
+            )
+            if first is None and (in_max > 0 or out_max > 0):
+                first = (layer, stage, in_max, out_max)
+            if first_material is None and (
+                (in_max > absolute_floor and in_rel > relative_floor)
+                or (out_max > absolute_floor and out_rel > relative_floor)
+            ):
+                first_material = (layer, stage, in_max, out_max)
+    reports.append(
+        "P0 WEAK_TQ TRACE_SUMMARY "
+        f"compared_stages={len(expected)} first_nonzero={first} "
+        f"first_material={first_material} "
+        "trace_numeric_parity=DIAGNOSTIC_ONLY "
+        "note=first_nonzero_may_be_BF16_rounding_not_first_causal_error"
+    )
+    return reports
+
+
+def describe_kv_trace(native_kv, tpr_kv, path, *, layers=(1, 2, 3, 4, 14, 28)):
+    """Compare actual post-RoPE K/raw-V seen by Native vs TPR leaf.
+
+    Native tensors come from the untouched core_attention forward-hook.
+    TPR tensors are concatenations of the *actual* past KV state and
+    current segment's context.new_key_values for the same layer.
+    path lists (segment_id, start, end) along the target leaf's ancestor path.
+    Report per-path region to identify shape-sensitive Prefix production
+    separately from positional or assembly faults. Pure diagnostic.
+    """
+    if not path or path[0][1] != 0:
+        raise AssertionError("KV diagnostic path must start at zero")
+    last = 0
+    for _, start, end in path:
+        if start != last or end <= start:
+            raise AssertionError(f"KV path is not contiguous: {path}")
+        last = end
+    if set(native_kv) != set(layers) or set(tpr_kv) != set(layers):
+        raise AssertionError(
+            f"KV trace missing native={sorted(set(layers)-set(native_kv))} "
+            f"tpr={sorted(set(layers)-set(tpr_kv))}"
+        )
+    report = []
+    max_error = (-1.0, None)
+    for number in layers:
+        for field, i in (("K_POST_ROPE", 0), ("V_RAW", 1)):
+            full_native = native_kv[number][i].detach().float().cpu()
+            full_tpr = tpr_kv[number][i].detach().float().cpu()
+            if full_native.shape != full_tpr.shape or full_native.shape[0] != last:
+                raise AssertionError(
+                    f"KV mismatch layer={number} {field} "
+                    f"native={tuple(full_native.shape)} "
+                    f"tpr={tuple(full_tpr.shape)} total_length={last}"
+                )
+            if not bool(torch.isfinite(full_native).all() and torch.isfinite(full_tpr).all()):
+                raise AssertionError(f"KV nonfinite in layer={number} {field}")
+            for segment_id, start, end in path:
+                a, b = full_native[start:end].double(), full_tpr[start:end].double()
+                delta = (a - b).abs()
+                delta_max = float(delta.max())
+                rel = float(
+                    torch.linalg.vector_norm(delta) /
+                    torch.linalg.vector_norm(a).clamp_min(1e-24)
+                )
+                positions = (delta.reshape(end-start, -1).amax(dim=1) > 0)
+                first_local = int(torch.nonzero(positions).flatten()[0]) if bool(positions.any()) else -1
+                first_abs = start + first_local if first_local >= 0 else -1
+                report.append(
+                    "P0 WEAK_TQ KV_TRACE "
+                    f"layer={number:02d} field={field} "
+                    f"segment={segment_id}[{start}:{end}] "
+                    f"max_abs={delta_max:.9g} rel_l2={rel:.9g} "
+                    f"differing_tokens={int(positions.sum())}/{end-start} "
+                    f"first_differing_abs={first_abs}"
+                )
+                if delta_max > max_error[0]:
+                    max_error = (delta_max, (number, field, segment_id, start, end))
+    report.append(
+        "P0 WEAK_TQ KV_SUMMARY "
+        f"compared_layers={len(layers)} "
+        f"segments_per_layer={len(path)} "
+        f"rows={len(report)} "
+        f"worst_max_abs={max_error[0]:.9g} "
+        f"worst_location={max_error[1]} "
+        "same_model_checkpoint=True probe_only=True"
+    )
+    return report
+
+
+
+def compare_first_attention_replay(
+    native_qkv, tpr_qkv, *, position_start: int, query_abs: int,
+    native_proj_input, tpr_proj_input, device, attention_fn=None,
+):
+    """Replay Native/TPR's ACTUAL post-RoPE Q/K/V at the first attention layer.
+
+    Swap one tensor at a time while leaving the real CANN rectangular FA
+    operator unchanged. We do NOT replace any module's forward in training.
+    Inputs and projection-entry witnesses are taken from the existing Trace.
+    No learned weights or FP32 GEMM intervention is used.
+    """
+    if attention_fn is None:
+        from verl.models.mcore.tpr.rectangular_attention import rectangular_causal_attention
+        attention_fn = rectangular_causal_attention
+    nq, nk, nv, nscale = native_qkv
+    tq, tk, tv, tscale, actual_tpr_out = tpr_qkv
+    if not (0 <= position_start <= query_abs < nk.shape[0]):
+        raise AssertionError("attention replay query outside Native KV")
+    if nk.shape != tk.shape or nv.shape != tv.shape:
+        raise AssertionError("Native/TPR KV shape mismatch")
+    if nq.shape[0] != nk.shape[0] or tq.shape[0] != tk.shape[0] - position_start:
+        raise AssertionError("Native/TPR Q shape differs from leaf geometry")
+    if not (nq.dtype == tq.dtype == nk.dtype == tk.dtype == nv.dtype == tv.dtype):
+        raise AssertionError("Native/TPR attention dtypes must match")
+    if nscale != tscale:
+        raise AssertionError(
+            f"Native and TPR attention softmax scales differ: {nscale} vs {tscale}"
+        )
+    dev = torch.device(device)
+    if dev.type == "cpu" and attention_fn.__module__.endswith("rectangular_attention"):
+        raise AssertionError("CANN attention replay requires NPU device")
+    # Captured query and KV tensors were saved on CPU to minimize peak NPU
+    # memory while running the real Forest. Rehydrate ONLY this layer here.
+    nq = nq[position_start:].to(device=dev)
+    tq, nk, nv, tk, tv = (x.to(device=dev) for x in (tq, nk, nv, tk, tv))
+    q_index = query_abs - position_start
+
+    variants = (
+        ("NATIVE_QKV", nq, nk, nv),
+        ("TPR_Q_ONLY", tq, nk, nv),
+        ("TPR_K_ONLY", nq, tk, nv),
+        ("TPR_V_ONLY", nq, nk, tv),
+        ("TPR_KV", nq, tk, tv),
+        ("TPR_ALL", tq, tk, tv),
+    )
+    results = {}
+    with torch.no_grad():
+        for name, q, k, v in variants:
+            out = attention_fn(
+                q, k, v, softmax_scale=nscale, dropout_p=0.0,
+            )
+            if not isinstance(out, torch.Tensor) or out.ndim != 3:
+                raise AssertionError(
+                    f"attention replay expected [Sq, batch, H*D], got {type(out)}"
+                )
+            results[name] = out[q_index].float().cpu().clone()
+
+    ref = results["NATIVE_QKV"]
+    reports = []
+    from_native = {
+        "NATIVE_QKV": native_proj_input.float().cpu(),
+        "TPR_ALL": tpr_proj_input.float().cpu(),
+    }
+    if actual_tpr_out is not None:
+        from_native["TPR_CORE_OUTPUT"] = actual_tpr_out[q_index].float().cpu()
+    witness = {}
+    for name, tensor in from_native.items():
+        replay = results["TPR_ALL"] if name != "NATIVE_QKV" else ref
+        max_abs, rel = _metric(replay, tensor)
+        witness[name] = max_abs
+        reports.append(
+            "P0 WEAK_TQ FA_REPLAY_WITNESS "
+            f"source={name} max_abs={max_abs:.9g} rel_l2={rel:.9g}"
+        )
+    for name, _q, _k, _v in variants[1:]:
+        max_abs, rel = _metric(ref, results[name])
+        reports.append(
+            "P0 WEAK_TQ FA_REPLAY "
+            f"variant={name} query_abs={query_abs} "
+            f"max_abs={max_abs:.9g} rel_l2={rel:.9g}"
+        )
+    # If witness mismatch is material, the captured QKV was not the actual
+    # operator input or we changed a relevant kernel argument, and the
+    # one-at-a-time counterfactual cannot be interpreted.
+    # BF16 identical replay should be exact on the controlled CANN path.
+    witness_tolerance = 1e-5
+    witnesses_match = all(value <= witness_tolerance for value in witness.values())
+    reports.append(
+        "P0 WEAK_TQ FA_REPLAY_SUMMARY "
+        f"q_abs={query_abs} query_M={tq.shape[0]} kv_M={nk.shape[0]} "
+        f"native_witness_max={witness['NATIVE_QKV']:.9g} "
+        f"tpr_witness_max={witness['TPR_ALL']:.9g} "
+        f"actual_core_witness_max={witness.get('TPR_CORE_OUTPUT', 0):.9g} "
+        f"softmax_scale={nscale} "
+        f"witness_valid={witnesses_match} "
+        "same_kernel=True gradient=False numeric_parity=DIAGNOSTIC_ONLY"
+    )
+    if not witnesses_match:
+        # Fail closed rather than misattribute differences to Q/K/V
+        # when the replay's actual-source witnesses disagree with the
+        # unmodified model's saved linear_proj inputs.
+        raise AssertionError(
+            f"FA replay does not reproduce actual Native and TPR core outputs: "
+            f"{witness}, tolerance={witness_tolerance}"
+        )
+    return reports
+
+
+def compare_root_v_provenance(
+    native_full_v, native_root_v, tpr_root_v,
+    native_full_input, native_root_input, tpr_root_input,
+):
+    """Distinguish physical-M effects from incorrect root KV reuse.
+
+    All three forwards use the same exact checkpoint. Native full processes
+    M=192, Native root cutoff M=134, and TPR root processes M=134.
+    The Root inputs are compared before the QKV GEMM, and V values are
+    compared after the projection. Diagnostic only; nothing is patched in
+    the training model.
+    """
+    n_full_v = native_full_v[:native_root_v.shape[0]]
+    n_full_in = native_full_input[:native_root_input.shape[0]]
+    fields = {
+        "QKV_INPUT": (n_full_in, native_root_input, tpr_root_input),
+        "V_RAW": (n_full_v, native_root_v, tpr_root_v),
+    }
+    reports = []
+    for label, values in fields.items():
+        full, cutoff, tree = (
+            v.detach().float().cpu() for v in values
+        )
+        if full.shape != cutoff.shape or full.shape != tree.shape:
+            raise AssertionError(
+                f"root {label} shape mismatch: "
+                f"full={tuple(full.shape)} cutoff={tuple(cutoff.shape)} "
+                f"tpr={tuple(tree.shape)}"
+            )
+        for name, left, right in (
+            ("FULL_TO_CUTOFF", full, cutoff),
+            ("CUTOFF_TO_TPR", cutoff, tree),
+            ("FULL_TO_TPR", full, tree),
+        ):
+            delta = (left.double() - right.double()).abs()
+            max_abs, rel = _metric(left, right)
+            changed = delta.reshape(delta.shape[0], -1).amax(dim=1) > 0
+            reports.append(
+                "P0 WEAK_TQ ROOT_PROVENANCE "
+                f"field={label} pair={name} root_tokens={len(left)} "
+                f"max_abs={max_abs:.9g} rel_l2={rel:.9g} "
+                f"changed_tokens={int(changed.sum())}/{len(left)}"
+            )
+    reports.append(
+        "P0 WEAK_TQ ROOT_PROVENANCE_SUMMARY "
+        f"compared_fields={len(fields)} compared_pairs=3 root_tokens={len(n_full_v)} "
+        "same_checkpoint=True all_default_BF16=True diagnostic_only=True"
+    )
+    return reports

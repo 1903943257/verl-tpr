@@ -208,6 +208,8 @@ class McoreEngineConfig(EngineConfig):
     use_mbridge: bool = True
     vanilla_mbridge: bool = False
     use_megatron_fsdp: bool = False
+    tpr_enabled: bool = False
+    tpr_cp_backend: Optional[str] = None
     strategy: str = "megatron"
     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
 

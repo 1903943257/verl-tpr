@@ -1,0 +1,369 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from megatron.core.transformer.attention import SelfAttention
+from verl.models.mcore.tpr import TPRSelfAttention, TPRAttentionContext, use_tpr_attention_context
+from verl.models.mcore.tpr import attention as tpr_attention
+
+
+class _IdentityProjection(torch.nn.Module):
+    def forward(self, tensor):
+        return tensor, None
+
+
+class _StubTPRSelfAttention(TPRSelfAttention):
+    """Small fixture that exercises TPR orchestration without a ModuleSpec."""
+
+    def __init__(self, query, key, value):
+        torch.nn.Module.__init__(self)
+        self.query = query
+        self.key = key
+        self.value = value
+        self.layer_number = 2
+        self.config = SimpleNamespace(
+            attention_dropout=0.0,
+            fused_single_qkv_rope=False,
+            attention_output_gate=False,
+            flash_decode=False,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+            expert_model_parallel_size=1,
+        )
+        self.pg_collection = SimpleNamespace(cp=None)
+        self.core_attention = SimpleNamespace(softmax_scale=0.25)
+        self.linear_proj = _IdentityProjection()
+        self.checkpoint_core_attention = False
+        self.offload_qkv_linear = False
+        self.offload_core_attention = False
+        self.offload_attn_proj = False
+        self._yarn_concentration_factor = 1.0
+
+    def get_query_key_value_tensors(self, hidden_states, key_value_states, *, split_qkv, output_gate):
+        assert key_value_states is None
+        assert split_qkv is True
+        assert output_gate is False
+        return self.query, self.key, self.value
+
+
+class _StubShardedBackend:
+    def __init__(self, *, prefix_length, global_suffix_length, local_suffix_length, parallel_size=2):
+        self.global_prefix_length = prefix_length
+        self.global_suffix_length = global_suffix_length
+        self.local_suffix_length = local_suffix_length
+        self.parallel_size = parallel_size
+        self.calls = []
+
+    def attention(self, layer_number, query, new_key, new_value, *, softmax_scale):
+        self.calls.append((layer_number, query, new_key, new_value, softmax_scale))
+        dependency = new_key.sum() + new_value.sum()
+        return query.reshape(query.shape[0], 1, -1) + dependency
+
+
+def test_no_context_delegates_to_original_self_attention(monkeypatch):
+    sentinel = (object(), object())
+    recorded = {}
+
+    def fake_forward(self, hidden_states, attention_mask, **kwargs):
+        recorded["hidden_states"] = hidden_states
+        recorded["attention_mask"] = attention_mask
+        recorded.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(SelfAttention, "forward", fake_forward)
+    attention = _StubTPRSelfAttention(None, None, None)
+    hidden_states = torch.randn(3, 1, 16)
+    attention_mask = torch.ones(3, 3, dtype=torch.bool)
+
+    assert attention(hidden_states, attention_mask) is sentinel
+    assert recorded["hidden_states"] is hidden_states
+    assert recorded["attention_mask"] is attention_mask
+    assert recorded["packed_seq_params"] is None
+
+
+def test_qwen_output_gate_uses_mcore_gate_and_preserves_gradient(monkeypatch):
+    query = torch.randn(3, 1, 4, 8, requires_grad=True)
+    key = torch.randn(3, 1, 2, 8, requires_grad=True)
+    value = torch.randn_like(key, requires_grad=True)
+    gate = torch.randn_like(query, requires_grad=True)
+    attention = _StubTPRSelfAttention(query, key, value)
+    attention.config.attention_output_gate = True
+
+    def project(hidden_states, key_value_states, *, split_qkv, output_gate):
+        assert split_qkv and output_gate and key_value_states is None
+        return query, key, value, gate
+
+    monkeypatch.setattr(attention, "get_query_key_value_tensors", project)
+    # Megatron wraps _apply_output_gate with @jit_fuser. That wrapper may
+    # invoke torch.compile/Inductor even for CPU-only orchestration tests,
+    # which is unrelated to TPR's Attention context or gate gradients.
+    # Exercise the exact eager gate math here; keep the NPU fused gate path
+    # unchanged in production.
+    def eager_output_gate(self, x, output_gate):
+        x_dtype = x.dtype
+        gate_reshaped = output_gate.contiguous().view(*x.shape)
+        return (x * torch.sigmoid(gate_reshaped.float())).to(x_dtype)
+
+    monkeypatch.setattr(_StubTPRSelfAttention, "_apply_output_gate", eager_output_gate)
+    monkeypatch.setattr(tpr_attention, "apply_rotary_pos_emb", lambda tensor, *a, **kw: tensor)
+    monkeypatch.setattr(
+        tpr_attention, "rectangular_causal_attention",
+        lambda q, k, v, **kw: q.reshape(3, 1, 32),
+    )
+    context = TPRAttentionContext(0, 3, suffix_rotary_pos_emb=torch.zeros(3, 1, 1, 8))
+    with use_tpr_attention_context(context):
+        output, _ = attention(torch.zeros(3, 1, 32), attention_mask=None)
+    expected = query.reshape(3, 1, 32) * gate.reshape(3, 1, 32).sigmoid()
+    torch.testing.assert_close(output, expected)
+    output.sum().backward()
+    torch.testing.assert_close(gate.grad, query.detach() * gate.sigmoid() * (1 - gate.sigmoid()))
+
+
+def test_tpr_forward_selects_layer_kv_collects_new_kv_and_preserves_prefix_grad(monkeypatch):
+    prefix_length, suffix_length = 6, 3
+    query = torch.randn(suffix_length, 1, 4, 8, requires_grad=True)
+    new_key = torch.randn(suffix_length, 1, 2, 8, requires_grad=True)
+    new_value = torch.randn(suffix_length, 1, 2, 8, requires_grad=True)
+    past_key = torch.randn(prefix_length, 1, 2, 8, requires_grad=True)
+    past_value = torch.randn(prefix_length, 1, 2, 8, requires_grad=True)
+    other_layer_kv = (
+        torch.randn_like(past_key, requires_grad=True),
+        torch.randn_like(past_value, requires_grad=True),
+    )
+    rope = torch.zeros(suffix_length, 1, 1, 8)
+    captured = {}
+
+    monkeypatch.setattr(tpr_attention, "apply_rotary_pos_emb", lambda tensor, *args, **kwargs: tensor)
+
+    def fake_rectangular(query_arg, key_arg, value_arg, **kwargs):
+        captured.update(query=query_arg, key=key_arg, value=value_arg, kwargs=kwargs)
+        prefix_dependency = key_arg.sum() + value_arg.sum()
+        return query_arg.reshape(suffix_length, 1, -1) + prefix_dependency
+
+    monkeypatch.setattr(tpr_attention, "rectangular_causal_attention", fake_rectangular)
+    attention = _StubTPRSelfAttention(query, new_key, new_value)
+    context = TPRAttentionContext(
+        prefix_length=prefix_length,
+        suffix_length=suffix_length,
+        past_key_values={1: other_layer_kv, 2: (past_key, past_value)},
+        suffix_rotary_pos_emb=rope,
+    )
+
+    with use_tpr_attention_context(context):
+        output, bias = attention(torch.randn(suffix_length, 1, 32), attention_mask=None)
+    output.sum().backward()
+
+    assert bias is None
+    assert captured["query"] is query
+    assert torch.equal(captured["key"][:prefix_length], past_key)
+    assert torch.equal(captured["value"][:prefix_length], past_value)
+    assert captured["kwargs"]["softmax_scale"] == 0.25
+    assert context.new_key_values[2][0] is new_key
+    assert context.new_key_values[2][1] is new_value
+    assert past_key.grad is not None and torch.count_nonzero(past_key.grad)
+    assert past_value.grad is not None and torch.count_nonzero(past_value.grad)
+    assert other_layer_kv[0].grad is None
+    assert other_layer_kv[1].grad is None
+
+
+def test_tpr_forward_with_zero_prefix_uses_only_new_kv(monkeypatch):
+    suffix_length = 6
+    query = torch.randn(suffix_length, 1, 4, 8, requires_grad=True)
+    new_key = torch.randn(suffix_length, 1, 2, 8, requires_grad=True)
+    new_value = torch.randn(suffix_length, 1, 2, 8, requires_grad=True)
+    rope = torch.zeros(suffix_length, 1, 1, 8)
+    captured = {}
+
+    monkeypatch.setattr(tpr_attention, "apply_rotary_pos_emb", lambda tensor, *args, **kwargs: tensor)
+
+    def fake_rectangular(query_arg, key_arg, value_arg, **kwargs):
+        captured.update(query=query_arg, key=key_arg, value=value_arg)
+        kv_dependency = key_arg.sum() + value_arg.sum()
+        return query_arg.reshape(suffix_length, 1, -1) + kv_dependency
+
+    monkeypatch.setattr(tpr_attention, "rectangular_causal_attention", fake_rectangular)
+    attention = _StubTPRSelfAttention(query, new_key, new_value)
+    context = TPRAttentionContext(
+        prefix_length=0,
+        suffix_length=suffix_length,
+        suffix_rotary_pos_emb=rope,
+    )
+
+    with use_tpr_attention_context(context):
+        output, bias = attention(torch.randn(suffix_length, 1, 32), attention_mask=None)
+    output.sum().backward()
+
+    assert bias is None
+    assert captured["query"] is query
+    assert captured["key"] is new_key
+    assert captured["value"] is new_value
+    assert captured["key"].shape[0] == suffix_length
+    assert context.new_key_values[2][0] is new_key
+    assert context.new_key_values[2][1] is new_value
+    assert new_key.grad is not None and torch.count_nonzero(new_key.grad)
+    assert new_value.grad is not None and torch.count_nonzero(new_value.grad)
+
+
+def test_tpr_forward_routes_local_qkv_through_sharded_backend(monkeypatch):
+    prefix_length, global_suffix_length, local_suffix_length = 6, 8, 4
+    query = torch.randn(local_suffix_length, 1, 4, 8, requires_grad=True)
+    new_key = torch.randn(local_suffix_length, 1, 2, 8, requires_grad=True)
+    new_value = torch.randn(local_suffix_length, 1, 2, 8, requires_grad=True)
+    rope = torch.zeros(local_suffix_length, 1, 1, 8)
+    backend = _StubShardedBackend(
+        prefix_length=prefix_length,
+        global_suffix_length=global_suffix_length,
+        local_suffix_length=local_suffix_length,
+    )
+    rope_calls = []
+
+    def fake_rope(tensor, rotary, **kwargs):
+        rope_calls.append(kwargs)
+        return tensor
+
+    monkeypatch.setattr(tpr_attention, "apply_rotary_pos_emb", fake_rope)
+    monkeypatch.setattr(
+        tpr_attention,
+        "rectangular_causal_attention",
+        lambda *args, **kwargs: pytest.fail("sharded path must bypass the single-rank adapter"),
+    )
+    attention = _StubTPRSelfAttention(query, new_key, new_value)
+    attention.config.context_parallel_size = 2
+    context = TPRAttentionContext(
+        prefix_length=prefix_length,
+        suffix_length=global_suffix_length,
+        suffix_rotary_pos_emb=rope,
+        attention_backend=backend,
+    )
+
+    with use_tpr_attention_context(context):
+        output, bias = attention(torch.randn(local_suffix_length, 1, 32), attention_mask=None)
+    output.sum().backward()
+
+    assert bias is None
+    assert len(backend.calls) == 1
+    layer_number, actual_query, actual_key, actual_value, scale = backend.calls[0]
+    assert layer_number == 2
+    assert actual_query is query and actual_key is new_key and actual_value is new_value
+    assert scale == 0.25
+    assert all(call["cp_group"] is None for call in rope_calls)
+    assert context.new_key_values[2][0] is new_key
+    assert context.new_key_values[2][1] is new_value
+    assert new_key.grad is not None and torch.count_nonzero(new_key.grad)
+    assert new_value.grad is not None and torch.count_nonzero(new_value.grad)
+
+
+def test_tpr_forward_rejects_missing_suffix_rope_before_qkv():
+    attention = _StubTPRSelfAttention(None, None, None)
+    context = TPRAttentionContext(prefix_length=0, suffix_length=3)
+
+    with use_tpr_attention_context(context), torch.no_grad():
+        try:
+            attention(torch.randn(3, 1, 16), attention_mask=None)
+        except ValueError as exc:
+            assert "suffix_rotary_pos_emb" in str(exc)
+        else:
+            raise AssertionError("missing suffix RoPE must be rejected")
+
+
+def test_softmax_scale_is_read_through_mindspeed_ulysses_wrapper():
+    wrapped = SimpleNamespace(local_attn=SimpleNamespace(softmax_scale=0.125))
+
+    assert tpr_attention._core_attention_softmax_scale(wrapped) == 0.125
+
+def test_tp2_uses_local_head_shards_and_relayed_prefix_gradients(monkeypatch):
+    """CPU orchestration contract; distributed NPU TP2 remains a separate gate."""
+    query = torch.randn(3, 1, 4, 8, requires_grad=True)
+    key = torch.randn(3, 1, 2, 8, requires_grad=True)
+    value = torch.randn(3, 1, 2, 8, requires_grad=True)
+    past_key = torch.randn(5, 1, 2, 8, requires_grad=True)
+    past_value = torch.randn(5, 1, 2, 8, requires_grad=True)
+    attention = _StubTPRSelfAttention(query, key, value)
+    attention.config.tensor_model_parallel_size = 2
+    attention.config.sequence_parallel = False
+    recorded = {}
+
+    monkeypatch.setattr(tpr_attention, "apply_rotary_pos_emb", lambda tensor, *a, **kw: tensor)
+
+    def local_attention(q, k, v, **kwargs):
+        recorded["local_q_heads"] = q.shape[-2]
+        recorded["local_kv_heads"] = k.shape[-2]
+        recorded["kv_length"] = k.shape[0]
+        return q.reshape(3, 1, -1) + k.sum() + v.sum()
+
+    monkeypatch.setattr(tpr_attention, "rectangular_causal_attention", local_attention)
+    context = TPRAttentionContext(
+        prefix_length=5,
+        suffix_length=3,
+        past_key_values={2: (past_key, past_value)},
+        suffix_rotary_pos_emb=torch.zeros(3, 1, 1, 8),
+    )
+    with use_tpr_attention_context(context):
+        output, _ = attention(torch.empty(3, 1, 32), attention_mask=None)
+    output.sum().backward()
+
+    assert recorded == {"local_q_heads": 4, "local_kv_heads": 2, "kv_length": 8}
+    assert output.shape == (3, 1, 32)
+    assert context.new_key_values[2][0] is key
+    assert past_key.grad is not None and torch.count_nonzero(past_key.grad)
+    assert past_value.grad is not None and torch.count_nonzero(past_value.grad)
+
+
+def test_tp2_native_sp_accepts_local_hidden_and_full_qkv(monkeypatch):
+    length = 4
+    q = torch.randn(length, 1, 4, 8, requires_grad=True)
+    k = torch.randn(length, 1, 2, 8, requires_grad=True)
+    v = torch.randn(length, 1, 2, 8, requires_grad=True)
+    attn = _StubTPRSelfAttention(q, k, v)
+    attn.config.tensor_model_parallel_size = 2
+    attn.config.sequence_parallel = True
+    monkeypatch.setattr(tpr_attention, "apply_rotary_pos_emb", lambda x, *args, **kwargs: x)
+    seen = {}
+    def core(query, key, value, **kwargs):
+        seen["length"] = query.shape[0]
+        return query.reshape(length, 1, -1) + key.sum() + value.sum()
+    monkeypatch.setattr(tpr_attention, "rectangular_causal_attention", core)
+    context = TPRAttentionContext(
+        prefix_length=0, suffix_length=length,
+        suffix_rotary_pos_emb=torch.zeros(length, 1, 1, 8),
+    )
+    with use_tpr_attention_context(context):
+        output, _ = attn(torch.empty(length // 2, 1, 32), attention_mask=None)
+    output.sum().backward()
+    assert seen == {"length": length}
+    assert context.new_key_values[2][0] is k
+    assert q.grad is not None and k.grad is not None and v.grad is not None
+
+def test_tp2_sp_rejects_odd_length_without_padding():
+    attn = _StubTPRSelfAttention(None, None, None)
+    attn.config.tensor_model_parallel_size = 2
+    attn.config.sequence_parallel = True
+    context = TPRAttentionContext(0, 3, suffix_rotary_pos_emb=torch.zeros(3, 1, 1, 8))
+    with use_tpr_attention_context(context), pytest.raises(ValueError, match="divisible"):
+        attn(torch.empty(2, 1, 32), attention_mask=None)
+
+def test_tp2_sp_requires_qkv_allgather():
+    q = torch.randn(2, 1, 4, 8)
+    k = torch.randn(2, 1, 2, 8)
+    attn = _StubTPRSelfAttention(q, k, k)
+    attn.config.tensor_model_parallel_size = 2
+    attn.config.sequence_parallel = True
+    context = TPRAttentionContext(0, 4, suffix_rotary_pos_emb=torch.zeros(4, 1, 1, 8))
+    with use_tpr_attention_context(context), pytest.raises(ValueError, match="restore the full"):
+        attn(torch.empty(2, 1, 32), attention_mask=None)
