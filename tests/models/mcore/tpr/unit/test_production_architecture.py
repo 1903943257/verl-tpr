@@ -171,3 +171,22 @@ def test_internal_relative_imports_resolve_after_relocation() -> None:
                 assert target.with_suffix(".py").is_file() or (target / "__init__.py").is_file(), (
                     f"{file} has unresolved relative import: level={item.level} module={item.module}"
                 )
+
+def test_public_dense_symbols_resolve_to_canonical_engine() -> None:
+    """No exported production executor or Ring type may point to legacy copies."""
+    import ast
+
+    syntax = ast.parse((MODEL / "__init__.py").read_text(encoding="utf-8"))
+    exports = next(ast.literal_eval(node.value) for node in syntax.body if
+                   isinstance(node, ast.Assign) and
+                   any(isinstance(target, ast.Name) and target.id == "_EXPORTS" for target in node.targets))
+    engine_expected = {
+        "RingCPBackend": "ring",
+        "SegmentExecutor": "executor",
+        "FixedTopologyScheduler": "executor",
+        "ShardedPastKVAnchors": "state",
+        "SegmentBackwardResult": "executor",
+    }
+    for name, module in engine_expected.items():
+        assert exports[name] == "verl.workers.engine.megatron.tpr." + module, name
+
