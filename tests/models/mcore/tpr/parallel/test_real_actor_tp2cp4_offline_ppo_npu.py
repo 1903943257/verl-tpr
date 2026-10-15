@@ -24,7 +24,6 @@ import torch.distributed as dist
 from megatron.core import parallel_state
 
 from verl.utils import tensordict_utils as tu
-from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 
 pytestmark = pytest.mark.skipif(
@@ -276,6 +275,9 @@ def test_recorded_full_vs_tpr_one_step():
         "TPR_OFFLINE_OUTPUT_DIR", "/workspace/tpr_offline_qwen4b_tp2cp4"
     ))
     runtime = _runtime()
+    # MindSpeed repatch must run before importing the Engine package: its
+    # parent __init__ eagerly imports MindSpeed and Megatron engine modules.
+    from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
     try:
         from verl.workers.utils.losses import ppo_loss
         batch, real_keys, count, data_sha = _load_real_pair(source, rows, mode)

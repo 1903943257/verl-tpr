@@ -42,6 +42,8 @@ jobs:
             tests.models.mcore.tpr.unit.test_ring_streaming_transport \
             tests.models.mcore.tpr.unit.test_offload_b_gate \
             tests.models.mcore.tpr.unit.test_activation_offload_adapter
+      - name: Verify MindSpeed repatch precedes Engine imports
+        run: python3 -m pytest -q tests/models/mcore/tpr/unit/test_tpr_mindspeed_import_order.py
       - name: Audit legacy model imports
         run: |
           python3 - <<'PY'
