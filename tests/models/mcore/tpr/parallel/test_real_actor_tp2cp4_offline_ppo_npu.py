@@ -79,6 +79,26 @@ def _runtime():
             expert_model_parallel_size=1,
         )
     args = get_full_args()
+    # MindSpeed's transformer_config_init_wrapper creates dataclass fields
+    # from every unknown get_full_args() key. An empty/invalid key raises
+    # TypeError deep inside dataclasses.make_dataclass; diagnose at source.
+    invalid = [
+        (repr(key), type(value).__name__)
+        for key, value in vars(args).items()
+        if not isinstance(key, str) or not key.isidentifier()
+    ]
+    print(
+        f"TPR_MINDSPEED_ARGS_AUDIT rank={dist.get_rank()} "
+        f"invalid={invalid} total={len(vars(args))} "
+        f"empty_key_present={'' in vars(args)}",
+        flush=True,
+    )
+    if invalid:
+        raise RuntimeError(
+            "MindSpeed get_full_args() contains invalid configuration keys "
+            f"immediately after repatch: {invalid}. "
+            "Do not construct TransformerConfig until the origin is fixed."
+        )
     assert args.context_parallel_algo == "megatron_cp_algo"
     tp_group = parallel_state.get_tensor_model_parallel_group()
     cp_group = parallel_state.get_context_parallel_group()
