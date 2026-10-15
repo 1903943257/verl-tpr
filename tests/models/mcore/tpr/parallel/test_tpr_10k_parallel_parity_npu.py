@@ -22,7 +22,7 @@ import torch.distributed as dist
 from megatron.core import parallel_state
 
 from verl.workers.engine.megatron.tpr.placement import plan_tpr_dta_dp
-from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
+from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
 from verl.utils import tensordict_utils as tu
 
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
@@ -168,7 +168,7 @@ def _load(capture: Path,runtime,mode: str,dp:int):
     )
     # Retaining TPR prefix sharing in the cropped 10K source matters:
     # otherwise an 'isolated TP/CP/DP TPR test' degenerates to eight Full rows.
-    from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+    from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans
     full_forest=build_tree_execution_plans(
         all_keys,all_batch,
         tree_policy=os.getenv("TPR_TREE_POLICY","qwen_turn"),

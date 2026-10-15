@@ -30,7 +30,7 @@ def _model(runtime, cp, layer_number=1):
     from megatron.core.models.backends import LocalSpecProvider
     from megatron.core.ssm.gated_delta_net import GatedDeltaNetSubmodules
     import mindspeed.core.ssm.gated_delta_net as native
-    from verl.models.mcore.tpr.gated_delta_net import TPRGatedDeltaNet
+    from verl.experimental.tpr.gdn.model import TPRGatedDeltaNet
 
     backend = LocalSpecProvider()
     submodules = GatedDeltaNetSubmodules(
@@ -52,7 +52,7 @@ def _random(shape, device, seed, dtype=DTYPE):
 
 
 def _state_shard(state, rank):
-    from verl.models.mcore.tpr.prefix_state import GDNLayerState
+    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
 
     # Qwen0.8B: Q/K/V each have 2048 channels; slice each independently.
     conv = torch.cat([part[:, rank*1024:(rank+1)*1024]
@@ -83,8 +83,8 @@ def _compare(label, left, right):
 @pytest.mark.parametrize("with_initial", [False, True], ids=["zero-state", "initial-state-vjp"])
 def test_single_stateful_gdn_cp2_matches_cp1(runtime, with_initial):
     import mindspeed.core.ssm.gated_delta_net as native
-    from verl.models.mcore.tpr.parallel.gdn_state import forward_gdn_cp_with_state, gdn_cp_state_shapes
-    from verl.models.mcore.tpr.prefix_state import GDNLayerState
+    from verl.experimental.tpr.gdn.state import forward_gdn_cp_with_state, gdn_cp_state_shapes
+    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
     from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
 
     torch.manual_seed(410001)

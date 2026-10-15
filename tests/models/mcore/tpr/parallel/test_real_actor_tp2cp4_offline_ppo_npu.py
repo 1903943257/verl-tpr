@@ -24,7 +24,7 @@ import torch.distributed as dist
 from megatron.core import parallel_state
 
 from verl.utils import tensordict_utils as tu
-from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
+from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 
 pytestmark = pytest.mark.skipif(
@@ -228,7 +228,7 @@ def _install_offline_full_ring_backend(mode: str) -> str:
         raise ValueError("TPR_OFFLINE_FULL_RING_BACKEND must be custom or native")
     if mode != "full" or chosen == "custom":
         return "tpr_custom_ring"
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.experimental.tpr import ring_attention as ring
 
     def native_full_attention(query, current_key, current_value, *,
                               prefix_blocks=(), **kwargs):
@@ -279,8 +279,8 @@ def test_recorded_full_vs_tpr_one_step():
     try:
         from verl.workers.utils.losses import ppo_loss
         batch, real_keys, count, data_sha = _load_real_pair(source, rows, mode)
-        from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
-        from verl.models.mcore.tpr.megatron_adapter import _trajectory_keys_from_minibatch
+        from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans
+        from verl.workers.engine.megatron.tpr.adapter import _trajectory_keys_from_minibatch
         forest = build_tree_execution_plans(
             _trajectory_keys_from_minibatch(batch), batch,
             tree_policy=os.getenv("TPR_TREE_POLICY", "exact"),

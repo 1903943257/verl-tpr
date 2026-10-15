@@ -32,7 +32,7 @@ def runtime():
 
 
 def _plan():
-    from verl.models.mcore.tpr.segment_plan import SegmentPlan, SegmentSpec, SegmentLossTerm
+    from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec, SegmentLossTerm
 
     pieces = [(torch.arange(128) * step + start) % VOCAB_SIZE
               for step, start in ((17, 23), (19, 101), (23, 307))]
@@ -48,7 +48,7 @@ def _plan():
 @contextmanager
 def _communication_probe(monkeypatch):
     import mindspeed.core.ssm.gated_delta_net as gdn
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.experimental.tpr import ring_attention as ring
 
     counts = Counter()
     transport, _ = ring._load_mindspeed_ring_primitives()
@@ -86,9 +86,9 @@ def _snapshot(states, kv, *, gradients=False):
 
 
 def _run(model, plan, runtime, monkeypatch, *, cp, tree):
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-    from verl.models.mcore.tpr.prefix_state import GDNLayerState, KVPrefixAnchors
-    from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState, KVPrefixAnchors
+    from verl.experimental.tpr.legacy.cp.execution_context import ShardedPastKVAnchors
 
     model.zero_grad(set_to_none=True)
     outputs, input_gradients, own_losses = {}, {}, Counter()
@@ -228,7 +228,7 @@ def _shard_states(states, rank):
 
 def test_small_hybrid_cp2_tree(runtime, monkeypatch):
     from verl.models.mcore.tpr.attention import TPRSelfAttention
-    from verl.models.mcore.tpr.gated_delta_net import TPRGatedDeltaNet
+    from verl.experimental.tpr.gdn.model import TPRGatedDeltaNet
 
     torch.manual_seed(430001)
     reference = make_qwen35_model(runtime, cp_size=1, tpr=True, num_layers=4)
