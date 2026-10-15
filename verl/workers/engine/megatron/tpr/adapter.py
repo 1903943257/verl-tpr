@@ -220,6 +220,8 @@ def run_tpr_forward_backward_batch(
             "TPR PPO phase-4 does not support: "
             + ", ".join(k for k, enabled in unsupported.items() if enabled)
         )
+    if any(getattr(module, "tpr_state_kind", None) == "gdn" for module in model.modules()):
+        raise NotImplementedError("GDN is an experimental TPR extension, not supported by production Dense PPO")
     attentions = [module for module in model.modules() if isinstance(module, TPRSelfAttention)]
     if not attentions:
         raise TypeError("TPR PPO requires TPRSelfAttention installed during model initialization")
