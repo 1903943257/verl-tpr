@@ -19,8 +19,8 @@ from __future__ import annotations
 from typing import Any, Protocol, runtime_checkable
 
 from verl.models.mcore.tpr.context import TPRAttentionBackend
-from verl.models.mcore.tpr.kv_stack import KVStack
-from verl.models.mcore.tpr.shard import (
+from verl.workers.engine.megatron.tpr.state import KVStack
+from verl.workers.engine.megatron.tpr.ring import (
     PrefixShard,
     RangeSequenceShard,
     SequenceShard,
@@ -34,7 +34,7 @@ from .execution_context import (
     make_cached_allgather_cp_backend,
     resolve_cp_group,
 )
-from verl.models.mcore.tpr.parallel.hybrid_attention import (
+from verl.experimental.tpr.hybrid import (
     HybridCPTopology,
     make_anchored_hybrid_cp_backend,
     make_cached_hybrid_cp_backend,
@@ -46,7 +46,7 @@ from verl.workers.engine.megatron.tpr.ring import (
     make_cached_ring_cp_backend,
     make_ring_sequence_shard,
 )
-from verl.models.mcore.tpr.parallel.ulysses_attention import (
+from verl.experimental.tpr.ulysses import (
     make_anchored_ulysses_cp_backend,
     make_cached_ulysses_cp_backend,
 )

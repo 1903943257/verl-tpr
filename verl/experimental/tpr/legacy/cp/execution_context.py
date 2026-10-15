@@ -23,10 +23,10 @@ from typing import Any
 
 from torch import Tensor
 
-from verl.models.mcore.tpr.kv_stack import KVStack
-from verl.models.mcore.tpr.prefix_state import KVPrefixAnchors
-from verl.models.mcore.tpr.shard import PrefixShard, SequenceShard, physical_sequence_shard
-from verl.models.mcore.tpr.parallel.allgather_attention import (
+from verl.workers.engine.megatron.tpr.state import KVStack
+from verl.experimental.tpr.gdn.prefix_state import KVPrefixAnchors
+from verl.workers.engine.megatron.tpr.ring import PrefixShard, SequenceShard, physical_sequence_shard
+from verl.experimental.tpr.allgather import (
     LocalKVBlock,
     _group_world_size_and_rank,
     allgather_cp_rectangular_attention,

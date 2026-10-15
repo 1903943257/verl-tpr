@@ -19,7 +19,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from verl.models.mcore.tpr.segment_plan import SegmentEvent, SegmentPlan
+from verl.workers.engine.megatron.tpr.tree import SegmentEvent, SegmentPlan
 
 TPR_REQUEST_KEY = "tpr_forward_backward_request"
 
