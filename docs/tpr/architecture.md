@@ -26,7 +26,9 @@ models.mcore.tpr.attention / context / rectangular_attention
     +-- new KV consumed by descendants; differentiable anchors during replay
 ```
 
-The base model code remains under `verl/models/mcore/tpr/`. Tree scheduling,
+The base model code remains under `verl/models/mcore/tpr/`. Legacy model
+PrefixState and Shard imports delegate to canonical Engine State and Ring
+classes; optional GDN continuation states live in `experimental/tpr/gdn/`. Tree scheduling,
 PPO ownership and distributed execution are Engine concerns and must not be
 imported by model-side primitives. The first-party `context.py` transfers
 per-forward prefix tensors, RoPE and new per-layer KV between the Executor and

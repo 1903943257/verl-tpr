@@ -82,3 +82,13 @@ def test_single_sequence_shard_implementation() -> None:
     assert 'class PrefixShard:' in ring
     assert "from .state import KVStack" not in ring
 
+
+
+def test_dense_prefix_state_is_engine_owned() -> None:
+    state = _source("state")
+    compat = (MODEL / "prefix_state.py").read_text(encoding="utf-8")
+    assert "class KVPrefixState:" in state
+    assert "class PrefixStateStack:" in state
+    assert "GDNPrefixState" not in state
+    assert "def __getattr__(name):" in compat
+
