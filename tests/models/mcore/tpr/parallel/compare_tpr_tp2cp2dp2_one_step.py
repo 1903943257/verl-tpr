@@ -21,16 +21,17 @@ def compare_sampled_gradients(full: dict, tpr: dict):
     for key in ("names", "shapes", "samples_per_name", "samples_per_parameter"):
         if left[key] != right[key]:
             raise AssertionError(f"Full/TPR sampled gradient layout differs: {key}")
-    # Full CP4's native Megatron gradient path is the reference; if it
-    # exhibits small per-CP replica drift, report it as a limitation of
-    # sampled Full-vs-TPR parity instead of misdiagnosing a DP2 bug.
-    # TPR DP2 must have exactly equal finalized gradients on all DP+CP ranks.
-    if right.get("replica_sample_max_abs") != 0:
+    # Full CP4's native reference can have small discrepancies too.
+    # DP2 keeps strict-by-default gating; an EXPLICIT diagnostic-only run
+    # may write a report, but must NOT be labelled gradient-correct.
+    full_replica_max_abs = float(left.get("replica_sample_max_abs", 0.0))
+    tpr_replica_max_abs = float(right.get("replica_sample_max_abs", 0.0))
+    tpr_exact = tpr_replica_max_abs == 0.0
+    if not tpr_exact and right.get("replica_consistency_enforced", True):
         raise AssertionError(
             "TPR DP2 replica gradients are not identical after finalize: "
-            f"sample_max_abs={right['replica_sample_max_abs']}"
+            f"sample_max_abs={tpr_replica_max_abs}"
         )
-    full_replica_max_abs = float(left.get("replica_sample_max_abs", 0.0))
     fvalues = [float(v) for shard in left["tp_shards"] for v in shard]
     tvalues = [float(v) for shard in right["tp_shards"] for v in shard]
     if not fvalues or len(fvalues) != len(tvalues):
@@ -44,7 +45,10 @@ def compare_sampled_gradients(full: dict, tpr: dict):
     return {
         "full_reference_replica_exact": full_replica_max_abs == 0,
         "full_reference_replica_sample_max_abs": full_replica_max_abs,
-        "tpr_dp2_replica_exact": True,
+        "tpr_dp2_replica_exact": tpr_exact,
+        "tpr_dp2_replica_sample_max_abs": tpr_replica_max_abs,
+        "dp2_gradient_replica_correctness_passed": tpr_exact,
+        "result_is_diagnostic_only": not tpr_exact,
         "sampled_gradient_parity_caveat": (
             "Full CP4 reference gradients have sampled replica disagreement; "
             "Full-vs-TPR gradient similarity uses its CP0 representative."
@@ -74,6 +78,20 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
         raise AssertionError("Expected Native Full and TPR respectively")
     if tpr.get("topology") != {"tp": 2, "cp": 2, "dp": 2, "world": 8}:
         raise AssertionError("TPR result is not TP2 CP2 DP2")
+    if (full.get("hccl_stats_reduce_dtype") != "float32"
+            or tpr.get("hccl_stats_reduce_dtype") != "float32"):
+        raise AssertionError(
+            "Stale Full/TPR benchmark: HCCL FP64 AllReduce cannot be "
+            "trusted on Ascend 910B; rerun BOTH modes with FP32 stats"
+        )
+    grad_dtype = tpr.get("gradient_sync_reduce_dtype")
+    if (grad_dtype not in ("bf16", "fp32")
+            or full.get("gradient_sync_reduce_dtype") != grad_dtype):
+        raise AssertionError(
+            "Full/TPR weight-gradient reduction precision differs or is "
+            "unrecorded: rerun BOTH with the same "
+            "TPR_OFFLINE_GRAD_SYNC_DTYPE=bf16 or fp32"
+        )
     for field in ("source_step", "source_capture", "input_sha256",
                   "checkpoint", "warmups", "repeats",
                   "capture_logprobs", "profiler_enabled"):
@@ -129,6 +147,7 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
         "input_sha256": tpr["input_sha256"],
         "full_topology": "TP2_CP4_DP1",
         "tpr_topology": "TP2_CP2_DP2",
+        "gradient_sync_reduce_dtype": grad_dtype,
         "full_median_fwd_bwd_s": f,
         "tpr_median_fwd_bwd_s": t,
         "speedup": f / t,
@@ -150,6 +169,8 @@ def compare(full_path: Path, tpr_path: Path) -> dict:
         f"sampled_grad_rel_l2={sampled_gradients['sampled_gradient_rel_l2']:.6g} "
         f"sampled_grad_cosine={sampled_gradients['sampled_gradient_cosine']:.6g} "
         f"full_replica_max_abs={sampled_gradients['full_reference_replica_sample_max_abs']:.9g} "
+        f"tpr_replica_max_abs={sampled_gradients['tpr_dp2_replica_sample_max_abs']:.9g} "
+        f"gradient_replica_validation_passed={int(sampled_gradients['dp2_gradient_replica_correctness_passed'])} "
         if sampled_gradients is not None else
         "sampled_grad_rel_l2=not_available "
     )

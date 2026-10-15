@@ -67,6 +67,20 @@ def test_fixed_shape_40k_one_mode():
     output_dir = Path(os.environ["TPR_BENCH_OUTPUT_DIR"])
     checkpoint = Path(os.environ.get("TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"))
     runtime = _runtime()
+    # The Full reference needs the same supported FP32 collective gate as
+    # the TPR DP2 benchmark; FP64 HCCL reductions cannot be trusted on 910B.
+    probe = torch.tensor(
+        float(dist.get_rank() + 1), dtype=torch.float32, device=runtime.device,
+    )
+    dist.all_reduce(probe, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+    torch.npu.synchronize()
+    if float(probe.item()) != 36.0:
+        raise AssertionError(
+            f"Full WORLD FP32 AllReduce failed on rank {dist.get_rank()}: "
+            f"rank_sum={probe.item()} expected=36"
+        )
+    if dist.get_rank() == 0:
+        print("TPR_FULL_WORLD_FP32_REDUCE_PASS rank_sum=36", flush=True)
     try:
         from verl.workers.utils.losses import ppo_loss
         # Reuse existing original PPO-capture loader. Its original source_keys
@@ -94,6 +108,14 @@ def test_fixed_shape_40k_one_mode():
         engine = _make_engine(model, runtime, finalize_time) if mode == "tpr" else None
         if os.getenv("TPR_EXEC_PROFILE", "0") not in ("0", "1"):
             raise ValueError("TPR_EXEC_PROFILE must be 0 or 1")
+        from .grad_sync_precision import offline_grad_sync_dtype
+        grad_sync_dtype = offline_grad_sync_dtype()
+        if dist.get_rank() == 0:
+            print(
+                f"TPR_FIXED_SHAPE_GRAD_REDUCE_MODE mode={mode} "
+                f"dtype={grad_sync_dtype} cp_group_size=4",
+                flush=True,
+            )
         runs = []
         for iteration in range(warmups + repeats):
             model.zero_grad(set_to_none=True)
@@ -117,13 +139,21 @@ def test_fixed_shape_40k_one_mode():
                 loss = float(out["loss"][0])
             torch.npu.synchronize()
             own_seconds = time.perf_counter() - start
-            critical = torch.tensor([own_seconds], dtype=torch.float64, device=runtime.device)
-            dist.all_reduce(critical, op=dist.ReduceOp.MAX)
+            # FP64 HCCL AllReduce is unsupported on Ascend 910B.
+            # Use FP32 for world MAX time and memory statistics.
+            critical = torch.tensor(
+                [own_seconds], dtype=torch.float32, device=runtime.device,
+            )
+            dist.all_reduce(
+                critical, op=dist.ReduceOp.MAX, group=dist.group.WORLD,
+            )
             peak = torch.tensor(
-                [float(torch.npu.max_memory_allocated())], dtype=torch.float64,
+                [float(torch.npu.max_memory_allocated())], dtype=torch.float32,
                 device=runtime.device,
             )
-            dist.all_reduce(peak, op=dist.ReduceOp.MAX)
+            dist.all_reduce(
+                peak, op=dist.ReduceOp.MAX, group=dist.group.WORLD,
+            )
 
             # AFTER timing: profiler materialization and optional per-rank
             # snapshots, never included in the F/B critical path.
@@ -190,10 +220,14 @@ def test_fixed_shape_40k_one_mode():
             measured = [r["critical_fwd_bwd_s"] for r in runs if not r["warmup"]]
             target.write_text(json.dumps({
                 "source_step": step, "mode": mode,
+                "topology": {"tp": 2, "cp": 4, "dp": 1, "world": 8},
                 "effective_sequence_cap": int(item.get("effective_sequence_cap", 40960)),
                 "input_sha256": data_sha, "source_capture": str(capture),
                 "checkpoint": str(checkpoint), "warmups": warmups,
                 "repeats": repeats, "updated_weights": False,
+                "gradient_sync_reduce_dtype": grad_sync_dtype,
+                "hccl_deterministic": os.getenv("HCCL_DETERMINISTIC", "unset"),
+                "hccl_stats_reduce_dtype": "float32",
                 "capture_logprobs": capture_logprobs,
                 "profiler_enabled": os.getenv("TPR_EXEC_PROFILE", "0") == "1",
                 "median_fwd_bwd_s": statistics.median(measured),
