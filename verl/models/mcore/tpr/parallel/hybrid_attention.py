@@ -1,18 +1,9 @@
-"""Compatibility import for moved experimental TPR implementation.
+"""Compatibility module alias for the optional verl.experimental.tpr.hybrid extension.
 
-New production TPR code must not import this module.
+The production PPO engine must import only its own Ring/Attention stack.
+This alias preserves object identity for legacy monkeypatch-based tests.
 """
 from importlib import import_module as _import_module
+import sys as _sys
 
-_impl = _import_module("verl.experimental.tpr.hybrid")
-for _symbol in dir(_impl):
-    if not _symbol.startswith("_"):
-        globals()[_symbol] = getattr(_impl, _symbol)
-
-
-def __getattr__(name):
-    return getattr(_impl, name)
-
-
-def __dir__():
-    return sorted(set(globals()) | set(dir(_impl)))
+_sys.modules[__name__] = _import_module("verl.experimental.tpr.hybrid")
