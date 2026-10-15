@@ -80,13 +80,13 @@ def _validate_kv_pair(
         raise ValueError(f"layer {layer} {kind} K/V device and dtype must match")
 
 
-def _assert_layers(actual: Mapping[int, object], expected: Iterable[int]) -> None:
+def _assert_layers(actual: Mapping[int, object], expected: Iterable[int], *, kind: str) -> None:
     expected_set = set(expected)
     for layer in expected_set:
         _validate_layer_number(layer)
     if set(actual) != expected_set:
         raise RuntimeError(
-            f"new KV layer mismatch: missing={sorted(expected_set - set(actual))}, "
+            f"new {kind} layer mismatch: missing={sorted(expected_set - set(actual))}, "
             f"unexpected={sorted(set(actual) - expected_set)}"
         )
 
@@ -176,7 +176,7 @@ class TPRAttentionContext:
         self._new_key_values[layer_number] = (key, value)
 
     def assert_new_kv_layers(self, expected_layer_numbers: Iterable[int]) -> None:
-        _assert_layers(self._new_key_values, expected_layer_numbers)
+        _assert_layers(self._new_key_values, expected_layer_numbers, kind="KV")
 
     @property
     def new_gdn_states(self) -> Mapping[int, GDNLayerState]:
@@ -199,7 +199,7 @@ class TPRAttentionContext:
         self._new_gdn_states[layer_number] = state
 
     def assert_new_gdn_layers(self, expected_layer_numbers: Iterable[int]) -> None:
-        _assert_layers(self._new_gdn_states, expected_layer_numbers)
+        _assert_layers(self._new_gdn_states, expected_layer_numbers, kind="GDN")
 
 
 def _validate_gdn_layer_state(layer: int, state: GDNLayerState) -> None:

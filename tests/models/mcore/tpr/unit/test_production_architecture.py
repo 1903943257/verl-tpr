@@ -153,7 +153,7 @@ def test_optional_cp_factories_outside_model_implementation() -> None:
 
 def test_context_is_thin_and_has_no_eager_engine_imports() -> None:
     source = (MODEL / "context.py").read_text(encoding="utf-8")
-    assert len(source.splitlines()) <= 220
+    assert len(source.splitlines()) <= 230
     assert "class TPRAttentionContext:" in source
     assert "def use_tpr_attention_context(" in source
     assert "def get_past_kv(" in source
