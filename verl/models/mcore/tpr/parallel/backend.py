@@ -41,7 +41,7 @@ from .hybrid_attention import (
     make_hybrid_sequence_shard,
     resolve_mindspeed_hybrid_topology,
 )
-from .ring_attention import (
+from verl.workers.engine.megatron.tpr.ring import (
     make_anchored_ring_cp_backend,
     make_cached_ring_cp_backend,
     make_ring_sequence_shard,

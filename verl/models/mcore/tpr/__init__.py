@@ -1,98 +1,90 @@
-# Copyright 2026 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""Lazy TPR model compatibility exports.
 
-"""Model-side primitives for depth-first tree-prefix-reuse training."""
+Importing model primitives must not eagerly initialize Engine, experimental CP
+backends or optional MindSpeed kernels. Prefer explicit submodule imports in
+production code; these exports only preserve existing public API/test imports.
+"""
+from importlib import import_module
 
-from .attention import TPRSelfAttention
-from .context import (
-    TPRAttentionBackend,
-    TPRAttentionContext,
-    get_tpr_attention_context,
-    use_tpr_attention_context,
-)
-from .engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
-from .fixed_topology_scheduler import (
-    FixedTopologyScheduler,
-    PhysicalExecution,
-    PhysicalExecutionKind,
-    SchedulerState,
-    TreeScheduleResult,
-)
-from .kv_stack import KVStack, KVStackEntry, PastKVAnchors, PastKVSlice, SegmentKV
-from .module_spec import make_tpr_module_spec_provider, replace_self_attention_with_tpr
-from .parallel import (
-    ALLGATHER_CP_BACKEND,
-    HYBRID_CP_BACKEND,
-    RING_CP_BACKEND,
-    ULYSSES_CP_BACKEND,
-    AllGatherCPBackend,
-    AllGatherCPAttentionBackend,
-    HybridCPAttentionBackend,
-    HybridCPBackend,
-    HybridCPTopology,
-    HybridLocalKVBlock,
-    LocalKVBlock,
-    RingBlockKind,
-    RingCPAttentionBackend,
-    RingCPBackend,
-    RingLocalKVBlock,
-    ShardedPastKVAnchors,
-    TPRCPBackend,
-    UlyssesCPAttentionBackend,
-    UlyssesCPBackend,
-    all_gather_sequence,
-    allgather_cp_rectangular_attention,
-    classify_ring_block,
-    hybrid_cp_rectangular_attention,
-    make_hybrid_sequence_shard,
-    make_ring_sequence_shard,
-    resolve_tpr_cp_backend,
-    resolve_mindspeed_hybrid_topology,
-    ring_cp_attention,
-    ulysses_cp_rectangular_attention,
-)
-from .prefix_state import (
-    GDNLayerState,
-    GDNPrefixAnchors,
-    GDNPrefixState,
-    KVPrefixAnchors,
-    KVPrefixState,
-    PrefixState,
-    PrefixStateEntry,
-    PrefixStateStack,
-)
-from .rectangular_attention import rectangular_causal_attention
-from .rope import build_sharded_rotary_pos_emb, build_suffix_rotary_pos_emb
-from .shard import (
-    PaddedSequenceShard,
-    PrefixShard,
-    RangeSequenceShard,
-    SequenceShard,
-    iter_valid_sequence_slices,
-    physical_sequence_shard,
-    round_up_sequence_length,
-)
-from .segment_executor import LeafVisitResult, SegmentBackwardResult, SegmentExecutor, SegmentForwardResult
-from .segment_plan import (
-    PopSegment,
-    PushSegment,
-    SegmentEvent,
-    SegmentEventKind,
-    SegmentLossTerm,
-    SegmentPlan,
-    SegmentSpec,
-)
+_EXPORTS = {
+    "all_gather_sequence": ".parallel",
+    "ALLGATHER_CP_BACKEND": ".parallel",
+    "allgather_cp_rectangular_attention": ".parallel",
+    "AllGatherCPAttentionBackend": ".parallel",
+    "AllGatherCPBackend": ".parallel",
+    "build_sharded_rotary_pos_emb": ".rope",
+    "build_suffix_rotary_pos_emb": ".rope",
+    "classify_ring_block": ".parallel",
+    "FixedTopologyScheduler": ".fixed_topology_scheduler",
+    "GDNLayerState": ".prefix_state",
+    "GDNPrefixAnchors": ".prefix_state",
+    "GDNPrefixState": ".prefix_state",
+    "get_tpr_attention_context": ".context",
+    "HYBRID_CP_BACKEND": ".parallel",
+    "hybrid_cp_rectangular_attention": ".parallel",
+    "HybridCPAttentionBackend": ".parallel",
+    "HybridCPBackend": ".parallel",
+    "HybridCPTopology": ".parallel",
+    "HybridLocalKVBlock": ".parallel",
+    "iter_valid_sequence_slices": ".shard",
+    "KVPrefixAnchors": ".prefix_state",
+    "KVPrefixState": ".prefix_state",
+    "KVStack": ".kv_stack",
+    "KVStackEntry": ".kv_stack",
+    "LeafVisitResult": ".segment_executor",
+    "LocalKVBlock": ".parallel",
+    "make_hybrid_sequence_shard": ".parallel",
+    "make_ring_sequence_shard": ".parallel",
+    "make_tpr_module_spec_provider": ".module_spec",
+    "PaddedSequenceShard": ".shard",
+    "PastKVAnchors": ".kv_stack",
+    "PastKVSlice": ".kv_stack",
+    "physical_sequence_shard": ".shard",
+    "PhysicalExecution": ".fixed_topology_scheduler",
+    "PhysicalExecutionKind": ".fixed_topology_scheduler",
+    "PopSegment": ".segment_plan",
+    "PrefixShard": ".shard",
+    "PrefixState": ".prefix_state",
+    "PrefixStateEntry": ".prefix_state",
+    "PrefixStateStack": ".prefix_state",
+    "PushSegment": ".segment_plan",
+    "RangeSequenceShard": ".shard",
+    "rectangular_causal_attention": ".rectangular_attention",
+    "replace_self_attention_with_tpr": ".module_spec",
+    "resolve_mindspeed_hybrid_topology": ".parallel",
+    "resolve_tpr_cp_backend": ".parallel",
+    "ring_cp_attention": ".parallel",
+    "RING_CP_BACKEND": ".parallel",
+    "RingBlockKind": ".parallel",
+    "RingCPAttentionBackend": ".parallel",
+    "RingCPBackend": ".parallel",
+    "RingLocalKVBlock": ".parallel",
+    "round_up_sequence_length": ".shard",
+    "SchedulerState": ".fixed_topology_scheduler",
+    "SegmentBackwardResult": ".segment_executor",
+    "SegmentEvent": ".segment_plan",
+    "SegmentEventKind": ".segment_plan",
+    "SegmentExecutor": ".segment_executor",
+    "SegmentForwardResult": ".segment_executor",
+    "SegmentKV": ".kv_stack",
+    "SegmentLossTerm": ".segment_plan",
+    "SegmentPlan": ".segment_plan",
+    "SegmentSpec": ".segment_plan",
+    "SequenceShard": ".shard",
+    "ShardedPastKVAnchors": ".parallel",
+    "TPR_REQUEST_KEY": ".engine_adapter",
+    "TPRAttentionBackend": ".context",
+    "TPRAttentionContext": ".context",
+    "TPRCPBackend": ".parallel",
+    "TPRForwardBackwardRequest": ".engine_adapter",
+    "TPRSelfAttention": ".attention",
+    "TreeScheduleResult": ".fixed_topology_scheduler",
+    "ULYSSES_CP_BACKEND": ".parallel",
+    "ulysses_cp_rectangular_attention": ".parallel",
+    "UlyssesCPAttentionBackend": ".parallel",
+    "UlyssesCPBackend": ".parallel",
+    "use_tpr_attention_context": ".context"
+}
 
 __all__ = [
     "ALLGATHER_CP_BACKEND",
@@ -171,5 +163,19 @@ __all__ = [
     "ring_cp_attention",
     "replace_self_attention_with_tpr",
     "use_tpr_attention_context",
-    "ulysses_cp_rectangular_attention",
+    "ulysses_cp_rectangular_attention"
 ]
+
+
+def __getattr__(name):
+    try:
+        module_name = _EXPORTS[name]
+    except KeyError as exc:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from exc
+    value = getattr(import_module(module_name, __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))
