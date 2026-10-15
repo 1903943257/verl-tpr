@@ -275,14 +275,20 @@ def test_recorded_full_vs_tpr_one_step():
         "TPR_OFFLINE_OUTPUT_DIR", "/workspace/tpr_offline_qwen4b_tp2cp4"
     ))
     runtime = _runtime()
-    # MindSpeed repatch must run before importing the Engine package: its
-    # parent __init__ eagerly imports MindSpeed and Megatron engine modules.
-    from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
     try:
         from verl.workers.utils.losses import ppo_loss
         batch, real_keys, count, data_sha = _load_real_pair(source, rows, mode)
+        # Build TransformerConfig before importing the new Engine package.
+        # Its parent package __init__ imports MindSpeed engines and can
+        # affect MindSpeed's get_full_args() global configuration state.
+        model, hf = make_real_qwen3_tp_model(
+            runtime, model_path=checkpoint, tp_size=2, cp_size=4,
+            sequence_parallel=False, profile="4b",
+        )
+        from verl.workers.engine.megatron.tpr.adapter import (
+            run_tpr_forward_backward_batch, _trajectory_keys_from_minibatch,
+        )
         from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans
-        from verl.workers.engine.megatron.tpr.adapter import _trajectory_keys_from_minibatch
         forest = build_tree_execution_plans(
             _trajectory_keys_from_minibatch(batch), batch,
             tree_policy=os.getenv("TPR_TREE_POLICY", "exact"),
@@ -294,13 +300,8 @@ def test_recorded_full_vs_tpr_one_step():
         if mode == "tpr" and os.getenv("TPR_TREE_POLICY", "exact") == "exact":
             if len(forest.trees) != 1 or forest.segment_count <= len(rows):
                 raise AssertionError("Exact TPR mode did not create expected shared tree")
-        # Turn mode is allowed to produce multiple trees if there is no valid
-        # complete-turn common prefix. Never invent shared KV for such rows.
+        # Turn mode can yield multiple trees without shared complete turns.
         ring_impl = _install_offline_full_ring_backend(mode)
-        model, hf = make_real_qwen3_tp_model(
-            runtime, model_path=checkpoint, tp_size=2, cp_size=4,
-            sequence_parallel=False, profile="4b",
-        )
         if hf.num_hidden_layers != 36:
             raise AssertionError("Not the real Qwen3-4B")
         model.config.no_sync_func = None

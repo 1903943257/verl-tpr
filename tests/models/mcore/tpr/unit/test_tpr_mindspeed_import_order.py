@@ -40,3 +40,19 @@ def test_tp_checkpoint_helper_has_no_module_level_engine_imports():
     maker = _function(tree, "make_real_qwen3_tp_model")
     assert any(node.module == "verl.workers.engine.megatron.tpr.adapter"
                for node in _engine_imports(list(ast.walk(maker))))
+
+def test_qwen_config_is_built_before_engine_import_in_replay():
+    tree = ast.parse((ROOT / "test_real_actor_tp2cp4_offline_ppo_npu.py").read_text())
+    runner = _function(tree, "test_recorded_full_vs_tpr_one_step")
+    calls = [
+        node for node in ast.walk(runner)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "make_real_qwen3_tp_model"
+    ]
+    imports = _engine_imports(list(ast.walk(runner)))
+    assert len(calls) == 1
+    assert imports and min(node.lineno for node in imports) > calls[0].lineno, (
+        "Importing the Engine package before constructing TransformerConfig "
+        "changes MindSpeed's full_args configuration."
+    )
