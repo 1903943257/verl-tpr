@@ -27,7 +27,7 @@ FA_LAYERS = (4, 8, 12, 16, 20, 24)
 def clamp_segment(model, sid, runtime, monkeypatch, *, cp, reference, store, layers, counts):
     from verl.models.mcore.tpr import attention
     from verl.models.mcore.tpr.context import TPRAttentionContext
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.models.mcore.tpr.parallel import ring
     shard = ring.make_ring_sequence_shard(128, cp_rank=runtime.cp_group.rank(), cp_size=2)
     indices = shard.global_indices(device="cpu")
     active, handles = [], []
@@ -90,7 +90,7 @@ def clamp_segment(model, sid, runtime, monkeypatch, *, cp, reference, store, lay
 def _forward_paths(model, runtime, monkeypatch, *, cp, reference):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
     from verl.models.mcore.tpr.prefix_state import KVPrefixAnchors
-    from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
+    from verl.models.mcore.tpr.kv_stack import ShardedPastKVAnchors
     plan = _plan()
     executor = SegmentExecutor(model, plan, expected_layer_numbers=FA_LAYERS,
                                cp_group=runtime.cp_group if cp == 2 else None,
@@ -133,7 +133,7 @@ def _forward_paths(model, runtime, monkeypatch, *, cp, reference):
 
 
 def _compare(reference, actual, runtime, label):
-    from verl.models.mcore.tpr.parallel.ring_attention import make_ring_sequence_shard
+    from verl.models.mcore.tpr.parallel.ring import make_ring_sequence_shard
     indices = make_ring_sequence_shard(128, cp_rank=runtime.cp_group.rank(), cp_size=2).global_indices(device="cpu")
     def pair(left, right):
         assert left.shape == right.shape and torch.isfinite(left).all() and torch.isfinite(right).all()

@@ -19,7 +19,7 @@ def metric(label, left, right, rank):
 
 def test_attention_whole_vs_prefix_transport(runtime, monkeypatch):
     from verl.models.mcore.tpr.rectangular_attention import rectangular_causal_attention
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.models.mcore.tpr.parallel import ring
     from .test_small_hybrid_tree_cp_npu import _communication_probe
     gen = torch.Generator().manual_seed(445501)
     base = {n: torch.randn(128, 1, heads, 256, generator=gen).bfloat16()

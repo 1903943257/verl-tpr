@@ -26,7 +26,7 @@ def trace_l4(model, patch, *, backend, rank, enabled):
         yield records
         return
     import torch_npu
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.models.mcore.tpr.parallel import ring
 
     native = importlib.import_module(
         "mindspeed.core.context_parallel.ring_context_parallel.ring_context_parallel")

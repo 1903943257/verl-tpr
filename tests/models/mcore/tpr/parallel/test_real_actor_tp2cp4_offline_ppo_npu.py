@@ -228,7 +228,7 @@ def _install_offline_full_ring_backend(mode: str) -> str:
         raise ValueError("TPR_OFFLINE_FULL_RING_BACKEND must be custom or native")
     if mode != "full" or chosen == "custom":
         return "tpr_custom_ring"
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.models.mcore.tpr.parallel import ring
 
     def native_full_attention(query, current_key, current_value, *,
                               prefix_blocks=(), **kwargs):

@@ -48,7 +48,7 @@ def _plan():
 @contextmanager
 def _communication_probe(monkeypatch):
     import mindspeed.core.ssm.gated_delta_net as gdn
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.models.mcore.tpr.parallel import ring
 
     counts = Counter()
     transport, _ = ring._load_mindspeed_ring_primitives()
@@ -88,7 +88,7 @@ def _snapshot(states, kv, *, gradients=False):
 def _run(model, plan, runtime, monkeypatch, *, cp, tree):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
     from verl.models.mcore.tpr.prefix_state import GDNLayerState, KVPrefixAnchors
-    from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
+    from verl.models.mcore.tpr.kv_stack import ShardedPastKVAnchors
 
     model.zero_grad(set_to_none=True)
     outputs, input_gradients, own_losses = {}, {}, Counter()

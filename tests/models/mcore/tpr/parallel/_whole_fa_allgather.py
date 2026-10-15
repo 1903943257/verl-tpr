@@ -13,8 +13,8 @@ def restore_zigzag_gather(value):
 
 
 def install_whole_fa_allgather(monkeypatch):
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
-    from verl.models.mcore.tpr.parallel import allgather_attention as ag
+    from verl.models.mcore.tpr.parallel import ring
+    from . import _test_only_allgather_oracle as ag
     from verl.models.mcore.tpr.rectangular_attention import rectangular_causal_attention
     counts = Counter()
     original_rs = ag._reduce_scatter_tensor
