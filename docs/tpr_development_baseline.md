@@ -17,6 +17,11 @@ The TPR test and experiment-document changes through Bridge commit
 after the initial import. This update did not change TPR runtime code or the
 VERL integration hooks.
 
+The 10K TP/CP/DP parity probes and their explicitly gated offline DP2 adapter
+change were synchronized through Bridge commit
+`d1ecfa17152185e73143a1e67ff058c44ccb9998` (2026-10-15). This does not
+enable production VERL DP2 training.
+
 The three legacy installers in `patches/` are retained for imported regression
 tests and provenance. Do not apply them to this already-integrated branch.
 

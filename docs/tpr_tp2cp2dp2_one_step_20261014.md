@@ -649,3 +649,185 @@ Next priorities:
 Results are isolated frozen-weights F/B+manual finalization only,
 not proof of PPO e2e training correctness, reward, or production
 Megatron-DDP performance.
+
+
+## Controlled 10K TP/CP/DP correctness isolation (added 2026-10-15)
+
+Goal: isolate *factor-by-factor* numerical effects of prefix reuse,
+TP1→TP2, CP1→RingCP2, DP1→DTA-placement DP2, and CP2+DP2.
+**These are correctness probes, not benchmarks or online training.**
+
+Run exactly six isolated Qwen3-4B/Ascend NPU topology arms:
+
+| Case | Model/algorithm | TP | CP | DP | NPU ranks |
+|---|---|---:|---:|---:|---:|
+| unshared_tp2cp1dp1 | unshared TPR execution (control, not native Megatron Full) | 2 | 1 | 1 | 2 |
+| tpr_tp1cp1dp1 | shared TPR, no TP/CP/DP parallelism | 1 | 1 | 1 | 1 |
+| tpr_tp2cp1dp1 | shared TPR, no CP | 2 | 1 | 1 | 2 |
+| tpr_tp2cp2dp1 | shared TPR, Ring CP2 | 2 | 2 | 1 | 4 |
+| tpr_tp2cp1dp2 | shared TPR, DP2 but **no CP** | 2 | 1 | 2 | 4 |
+| tpr_tp2cp2dp2 | shared TPR, Ring CP2 plus DP2 | 2 | 2 | 2 | 8 |
+
+The **TP1CP1DP1** case is included even though it may have greater
+per-NPU memory demand. On a capacity error, report it explicitly,
+not as a numerical-correctness failure or silent downgrade.
+
+Use the existing Step6 matched *30K* frozen capture from
+`/workspace/tpr_dp2_30k_bf16_deterministic_pair_v1`.
+Construct ONE immutable shared 10,240-token controlled dataset and
+reuse it in all arms. Preserve original PPO response
+`old_log_probs`, `advantages` and masks for every retained token.
+
+**Critical disclosure:** Original prompts may themselves exceed 10K.
+In that case the 10K preparation retains at most the last 4,096
+prompt tokens and the following leading response window. This changes
+model conditioning and RoPE positions. The data is valid as
+a **same-input fixed-label numerical experiment**, but is **not**
+equivalent to the original online PPO run. Output
+`parity_capture_audit.json` records each row's prompt/response
+truncation and `changes_original_conditioning`.
+
+The NPU launcher runs from the bridge-synchronized VERL source tree:
+
+    cd /workspace/uni-agent-cc/verl
+    # Synchronize new bridge/main commits into this container as usual.
+    pytest -q tests/models/mcore/tpr/unit/test_tpr_10k_parallel_parity_cpu.py
+    HCCL_DETERMINISTIC=true \
+    bash tests/models/mcore/tpr/parallel/run_tpr_10k_parallel_parity.sh \
+      /workspace/tpr_dp2_30k_bf16_deterministic_pair_v1 \
+      /workspace/tpr_10k_axes_correctness_v1
+
+The script is resumable: a completed case's `result.json` is reused;
+a failed case without a valid result must be diagnosed, not
+overwritten. Six-case CPU comparison runs automatically on success:
+
+    /workspace/tpr_10k_axes_correctness_v1/comparison_10k.json
+
+Pairwise checks:
+- `unshared_vs_tpr_no_cp`: prefix-reuse effect without CP.
+- `tp_only`: TP1→TP2 at CP=1, DP=1.
+- `cp_only`: CP1→RingCP2 with TP=2, DP=1.
+- `dp_only_cp1`: DP1→DP2 with **CP=1**, TP=2.
+- `dp_only_cp2`: DP1→DP2 under TP2 RingCP2.
+- `cp2dp2_vs_no_cp`: combined effect.
+
+Each result preserves source fingerprint, global supervised PPO
+token count, topology, DP original-row assignments, global PPO
+loss, **every selected logical token new_logprob**, and 64 canonical
+full-coordinate sparse parameter-gradient samples for each weight.
+The comparator reconstructs host-FP64 PPO ratio/clip decisions and
+effective dLoss/dLogprob from original saved labels. Reports:
+loss gap, gradient relative-L2/cosine, per-token logprob difference,
+Clip status switches and effective PPO-gradient relative-L2.
+
+The canonical gradient witness accounts for TP-sharded QKV/FC1
+gate+up/FC2/linear projection/embedding layouts; avoids counting
+identical CP/DP replicas twice; audits CP/DP sampled replica exactness.
+Q/K RMSNorm weights are replicated among TP ranks but get **per-head
+local gradients**. Witness explicitly sums those TP contributions
+for comparison against TP1; it ALSO reports
+`qk_norm_tp_local_gradient_max_abs`. This **does not modify the
+actual optimizer gradient**. Any necessary TP synchronization of the
+physical Q/K Norm gradient must be addressed separately before
+production optimizer updates.
+
+All arms use BF16 gradients, HCCL_DETERMINISTIC=true, no activation
+recompute, no optimizer/rollout. Experimental DP2 exception is
+allowed **only** when both `TPR_RUN_10K_PARALLEL_PARITY=1` and
+`TPR_10K_PARITY_ONLY=1` are set in addition to the separate
+DP2 experimental flag. Production DP gate is otherwise unchanged.
+
+Caveats: the control `unshared_tp2cp1dp1` disables shared prefixes
+inside the SAME TPR Segment backend. It is not the independent native
+Megatron Full schedule. The canonical 64-samples/parameter gradient
+comparison is sparse (but comparable across TP1/TP2), not
+full-model Rel L2. This matrix therefore isolates plausible sources
+of error but does not alone certify full-gradient optimizer parity.
+
+
+Additional safety gate: before each 10K arm, the exact eight-row
+controlled input is independently planned with `qwen_turn`.
+If `global_unique_tree_tokens >= global_logical_tokens`, the run
+aborts rather than quietly claiming TPR correctness on data with no
+actual shared Prefix. The reuse ratio is stored in
+`global_tpr_reuse_audit` for each result.
+
+
+Improved 10K correctness witness: **every** trainable Norm parameter
+(`input_layernorm`, `pre_mlp_layernorm`, final Norm and
+per-head Q/K Norm) is now compared using its complete gradient tensor,
+not eight or 64 sparsely selected elements. The cross-topology report
+prints `norm_full_rel_l2` / `norm_full_cos`, a genuine all-element
+Norm-only metric. Non-Norm large matrices remain canonical sparse
+(64 full-coordinate samples per parameter). The actual TP-shared
+Q/K Norm optimizer-state synchronization remains out of scope.
+
+
+### 10K TP1 OOM and safe resume protocol (2026-10-15)
+
+Observed `unshared_tp2cp1dp1` succeeds and prints 22,680 PPO
+tokens, loss `0.0142083429`, 18,560 canonical sparse gradient
+elements and 22,680 token logprobs.
+The next `tpr_tp1cp1dp1` fails in backward due to NPU OOM:
+56.48 GiB active on a 60.95 GiB card, 1.74 GiB allocation
+attempt, 384.51 MiB free. **Do NOT call TP parity PASS**:
+a successful `unshared TP2` only establishes one runnable TP2
+control; both shared TPR TP1 and shared TPR TP2 must have comparable
+gradient/logprob witnesses to isolate TP.
+
+The six-arm runner now supports opt-in `TPR_10K_SKIP_TP1_OOM=1`:
+it REQUIRES `tpr_tp1cp1dp1.log` to contain the actual
+"out of memory" text before skipping only TP1, and resumes
+the four pending TP2 CP/DP topologies, reusing the finished
+unshared result. The resulting `comparison_10k.json`
+will mark `complete_matrix=false`,
+`tp_correctness_status=NOT_EVALUATED_TP1_OOM`,
+and exclude only the `tp_only` pair from measured metrics.
+Other individual checks (unshared-vs-shared CP1, CP-only,
+DP-only CP1, DP-only CP2) can still be quantified.
+
+    # First sync updated bridge/main into the VERL container.
+    cd /workspace/uni-agent-cc/verl
+    TPR_10K_SKIP_TP1_OOM=1 HCCL_DETERMINISTIC=true \
+      bash tests/models/mcore/tpr/parallel/run_tpr_10k_parallel_parity.sh \
+        /workspace/tpr_dp2_30k_bf16_deterministic_pair_v1 \
+        /workspace/tpr_10k_axes_correctness_v1
+
+To finish TP1-vs-TP2 parity, create a separate much shorter
+controlled shared capture (2K-4K per trajectory, or fewer complete
+selected trees) and run both TP1CP1DP1 and TP2CP1DP1 on the SAME
+short input. Preserve genuine shared Prefix, original retained PPO
+labels, identical model weights, and corrected Q/K Norm TP gradient
+semantics. The original 10K unshared TP2 PASS cannot substitute
+for this paired numerical comparison.
+
+
+### 2026-10-15 final 10K protocol: permanently remove TP1 case
+
+**This section supersedes the earlier six-case and OOM-log skip protocols.**
+Following TP1CP1DP1 backward OOM, the user elected to exclude TP
+correctness isolation from this 10K matrix entirely.
+
+The experiment now has exactly FIVE arms, ALL at TP2:
+`unshared_tp2cp1dp1`, `tpr_tp2cp1dp1`,
+`tpr_tp2cp2dp1`, `tpr_tp2cp1dp2`, and
+`tpr_tp2cp2dp2`.
+
+No `TPR_10K_SKIP_TP1_OOM` flag is needed, no TP1 OOM log is
+read, and no TP1 artifacts are required. The five-way comparator
+omits `tp_only` and explicitly marks
+`tp_correctness_status=NOT_EVALUATED_TP_FIXED_AT_2`.
+`complete_matrix=true` means all **five CP/DP arms** completed,
+not that TP numerical correctness was established.
+
+Run with the existing Step6 10K workspace, reusing all completed
+results without overwriting or rebuilding the capture:
+
+    cd /workspace/uni-agent-cc/verl
+    # Sync latest bridge/main to container first.
+    bash tests/models/mcore/tpr/parallel/run_tpr_10k_parallel_parity.sh \
+      /workspace/tpr_dp2_30k_bf16_deterministic_pair_v1 \
+      /workspace/tpr_10k_axes_correctness_v1
+
+Remaining comparisons: unshared-vs-TPR with CP1, CP-only,
+DP-only with CP1, DP-only with CP2, and CP2DP2-vs-CP1.

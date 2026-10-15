@@ -55,15 +55,24 @@ def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None
 
 
 def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
-    """Keep DP1 production scope; gate the isolated TP2/CP2/DP2 replay."""
+    """Keep DP1 production scope; explicitly gate isolated DP2 parity experiments."""
     import os
 
     tp, cp = sizes["TP"], sizes["CP"]
-    experimental_dp2 = (
+    existing_dp2 = (
         ppo and tp == 2 and cp == 2 and sizes["DP"] == 2
         and os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") == "1"
         and os.getenv("TPR_RUN_TP2CP2DP2_ONE_STEP") == "1"
     )
+    # Isolated 10K correctness matrix only. This deliberately does NOT
+    # expand the supported production VERL DP topology.
+    parity_10k_dp2 = (
+        ppo and tp in (1, 2) and cp in (1, 2) and sizes["DP"] == 2
+        and os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") == "1"
+        and os.getenv("TPR_RUN_10K_PARALLEL_PARITY") == "1"
+        and os.getenv("TPR_10K_PARITY_ONLY") == "1"
+    )
+    experimental_dp2 = existing_dp2 or parity_10k_dp2
     supported_cp = (
         (cp in (1, 2) if tp == 1 else cp in (1, 2, 4))
         if ppo else (cp >= 1 if tp == 1 else cp in (1, 2, 4))
@@ -74,7 +83,7 @@ def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
         raise NotImplementedError(
             "TPR PPO: TP1 CP1/2 or TP2 CP1/2/4; "
             "thin entry: TP1 CP>=1 or TP2 CP1/2/4; "
-            f"PP=EP=1, DP=1 (or explicitly gated offline TP2/CP2/DP2), got {sizes}"
+            f"PP=EP=1, DP=1 (or explicitly gated offline DP2 parity), got {sizes}"
         )
     return tp
 
