@@ -17,6 +17,10 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from collections.abc import Callable
+from dataclasses import dataclass
+from torch import Tensor
+from .tree import ForestExecutionPlan, TreeExecutionPlan
 from typing import TYPE_CHECKING, Any
 
 from megatron.core.utils import get_model_config
@@ -24,13 +28,75 @@ from megatron.core.utils import get_model_config
 from verl.utils.megatron_utils import unwrap_model
 
 from verl.models.mcore.tpr.attention import TPRSelfAttention
-from .scheduler import FixedTopologyScheduler
 from verl.models.mcore.tpr.module_spec import install_tpr_vanilla_mbridge_spec, make_tpr_module_spec_provider
 from .ring import aggregate_cp_loss, resolve_engine_cp_runtime
-from .executor import SegmentExecutor
+from .executor import FixedTopologyScheduler, SegmentExecutor
 
 if TYPE_CHECKING:
     from verl.workers.engine.megatron.transformer_impl import MegatronEngine
+
+
+@dataclass(frozen=True, slots=True)
+class TPRBatchResult:
+    tree_results: tuple[Any, ...]
+    normalized_loss: Tensor
+    tree_count: int
+    segment_count: int
+    logical_loss_tokens: int
+
+
+class TPRBatchRunner:
+    """Execute a complete PPO mini-batch as a forest under one grad-sync scope.
+
+    run_tree(plan) must execute a full single-tree F/B schedule and return an
+    object with a scalar normalized_loss attribute. Its loss values must
+    already use the SAME original mini-batch global denominator. The runner
+    never normalizes again, and must not finalize per tree.
+    """
+
+    def __init__(
+        self,
+        *,
+        run_tree: Callable[[TreeExecutionPlan], Any],
+        finalize_gradients: Callable[[], None],
+        no_sync_context: Callable[[], Any] | None = None,
+    ) -> None:
+        if not callable(run_tree) or not callable(finalize_gradients):
+            raise TypeError("run_tree and finalize_gradients must be callable")
+        self.run_tree = run_tree
+        self.finalize_gradients = finalize_gradients
+        self.no_sync_context = no_sync_context
+        self._ran = False
+
+    def run(self, forest: ForestExecutionPlan) -> TPRBatchResult:
+        if self._ran:
+            raise RuntimeError("TPRBatchRunner is single-use for one optimizer mini-batch")
+        self._ran = True
+        if not isinstance(forest, ForestExecutionPlan) or not forest.trees:
+            raise ValueError("forest must contain at least one executable tree")
+
+        results = []
+        accumulated_loss: Tensor | None = None
+        context = nullcontext() if self.no_sync_context is None else self.no_sync_context()
+        with context:
+            for tree_plan in forest.trees:
+                output = self.run_tree(tree_plan)
+                loss = getattr(output, "normalized_loss", None)
+                if not isinstance(loss, Tensor) or loss.numel() != 1:
+                    raise TypeError("run_tree must return an object with scalar Tensor normalized_loss")
+                results.append(output)
+                accumulated_loss = loss.detach() if accumulated_loss is None else accumulated_loss + loss.detach()
+
+        # No finalization if any tree failed or produced an invalid loss.
+        self.finalize_gradients()
+        assert accumulated_loss is not None
+        return TPRBatchResult(
+            tree_results=tuple(results),
+            normalized_loss=accumulated_loss,
+            tree_count=len(forest.trees),
+            segment_count=forest.segment_count,
+            logical_loss_tokens=forest.logical_loss_tokens,
+        )
 
 
 def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None:
@@ -176,8 +242,7 @@ def run_tpr_forward_backward_batch(
     from verl.utils.megatron_utils import unwrap_model
 
     from .objective import SegmentPPOObjectiveAdapter
-    from .batch_runner import TPRBatchRunner
-    from .tree import build_tree_execution_plans
+        from .tree import build_tree_execution_plans
 
     if forward_only:
         raise NotImplementedError("TPR PPO schedule is training-only; use native forward_only")
