@@ -25,7 +25,7 @@ from verl.models.mcore.config_converter import (
     hf_to_mcore_config_dense,
 )
 from verl.models.mcore.tpr import replace_self_attention_with_tpr
-from verl.models.mcore.tpr.module_spec import _get_layer_specs
+from verl.workers.engine.megatron.tpr.adapter import _get_layer_specs
 from ..profiling.test_tpr_engine_profile_npu import _ProfileFusedCausalAttention
 
 from ..correctness.test_tpr_qwen3_compatibility_npu import (

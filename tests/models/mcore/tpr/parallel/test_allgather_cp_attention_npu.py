@@ -30,7 +30,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-import verl.models.mcore.tpr.parallel.allgather_attention as cp_attention
+import verl.experimental.tpr.allgather as cp_attention
 from verl.models.mcore.tpr import AllGatherCPBackend, LocalKVBlock, PrefixShard, SequenceShard
 from verl.utils.device import is_torch_npu_available
 

@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-import verl.models.mcore.tpr.parallel.allgather_attention as cp_attention
+import verl.experimental.tpr.allgather as cp_attention
 from verl.models.mcore.tpr import LocalKVBlock, PaddedSequenceShard, PrefixShard
 
 

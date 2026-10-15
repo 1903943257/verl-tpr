@@ -35,7 +35,7 @@ class GDNLayerReplay:
 
 def replay_gdn(model, capture, reference, runtime, monkeypatch, metrics, *, cp):
     """No model .grad mutation. CP2 parameter VJPs SUM once; states never SUM."""
-    from verl.models.mcore.tpr.prefix_state import GDNLayerState
+    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
     from ._first_gdn_zigzag_control import zigzag_control_forward
 
     layer = model.decoder.layers[4].self_attention
