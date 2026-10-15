@@ -17,7 +17,7 @@ from ._native_ring_tnd_layout import install_native_tnd_layout
 
 def test_ordinary_ring_schedule(runtime, monkeypatch):
     import torch_npu
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.experimental.tpr import ring_attention as ring
     from verl.models.mcore.tpr.rectangular_attention import rectangular_causal_attention
 
     native = importlib.import_module(

@@ -18,8 +18,8 @@ import pytest
 import torch
 from torch import nn
 
-import verl.models.mcore.tpr.parallel.execution_context as cp_execution
-import verl.models.mcore.tpr.segment_executor as segment_execution
+import verl.experimental.tpr.legacy.cp.execution_context as cp_execution
+import verl.experimental.tpr.legacy.segment_executor as segment_execution
 from verl.models.mcore.tpr import (
     RangeSequenceShard,
     SegmentExecutor,

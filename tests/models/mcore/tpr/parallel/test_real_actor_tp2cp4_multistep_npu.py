@@ -25,7 +25,7 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
 from verl.utils import tensordict_utils as tu
-from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
+from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 from .native_full_megatron_schedule import run_native_full_step
 from .test_real_actor_tp2cp4_offline_ppo_npu import (
@@ -220,8 +220,8 @@ def test_recorded_fixed_ppo_optimizer_drift():
     runtime = _runtime()
     try:
         from verl.workers.utils.losses import ppo_loss
-        from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
-        from verl.models.mcore.tpr.megatron_adapter import _trajectory_keys_from_minibatch
+        from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans
+        from verl.workers.engine.megatron.tpr.adapter import _trajectory_keys_from_minibatch
         first = manifest_items[0] if manifest_items is not None else None
         if first is not None:
             capture = Path(first["capture"])

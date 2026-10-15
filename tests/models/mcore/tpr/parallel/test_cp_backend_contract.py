@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import verl.models.mcore.tpr.parallel.backend as backend_module
+import verl.experimental.tpr.legacy.cp.backend as backend_module
 from verl.models.mcore.tpr import (
     ALLGATHER_CP_BACKEND,
     AllGatherCPBackend,
@@ -28,7 +28,7 @@ from verl.models.mcore.tpr import (
     TPRCPBackend,
     UlyssesCPBackend,
 )
-from verl.models.mcore.tpr.parallel import resolve_tpr_cp_backend
+from verl.experimental.tpr import resolve_tpr_cp_backend
 
 
 class _CustomBackend:
