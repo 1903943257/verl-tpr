@@ -18,7 +18,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
-_LAYER_RE = re.compile(r"(?:^|\\.)layers\\.(\\d+)\\.")
+_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
 def _kind(name: str) -> str:
