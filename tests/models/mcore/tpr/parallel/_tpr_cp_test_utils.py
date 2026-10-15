@@ -32,9 +32,7 @@ from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.transformer_config import TransformerConfig
-import verl.models.mcore.tpr.parallel.allgather_attention as cp_attention
-import verl.models.mcore.tpr.parallel.ring_attention as ring_attention
-import verl.models.mcore.tpr.parallel.ulysses_attention as ulysses_attention
+import verl.models.mcore.tpr.parallel.ring as ring_attention
 from verl.models.mcore.tpr import (
     FixedTopologyScheduler,
     PhysicalExecutionKind,
@@ -728,55 +726,14 @@ def _run_tpr_cp(
 
 @contextmanager
 def _collective_probe():
-    original_all_gather = cp_attention._all_gather_into_tensor
-    original_reduce_scatter = cp_attention._reduce_scatter_tensor
-    counts = {"all_gather": 0, "reduce_scatter": 0}
-
-    def all_gather(output, input_, group):
-        counts["all_gather"] += 1
-        return original_all_gather(output, input_, group)
-
-    def reduce_scatter(output, input_, group):
-        counts["reduce_scatter"] += 1
-        return original_reduce_scatter(output, input_, group)
-
-    cp_attention._all_gather_into_tensor = all_gather
-    cp_attention._reduce_scatter_tensor = reduce_scatter
-    try:
-        yield counts
-    finally:
-        cp_attention._all_gather_into_tensor = original_all_gather
-        cp_attention._reduce_scatter_tensor = original_reduce_scatter
+    pytest.skip("AllGather CP was removed from this Ring-only branch")
+    yield {}
 
 
 @contextmanager
 def _hybrid_communication_probe():
-    original_all_to_all = ulysses_attention._mindspeed_all_to_all
-    original_ring_forward = ring_attention._block_attention_forward
-    original_ring_backward = ring_attention._block_attention_backward
-    counts = {"all_to_all": 0, "ring_forward": 0, "ring_backward": 0}
-
-    def all_to_all(*args, **kwargs):
-        counts["all_to_all"] += 1
-        return original_all_to_all(*args, **kwargs)
-
-    def ring_forward(*args, **kwargs):
-        counts["ring_forward"] += 1
-        return original_ring_forward(*args, **kwargs)
-
-    def ring_backward(*args, **kwargs):
-        counts["ring_backward"] += 1
-        return original_ring_backward(*args, **kwargs)
-
-    ulysses_attention._mindspeed_all_to_all = all_to_all
-    ring_attention._block_attention_forward = ring_forward
-    ring_attention._block_attention_backward = ring_backward
-    try:
-        yield counts
-    finally:
-        ulysses_attention._mindspeed_all_to_all = original_all_to_all
-        ring_attention._block_attention_forward = original_ring_forward
-        ring_attention._block_attention_backward = original_ring_backward
+    pytest.skip("Hybrid Ulysses Attention was removed from this Ring-only branch")
+    yield {}
 
 
 def _clone_prefix_gradients(executor, *, segment_id=0):

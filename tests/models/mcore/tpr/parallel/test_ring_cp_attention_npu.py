@@ -31,7 +31,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-import verl.models.mcore.tpr.parallel.ring_attention as ring
+import verl.models.mcore.tpr.parallel.ring as ring
 from verl.models.mcore.tpr import RingLocalKVBlock, make_ring_sequence_shard
 from verl.utils.device import is_torch_npu_available
 
@@ -338,8 +338,8 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
 
     transport = calls.pop("transport")
     assert transport == {"forward": len(prefix_lengths) + 1, "backward": len(prefix_lengths) + 1}
-    coalesce = os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "0") == "1"
-    query_merge = (coalesce and os.getenv("TPR_RING_COALESCE_PREFIX_QUERY", "0") == "1"
+    coalesce = os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "1") == "1"
+    query_merge = (coalesce and os.getenv("TPR_RING_COALESCE_PREFIX_QUERY", "1") == "1"
                    and bool(prefix_lengths) and not noncontiguous_query
                    and all(length % (2 * _EXPECTED_WORLD_SIZE) == 0
                            for length in (*prefix_lengths, current_length)))
@@ -391,7 +391,7 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
     )
     dist.all_reduce(mask_phases, op=dist.ReduceOp.MAX, group=cp_group)
     assert mask_phases.tolist() == [int(has_padding), int(has_padding)]
-    RingP2P, _ = ring._load_mindspeed_ring_primitives()
+    RingP2P = ring._load_mindspeed_ring_primitives()
     assert RingP2P.__module__.endswith("context_parallel.utils")
 
     if rank == 0:

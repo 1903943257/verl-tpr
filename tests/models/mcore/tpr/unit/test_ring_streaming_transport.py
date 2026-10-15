@@ -37,7 +37,7 @@ class Buffer:
 class TransportTest(unittest.TestCase):
     def run_ring(self, cp, backward):
         queues = [Queue() for _ in range(cp)]
-        path = Path(__file__).resolve().parents[5] / "verl/models/mcore/tpr/parallel/ring_attention.py"
+        path = Path(__file__).resolve().parents[5] / "verl/models/mcore/tpr/parallel/ring.py"
         nodes = [n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef)
                  and n.name in ("_circulate_kv", "_reduce_ring_gradients_to_owner")]
 
@@ -67,7 +67,7 @@ class TransportTest(unittest.TestCase):
 
             torch = NS(stack=lambda pair, dim: allocate([x.value for x in pair]),
                        empty_like=lambda t: allocate([0, 0]), zeros_like=lambda t: allocate([0, 0]))
-            ns = dict(torch=torch, _load_mindspeed_ring_primitives=lambda: (Ring, None),
+            ns = dict(torch=torch, _load_mindspeed_ring_primitives=lambda: Ring,
                       _observe_ring_storage=lambda *args: None)
             exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), ns)
             key, value = Cell([rank + 1], 0), Cell([10 * (rank + 1)], 0)

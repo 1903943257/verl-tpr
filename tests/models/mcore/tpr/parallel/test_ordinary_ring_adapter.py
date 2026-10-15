@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl.models.mcore.tpr.parallel import ring_attention as ring
+from . import _native_whole_ring_reference as ring
 
 
 def test_native_adapter_preserves_gqa_dtype_and_autograd(monkeypatch):

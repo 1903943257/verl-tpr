@@ -5,7 +5,7 @@ from collections import Counter
 from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
-import verl.models.mcore.tpr.parallel.ring_attention as ring
+import verl.models.mcore.tpr.parallel.ring as ring
 from verl.models.mcore.tpr import SegmentExecutor
 
 

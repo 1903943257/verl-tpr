@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-import verl.models.mcore.tpr.parallel.ring_attention as ring
+import verl.models.mcore.tpr.parallel.ring as ring
 from verl.models.mcore.tpr import (
     RingBlockKind,
     classify_ring_block,

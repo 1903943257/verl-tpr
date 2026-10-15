@@ -61,7 +61,8 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
 
-import verl.models.mcore.tpr.parallel.ring_attention as ring_attention
+import verl.models.mcore.tpr.parallel.ring as ring_attention
+from ..parallel import _native_whole_ring_reference
 import verl.models.mcore.tpr.attention as local_attention
 from verl.models.mcore.tpr import (
     FixedTopologyScheduler,
@@ -473,7 +474,7 @@ def _run_plan(
         def whole(query, current_key, current_value, *, prefix_blocks=(), **kwargs):
             if prefix_blocks:
                 raise AssertionError("native Reference Ring cannot execute Prefix blocks")
-            return ring_attention.ordinary_ring_cp_attention(
+            return _native_whole_ring_reference.ordinary_ring_cp_attention(
                 query, current_key, current_value, **kwargs
             )
 
