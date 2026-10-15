@@ -8,6 +8,7 @@ from verl.models.mcore.tpr.parallel import ring
 def test_only_ring_backend_is_selectable(monkeypatch):
     monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _g: (2, 0))
     group = object()
+    assert ring.resolve_cp_group(group) == (2, 0)
     for name in (None, "auto", "ring", "megatron_cp_algo"):
         backend = ring.resolve_tpr_cp_backend(
             name, cp_group=group, parallel_size=2, parallel_rank=0,
