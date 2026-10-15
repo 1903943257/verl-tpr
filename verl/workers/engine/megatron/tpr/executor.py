@@ -23,9 +23,7 @@ import os
 from typing import Any, Protocol
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
 
 from verl.models.mcore.tpr.context import KVPair, TPRAttentionContext, use_tpr_attention_context
 from verl.models.mcore.tpr.activation_offload import validate_activation_offload, with_activation_offload
@@ -38,7 +36,7 @@ from .state import (
     resolve_cp_group,
 )
 from verl.models.mcore.tpr.prefix_state import GDNLayerState, GDNPrefixAnchors, GDNPrefixState
-from verl.models.mcore.tpr.segment_plan import SegmentId, SegmentLossTerm, SegmentPlan, SegmentSpec
+from verl.models.mcore.tpr.segment_plan import SegmentId, SegmentPlan, SegmentSpec
 from verl.models.mcore.tpr.shard import PrefixShard, SequenceShard
 
 
@@ -212,17 +210,6 @@ class LeafVisitResult:
     backward: SegmentBackwardResult
 
 
-@dataclass(frozen=True, slots=True)
-class _ChunkedLanguageModelOutput:
-    """Small loss-only result returned by Megatron's native output_processor."""
-
-    per_term_loss: Tensor
-    loss_sum: Tensor
-    normalized_loss: Tensor
-    backward_anchor: Tensor
-    local_sequence_length: int
-
-
 class SegmentExecutor:
     """Execute graph-free Push and gradient-carrying Pop for a SegmentPlan.
 
@@ -239,7 +226,6 @@ class SegmentExecutor:
         expected_layer_numbers: tuple[int, ...] | None = None,
         kv_stack: KVStack | None = None,
         loss_scale_func: Callable[[Tensor], Tensor] | None = None,
-        loss_chunk_size: int | None = None,
         cp_group: Any | None = None,
         cp_backend: RingCPBackend | str | None = None,
         segment_loss_fn: Callable[[SegmentSpec, Tensor], tuple[Tensor, dict[str, Any]]] | None = None,
@@ -264,21 +250,16 @@ class SegmentExecutor:
         if len(set(expected_layer_numbers)) != len(expected_layer_numbers):
             raise ValueError(f"expected_layer_numbers contains duplicates: {expected_layer_numbers}")
 
-        if plan.topology_only != (segment_loss_fn is not None):
-            raise ValueError(
-                "topology_only SegmentPlan requires segment_loss_fn; "
-                "CE SegmentPlan must use the existing CE loss path"
-            )
+        if not plan.topology_only:
+            raise ValueError("Production TPR requires a PPO topology-only SegmentPlan")
+        if not callable(segment_loss_fn):
+            raise TypeError("Production TPR requires a callable segment_loss_fn")
         counts = dict(segment_loss_term_counts or {})
-        if segment_loss_fn is not None:
-            if not callable(segment_loss_fn):
-                raise TypeError("segment_loss_fn must be callable")
-            if not counts:
-                raise ValueError("segment_loss_term_counts is required for external objectives")
-            if any(segment_id not in plan.segments or count < 0 for segment_id, count in counts.items()):
-                raise ValueError("invalid external segment objective counts")
-        elif counts:
-            raise ValueError("segment_loss_term_counts is only valid with segment_loss_fn")
+        if not counts or any(
+            segment_id not in plan.segments or count < 0
+            for segment_id, count in counts.items()
+        ):
+            raise ValueError("invalid PPO segment objective counts")
         self.segment_loss_fn = segment_loss_fn
         self.segment_loss_term_counts = counts
         self.segment_loss_metrics: list[tuple[SegmentId, dict[str, Any]]] = []
@@ -288,13 +269,6 @@ class SegmentExecutor:
         self.expected_layer_numbers = tuple(sorted(expected_layer_numbers))
         self.kv_stack = KVStack() if kv_stack is None else kv_stack
         self.loss_scale_func = loss_scale_func
-        if loss_chunk_size is not None and (
-            not isinstance(loss_chunk_size, int)
-            or isinstance(loss_chunk_size, bool)
-            or loss_chunk_size <= 0
-        ):
-            raise ValueError(f"loss_chunk_size must be a positive integer or None, got {loss_chunk_size!r}")
-        self.loss_chunk_size = loss_chunk_size
         self.cp_group = cp_group
         self.gdn_layer_numbers = tuple(
             sorted(module.layer_number for module in model.modules()
@@ -641,43 +615,13 @@ class SegmentExecutor:
                 else nullcontext()
             )
             with rope_context, use_tpr_attention_context(context):
-                use_chunked_lm_head = (
-                    not no_grad and self.segment_loss_fn is None and self._can_chunk_language_model_output()
+                logits = self.model(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    attention_mask=None,
                 )
-                if use_chunked_lm_head:
-                    # Older Megatron revisions do not expose output_processor.
-                    # Temporarily stop the native GPTModel after the decoder,
-                    # then invoke the same native output layer / CE ourselves in
-                    # sequence chunks. Restore post_process before returning.
-                    original_post_process = self.model.post_process
-                    self.model.post_process = False
-                    try:
-                        hidden_states = self.model(
-                            input_ids=input_ids,
-                            position_ids=position_ids,
-                            attention_mask=None,
-                        )
-                    finally:
-                        self.model.post_process = original_post_process
-                    logits = self._chunk_language_model_output(
-                        segment,
-                        local_sequence_length=shard.local_length,
-                        hidden_states=hidden_states,
-                    )
-                else:
-                    logits = self.model(
-                        input_ids=input_ids,
-                        position_ids=position_ids,
-                        attention_mask=None,
-                    )
         if os.getenv("TPR_MEM_TRACE", "0") == "1":
             print(f"TPR_MEM FORWARD_END segment={segment.segment_id} no_grad={no_grad} alloc_gib={torch.npu.memory_allocated() / (1024 ** 3):.3f} reserved_gib={torch.npu.memory_reserved() / (1024 ** 3):.3f}", flush=True)
-        if isinstance(logits, _ChunkedLanguageModelOutput):
-            if logits.local_sequence_length != shard.local_length:
-                raise RuntimeError(
-                    "chunked language-model output local sequence length differs from shard"
-                )
-            return context, logits
         if not isinstance(logits, Tensor) or logits.ndim != 3:
             raise ValueError(f"model must return logits [batch, sequence, vocab], got {type(logits).__name__}")
         expected_shape = (1, shard.local_length)
@@ -685,272 +629,28 @@ class SegmentExecutor:
             raise ValueError(f"model logits must start with shape {expected_shape}, got {tuple(logits.shape)}")
         return context, logits
 
-    def _can_chunk_language_model_output(self) -> bool:
-        if self.loss_chunk_size is None:
-            return False
-        if not callable(getattr(self.model, "compute_language_model_loss", None)):
-            return False
-        if not callable(getattr(self.model, "output_layer", None)):
-            return False
-        if not isinstance(getattr(self.model, "post_process", None), bool):
-            return False
-        # TPR currently supports the ordinary dense GPT LM head only.
-        if getattr(self.model.config, "mtp_num_layers", 0):
-            return False
-        return True
-
-    def _chunk_language_model_output(
-        self,
-        segment: SegmentSpec,
-        *,
-        local_sequence_length: int,
-        hidden_states: Tensor,
-    ) -> _ChunkedLanguageModelOutput:
-        """Project token chunks to vocab logits and immediately run native CE."""
-        if not isinstance(hidden_states, Tensor) or hidden_states.ndim != 3:
-            raise ValueError(
-                "post_process=False must return decoder hidden states [sequence, batch, hidden]"
-            )
-        if hidden_states.shape[0] != local_sequence_length or hidden_states.shape[1] != 1:
-            raise ValueError(
-                "decoder hidden states must have shape "
-                f"[{local_sequence_length}, 1, hidden], got {tuple(hidden_states.shape)}"
-            )
-        output_layer = self.model.output_layer
-        compute_language_model_loss = self.model.compute_language_model_loss
-        config = self.model.config
-        output_weight = (
-            self.model.shared_embedding_or_output_weight()
-            if getattr(self.model, "share_embeddings_and_output_weights", False)
-            else None
-        )
-        scale_logits = getattr(self.model, "_scale_logits", lambda value: value)
-        owned_terms = self._owned_loss_terms(segment)
-        if not owned_terms:
-            # Preserve a differentiable path through every CP rank so Ring
-            # attention backward collectives are traversed even without loss.
-            anchor = hidden_states.float().sum() * 0.0
-            empty = hidden_states.new_empty((0,), dtype=torch.float32)
-            return _ChunkedLanguageModelOutput(
-                per_term_loss=empty,
-                loss_sum=anchor,
-                normalized_loss=anchor,
-                backward_anchor=anchor,
-                local_sequence_length=local_sequence_length,
-            )
-
-        shard = self._segment_shard(segment)
-        local_offsets = tuple(shard.global_to_local(term.query_offset) for term in owned_terms)
-        if any(offset is None for offset in local_offsets):
-            raise RuntimeError(f"segment {segment.segment_id} has a loss term outside its local shard")
-        device = hidden_states.device
-        query_offsets = torch.tensor(local_offsets, dtype=torch.long, device=device)
-        targets = torch.tensor(
-            [term.target_token_id for term in owned_terms],
-            dtype=torch.long,
-            device=device,
-        )
-        max_target = max(term.target_token_id for term in owned_terms)
-        vocab_size = int(getattr(self.model, "vocab_size", 0))
-        if vocab_size and max_target >= vocab_size:
-            raise ValueError(
-                f"segment {segment.segment_id} target token {max_target} "
-                f"is outside vocabulary size {vocab_size}"
-            )
-        weights = torch.tensor(
-            [term.weight for term in owned_terms],
-            dtype=torch.float32,
-            device=device,
-        )
-
-        def project_and_loss(full_hidden, offsets, labels):
-            selected_hidden = full_hidden.index_select(0, offsets)
-            projected = output_layer(selected_hidden, weight=output_weight)
-            chunk_logits = projected[0] if isinstance(projected, tuple) else projected
-            if getattr(config, "use_mup", False):
-                chunk_logits = scale_logits(chunk_logits)
-            return compute_language_model_loss(
-                labels.unsqueeze(0),
-                chunk_logits,
-            ).reshape(-1)
-
-        loss_chunks = []
-        chunk_size = self.loss_chunk_size
-        for start in range(0, len(owned_terms), chunk_size):
-            end = min(start + chunk_size, len(owned_terms))
-            loss_chunks.append(
-                checkpoint(
-                    project_and_loss,
-                    hidden_states,
-                    query_offsets[start:end],
-                    targets[start:end],
-                    use_reentrant=False,
-                    preserve_rng_state=False,
-                )
-            )
-        per_term_loss = torch.cat(loss_chunks, dim=0)
-        if per_term_loss.numel() != len(owned_terms):
-            raise RuntimeError(
-                f"segment {segment.segment_id} native chunked CE returned "
-                f"{per_term_loss.numel()} losses for {len(owned_terms)} owned terms"
-            )
-        loss_sum = torch.sum(per_term_loss.float() * weights)
-        return _ChunkedLanguageModelOutput(
-            per_term_loss=per_term_loss,
-            loss_sum=loss_sum,
-            normalized_loss=loss_sum / self.plan.total_loss_weight,
-            backward_anchor=loss_sum,
-            local_sequence_length=local_sequence_length,
-        )
-
-    def _compute_loss(
-        self,
-        segment: SegmentSpec,
-        logits: Tensor | _ChunkedLanguageModelOutput,
-    ) -> tuple[Tensor, Tensor]:
-        if self.segment_loss_fn is not None:
-            if not isinstance(logits, Tensor):
-                raise TypeError("external segment objective requires raw logits Tensor")
-            if not self._owned_loss_count(segment):
-                connected_zero = logits.float().sum() * 0.0
-                return connected_zero, connected_zero
-            loss, metrics = self.segment_loss_fn(segment, logits)
-            if not isinstance(loss, Tensor) or loss.numel() != 1 or not loss.requires_grad:
-                raise TypeError("external segment objective must return a differentiable scalar Tensor")
-            self.segment_loss_metrics.append((segment.segment_id, metrics))
-            # The objective supplies its original VERL global normalization.
-            # Unlike CE, there is no per-tree denominator or additional /M here.
-            return loss, loss
-        if isinstance(logits, _ChunkedLanguageModelOutput):
-            return logits.loss_sum, logits.normalized_loss
-        owned_terms = self._owned_loss_terms(segment)
-        if not owned_terms:
-            zero = logits.new_zeros((), dtype=torch.float32)
-            return zero, zero
-        shard = self._segment_shard(segment)
-        local_offsets = tuple(shard.global_to_local(term.query_offset) for term in owned_terms)
-        if any(offset is None for offset in local_offsets):
-            raise RuntimeError(f"segment {segment.segment_id} has a loss term outside its local shard")
-        query_offsets = torch.tensor(
-            local_offsets,
-            dtype=torch.long,
-            device=logits.device,
-        )
-        targets = torch.tensor(
-            [term.target_token_id for term in owned_terms],
-            dtype=torch.long,
-            device=logits.device,
-        )
-        max_target = max(term.target_token_id for term in owned_terms)
-        native_loss = getattr(self.model, "compute_language_model_loss", None)
-        # Under TP>1 Megatron's logits contain a *local vocabulary shard*.
-        # Labels retain GLOBAL vocab ids, so comparing them to local_vocab
-        # falsely rejects valid targets on TP ranks. Only the test-double CE
-        # fallback expects full-vocabulary local logits.
-        global_vocab_size = getattr(self.model, "vocab_size", None)
-        if callable(native_loss):
-            if global_vocab_size is not None and max_target >= global_vocab_size:
-                raise ValueError(
-                    f"segment {segment.segment_id} target token {max_target} "
-                    f"is outside global vocabulary size {global_vocab_size}"
-                )
-        elif max_target >= logits.shape[-1]:
-            raise ValueError(
-                f"segment {segment.segment_id} target token {max_target} "
-                f"is outside vocabulary size {logits.shape[-1]}"
-            )
-        weights = torch.tensor(
-            [term.weight for term in owned_terms],
-            dtype=torch.float32,
-            device=logits.device,
-        )
-        compute_language_model_loss = native_loss
-        if callable(compute_language_model_loss):
-            # Follow Megatron's native language-model CE path. For long local
-            # sequences, checkpoint sequence chunks so the large [tokens, vocab]
-            # BF16 selection and Megatron's FP32 CE workspace are materialized
-            # one chunk at a time instead of for the entire local sequence.
-            #
-            # We deliberately chunk the token/sequence dimension, NOT vocab:
-            # each chunk still sees the complete vocabulary and therefore uses
-            # exactly the same native softmax / CE semantics and FP32 policy.
-            # index_select stays inside the checkpoint because Megatron CE may
-            # modify its logits workspace in-place; this also prevents retaining
-            # a full-size selected_logits copy until backward.
-            if self.loss_chunk_size is not None and len(owned_terms) > self.loss_chunk_size:
-                def native_loss_chunk(full_logits, offsets, labels):
-                    chunk_logits = full_logits[0].index_select(0, offsets)
-                    return compute_language_model_loss(
-                        labels.unsqueeze(0),
-                        chunk_logits.unsqueeze(1),
-                    ).reshape(-1)
-
-                loss_chunks = []
-                for start in range(0, len(owned_terms), self.loss_chunk_size):
-                    end = min(start + self.loss_chunk_size, len(owned_terms))
-                    loss_chunks.append(
-                        checkpoint(
-                            native_loss_chunk,
-                            logits,
-                            query_offsets[start:end],
-                            targets[start:end],
-                            use_reentrant=False,
-                            preserve_rng_state=False,
-                        )
-                    )
-                per_term_loss = torch.cat(loss_chunks, dim=0)
-            else:
-                selected_logits = logits[0].index_select(0, query_offsets)
-                per_term_loss = compute_language_model_loss(
-                    targets.unsqueeze(0),
-                    selected_logits.unsqueeze(1),
-                ).reshape(-1)
-        else:
-            # Algebraic unit-test doubles are intentionally allowed to omit the
-            # Megatron LanguageModule API. Production GPTModel instances expose
-            # compute_language_model_loss and never take this fallback.
-            selected_logits = logits[0].index_select(0, query_offsets)
-            per_term_loss = F.cross_entropy(
-                selected_logits.float(),
-                targets,
-                reduction="none",
-            )
-        if per_term_loss.numel() != len(owned_terms):
-            raise RuntimeError(
-                f"segment {segment.segment_id} native CE returned {per_term_loss.numel()} "
-                f"losses for {len(owned_terms)} owned terms"
-            )
-        loss_sum = torch.sum(per_term_loss.reshape(-1).float() * weights)
-        return loss_sum, loss_sum / self.plan.total_loss_weight
+    def _compute_loss(self, segment: SegmentSpec, logits: Tensor) -> tuple[Tensor, Tensor]:
+        """Delegate all policy math to VERL's original PPO callback."""
+        if not self._owned_loss_count(segment):
+            connected_zero = logits.float().sum() * 0.0
+            return connected_zero, connected_zero
+        loss, metrics = self.segment_loss_fn(segment, logits)
+        if not isinstance(loss, Tensor) or loss.numel() != 1 or not loss.requires_grad:
+            raise TypeError("PPO objective must return a differentiable scalar Tensor")
+        self.segment_loss_metrics.append((segment.segment_id, metrics))
+        return loss, loss
 
     def _owned_loss_count(self, segment: SegmentSpec) -> int:
-        if self.segment_loss_fn is not None:
-            return self.segment_loss_term_counts.get(segment.segment_id, 0)
-        return len(self._owned_loss_terms(segment))
-
-    def _owned_loss_terms(self, segment: SegmentSpec) -> tuple[SegmentLossTerm, ...]:
-        if not self.cp_enabled:
-            return segment.loss_terms
-        shard = self._segment_shard(segment)
-        return tuple(
-            term
-            for term in segment.loss_terms
-            if shard.owns(term.query_offset)
-        )
+        return self.segment_loss_term_counts.get(segment.segment_id, 0)
 
     def _prepare_backward_loss(
         self,
         normalized_loss: Tensor,
         *,
-        logits: Tensor | _ChunkedLanguageModelOutput,
+        logits: Tensor,
         has_owned_loss: bool,
     ) -> Tensor:
-        if has_owned_loss:
-            backward_loss = normalized_loss * self.cp_size
-        elif isinstance(logits, _ChunkedLanguageModelOutput):
-            backward_loss = logits.backward_anchor
-        else:
-            backward_loss = logits.float().sum() * 0.0
+        backward_loss = normalized_loss * self.cp_size if has_owned_loss else logits.float().sum() * 0.0
         return backward_loss if self.loss_scale_func is None else self.loss_scale_func(backward_loss)
 
     def _segment_shard(self, segment: SegmentSpec) -> SequenceShard:
