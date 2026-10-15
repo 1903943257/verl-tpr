@@ -17,10 +17,10 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from dataclasses import dataclass
 import os
-from typing import Any
+from typing import Any, Protocol
 
 import torch
 import torch.nn.functional as F
@@ -30,20 +30,161 @@ from torch.utils.checkpoint import checkpoint
 from verl.models.mcore.tpr.context import KVPair, TPRAttentionContext, use_tpr_attention_context
 from verl.models.mcore.tpr.activation_offload import validate_activation_offload, with_activation_offload
 from .state import KVStack
-from verl.models.mcore.tpr.parallel.backend import TPRCPBackend, resolve_tpr_cp_backend
-from verl.models.mcore.tpr.parallel.execution_context import (
+from .ring import RingCPBackend
+from .state import (
     ShardedPastKVAnchors,
     accumulate_sharded_past_anchor_gradients,
     build_sharded_past_anchors,
     resolve_cp_group,
 )
 from verl.models.mcore.tpr.prefix_state import GDNLayerState, GDNPrefixAnchors, GDNPrefixState
-from verl.models.mcore.tpr.rope import (
-    build_sharded_rotary_pos_emb,
-    disable_bound_context_parallel_sharding,
-)
 from verl.models.mcore.tpr.segment_plan import SegmentId, SegmentLossTerm, SegmentPlan, SegmentSpec
 from verl.models.mcore.tpr.shard import PrefixShard, SequenceShard
+
+
+class _RotaryEmbedding(Protocol):
+    def __call__(
+        self,
+        max_seq_len: int,
+        offset: int = 0,
+        packed_seq: bool = False,
+        cp_group: object | None = None,
+    ) -> Tensor: ...
+
+
+class _UnshardedContextParallelGroup:
+    """Size-one sentinel that prevents RotaryEmbedding using its bound CP group."""
+
+    @staticmethod
+    def size() -> int:
+        return 1
+
+
+_UNSHARDED_CP_GROUP = _UnshardedContextParallelGroup()
+
+
+@contextmanager
+def disable_bound_context_parallel_sharding(rotary_embedding: _RotaryEmbedding):
+    """Temporarily stop implicit CP slicing by a bound RotaryEmbedding group.
+
+    GPTModel builds a rotary embedding in ``_preprocess`` even though TPR
+    attention consumes the rank-local embedding stored in its execution
+    context.  For padded, non-divisible sequence lengths that unused build can
+    fail in MindSpeed before TPR attention is reached.  Override the embedding's
+    bound group only for the model forward and restore it on every exit path.
+    """
+
+    if not hasattr(rotary_embedding, "cp_group"):
+        yield
+        return
+    cp_group = rotary_embedding.cp_group
+    rotary_embedding.cp_group = _UNSHARDED_CP_GROUP
+    try:
+        yield
+    finally:
+        rotary_embedding.cp_group = cp_group
+
+
+def build_suffix_rotary_pos_emb(
+    rotary_embedding: _RotaryEmbedding,
+    *,
+    prefix_length: int,
+    suffix_length: int,
+    disable_context_parallel_sharding: bool = False,
+) -> Tensor:
+    """Build standard 1D RoPE frequencies for positions ``[P, P+b)``.
+
+    This delegates frequency generation to the model's existing Megatron
+    ``RotaryEmbedding`` instance, preserving its rotary dimension, base,
+    interpolation, interleaving, and scaling settings.  The MVP deliberately
+    requests neither packed-sequence nor context-parallel sharding.
+    """
+
+    _validate_length("prefix_length", prefix_length, allow_zero=True)
+    _validate_length("suffix_length", suffix_length, allow_zero=False)
+    if not callable(rotary_embedding):
+        raise TypeError("rotary_embedding must be callable")
+
+    rotary_pos_emb = rotary_embedding(
+        suffix_length,
+        offset=prefix_length,
+        packed_seq=False,
+        cp_group=_UNSHARDED_CP_GROUP if disable_context_parallel_sharding else None,
+    )
+    if not isinstance(rotary_pos_emb, Tensor):
+        raise TypeError(
+            "TPR RoPE MVP requires standard RotaryEmbedding to return one tensor; "
+            f"got {type(rotary_pos_emb).__name__}"
+        )
+    if rotary_pos_emb.ndim != 4:
+        raise ValueError(
+            "suffix rotary embedding must have shape [suffix, 1, 1, rotary_dim], "
+            f"got {rotary_pos_emb.shape}"
+        )
+    if rotary_pos_emb.shape[0] != suffix_length:
+        raise ValueError(
+            f"suffix rotary embedding sequence length must be {suffix_length}, "
+            f"got {rotary_pos_emb.shape[0]}"
+        )
+    if rotary_pos_emb.shape[1] != 1 or rotary_pos_emb.shape[2] != 1:
+        raise ValueError(
+            "TPR RoPE MVP requires singleton batch/head broadcast dimensions, "
+            f"got {rotary_pos_emb.shape}"
+        )
+    if rotary_pos_emb.shape[3] <= 0:
+        raise ValueError("suffix rotary embedding must have a positive rotary dimension")
+    return rotary_pos_emb
+
+
+def build_sharded_rotary_pos_emb(
+    rotary_embedding: _RotaryEmbedding,
+    *,
+    position_start: int,
+    shard: SequenceShard,
+    disable_context_parallel_sharding: bool = False,
+) -> Tensor:
+    """Build RoPE in the local-token order described by ``shard``."""
+
+    _validate_length("position_start", position_start, allow_zero=True)
+    if not isinstance(shard, SequenceShard):
+        raise TypeError(f"shard must implement SequenceShard, got {type(shard).__name__}")
+    chunks = []
+    for physical_start, physical_end in shard.physical_global_ranges:
+        valid_end = min(physical_end, shard.global_length)
+        valid_length = max(0, valid_end - physical_start)
+        physical_length = physical_end - physical_start
+        if valid_length:
+            chunk = build_suffix_rotary_pos_emb(
+                rotary_embedding,
+                prefix_length=position_start + physical_start,
+                suffix_length=valid_length,
+                disable_context_parallel_sharding=disable_context_parallel_sharding,
+            )
+        else:
+            chunk = build_suffix_rotary_pos_emb(
+                rotary_embedding,
+                prefix_length=position_start + shard.global_length - 1,
+                suffix_length=1,
+                disable_context_parallel_sharding=disable_context_parallel_sharding,
+            )
+        if valid_length < physical_length:
+            padding = chunk[-1:].expand(physical_length - valid_length, *chunk.shape[1:])
+            chunk = torch.cat((chunk if valid_length else chunk[:0], padding), dim=0)
+        chunks.append(chunk)
+    rotary_pos_emb = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+    if rotary_pos_emb.shape[0] != shard.local_length:
+        raise RuntimeError(
+            f"sharded rotary embedding length must be {shard.local_length}, "
+            f"got {rotary_pos_emb.shape[0]}"
+        )
+    return rotary_pos_emb
+
+
+def _validate_length(name: str, value: int, *, allow_zero: bool) -> None:
+    lower_bound = 0 if allow_zero else 1
+    if not isinstance(value, int) or isinstance(value, bool) or value < lower_bound:
+        qualifier = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{name} must be a {qualifier} integer, got {value!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +241,7 @@ class SegmentExecutor:
         loss_scale_func: Callable[[Tensor], Tensor] | None = None,
         loss_chunk_size: int | None = None,
         cp_group: Any | None = None,
-        cp_backend: TPRCPBackend | str | None = None,
+        cp_backend: RingCPBackend | str | None = None,
         segment_loss_fn: Callable[[SegmentSpec, Tensor], tuple[Tensor, dict[str, Any]]] | None = None,
         segment_loss_term_counts: Mapping[SegmentId, int] | None = None,
     ) -> None:
@@ -177,12 +318,16 @@ class SegmentExecutor:
             self.cp_size, self.cp_rank = resolve_cp_group(cp_group)
             if self.cp_size <= 1:
                 raise ValueError(f"cp_group must contain more than one rank, got {self.cp_size}")
-            self.cp_backend = resolve_tpr_cp_backend(
-                cp_backend,
-                cp_group=cp_group,
-                parallel_size=self.cp_size,
-                parallel_rank=self.cp_rank,
-            )
+            if isinstance(cp_backend, RingCPBackend):
+                if (cp_backend.parallel_size, cp_backend.parallel_rank) != (self.cp_size, self.cp_rank):
+                    raise ValueError("RingCPBackend coordinates do not match initialized CP group")
+                self.cp_backend = cp_backend
+            elif cp_backend in (None, "ring", "megatron_cp_algo"):
+                self.cp_backend = RingCPBackend(
+                    cp_group, parallel_size=self.cp_size, parallel_rank=self.cp_rank,
+                )
+            else:
+                raise NotImplementedError("Production TPR only supports Ring CP")
             if self.gdn_layer_numbers and (
                 self.cp_size != 2 or any(s.length % 4 for s in plan.segments.values())
             ):

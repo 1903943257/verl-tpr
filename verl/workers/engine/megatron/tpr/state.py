@@ -19,12 +19,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Any
 
 import torch
+import torch.distributed as dist
 from torch import Tensor
 
 from verl.models.mcore.tpr.context import KVPair
-from verl.models.mcore.tpr.prefix_state import KVPrefixState, PrefixStateEntry, PrefixStateStack
+from verl.models.mcore.tpr.prefix_state import KVPrefixAnchors, KVPrefixState, PrefixStateEntry, PrefixStateStack
 from verl.models.mcore.tpr.segment_plan import SegmentId, SegmentSpec
 from verl.models.mcore.tpr.shard import SequenceShard
 
@@ -210,3 +212,36 @@ class KVStack(PrefixStateStack):
             super().assert_empty()
         except RuntimeError as exc:
             raise RuntimeError(str(exc).replace("prefix-state stack", "KV stack")) from exc
+
+
+# CP rank-local Prefix anchors; independent of any AllGather attention backend.
+@dataclass(frozen=True, slots=True)
+class ShardedPastKVAnchors:
+    entries: tuple[KVPrefixAnchors, ...]
+    stack_signature: tuple[int, ...]
+
+    @property
+    def global_prefix_length(self) -> int:
+        return sum(entry.shard.global_length for entry in self.entries)
+
+
+def resolve_cp_group(group: Any) -> tuple[int, int]:
+    if not dist.is_available() or not dist.is_initialized():
+        if group is not None:
+            raise RuntimeError("a CP process group requires torch.distributed initialization")
+        return 1, 0
+    return dist.get_world_size(group), dist.get_rank(group)
+
+
+def build_sharded_past_anchors(kv_stack: KVStack) -> ShardedPastKVAnchors:
+    entries = tuple(kv_stack.get(i).kv.make_anchors() for i in kv_stack.segment_ids)
+    return ShardedPastKVAnchors(entries=entries, stack_signature=kv_stack.segment_ids)
+
+
+def accumulate_sharded_past_anchor_gradients(kv_stack: KVStack, anchors: ShardedPastKVAnchors) -> None:
+    if not isinstance(anchors, ShardedPastKVAnchors):
+        raise TypeError(f"expected ShardedPastKVAnchors, got {type(anchors).__name__}")
+    if anchors.stack_signature != kv_stack.segment_ids:
+        raise RuntimeError("stale Prefix anchor stack signature")
+    for entry in anchors.entries:
+        kv_stack.get(entry.segment_id).kv.accumulate_anchor_gradients(entry)

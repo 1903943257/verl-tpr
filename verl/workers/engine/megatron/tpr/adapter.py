@@ -26,7 +26,7 @@ from verl.utils.megatron_utils import unwrap_model
 from verl.models.mcore.tpr.attention import TPRSelfAttention
 from .scheduler import FixedTopologyScheduler
 from verl.models.mcore.tpr.module_spec import install_tpr_vanilla_mbridge_spec, make_tpr_module_spec_provider
-from verl.models.mcore.tpr.parallel.engine_runtime import aggregate_cp_loss, resolve_engine_cp_runtime
+from .ring import aggregate_cp_loss, resolve_engine_cp_runtime
 from .executor import SegmentExecutor
 
 if TYPE_CHECKING:

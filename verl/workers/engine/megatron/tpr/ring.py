@@ -35,7 +35,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from .state import KVStack
+from .state import KVStack, ShardedPastKVAnchors, resolve_cp_group
 from verl.models.mcore.tpr.rectangular_attention import _compressed_causal_mask
 from verl.models.mcore.tpr.shard import (
     RangeSequenceShard,
@@ -45,8 +45,9 @@ from verl.models.mcore.tpr.shard import (
     physical_sequence_shard,
     round_up_sequence_length,
 )
-from verl.models.mcore.tpr.parallel.allgather_attention import _group_world_size_and_rank
-from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
+from megatron.core import parallel_state
+
+_group_world_size_and_rank = resolve_cp_group
 
 _TND_LAYOUT = "TND"
 _RIGHT_DOWN_CAUSAL_MODE = 3
@@ -1199,3 +1200,104 @@ def make_anchored_ring_cp_backend(
         },
         cp_group=cp_group,
     )
+
+
+# Production CP policy: only the Prefix-aware Ring implementation is admitted.
+class RingCPBackend:
+    backend_name = "ring"
+
+    def __init__(self, group: Any, *, parallel_size: int | None = None, parallel_rank: int | None = None):
+        if (parallel_size is None) != (parallel_rank is None):
+            raise ValueError("parallel_size and parallel_rank must be provided together")
+        if parallel_size is None:
+            parallel_size, parallel_rank = resolve_cp_group(group)
+        if parallel_size <= 1 or not 0 <= parallel_rank < parallel_size:
+            raise ValueError(f"invalid Ring CP coordinate {parallel_rank}/{parallel_size}")
+        self._cp_group = group
+        self._parallel_size = parallel_size
+        self._parallel_rank = parallel_rank
+
+    @property
+    def parallel_size(self) -> int:
+        return self._parallel_size
+
+    @property
+    def parallel_rank(self) -> int:
+        return self._parallel_rank
+
+    def validate_segment_length(self, global_length: int) -> None:
+        self.make_sequence_shard(global_length)
+
+    def make_sequence_shard(self, global_length: int) -> SequenceShard:
+        return make_ring_sequence_shard(
+            global_length, cp_rank=self.parallel_rank, cp_size=self.parallel_size,
+        )
+
+    def make_attention_backend(
+        self, kv_stack: KVStack, *, expected_layer_numbers: tuple[int, ...],
+        current_shard: SequenceShard, past_anchors: ShardedPastKVAnchors | None,
+    ) -> RingCPAttentionBackend:
+        if not isinstance(physical_sequence_shard(current_shard), RangeSequenceShard):
+            raise TypeError("Ring CP requires a RangeSequenceShard")
+        if past_anchors is None:
+            return make_cached_ring_cp_backend(
+                kv_stack, expected_layer_numbers=expected_layer_numbers,
+                current_shard=current_shard, cp_group=self._cp_group,
+            )
+        return make_anchored_ring_cp_backend(
+            past_anchors, expected_layer_numbers=expected_layer_numbers,
+            current_shard=current_shard, cp_group=self._cp_group,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class TPREngineCPRuntime:
+    group: Any | None
+    backend: RingCPBackend | None
+    size: int
+    rank: int
+
+    @property
+    def enabled(self) -> bool:
+        return self.size > 1
+
+    @property
+    def backend_name(self) -> str:
+        return "none" if self.backend is None else self.backend.backend_name
+
+
+def resolve_engine_cp_runtime(engine: Any, model_config: Any) -> TPREngineCPRuntime:
+    configured_size = engine.engine_config.context_parallel_size
+    if not isinstance(configured_size, int) or isinstance(configured_size, bool) or configured_size <= 0:
+        raise ValueError(f"context_parallel_size must be positive, got {configured_size!r}")
+    backend_name = getattr(engine.engine_config, "tpr_cp_backend", None)
+    if configured_size == 1:
+        if backend_name not in (None, "auto"):
+            raise ValueError(f"tpr_cp_backend={backend_name!r} requires CP>1")
+        return TPREngineCPRuntime(group=None, backend=None, size=1, rank=0)
+    if backend_name not in (None, "auto", "ring", "megatron_cp_algo"):
+        raise NotImplementedError("Production TPR only supports Ring CP")
+    if getattr(engine.engine_config, "dynamic_context_parallel", False):
+        raise NotImplementedError("Dynamic CP is not supported by TPR")
+    if not dist.is_initialized() or not parallel_state.model_parallel_is_initialized():
+        raise RuntimeError("TPR CP requires initialized torch.distributed and Megatron groups")
+    group = parallel_state.get_context_parallel_group()
+    size, rank = resolve_cp_group(group)
+    if size != configured_size:
+        raise RuntimeError(f"TPR CP topology mismatch: configured {configured_size}, actual {size}")
+    return TPREngineCPRuntime(
+        group=group,
+        backend=RingCPBackend(group, parallel_size=size, parallel_rank=rank),
+        size=size, rank=rank,
+    )
+
+
+def aggregate_cp_loss(
+    loss_sum: Tensor, normalized_loss: Tensor, runtime: TPREngineCPRuntime,
+) -> tuple[Tensor, Tensor]:
+    global_loss_sum = loss_sum.detach().clone()
+    global_normalized_loss = normalized_loss.detach().clone()
+    if runtime.enabled:
+        dist.all_reduce(global_loss_sum, op=dist.ReduceOp.SUM, group=runtime.group)
+        dist.all_reduce(global_normalized_loss, op=dist.ReduceOp.SUM, group=runtime.group)
+    return global_loss_sum, global_normalized_loss
