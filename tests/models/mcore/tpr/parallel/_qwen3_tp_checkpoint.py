@@ -224,6 +224,23 @@ def make_real_qwen3_tp_model(
     state_dict of a checkpoint-loaded peer BEFORE performing any forward.
     """
     hf = load_qwen3_dense_config(model_path, profile=profile)
+    # Establish whether HF checkpoint loading mutates MindSpeed's global args.
+    from mindspeed.args_utils import get_full_args
+    raw_args = vars(get_full_args())
+    invalid = [
+        (repr(key), type(value).__name__)
+        for key, value in raw_args.items()
+        if not isinstance(key, str) or not key.isidentifier()
+    ]
+    print(
+        f"TPR_MINDSPEED_CONFIG_AUDIT invalid={invalid} total={len(raw_args)} "
+        f"empty_key_present={'' in raw_args}",
+        flush=True,
+    )
+    if invalid:
+        raise RuntimeError(
+            f"Malformed MindSpeed arguments before TransformerConfig creation: {invalid}"
+        )
     config = hf_to_mcore_config_dense(
         hf, torch.bfloat16,
         tensor_model_parallel_size=tp_size,
