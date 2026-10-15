@@ -149,3 +149,16 @@ def test_optional_cp_factories_outside_model_implementation() -> None:
         source = (old_parallel / f"{name}.py").read_text(encoding="utf-8")
         assert len(source.splitlines()) <= 20, name
         assert "experimental.tpr.legacy.cp." in source
+
+
+def test_context_is_thin_and_has_no_eager_engine_imports() -> None:
+    source = (MODEL / "context.py").read_text(encoding="utf-8")
+    assert len(source.splitlines()) <= 220
+    assert "class TPRAttentionContext:" in source
+    assert "def use_tpr_attention_context(" in source
+    assert "def get_past_kv(" in source
+    assert "def set_new_kv(" in source
+    assert "def assert_new_kv_layers(" in source
+    assert "from verl.workers" not in source
+    assert "from megatron" not in source
+
