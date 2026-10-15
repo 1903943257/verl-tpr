@@ -18,13 +18,12 @@ import torch.nn.functional as F
 from torch import nn
 
 from verl.models.mcore.tpr import (
-    SegmentExecutor,
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,
     get_tpr_attention_context,
 )
-from verl.experimental.tpr.legacy.segment_executor import _compact_kv_cache
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor, _compact_kv_cache
 
 
 class _FakeRotaryEmbedding:

@@ -145,6 +145,7 @@ def test_replacement_is_idempotent():
 
 
 def test_hybrid_spec_dispatch_preserves_pattern_and_is_idempotent(monkeypatch):
+    from verl.experimental.tpr.gdn.module_spec import replace_self_attention_with_tpr
     import sys
     from types import ModuleType
 

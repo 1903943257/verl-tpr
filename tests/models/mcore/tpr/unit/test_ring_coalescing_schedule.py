@@ -90,7 +90,7 @@ def shard(length, *, cp_rank, cp_size, padded_length=None):
 
 
 def load_dispatch():
-    source = Path(__file__).resolve().parents[5] / "verl/models/mcore/tpr/parallel/ring_attention.py"
+    source = Path(__file__).resolve().parents[5] / "verl/workers/engine/megatron/tpr/ring.py"
     wanted = {"RingBlockKind", "_RingRangeSlice", "_iter_range_slices", "_prefix_full_slices",
               "classify_ring_block", "_physical_block_attention_mask", "_RingTPRAttention",
               "_can_coalesce_prefix_query", "_slice_tnd_result", "_trace_merged_query",

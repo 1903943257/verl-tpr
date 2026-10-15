@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 
-SOURCE = Path(__file__).resolve().parents[5] / "verl/models/mcore/tpr/activation_offload.py"
+SOURCE = Path(__file__).resolve().parents[5] / "verl/experimental/tpr/offload.py"
 
 
 class Tensor:
@@ -41,7 +41,7 @@ class Module:
 
 class AdapterTest(unittest.TestCase):
     def setUp(self):
-        context = ModuleType("_offload_test.context")
+        context = ModuleType("verl.models.mcore.tpr.context")
         context.get_tpr_attention_context = lambda: None
         torch = ModuleType("torch")
         torch.Tensor = Tensor
@@ -65,7 +65,7 @@ class AdapterTest(unittest.TestCase):
         native_module.SwapPrefetch.swap_prefetch = None
         native_module.get_layer_id = lambda name: "0"
         self.imports = patch.dict(sys.modules, {
-            "torch": torch, "_offload_test.context": context,
+            "torch": torch, "verl.models.mcore.tpr.context": context,
             "megatron.training": training,
             "mindspeed.core.memory.swap_attention.prefetch": native_module,
             "mindspeed.core.memory.swap_attention": native_package,

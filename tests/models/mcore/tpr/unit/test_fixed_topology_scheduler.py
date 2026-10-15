@@ -14,16 +14,16 @@
 
 import pytest
 import torch
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+from verl.experimental.tpr.legacy.fixed_topology_scheduler import FixedTopologyScheduler
 
 from .test_segment_executor import _FakeTPRModel
 from verl.models.mcore.tpr import (
-    FixedTopologyScheduler,
     PhysicalExecution,
     PhysicalExecutionKind,
     PopSegment,
     PushSegment,
     SchedulerState,
-    SegmentExecutor,
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,
