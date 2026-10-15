@@ -270,7 +270,7 @@ def plan_tpr_dta_dp(
     invokes the unchanged TPR build_tree_execution_plans/runner on its local
     batch.  The outer VERL Trainer integration is not enabled yet.
     """
-    from verl.models.mcore.tpr.trajectory_tree import _parse_key
+    from .tree import _parse_key
 
     if len(trajectory_keys) != len(token_sequences):
         raise ValueError("trajectory_keys and token_sequences must have equal lengths")
