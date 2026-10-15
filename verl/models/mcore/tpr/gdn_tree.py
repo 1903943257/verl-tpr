@@ -6,8 +6,8 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from ..prefix_state import GDNPrefixState
-from .gdn_state import forward_gdn_cp_with_state
+from .prefix_state import GDNPrefixState
+from .gdn_cp import forward_gdn_cp_with_state
 
 
 class GDNCPStack(nn.Module):

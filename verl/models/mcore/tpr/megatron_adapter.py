@@ -27,7 +27,7 @@ from .attention import TPRSelfAttention
 from .engine_adapter import TPRForwardBackwardRequest
 from .fixed_topology_scheduler import FixedTopologyScheduler
 from .module_spec import install_tpr_vanilla_mbridge_spec, make_tpr_module_spec_provider
-from .parallel.engine_runtime import aggregate_cp_loss, resolve_engine_cp_runtime
+from .megatron_cp import aggregate_cp_loss, resolve_engine_cp_runtime
 from .segment_executor import SegmentExecutor
 
 if TYPE_CHECKING:

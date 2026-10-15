@@ -24,7 +24,7 @@ import torch
 from torch import Tensor
 
 from .context import KVPair
-from .prefix_state import KVPrefixState, PrefixStateEntry, PrefixStateStack
+from .prefix_state import KVPrefixAnchors, KVPrefixState, PrefixStateEntry, PrefixStateStack
 from .segment_plan import SegmentId, SegmentSpec
 from .shard import SequenceShard
 
@@ -210,3 +210,38 @@ class KVStack(PrefixStateStack):
             super().assert_empty()
         except RuntimeError as exc:
             raise RuntimeError(str(exc).replace("prefix-state stack", "KV stack")) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class ShardedPastKVAnchors:
+    """Per-segment local KV leaves for one active root-to-parent path."""
+
+    entries: tuple[KVPrefixAnchors, ...]
+    stack_signature: tuple[int, ...]
+
+    @property
+    def global_prefix_length(self) -> int:
+        return sum(entry.shard.global_length for entry in self.entries)
+
+def build_sharded_past_anchors(kv_stack: KVStack) -> ShardedPastKVAnchors:
+    """Create one independent local anchor pair for every Prefix segment."""
+
+    entries = tuple(kv_stack.get(segment_id).kv.make_anchors() for segment_id in kv_stack.segment_ids)
+    return ShardedPastKVAnchors(entries=entries, stack_signature=kv_stack.segment_ids)
+
+
+def accumulate_sharded_past_anchor_gradients(
+    kv_stack: KVStack,
+    anchors: ShardedPastKVAnchors,
+) -> None:
+    """Accumulate ReduceScatter-produced local gradients into Prefix states."""
+
+    if not isinstance(anchors, ShardedPastKVAnchors):
+        raise TypeError(f"anchors must be ShardedPastKVAnchors, got {type(anchors).__name__}")
+    if anchors.stack_signature != kv_stack.segment_ids:
+        raise RuntimeError(
+            f"sharded past KV anchors are stale: built for {anchors.stack_signature}, "
+            f"current stack is {kv_stack.segment_ids}"
+        )
+    for entry in anchors.entries:
+        kv_stack.get(entry.segment_id).kv.accumulate_anchor_gradients(entry)

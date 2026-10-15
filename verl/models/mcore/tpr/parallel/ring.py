@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MindSpeed Ring CP extension for external-prefix TPR attention.
+"""Single Ring CP implementation for external-prefix TPR attention.
 
 MindSpeed's native causal Ring Attention assumes that Q/K/V are equal-length
 shards of one sequence. TPR instead supplies Current Q and an ordered sequence
@@ -45,8 +45,13 @@ from ..shard import (
     physical_sequence_shard,
     round_up_sequence_length,
 )
-from .allgather_attention import _group_world_size_and_rank
-from .execution_context import ShardedPastKVAnchors
+from ..kv_stack import ShardedPastKVAnchors
+def _group_world_size_and_rank(process_group: Any) -> tuple[int, int]:
+    if not dist.is_available() or not dist.is_initialized():
+        if process_group is not None:
+            raise RuntimeError("a CP process group requires torch.distributed to be initialized")
+        return 1, 0
+    return dist.get_world_size(process_group), dist.get_rank(process_group)
 
 _TND_LAYOUT = "TND"
 _RIGHT_DOWN_CAUSAL_MODE = 3
@@ -180,10 +185,10 @@ def classify_ring_block(
 
 def _load_mindspeed_ring_primitives():
     try:
-        from mindspeed.core.context_parallel.utils import RingP2P, forward_update_without_fused
+        from mindspeed.core.context_parallel.utils import RingP2P
     except ImportError as exc:  # pragma: no cover - requires the server MindSpeed runtime
         raise RuntimeError("MindSpeed RingP2P and online-softmax utilities are required") from exc
-    return RingP2P, forward_update_without_fused
+    return RingP2P
 
 
 def _process_group_global_ranks(process_group: Any) -> tuple[int, ...]:
@@ -314,8 +319,8 @@ def _normalize_inputs(
         query_heads=query.shape[2],
         head_dim=query.shape[-1],
         softmax_scale=float(scale),
-        coalesce_prefix_full=os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "0") == "1",
-        coalesce_prefix_query=os.getenv("TPR_RING_COALESCE_PREFIX_QUERY", "0") == "1",
+        coalesce_prefix_full=os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "1") == "1",
+        coalesce_prefix_query=os.getenv("TPR_RING_COALESCE_PREFIX_QUERY", "1") == "1",
     )
     return blocks, config
 
@@ -326,7 +331,7 @@ def _circulate_kv(key, value, config, consume):
     Like native Ring, launch the next transfer before FA and wait before
     reusing either buffer. The callback must not retain remote tensor views.
     """
-    RingP2P, _ = _load_mindspeed_ring_primitives()
+    RingP2P = _load_mindspeed_ring_primitives()
     ring = RingP2P(config.global_ranks, config.cp_group)
     current = torch.stack((key, value), dim=0).contiguous()
     received = torch.empty_like(current)
@@ -746,7 +751,7 @@ def _reduce_ring_gradients_to_owner(key, value, config, consume):
     Replay rank+1,...,rank-1; the last step uses local KV without a transfer.
     dKV follows the same reverse Ring and ends at its owner after CP-1 hops.
     """
-    RingP2P, _ = _load_mindspeed_ring_primitives()
+    RingP2P = _load_mindspeed_ring_primitives()
     kv_ring = RingP2P(config.global_ranks, config.cp_group, is_backward=True)
     grad_ring = RingP2P(config.global_ranks, config.cp_group, is_backward=True)
     current = torch.stack((key, value), dim=0).contiguous()
@@ -971,65 +976,6 @@ class _RingTPRAttention(torch.autograd.Function):
         return (query_gradient.unsqueeze(1), *local_gradients, None)
 
 
-def ordinary_ring_cp_attention(
-    query: Tensor,
-    current_key: Tensor,
-    current_value: Tensor,
-    *,
-    current_shard: SequenceShard,
-    cp_group: Any,
-    softmax_scale: float | None = None,
-    allow_trailing_padding: bool = False,
-) -> Tensor:
-    """Whole causal attention using paired MindSpeed native Ring.
-
-    Explicit entry point: an empty prefix alone does NOT identify whole mode
-    (a segmented execution's root also has no prefix). Keep that root on the
-    existing TPR schedule until the prefix extension is migrated separately.
-
-    MindSpeed owns streaming KV, causal grouping, output/stat correction,
-    reverse backward and owner dKV accumulation. No extra gradient SUM/cast.
-    """
-    _, config = _normalize_inputs(
-        query, current_key, current_value, prefix_blocks=(),
-        current_shard=current_shard, cp_group=cp_group,
-        softmax_scale=softmax_scale,
-    )
-    if current_shard.global_length != current_shard.padded_length:
-        if not allow_trailing_padding:
-            raise ValueError("ordinary whole Ring requires an unpadded sequence")
-        # The SegmentExecutor's Ring sequence shard has only VIRTUAL right-
-        # padding after the final real token. For causal attention every real
-        # query is earlier than these virtual tokens, so padded keys cannot
-        # contribute to any real query; the PPO mask excludes padded queries.
-        # Never allow this option when Prefix blocks are present.
-        if not (0 < current_shard.global_length < current_shard.padded_length):
-            raise ValueError("native whole Ring requires strictly trailing padding")
-    from mindspeed.core.context_parallel.ring_context_parallel.ring_context_parallel import (
-        ringattn_context_parallel,
-    )
-
-    cp_para = {
-        "causal": True,
-        "cp_group": cp_group,
-        "cp_size": config.cp_size,
-        "rank": config.cp_rank,
-        "cp_global_ranks": list(config.global_ranks),
-        "cp_inner_ranks": [dist.get_rank()],
-        "cp_outer_ranks": list(config.global_ranks),
-        "cp_dkv_outer_ranks": list(config.global_ranks),
-        "megatron_cp_in_bnsd": False,
-        "cache_policy": None,
-        "pse_type": 1,
-    }
-    # Native ordinary causal Ring consumes SBH, retaining GQA's smaller KV H.
-    q, k, v = (x.flatten(2).contiguous() for x in (query, current_key, current_value))
-    return ringattn_context_parallel(
-        q, k, v, config.query_heads, cp_para,
-        softmax_scale=config.softmax_scale, dropout_p=0.0,
-    )
-
-
 def ring_cp_attention(
     query: Tensor,
     current_key: Tensor,
@@ -1199,3 +1145,84 @@ def make_anchored_ring_cp_backend(
         },
         cp_group=cp_group,
     )
+
+
+RING_CP_BACKEND = "ring"
+MINDSPEED_RING_CP_ALGO = "megatron_cp_algo"
+
+
+class RingCPBackend:
+    """Sole TPR context-parallel policy; no alternate Attention backend."""
+
+    backend_name = RING_CP_BACKEND
+
+    def __init__(self, cp_group: Any, *, parallel_size: int | None = None,
+                 parallel_rank: int | None = None) -> None:
+        size, rank = _group_world_size_and_rank(cp_group)
+        if size <= 1:
+            raise ValueError("Ring CP requires more than one rank")
+        if parallel_size is not None and parallel_size != size:
+            raise ValueError("Ring process group size does not match configured CP")
+        if parallel_rank is not None and parallel_rank != rank:
+            raise ValueError("Ring process group rank does not match configured CP")
+        self._cp_group = cp_group
+        self._parallel_size = size
+        self._parallel_rank = rank
+
+    @property
+    def parallel_size(self) -> int:
+        return self._parallel_size
+
+    @property
+    def parallel_rank(self) -> int:
+        return self._parallel_rank
+
+    def validate_segment_length(self, global_length: int) -> None:
+        make_ring_sequence_shard(
+            global_length, cp_rank=self.parallel_rank, cp_size=self.parallel_size,
+        )
+
+    def make_sequence_shard(self, global_length: int) -> SequenceShard:
+        return make_ring_sequence_shard(
+            global_length, cp_rank=self.parallel_rank, cp_size=self.parallel_size,
+        )
+
+    def make_attention_backend(
+        self,
+        kv_stack: KVStack,
+        *,
+        expected_layer_numbers: tuple[int, ...],
+        current_shard: SequenceShard,
+        past_anchors: ShardedPastKVAnchors | None,
+    ) -> RingCPAttentionBackend:
+        if not isinstance(physical_sequence_shard(current_shard), RangeSequenceShard):
+            raise TypeError("Ring CP requires RangeSequenceShard")
+        if past_anchors is None:
+            return make_cached_ring_cp_backend(
+                kv_stack, expected_layer_numbers=expected_layer_numbers,
+                current_shard=current_shard, cp_group=self._cp_group,
+            )
+        return make_anchored_ring_cp_backend(
+            past_anchors, expected_layer_numbers=expected_layer_numbers,
+            current_shard=current_shard, cp_group=self._cp_group,
+        )
+
+
+def resolve_tpr_cp_backend(
+    backend: RingCPBackend | str | None, *,
+    cp_group: Any, parallel_size: int, parallel_rank: int,
+) -> RingCPBackend:
+    """Reject obsolete CP algorithms rather than silently changing semantics."""
+    if backend is None or backend in ("auto", RING_CP_BACKEND, MINDSPEED_RING_CP_ALGO):
+        return RingCPBackend(cp_group, parallel_size=parallel_size,
+                             parallel_rank=parallel_rank)
+    if isinstance(backend, str):
+        raise NotImplementedError(
+            f"TPR only supports Ring CP, got {backend!r}; configure "
+            "'tpr_cp_backend=ring' or 'context_parallel_algo=megatron_cp_algo'"
+        )
+    if not isinstance(backend, RingCPBackend):
+        raise TypeError(f"expected RingCPBackend, got {type(backend).__name__}")
+    if (backend.parallel_size, backend.parallel_rank) != (parallel_size, parallel_rank):
+        raise ValueError("Ring backend coordinates do not match process group")
+    return backend

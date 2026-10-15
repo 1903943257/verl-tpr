@@ -81,7 +81,7 @@ class TPRGatedDeltaNet(GatedDeltaNet):
         initial_state = context.get_initial_gdn_state(self.layer_number)
 
         if self.cp_size == 2:
-            from .parallel.gdn_state import forward_gdn_cp_with_state
+            from .gdn_cp import forward_gdn_cp_with_state
 
             output, final_state = forward_gdn_cp_with_state(
                 self,
@@ -192,7 +192,7 @@ class TPRGatedDeltaNet(GatedDeltaNet):
                 f"CP={self.cp_size}, TP={self.tp_size}, SP={self.sp_size}"
             )
         if self.cp_size == 2:
-            from .parallel.ring_attention import RingCPAttentionBackend
+            from .parallel.ring import RingCPAttentionBackend
 
             if not isinstance(context.attention_backend, RingCPAttentionBackend):
                 raise NotImplementedError("TPR GDN CP2 requires the native-zigzag Ring backend")

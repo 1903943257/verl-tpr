@@ -7,7 +7,7 @@ in chronological order with rank-local Q/K/V channels and recurrent heads.
 
 import torch
 
-from ..prefix_state import GDNLayerState
+from .prefix_state import GDNLayerState
 
 
 def gdn_cp_state_shapes(layer, batch=1):
@@ -33,7 +33,7 @@ def forward_gdn_cp_with_state(
     must not be silently used as continuation state.
     """
     import mindspeed.core.ssm.gated_delta_net as native
-    from ..gated_delta_net import _stage1_causal_conv1d, _stage1_gated_delta_rule
+    from .gated_delta_net import _stage1_causal_conv1d, _stage1_gated_delta_rule
 
     if not isinstance(layer, native.GatedDeltaNet):
         raise TypeError("requires the patched MindSpeed GatedDeltaNet")

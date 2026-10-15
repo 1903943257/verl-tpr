@@ -30,12 +30,11 @@ from torch.utils.checkpoint import checkpoint
 from .context import KVPair, TPRAttentionContext, use_tpr_attention_context
 from .activation_offload import validate_activation_offload, with_activation_offload
 from .kv_stack import KVStack
-from .parallel.backend import TPRCPBackend, resolve_tpr_cp_backend
-from .parallel.execution_context import (
+from .parallel.ring import RingCPBackend, resolve_tpr_cp_backend, resolve_cp_group
+from .kv_stack import (
     ShardedPastKVAnchors,
     accumulate_sharded_past_anchor_gradients,
     build_sharded_past_anchors,
-    resolve_cp_group,
 )
 from .prefix_state import GDNLayerState, GDNPrefixAnchors, GDNPrefixState
 from .rope import (
@@ -100,7 +99,7 @@ class SegmentExecutor:
         loss_scale_func: Callable[[Tensor], Tensor] | None = None,
         loss_chunk_size: int | None = None,
         cp_group: Any | None = None,
-        cp_backend: TPRCPBackend | str | None = None,
+        cp_backend: RingCPBackend | str | None = None,
         segment_loss_fn: Callable[[SegmentSpec, Tensor], tuple[Tensor, dict[str, Any]]] | None = None,
         segment_loss_term_counts: Mapping[SegmentId, int] | None = None,
     ) -> None:

@@ -24,8 +24,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state
 
-from .backend import ALLGATHER_CP_BACKEND, TPRCPBackend, resolve_tpr_cp_backend
-from .execution_context import resolve_cp_group
+from .parallel.ring import RING_CP_BACKEND, RingCPBackend, resolve_tpr_cp_backend, resolve_cp_group
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,7 +32,7 @@ class TPREngineCPRuntime:
     """One validated CP group and backend selected for an Engine request."""
 
     group: Any | None
-    backend: TPRCPBackend | None
+    backend: RingCPBackend | None
     size: int
     rank: int
 
@@ -79,7 +78,7 @@ def _configured_cp_algorithm(engine: Any, model_config: Any) -> str:
     except (AssertionError, ImportError, RuntimeError):
         global_args = None
     algorithm = _setting(global_args, "context_parallel_algo")
-    return ALLGATHER_CP_BACKEND if algorithm is None else algorithm
+    return RING_CP_BACKEND if algorithm is None else algorithm
 
 
 def resolve_engine_cp_runtime(engine: Any, model_config: Any) -> TPREngineCPRuntime:
