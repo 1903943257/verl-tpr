@@ -16,7 +16,7 @@ class FACoreReplay:
             yield
             return
         from verl.models.mcore.tpr import attention
-        from verl.models.mcore.tpr.parallel import ring_attention as ring
+        from verl.experimental.tpr import ring_attention as ring
         active = []
         handles = []
         rect, ring_fn = attention.rectangular_causal_attention, ring.ring_cp_attention
@@ -80,7 +80,7 @@ class FACoreReplay:
 
     def compare(self, actual, runtime, metrics):
         from verl.models.mcore.tpr.rectangular_attention import rectangular_causal_attention
-        from verl.models.mcore.tpr.parallel.ring_attention import (
+        from verl.workers.engine.megatron.tpr.ring import (
             ring_cp_attention, make_ring_sequence_shard, RingLocalKVBlock,
         )
         assert set(self.records) == set(actual.records) == {4, 24}
@@ -154,7 +154,7 @@ class FACoreReplay:
             if layer == 4:
                 from ._ring_merge_probe import ring_merge_probe, report_ring_merge
                 from unittest.mock import patch
-                from verl.models.mcore.tpr.parallel import ring_attention as ring
+                from verl.experimental.tpr import ring_attention as ring
                 fp32_merge = ring._merge_attention
 
                 def legacy_merge(previous, current, *, query_length):

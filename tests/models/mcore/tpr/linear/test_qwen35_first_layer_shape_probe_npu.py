@@ -77,7 +77,7 @@ class _Trace:
 
 @contextmanager
 def _trace_layer(layer, monkeypatch):
-    import verl.models.mcore.tpr.gated_delta_net as gdn_module
+    import verl.experimental.tpr.gdn.model as gdn_module
 
     trace = _Trace()
     handles = []

@@ -77,7 +77,7 @@ def _make_gdn(runtime) -> nn.Module:
     from megatron.core.models.backends import LocalSpecProvider
     from megatron.core.ssm.gated_delta_net import GatedDeltaNetSubmodules
 
-    from verl.models.mcore.tpr.gated_delta_net import TPRGatedDeltaNet
+    from verl.experimental.tpr.gdn.model import TPRGatedDeltaNet
 
     config = qwen35_config(cp_size=1)
     backend = LocalSpecProvider()
@@ -253,7 +253,7 @@ def _diagnostic_pass(model, prefix, suffixes, prefix_target, suffix_targets, den
 @contextmanager
 def _operator_boundary_probe(model):
     """Retain actual seam tensors; wrappers neither replace nor detach computation."""
-    import verl.models.mcore.tpr.gated_delta_net as gdn_seam
+    import verl.experimental.tpr.gdn.model as gdn_seam
 
     records = {}
 

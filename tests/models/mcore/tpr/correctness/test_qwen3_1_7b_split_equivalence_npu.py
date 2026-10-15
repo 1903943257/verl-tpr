@@ -78,7 +78,7 @@ def _real_recorded_tokens(p, s):
 
 
 def _rope(model, start, length):
-    from verl.models.mcore.tpr.rope import build_suffix_rotary_pos_emb
+    from verl.workers.engine.megatron.tpr.executor import build_suffix_rotary_pos_emb
 
     return build_suffix_rotary_pos_emb(
         model.rotary_pos_emb, prefix_length=start, suffix_length=length

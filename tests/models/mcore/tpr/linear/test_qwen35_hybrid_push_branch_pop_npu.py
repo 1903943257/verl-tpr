@@ -71,7 +71,7 @@ def runtime():
 
 
 def _plan(length=64, *, owned=True, offload_tokens=False):
-    from verl.models.mcore.tpr.segment_plan import SegmentLossTerm, SegmentPlan, SegmentSpec
+    from verl.workers.engine.megatron.tpr.tree import SegmentLossTerm, SegmentPlan, SegmentSpec
 
     tokens = [(torch.arange(length) * step + start) % VOCAB_SIZE
               for step, start in ((17, 23), (19, 101), (23, 307))]
@@ -213,7 +213,7 @@ def _native_reference(model, plan, device, *, tpr_context=False, probe=None):
         context_manager = nullcontext()
         if tpr_context:
             from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
-            from verl.models.mcore.tpr.rope import build_suffix_rotary_pos_emb
+            from verl.workers.engine.megatron.tpr.executor import build_suffix_rotary_pos_emb
 
             context = TPRAttentionContext(
                 prefix_length=0, suffix_length=tokens.numel(),
@@ -357,7 +357,7 @@ def _run_engine(model, plan, monkeypatch):
     from verl.utils import tensordict_utils as tu
     from verl.models.mcore.tpr import TPR_REQUEST_KEY, TPRForwardBackwardRequest
     from verl.models.mcore.tpr import megatron_adapter
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
 
     instances = []
 
@@ -425,8 +425,8 @@ def _run_engine(model, plan, monkeypatch):
 
 
 def _connected_reference(model, plan, *, probe=None):
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-    from verl.models.mcore.tpr.prefix_state import GDNLayerState
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
 
     model.zero_grad(set_to_none=True)
     executor = SegmentExecutor(model, plan)
@@ -483,7 +483,7 @@ def _compare(label, reference, actual):
 def test_full_qwen35_hybrid_engine_push_branch_pop(runtime, monkeypatch):
     # Imports/build happen only AFTER initialize_npu_runtime installs MindSpeed.
     from verl.models.mcore.tpr.attention import TPRSelfAttention
-    from verl.models.mcore.tpr.gated_delta_net import TPRGatedDeltaNet
+    from verl.experimental.tpr.gdn.model import TPRGatedDeltaNet
     import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
 
     torch.manual_seed(353301)
@@ -593,7 +593,7 @@ def test_qwen35_cp1_repeatability_without_offload(runtime, monkeypatch, path, la
     No swap hooks, optimizer or first-layer projection controls are installed.
     """
     import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
-    from verl.models.mcore.tpr.activation_offload import swap_enabled
+    from verl.experimental.tpr.offload import swap_enabled
 
     torch.manual_seed(123)
     model = make_qwen35_model(runtime, cp_size=1, tpr=path == "tpr", num_layers=layers)
@@ -649,7 +649,7 @@ def test_qwen35_cp1_repeatability_without_offload(runtime, monkeypatch, path, la
 def test_leaf_final_state_capture_repeatability_control(runtime, monkeypatch):
     """Report whether unused leaf final-state capture changes repeatability."""
     import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
 
     torch.manual_seed(123)
     model = make_qwen35_model(runtime, cp_size=1, tpr=True, num_layers=4)
@@ -692,7 +692,7 @@ def test_leaf_final_state_capture_repeatability_control(runtime, monkeypatch):
 def test_push_saved_state_matches_pop_recompute(runtime, monkeypatch):
     """Push graph-free GDN state must bitwise match Pop's fresh recomputed boundary."""
     import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
 
     torch.manual_seed(123)
     model = make_qwen35_model(runtime, cp_size=1, tpr=True, num_layers=4)
@@ -730,7 +730,7 @@ def test_push_saved_state_matches_pop_recompute(runtime, monkeypatch):
 def test_saved_prefix_state_is_read_only_across_leaf_forward_backward(runtime, monkeypatch):
     """Zero-copy GDN anchors must never mutate persistent PrefixState storage."""
     import mindspeed.core.ssm.gated_delta_net as mindspeed_gdn
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
 
     torch.manual_seed(123)
     model = make_qwen35_model(runtime, cp_size=1, tpr=True, num_layers=4)
