@@ -76,14 +76,15 @@ def trace_l4(model, patch, *, backend, rank, enabled):
 
         patch.setattr(torch_npu, name, kernel)
 
-    original_entry = ring.ordinary_ring_cp_attention
+    from . import _native_whole_ring_reference as native_ref
+    original_entry = native_ref.ordinary_ring_cp_attention
 
     def entry(*args, **kwargs):
         if active[0]:
             records["native_entry"] += 1
         return original_entry(*args, **kwargs)
 
-    patch.setattr(ring, "ordinary_ring_cp_attention", entry)
+    patch.setattr(native_ref, "ordinary_ring_cp_attention", entry)
     patch.setattr(layer.self_attention, "forward", layer_forward)
     try:
         yield records
