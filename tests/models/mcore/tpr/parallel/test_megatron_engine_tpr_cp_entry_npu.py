@@ -53,18 +53,11 @@ from ._tpr_cp_test_utils import (
     _run_independent_cp_reference,
     _tokens,
     cp_runtime,
-    hybrid_cp_runtime,
 )
 
 
 _CP2_ENGINE_CASES = ((128, 64, 32), (127, 63, 31))
-_CP4_ENGINE_CASES = ((128, 64, 32), (127, 63, 31))
-_MINDSPEED_ALGORITHM = {
-    "allgather": "kvallgather_cp_algo",
-    "ulysses": "ulysses_cp_algo",
-    "ring": "megatron_cp_algo",
-    "hybrid": "hybrid_cp_algo",
-}
+_MINDSPEED_ALGORITHM = {"ring": "megatron_cp_algo"}
 
 
 def _run_engine_tpr(model, plan, runtime, *, expected_backend):

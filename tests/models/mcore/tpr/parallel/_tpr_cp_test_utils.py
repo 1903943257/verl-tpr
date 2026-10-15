@@ -53,8 +53,6 @@ from ._cp_gdn_test_utils import (
 
 
 _EXPECTED_WORLD_SIZE = 2
-_HYBRID_WORLD_SIZE = 4
-_HYBRID_ULYSSES_SIZE = 2
 _PREFIX_LENGTH = 1024
 _FIRST_SUFFIX_LENGTH = 512
 _SECOND_SUFFIX_LENGTH = 256
@@ -65,12 +63,6 @@ _EQUIVALENCE_CASES = (
     (128, 64, 32),
     (1024, 512, 256),
     (2048, 128, 512),
-    (127, 63, 31),
-    (1025, 511, 257),
-)
-_HYBRID_EQUIVALENCE_CASES = (
-    (128, 64, 32),
-    (1024, 512, 256),
     (127, 63, 31),
     (1025, 511, 257),
 )
@@ -142,83 +134,6 @@ def cp_runtime():
         cp_group=cp_group,
         tp_group=tp_group,
         pp_group=pp_group,
-    )
-
-    dist.barrier(group=cp_group)
-    parallel_state.destroy_model_parallel()
-    dist.destroy_process_group()
-
-
-@pytest.fixture(scope="module")
-def hybrid_cp_runtime():
-    if int(os.getenv("WORLD_SIZE", "1")) != _HYBRID_WORLD_SIZE:
-        pytest.skip("Hybrid CP cases require torchrun --nproc_per_node=4")
-    import torch_npu  # noqa: F401
-
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.npu.set_device(local_rank)
-    if not dist.is_initialized():
-        dist.init_process_group(backend="hccl")
-
-    pytest_argv = sys.argv[:]
-    try:
-        sys.argv[:] = [sys.argv[0]]
-        from mindspeed.megatron_adaptor import repatch
-    finally:
-        sys.argv[:] = pytest_argv
-
-    from mindspeed.args_utils import get_full_args
-
-    vars(get_full_args()).pop("", None)
-    repatch(
-        {
-            "context_parallel_size": _HYBRID_WORLD_SIZE,
-            "context_parallel_algo": "hybrid_cp_algo",
-            "ulysses_degree_in_cp": _HYBRID_ULYSSES_SIZE,
-        }
-    )
-
-    if not parallel_state.model_parallel_is_initialized():
-        parallel_state.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1,
-            context_parallel_size=_HYBRID_WORLD_SIZE,
-            expert_model_parallel_size=1,
-        )
-
-    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-    from mindspeed.core.context_parallel.model_parallel_utils import (
-        get_context_parallel_group_for_hybrid_ring,
-        get_context_parallel_group_for_hybrid_ulysses,
-    )
-
-    model_parallel_cuda_manual_seed(260908)
-    cp_group = parallel_state.get_context_parallel_group()
-    tp_group = parallel_state.get_tensor_model_parallel_group()
-    pp_group = parallel_state.get_pipeline_model_parallel_group()
-    ulysses_group = get_context_parallel_group_for_hybrid_ulysses()
-    ring_group = get_context_parallel_group_for_hybrid_ring()
-    if (
-        cp_group.size() != _HYBRID_WORLD_SIZE
-        or ulysses_group.size() != _HYBRID_ULYSSES_SIZE
-        or ring_group.size() != _HYBRID_WORLD_SIZE // _HYBRID_ULYSSES_SIZE
-        or tp_group.size() != 1
-        or pp_group.size() != 1
-    ):
-        raise AssertionError(
-            "unexpected Hybrid topology: "
-            f"TP={tp_group.size()}, PP={pp_group.size()}, CP={cp_group.size()}, "
-            f"U={ulysses_group.size()}, R={ring_group.size()}"
-        )
-    yield SimpleNamespace(
-        rank=dist.get_rank(cp_group),
-        cp_size=cp_group.size(),
-        device=torch.device("npu", local_rank),
-        cp_group=cp_group,
-        tp_group=tp_group,
-        pp_group=pp_group,
-        ulysses_group=ulysses_group,
-        ring_group=ring_group,
     )
 
     dist.barrier(group=cp_group)
@@ -748,12 +663,6 @@ def _collective_probe():
         ring_attention._reduce_ring_gradients_to_owner = original_backward
 
 
-@contextmanager
-def _hybrid_communication_probe():
-    pytest.skip("Hybrid Ulysses Attention was removed from this Ring-only branch")
-    yield {}
-
-
 def _clone_prefix_gradients(executor, *, segment_id=0):
     return {
         layer_number: (key.clone(), value.clone())
@@ -808,29 +717,12 @@ def _run_controlled_equivalence(
         logical_indices,
         logical_count,
     )
-    probe = _hybrid_communication_probe() if tpr_backend == "hybrid" else nullcontext(None)
-    with probe as hybrid_counts:
-        actual = _run_tpr_cp(
-            tpr_model,
-            tpr_plan,
-            runtime,
-            logical_indices,
-            logical_count,
-            cp_backend=tpr_backend,
-        )
-
-    if hybrid_counts is not None:
-        local_counts = torch.tensor(
-            tuple(hybrid_counts.values()),
-            dtype=torch.int64,
-            device=runtime.device,
-        )
-        rank_counts = [torch.empty_like(local_counts) for _ in range(runtime.cp_size)]
-        dist.all_gather(rank_counts, local_counts, group=runtime.cp_group)
-        if any(not torch.equal(counts, rank_counts[0]) for counts in rank_counts[1:]):
-            raise AssertionError(f"Hybrid collective counts differ across CP ranks: {rank_counts}")
-        if torch.any(local_counts <= 0).item():
-            raise AssertionError(f"Hybrid path did not execute every communication phase: {hybrid_counts}")
+    if tpr_backend != "ring":
+        raise ValueError("controlled equivalence is Ring-only")
+    actual = _run_tpr_cp(
+        tpr_model, tpr_plan, runtime, logical_indices, logical_count,
+        cp_backend="ring",
+    )
 
     assert reference.execution_trace == (
         (PhysicalExecutionKind.VISIT_LEAF, 1),
