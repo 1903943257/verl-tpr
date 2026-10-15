@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from . import _native_whole_ring_reference as ring
+from verl.models.mcore.tpr.parallel import ring as production_ring
 
 
 def test_native_adapter_preserves_gqa_dtype_and_autograd(monkeypatch):
@@ -96,12 +97,12 @@ def test_offline_native_ring_adapter_flattens_heads_for_projection(monkeypatch):
     # The installer replaces only the custom dispatch function, preserving
     # the original MindSpeed native function and its autograd contract.
     with monkeypatch.context() as local_patch:
-        local_patch.setattr(ring, "ring_cp_attention", lambda *a, **k: None)
+        local_patch.setattr(production_ring, "ring_cp_attention", lambda *a, **k: None)
         backend = _install_offline_full_ring_backend("full")
         assert backend.startswith("mindspeed_native_")
         q = torch.randn(23, 1, 16, 128, requires_grad=True)
         k = torch.randn(23, 1, 4, 128, requires_grad=True)
-        out = ring.ring_cp_attention(q,k,k,prefix_blocks=())
+        out = production_ring.ring_cp_attention(q,k,k,prefix_blocks=())
         assert out.shape == (23,1,2048)
         # This is the exact input layout expected by Megatron RowParallelLinear.
         weight = torch.randn(17,2048)

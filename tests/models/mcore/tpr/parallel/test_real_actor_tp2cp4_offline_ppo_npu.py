@@ -229,12 +229,13 @@ def _install_offline_full_ring_backend(mode: str) -> str:
     if mode != "full" or chosen == "custom":
         return "tpr_custom_ring"
     from verl.models.mcore.tpr.parallel import ring
+    from . import _native_whole_ring_reference as native_reference
 
     def native_full_attention(query, current_key, current_value, *,
                               prefix_blocks=(), **kwargs):
         if prefix_blocks:
             raise AssertionError("Native Full Ring cannot receive shared Prefix KV")
-        result = ring.ordinary_ring_cp_attention(
+        result = native_reference.ordinary_ring_cp_attention(
             query, current_key, current_value,
             allow_trailing_padding=True, **kwargs
         )
