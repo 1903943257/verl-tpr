@@ -260,7 +260,7 @@ def build_trajectory_trees_turn(
 ) -> tuple[TrajectoryTree, ...]:
     """Build exact TPR topology sharing only completed Turn units.
 
-    Qwen3-only experimental strategy. A captured prompt endpoint may be used
+    Production Qwen3/ChatML turn-boundary strategy. A captured prompt endpoint may be used
     even when the ChatML prompt ends in an open assistant header. When no
     common valid unit exists, returns separate full-sequence trees rather
     than fabricating any shared prefix.
