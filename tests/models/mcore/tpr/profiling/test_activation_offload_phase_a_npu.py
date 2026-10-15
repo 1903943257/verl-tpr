@@ -107,7 +107,7 @@ def _make_real_qwen_model(runtime, monkeypatch, *, max_sequence_length, tpr=True
 
 def _plan(prefix=1024, suffix=1024, owned=True):
     from ..equivalence.test_tpr_engine_reference_equivalence_npu import _make_plan
-    from verl.models.mcore.tpr.segment_plan import SegmentPlan
+    from verl.workers.engine.megatron.tpr.tree import SegmentPlan
 
     plan = _make_plan(torch.arange(prefix) % 2048,
                       (torch.arange(suffix) + 37) % 2048,
@@ -119,7 +119,7 @@ def _plan(prefix=1024, suffix=1024, owned=True):
 
 
 def _run(model, plan, *, observe=False, counts=None, memory_audit=None):
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
 
     model.zero_grad(set_to_none=True)
     logs = {}
@@ -236,7 +236,7 @@ def _reference_trajectories(prefix, suffix, *, device):
 
 
 def _run_reference(model, trajectories, *, total_loss_weight, counts=None):
-    from verl.models.mcore.tpr.activation_offload import mindspeed_swap_attention
+    from verl.experimental.tpr.offload import mindspeed_swap_attention
 
     model.zero_grad(set_to_none=True)
     loss_sum = next(model.parameters()).new_zeros((), dtype=torch.float32)

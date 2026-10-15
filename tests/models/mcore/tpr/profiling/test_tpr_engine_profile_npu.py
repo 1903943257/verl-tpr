@@ -49,7 +49,7 @@ from verl.models.mcore.tpr import TPR_REQUEST_KEY, TPRForwardBackwardRequest, Se
 from verl.models.mcore.tpr import attention as tpr_attention_module
 from verl.models.mcore.tpr import rectangular_attention as rectangular_attention_module
 from verl.models.mcore.tpr.context import TPRAttentionContext, get_tpr_attention_context
-from verl.models.mcore.tpr.kv_stack import KVStack, KVStackEntry, SegmentKV
+from verl.workers.engine.megatron.tpr.state import KVStack, KVStackEntry, SegmentKV
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
 

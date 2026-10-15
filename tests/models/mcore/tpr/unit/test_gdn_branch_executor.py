@@ -4,8 +4,8 @@ import pytest
 import torch
 from torch import nn
 
-from verl.models.mcore.tpr.parallel.gdn_tree import GDNCPBranchExecutor
-from verl.models.mcore.tpr.prefix_state import GDNLayerState
+from verl.experimental.tpr.gdn.tree import GDNCPBranchExecutor
+from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
 
 
 class _Stack(nn.Module):

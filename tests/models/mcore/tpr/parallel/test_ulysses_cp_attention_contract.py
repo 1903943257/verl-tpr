@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-import verl.models.mcore.tpr.parallel.ulysses_attention as ulysses
+import verl.experimental.tpr.ulysses as ulysses
 from verl.models.mcore.tpr import LocalKVBlock, PaddedSequenceShard, PrefixShard
 
 

@@ -5,10 +5,10 @@ import torch
 from torch import nn
 
 from verl.models.mcore.tpr.context import get_tpr_attention_context
-from verl.models.mcore.tpr.fixed_topology_scheduler import FixedTopologyScheduler
-from verl.models.mcore.tpr.prefix_state import GDNLayerState
-from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-from verl.models.mcore.tpr.segment_plan import SegmentLossTerm, SegmentPlan, SegmentSpec
+from verl.experimental.tpr.legacy.fixed_topology_scheduler import FixedTopologyScheduler
+from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+from verl.workers.engine.megatron.tpr.tree import SegmentLossTerm, SegmentPlan, SegmentSpec
 
 
 class _GDNMarker(nn.Module):
