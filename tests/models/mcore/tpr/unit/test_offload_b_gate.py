@@ -27,7 +27,7 @@ class GateTest(unittest.TestCase):
         passed, limits, severity = gate.gradient_gate(metrics(0.018), baseline)
         self.assertFalse(passed)
         self.assertGreater(severity, 1.0)
-        self.assertEqual(limits["relative_l2"], 0.009)
+        self.assertAlmostEqual(limits["relative_l2"], 0.009)
         self.assertFalse(gate.gradient_gate(metrics(0.004), baseline)[1].get("max_abs"))
 
     def test_zero_noise_does_not_produce_zero_budget(self):
