@@ -157,7 +157,7 @@ def test_hybrid_spec_dispatch_preserves_pattern_and_is_idempotent(monkeypatch):
 
     native = ModuleType("mindspeed.core.ssm.gated_delta_net")
     native.GatedDeltaNet = GatedDeltaNet
-    adapted = ModuleType("verl.models.mcore.tpr.gated_delta_net")
+    adapted = ModuleType("verl.experimental.tpr.gdn.model")
     adapted.TPRGatedDeltaNet = TPRGatedDeltaNet
     monkeypatch.setitem(sys.modules, native.__name__, native)
     monkeypatch.setitem(sys.modules, adapted.__name__, adapted)
