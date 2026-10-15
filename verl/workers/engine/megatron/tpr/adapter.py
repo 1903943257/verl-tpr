@@ -530,18 +530,9 @@ def replace_self_attention_with_tpr(transformer_layer_spec: _SpecT) -> _SpecT:
         attention_module = get_module(attention_spec)
         if attention_module is TPRSelfAttention:
             continue
-        if getattr(attention_module, "tpr_state_kind", None) == "gdn":
-            continue
-        if getattr(attention_module, "__name__", None) == "GatedDeltaNet":
-            # Import only after the NPU adaptor has installed the MindSpeed spec.
-            from mindspeed.core.ssm.gated_delta_net import GatedDeltaNet
-
-            from verl.experimental.tpr.gdn.model import TPRGatedDeltaNet
-
-            if attention_module is not GatedDeltaNet:
-                raise TypeError("TPR GDN requires the patched MindSpeed GatedDeltaNet spec")
-            layer_submodules.self_attention = replace(attention_spec, module=TPRGatedDeltaNet)
-            continue
+        if (getattr(attention_module, "tpr_state_kind", None) == "gdn"
+                or getattr(attention_module, "__name__", None) == "GatedDeltaNet"):
+            raise NotImplementedError("Production TPR ModuleSpec supports Dense SelfAttention only")
         if attention_module is not SelfAttention:
             module_name = getattr(attention_module, "__name__", repr(attention_module))
             raise TypeError(
