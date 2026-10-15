@@ -34,7 +34,7 @@ from .state import (
     accumulate_sharded_past_anchor_gradients,
     build_sharded_past_anchors,
 )
-from verl.models.mcore.tpr.segment_plan import SegmentEvent, SegmentEventKind, SegmentId, SegmentPlan, SegmentSpec
+from .tree import SegmentEvent, SegmentEventKind, SegmentId, SegmentPlan, SegmentSpec
 
 
 class _RotaryEmbedding(Protocol):

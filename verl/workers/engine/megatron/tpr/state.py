@@ -26,7 +26,7 @@ from torch import Tensor
 
 from verl.models.mcore.tpr.context import KVPair
 from verl.models.mcore.tpr.prefix_state import KVPrefixAnchors, KVPrefixState, PrefixStateEntry, PrefixStateStack
-from verl.models.mcore.tpr.segment_plan import SegmentId, SegmentSpec
+from .tree import SegmentId, SegmentSpec
 from .ring import SequenceShard
 
 
