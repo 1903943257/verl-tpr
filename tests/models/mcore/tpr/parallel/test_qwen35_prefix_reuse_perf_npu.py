@@ -99,7 +99,7 @@ class _Profile:
         patch.setattr(owner, attr, wrapped)
 
     def install(self, patch, model):
-        from verl.models.mcore.tpr.parallel import allgather_attention as ag
+        from . import _test_only_allgather_oracle as ag
         from verl.models.mcore.tpr import segment_executor as se
         from verl.models.mcore.tpr.prefix_state import GDNPrefixState, KVPrefixState
         from verl.models.mcore.tpr.kv_stack import KVStack
@@ -221,7 +221,7 @@ def _rank_max(values, runtime):
 
 def _sample(model, runtime, refs, tree, mode, patch, profiled, trace=None):
     import mindspeed.core.ssm.gated_delta_net as gdn
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.models.mcore.tpr.parallel import ring
 
     model.zero_grad(set_to_none=True)
     profile = _Profile() if profiled else None

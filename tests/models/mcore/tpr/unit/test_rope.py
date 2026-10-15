@@ -16,8 +16,8 @@ import pytest
 import torch
 
 from verl.models.mcore.tpr.rope import disable_bound_context_parallel_sharding
+from verl.models.mcore.tpr.shard import PrefixShard, maybe_pad_sequence_shard
 from verl.models.mcore.tpr import (
-    AllGatherCPBackend,
     RangeSequenceShard,
     build_sharded_rotary_pos_emb,
     build_suffix_rotary_pos_emb,
@@ -128,7 +128,7 @@ def test_sharded_rope_follows_noncontiguous_local_token_order():
 
 def test_sharded_rope_repeats_the_last_logical_position_for_padding():
     rotary_embedding = _RecordingRotaryEmbedding()
-    shard = AllGatherCPBackend(object(), parallel_size=2, parallel_rank=1).make_sequence_shard(7)
+    shard = maybe_pad_sequence_shard(7, PrefixShard.contiguous(8, cp_rank=1, cp_size=2))
 
     result = build_sharded_rotary_pos_emb(
         rotary_embedding,
@@ -143,11 +143,7 @@ def test_sharded_rope_repeats_the_last_logical_position_for_padding():
 
 def test_padded_prefix_does_not_shift_the_first_suffix_rope_position():
     rotary_embedding = _RecordingRotaryEmbedding()
-    suffix_shard = AllGatherCPBackend(
-        object(),
-        parallel_size=2,
-        parallel_rank=0,
-    ).make_sequence_shard(63)
+    suffix_shard = maybe_pad_sequence_shard(63, PrefixShard.contiguous(64, cp_rank=0, cp_size=2))
 
     result = build_sharded_rotary_pos_emb(
         rotary_embedding,

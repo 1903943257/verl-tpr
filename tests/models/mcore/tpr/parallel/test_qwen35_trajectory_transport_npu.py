@@ -60,8 +60,8 @@ def projection_control(model, patch, enabled):
 def execute(model, runtime, *, cp, segmented):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
     from verl.models.mcore.tpr.prefix_state import KVPrefixAnchors
-    from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
-    from verl.models.mcore.tpr.parallel.ring_attention import make_ring_sequence_shard
+    from verl.models.mcore.tpr.kv_stack import ShardedPastKVAnchors
+    from verl.models.mcore.tpr.parallel.ring import make_ring_sequence_shard
     whole, split = plans()
     plan = split if segmented else whole
     executor = SegmentExecutor(model, plan, expected_layer_numbers=(4, 8, 12, 16, 20, 24),

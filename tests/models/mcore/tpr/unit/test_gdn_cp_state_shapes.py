@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl.models.mcore.tpr.parallel.gdn_state import gdn_cp_state_shapes
+from verl.models.mcore.tpr.gdn_cp import gdn_cp_state_shapes
 
 
 def _layer(cp):

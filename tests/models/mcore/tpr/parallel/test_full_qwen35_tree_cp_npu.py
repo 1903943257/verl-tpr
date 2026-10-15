@@ -121,7 +121,7 @@ def _engine_run(model, plan, executor_type, runtime, monkeypatch):
 def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False, fa_replay=False, gdn_capture=None, closure_capture=None, fa_transport=None):
     from verl.models.mcore.tpr.segment_executor import SegmentExecutor
     from verl.models.mcore.tpr.prefix_state import GDNLayerState, KVPrefixAnchors
-    from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
+    from verl.models.mcore.tpr.kv_stack import ShardedPastKVAnchors
 
     gdn_layers, fa_layers = assert_hybrid_architecture(model)
     gdn_numbers = tuple(layer.layer_number for layer in gdn_layers)
