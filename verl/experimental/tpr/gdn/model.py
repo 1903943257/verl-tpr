@@ -26,7 +26,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from mindspeed.core.ssm.gated_delta_net import GatedDeltaNet
 
 from verl.models.mcore.tpr.context import TPRAttentionContext, get_tpr_attention_context
-from verl.models.mcore.tpr.prefix_state import GDNLayerState
+from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
 
 
 class TPRGatedDeltaNet(GatedDeltaNet):
@@ -192,7 +192,7 @@ class TPRGatedDeltaNet(GatedDeltaNet):
                 f"CP={self.cp_size}, TP={self.tp_size}, SP={self.sp_size}"
             )
         if self.cp_size == 2:
-            from verl.models.mcore.tpr.parallel.ring_attention import RingCPAttentionBackend
+            from verl.workers.engine.megatron.tpr.ring import RingCPAttentionBackend
 
             if not isinstance(context.attention_backend, RingCPAttentionBackend):
                 raise NotImplementedError("TPR GDN CP2 requires the native-zigzag Ring backend")

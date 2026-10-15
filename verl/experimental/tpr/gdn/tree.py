@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
-from verl.models.mcore.tpr.prefix_state import GDNPrefixState
+from verl.experimental.tpr.gdn.prefix_state import GDNPrefixState
 from .state import forward_gdn_cp_with_state
 
 

@@ -7,7 +7,7 @@ in chronological order with rank-local Q/K/V channels and recurrent heads.
 
 import torch
 
-from verl.models.mcore.tpr.prefix_state import GDNLayerState
+from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
 
 
 def gdn_cp_state_shapes(layer, batch=1):

@@ -25,7 +25,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from verl.models.mcore.tpr.shard import (
+from verl.workers.engine.megatron.tpr.ring import (
     PrefixShard,
     SequenceShard,
     iter_valid_sequence_slices,

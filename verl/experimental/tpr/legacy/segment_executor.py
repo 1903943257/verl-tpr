@@ -28,22 +28,22 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 from verl.models.mcore.tpr.context import KVPair, TPRAttentionContext, use_tpr_attention_context
-from verl.models.mcore.tpr.activation_offload import validate_activation_offload, with_activation_offload
-from verl.models.mcore.tpr.kv_stack import KVStack
-from verl.models.mcore.tpr.parallel.backend import TPRCPBackend, resolve_tpr_cp_backend
-from verl.models.mcore.tpr.parallel.execution_context import (
+from verl.experimental.tpr.offload import validate_activation_offload, with_activation_offload
+from verl.workers.engine.megatron.tpr.state import KVStack
+from verl.experimental.tpr.legacy.cp.backend import TPRCPBackend, resolve_tpr_cp_backend
+from verl.experimental.tpr.legacy.cp.execution_context import (
     ShardedPastKVAnchors,
     accumulate_sharded_past_anchor_gradients,
     build_sharded_past_anchors,
     resolve_cp_group,
 )
-from verl.models.mcore.tpr.prefix_state import GDNLayerState, GDNPrefixAnchors, GDNPrefixState
-from verl.models.mcore.tpr.rope import (
+from verl.experimental.tpr.gdn.prefix_state import GDNLayerState, GDNPrefixAnchors, GDNPrefixState
+from verl.workers.engine.megatron.tpr.executor import (
     build_sharded_rotary_pos_emb,
     disable_bound_context_parallel_sharding,
 )
-from verl.models.mcore.tpr.segment_plan import SegmentId, SegmentLossTerm, SegmentPlan, SegmentSpec
-from verl.models.mcore.tpr.shard import PrefixShard, SequenceShard
+from verl.workers.engine.megatron.tpr.tree import SegmentId, SegmentLossTerm, SegmentPlan, SegmentSpec
+from verl.workers.engine.megatron.tpr.ring import PrefixShard, SequenceShard
 
 
 @dataclass(frozen=True, slots=True)

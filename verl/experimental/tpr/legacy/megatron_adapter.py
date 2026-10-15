@@ -27,7 +27,7 @@ from verl.models.mcore.tpr.attention import TPRSelfAttention
 from .engine_adapter import TPRForwardBackwardRequest
 from .fixed_topology_scheduler import FixedTopologyScheduler
 from verl.experimental.tpr.gdn.module_spec import install_tpr_vanilla_mbridge_spec, make_tpr_module_spec_provider
-from verl.models.mcore.tpr.parallel.engine_runtime import aggregate_cp_loss, resolve_engine_cp_runtime
+from verl.experimental.tpr.legacy.cp.engine_runtime import aggregate_cp_loss, resolve_engine_cp_runtime
 from .segment_executor import SegmentExecutor
 
 if TYPE_CHECKING:

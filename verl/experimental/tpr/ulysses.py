@@ -23,15 +23,15 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from verl.models.mcore.tpr.kv_stack import KVStack
+from verl.workers.engine.megatron.tpr.state import KVStack
 from verl.models.mcore.tpr.rectangular_attention import rectangular_causal_attention
-from verl.models.mcore.tpr.shard import PrefixShard, SequenceShard, physical_sequence_shard
+from verl.workers.engine.megatron.tpr.ring import PrefixShard, SequenceShard, physical_sequence_shard
 from .allgather import (
     LocalKVBlock,
     _group_world_size_and_rank,
     _physical_causal_padding_mask,
 )
-from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
+from verl.experimental.tpr.legacy.cp.execution_context import ShardedPastKVAnchors
 
 
 def _load_mindspeed_seq_all_to_all():

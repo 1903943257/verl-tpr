@@ -16,8 +16,8 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from verl.models.mcore.tpr.segment_plan import SegmentSpec
-from verl.models.mcore.tpr.shard import SequenceShard
+from verl.workers.engine.megatron.tpr.tree import SegmentSpec
+from verl.workers.engine.megatron.tpr.ring import SequenceShard
 from .tree_plan_builder import SegmentObjectiveRef, TreeExecutionPlan
 
 

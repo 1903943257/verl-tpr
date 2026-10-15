@@ -25,8 +25,8 @@ from typing import Any
 import torch.distributed as dist
 from torch import Tensor
 
-from verl.models.mcore.tpr.kv_stack import KVStack
-from verl.models.mcore.tpr.shard import (
+from verl.workers.engine.megatron.tpr.state import KVStack
+from verl.workers.engine.megatron.tpr.ring import (
     RangeSequenceShard,
     SequenceShard,
     maybe_pad_sequence_shard,
@@ -34,8 +34,8 @@ from verl.models.mcore.tpr.shard import (
     round_up_sequence_length,
 )
 from .allgather import _group_world_size_and_rank
-from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
-from verl.models.mcore.tpr.parallel.ring_attention import RingLocalKVBlock, make_ring_sequence_shard, ring_cp_attention
+from verl.experimental.tpr.legacy.cp.execution_context import ShardedPastKVAnchors
+from verl.workers.engine.megatron.tpr.ring import RingLocalKVBlock, make_ring_sequence_shard, ring_cp_attention
 from .ulysses import _head_to_sequence, _sequence_to_head
 
 
