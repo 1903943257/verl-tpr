@@ -110,7 +110,7 @@ class _Probe:
 
     def __init__(self, monkeypatch, *, timing=False, stage="capacity", synchronize=False):
         from mindspeed.core.memory.swap_attention.prefetch import SwapTensor
-        from verl.models.mcore.tpr.parallel import ring_attention
+        from verl.models.mcore.tpr.parallel import ring as ring_attention
         self.phase = "setup"
         self.stage = stage
         self.synchronize = synchronize
