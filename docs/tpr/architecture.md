@@ -26,9 +26,11 @@ models.mcore.tpr.attention / context / rectangular_attention
     +-- new KV consumed by descendants; differentiable anchors during replay
 ```
 
-The base model code remains under `verl/models/mcore/tpr/`. Legacy model
-PrefixState and Shard imports delegate to canonical Engine State and Ring
-classes; optional GDN continuation states live in `experimental/tpr/gdn/`. Tree scheduling,
+The model package `verl/models/mcore/tpr/` now physically contains only
+`attention.py`, `context.py`, `rectangular_attention.py` and its lazy
+`__init__.py`. The Engine owns all Segment plans, Prefix State, Shard/Padding,
+ModuleSpec installation and TP group agreement. Optional GDN lives in
+`experimental/tpr/gdn/`. Tree scheduling,
 PPO ownership and distributed execution are Engine concerns and must not be
 imported by model-side primitives. The first-party `context.py` transfers
 per-forward prefix tensors, RoPE and new per-layer KV between the Executor and
@@ -70,18 +72,17 @@ Ring CP uses the MindSpeed two-range zigzag placement. Logical Segment tokens
 are distinct from physically padded tokens (multiple of `2*CP`): a physical
 query/KV must not receive an unintended padded loss or attention score.
 `ring.py` now owns Ring communication, the physical/logical SequenceShard,
-zigzag layout, padding metadata and block validity masks. The historical
-`models/mcore/tpr/shard.py` is a module alias, not another implementation.
+zigzag layout, padding metadata and block validity masks. The old model-side shard implementation has been deleted; all imports now use Engine Ring.
 Padding numerical correctness still needs the NPU CP2/CP4 parity gate.
 
 ### Optional experiments
 
 `verl/experimental/tpr/` contains AllGather, Ulysses, Hybrid, GDN and activation
-offload experiments. Their old paths are compatibility imports for historical
-tests. **Production PPO must never import these experimental backends.** The
-old model-side parallel/backend.py factory is now a thin alias to an experimental-only factory.
-The `ring_attention.py` compatibility import is the **same module object** as
-Engine `ring.py`: there is only one maintained Ring implementation.
+offload experiments. Historical CE/Exact reference implementations are held only under
+`experimental/tpr/legacy/`, and their tests now import them explicitly.
+**Production PPO must never import these experimental backends.** The
+model-side `parallel/` directory and duplicate Ring/CP factories are deleted;
+Engine `ring.py` is the sole maintained Ring kernel.
 
 ### Reusing native components
 
@@ -94,10 +95,10 @@ silently disable checks.
 
 ### Source reduction guarantees
 
-The Engine owns all Dense training state and Segment plans. Model-side files
-retain Attention, Context and CANN helpers. To keep historical tests useful,
-legacy import paths remain short compatibility aliases rather than duplicate
-implementations.
+The Engine owns all Dense training state and Segment plans. Model-side code
+contains only Attention/Context/CANN. Historical CE/Exact code is kept as
+an explicitly experimental reference, not a second production implementation.
+The old model-side compatibility files are physically deleted.
 
 The query/KV coalescing optimization (qkvmerge) is intentionally retained.
 The Ring implementation still includes _can_coalesce_prefix_query,

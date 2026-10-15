@@ -60,10 +60,11 @@ def test_ppo_executor_no_legacy_ce_gdn_paths() -> None:
     assert "self.gdn_states" not in source
 
 
-def test_single_ring_module_alias() -> None:
-    source = (MODEL / "parallel/ring_attention.py").read_text(encoding="utf-8")
-    assert "_sys.modules[__name__] = _ring" in source
-    assert "class _RingTPRAttention" not in source
+def test_model_dir_is_only_attention_context_cann() -> None:
+    expected = {"__init__.py", "attention.py", "context.py", "rectangular_attention.py"}
+    assert {f.name for f in MODEL.glob("*.py")} == expected
+    assert not (MODEL / "parallel").exists()
+    assert "class RingCPBackend:" in _source("ring")
 
 
 def test_engine_routes_to_new_adapter() -> None:
@@ -71,66 +72,52 @@ def test_engine_routes_to_new_adapter() -> None:
     assert "from verl.workers.engine.megatron.tpr.adapter import" in engine
 
 
-def test_single_sequence_shard_implementation() -> None:
-    from pathlib import Path
-
-    source = (MODEL / "shard.py").read_text(encoding="utf-8")
+def test_engine_owns_shard_tree_state() -> None:
     ring = _source("ring")
-    assert 'tpr.ring' in source
-    assert 'class PaddedSequenceShard:' in ring
-    assert 'class RangeSequenceShard:' in ring
-    assert 'class PrefixShard:' in ring
-    assert "from .state import KVStack" not in ring
-
-
-
-def test_dense_prefix_state_is_engine_owned() -> None:
     state = _source("state")
-    compat = (MODEL / "prefix_state.py").read_text(encoding="utf-8")
+    tree = _source("tree")
+    assert "class PaddedSequenceShard:" in ring
+    assert "class RangeSequenceShard:" in ring
+    assert "class PrefixShard:" in ring
+    assert "from .state import KVStack" not in ring
     assert "class KVPrefixState:" in state
     assert "class PrefixStateStack:" in state
     assert "GDNPrefixState" not in state
-    assert "def __getattr__(name):" in compat
+    assert "class SegmentPlan:" in tree
+    assert "class SegmentObjectiveRef:" in tree
+    assert "def digest_forest_plan(" in tree
 
 
+def test_no_obsolete_model_submodule_imports() -> None:
+    allowed = {"attention", "context", "rectangular_attention"}
+    prefix = "verl.models.mcore.tpr."
+    for base in (ROOT / "verl", ROOT / "tests/models/mcore/tpr"):
+        for f in base.rglob("*.py"):
+            syntax = ast.parse(f.read_text(encoding="utf-8"), filename=str(f))
+            for item in ast.walk(syntax):
+                mods = []
+                if isinstance(item, ast.ImportFrom) and item.module:
+                    mods.append(item.module)
+                if isinstance(item, ast.Import):
+                    mods += [alias.name for alias in item.names]
+                for name in mods:
+                    if name.startswith(prefix):
+                        part = name[len(prefix):].split(".")[0]
+                        assert part in allowed, f"{f} still imports deleted {name}"
 
-def test_compatibility_aliases_have_live_targets() -> None:
-    """Moved Python module aliases must refer to files in this checkout."""
-    paths = [
-        MODEL / "shard.py",
-        MODEL / "segment_plan.py",
-        MODEL / "rope.py",
-        MODEL / "kv_stack.py",
-        MODEL / "prefix_state.py",
-        MODEL / "megatron_adapter.py",
-        MODEL / "segment_executor.py",
-        MODEL / "objective_adapter.py",
-        MODEL / "fixed_topology_scheduler.py",
-        MODEL / "tree_plan_builder.py",
-        MODEL / "trajectory_tree.py",
-        MODEL / "trajectory_tree_turn.py",
-        MODEL / "tpr_batch_runner.py",
-        MODEL / "engine_adapter.py",
-        MODEL / "parallel/backend.py",
-        MODEL / "parallel/execution_context.py",
-        MODEL / "parallel/engine_runtime.py",
-        MODEL / "parallel/ring_attention.py",
-        MODEL / "parallel/allgather_attention.py",
-        MODEL / "parallel/ulysses_attention.py",
-        MODEL / "parallel/hybrid_attention.py",
-    ]
-    for path in paths:
-        source = path.read_text(encoding="utf-8")
-        assert len(source.splitlines()) < 100, f"Compatibility file should be thin: {path}"
-        tree = ast.parse(source)
-        targets = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_import_module":
-                if node.args and isinstance(node.args[0], ast.Constant):
-                    targets.append(node.args[0].value)
-        for module in targets:
-            candidate = ROOT / (module.replace(".", "/") + ".py")
-            assert candidate.is_file(), f"{path} points to nonexistent {module}"
+
+def test_lazy_exports_resolve_to_real_modules() -> None:
+    for path in (MODEL / "__init__.py", ROOT / "verl/experimental/tpr/__init__.py"):
+        syntax = ast.parse(path.read_text(encoding="utf-8"))
+        assignments = {}
+        for n in syntax.body:
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
+                if n.targets[0].id in ("_EXPORTS", "_MODULES"):
+                    assignments[n.targets[0].id] = ast.literal_eval(n.value)
+        for entries in assignments.values():
+            for symbol, module in entries.items():
+                candidate = ROOT / (module.replace(".", "/") + ".py")
+                assert candidate.is_file(), f"{path} export {symbol} points to missing {module}"
 
 
 def test_ring_retains_qkvmerge_and_padding_contract() -> None:
@@ -143,12 +130,11 @@ def test_ring_retains_qkvmerge_and_padding_contract() -> None:
     assert "class RingCPBackend:" in source
 
 
-def test_optional_cp_factories_outside_model_implementation() -> None:
-    old_parallel = MODEL / "parallel"
+def test_optional_cp_factories_are_experimental() -> None:
+    cp = ROOT / "verl/experimental/tpr/legacy/cp"
     for name in ("backend", "engine_runtime", "execution_context"):
-        source = (old_parallel / f"{name}.py").read_text(encoding="utf-8")
-        assert len(source.splitlines()) <= 20, name
-        assert "experimental.tpr.legacy.cp." in source
+        assert (cp / f"{name}.py").is_file()
+    assert not (MODEL / "parallel").exists()
 
 
 def test_context_is_thin_and_has_no_eager_engine_imports() -> None:

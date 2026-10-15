@@ -13,6 +13,12 @@ from torch import Tensor
 
 from verl.workers.engine.megatron.tpr.tree import SegmentId
 from verl.workers.engine.megatron.tpr.state import (
+    PrefixState,
+    KVPrefixAnchors,
+    KVPrefixState,
+    PrefixStateEntry,
+    PrefixStateStack,
+    _normalize_local_kv,
     _validate_segment_id,
     _validate_layer_number,
     _compact_graph_free_tensor,
