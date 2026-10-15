@@ -5,7 +5,7 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from verl.models.mcore.tpr import actor_capture
+from verl.experimental.tpr import actor_capture
 from verl.utils import tensordict_utils as tu
 
 

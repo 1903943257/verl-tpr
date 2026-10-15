@@ -18,7 +18,7 @@ import pytest
 
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
-from verl.models.mcore.tpr.module_spec import _get_layer_specs
+from verl.experimental.tpr.gdn.module_spec import _get_layer_specs
 from verl.models.mcore.tpr import (
     TPRSelfAttention,
     make_tpr_module_spec_provider,

@@ -26,7 +26,7 @@ from verl.utils.megatron_utils import unwrap_model
 from verl.models.mcore.tpr.attention import TPRSelfAttention
 from .engine_adapter import TPRForwardBackwardRequest
 from .fixed_topology_scheduler import FixedTopologyScheduler
-from verl.models.mcore.tpr.module_spec import install_tpr_vanilla_mbridge_spec, make_tpr_module_spec_provider
+from verl.experimental.tpr.gdn.module_spec import install_tpr_vanilla_mbridge_spec, make_tpr_module_spec_provider
 from verl.models.mcore.tpr.parallel.engine_runtime import aggregate_cp_loss, resolve_engine_cp_runtime
 from .segment_executor import SegmentExecutor
 
@@ -173,7 +173,7 @@ def run_tpr_forward_backward(
     )
     scheduler = FixedTopologyScheduler(request.plan, executor, events=request.events)
     if tp_size > 1:
-        from verl.models.mcore.tpr.tp_validation import assert_tp_plan_agreement, digest_segment_plan
+        from verl.workers.engine.megatron.tpr.tree import assert_tp_plan_agreement, digest_segment_plan
 
         assert_tp_plan_agreement(
             digest_segment_plan(request.plan, scheduler.events), tp_size=tp_size
@@ -364,7 +364,7 @@ def run_tpr_forward_backward_batch(
         stage_ms["tree_build_cpu_ms"] = (time.perf_counter()-profile_origin)*1000
     tp_check_start = time.perf_counter()
     if tp_size > 1:
-        from verl.models.mcore.tpr.tp_validation import assert_tp_plan_agreement, digest_forest_plan
+        from verl.workers.engine.megatron.tpr.tree import assert_tp_plan_agreement, digest_forest_plan
 
         assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size)
     if detailed_profile:
@@ -397,7 +397,7 @@ def run_tpr_forward_backward_batch(
         raise RuntimeError("TPR PPO requires native finalize_model_grads_func")
 
     metric_lists: dict[str, list[Any]] = {}
-    from verl.models.mcore.tpr.segment_event_profiler import SegmentEventProfiler
+    from verl.workers.engine.megatron.tpr.executor import SegmentEventProfiler
     event_profiler = SegmentEventProfiler() if detailed_profile else None
     setup_ms = 0.0
     metrics_ms = 0.0

@@ -6,7 +6,7 @@ from itertools import combinations
 
 import pytest
 
-from verl.models.mcore.tpr.dp_placement import (
+from verl.workers.engine.megatron.tpr.placement import (
     _tree_token_cost,
     plan_dta_dfs,
     plan_tpr_dta_dp,

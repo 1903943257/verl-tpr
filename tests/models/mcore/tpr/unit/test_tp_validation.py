@@ -12,7 +12,7 @@ from verl.models.mcore.tpr.segment_plan import (
     SegmentPlan,
     SegmentSpec,
 )
-from verl.models.mcore.tpr.tp_validation import (
+from verl.workers.engine.megatron.tpr.tree import (
     assert_tp_plan_agreement,
     digest_forest_plan,
     digest_segment_plan,
