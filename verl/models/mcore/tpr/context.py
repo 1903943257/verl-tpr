@@ -30,7 +30,7 @@ from typing import TYPE_CHECKING, Protocol
 from torch import Tensor
 
 if TYPE_CHECKING:
-    from .prefix_state import GDNLayerState
+    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
 
 KVPair = tuple[Tensor, Tensor]
 RotaryPosEmb = Tensor | tuple[Tensor, Tensor]
@@ -203,7 +203,7 @@ class TPRAttentionContext:
 
 
 def _validate_gdn_layer_state(layer: int, state: GDNLayerState) -> None:
-    from .prefix_state import GDNLayerState
+    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
     if not isinstance(state, GDNLayerState):
         raise TypeError(f"layer {layer} GDN state must be GDNLayerState, got {type(state).__name__}")
 

@@ -150,3 +150,24 @@ def test_context_is_thin_and_has_no_eager_engine_imports() -> None:
     assert "from verl.workers" not in source
     assert "from megatron" not in source
 
+
+
+def test_internal_relative_imports_resolve_after_relocation() -> None:
+    """AST-only smoke check: no migrated module imports a vanished sibling."""
+    for base in (
+        ROOT / "verl/models/mcore/tpr",
+        ROOT / "verl/workers/engine/megatron/tpr",
+        ROOT / "verl/experimental/tpr",
+    ):
+        for file in base.rglob("*.py"):
+            syntax = ast.parse(file.read_text(encoding="utf-8"))
+            for item in ast.walk(syntax):
+                if not isinstance(item, ast.ImportFrom) or item.level == 0 or not item.module:
+                    continue
+                ancestor = file.parent
+                for _ in range(item.level - 1):
+                    ancestor = ancestor.parent
+                target = ancestor.joinpath(*item.module.split("."))
+                assert target.with_suffix(".py").is_file() or (target / "__init__.py").is_file(), (
+                    f"{file} has unresolved relative import: level={item.level} module={item.module}"
+                )
