@@ -242,7 +242,7 @@ def run_tpr_forward_backward_batch(
     from verl.utils.megatron_utils import unwrap_model
 
     from .objective import SegmentPPOObjectiveAdapter
-        from .tree import build_tree_execution_plans
+    from .tree import build_tree_execution_plans
 
     if forward_only:
         raise NotImplementedError("TPR PPO schedule is training-only; use native forward_only")
