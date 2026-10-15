@@ -52,7 +52,7 @@ def runtime():
 @pytest.fixture
 def native_args(runtime, monkeypatch):
     from mindspeed.args_utils import get_full_args
-    from verl.models.mcore.tpr import activation_offload
+    from verl.experimental.tpr import offload as activation_offload
     args = SimpleNamespace(**vars(get_full_args()))
     vars(args).update(swap_attention=False, context_parallel_size=runtime.cp_size,
                       pipeline_model_parallel_size=1, eval_interval=0, curr_iteration=1,

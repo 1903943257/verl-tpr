@@ -55,7 +55,7 @@ def native_args(runtime, monkeypatch):
     # Only supply the training namespace normally initialized by the launcher.
     # Transfers, streams, pinned buffers and saved-tensor hooks remain real.
     from mindspeed import args_utils
-    from verl.models.mcore.tpr import activation_offload
+    from verl.experimental.tpr import offload as activation_offload
     args = SimpleNamespace(**vars(args_utils.get_full_args()))
     vars(args).update(swap_attention=False, pipeline_model_parallel_size=1,
                       eval_interval=0, curr_iteration=1, noop_layers=None,

@@ -111,7 +111,7 @@ def test_hybrid_rejects_non_ring_cp_before_execution(backend):
 @pytest.mark.parametrize("cp_size", [2, 4])
 def test_hybrid_rejects_padded_segments_or_cp4(monkeypatch, cp_size):
     from types import SimpleNamespace
-    from verl.models.mcore.tpr import segment_executor as module
+    from verl.experimental.tpr.legacy import segment_executor as module
 
     monkeypatch.setattr(module, "resolve_cp_group", lambda group: (cp_size, 0))
     monkeypatch.setattr(module, "resolve_tpr_cp_backend", lambda *args, **kwargs: SimpleNamespace())
@@ -123,7 +123,7 @@ def test_hybrid_rejects_padded_segments_or_cp4(monkeypatch, cp_size):
 
 def test_hybrid_accepts_explicit_aligned_ring_cp2(monkeypatch):
     from types import SimpleNamespace
-    from verl.models.mcore.tpr import segment_executor as module
+    from verl.experimental.tpr.legacy import segment_executor as module
 
     lengths = []
     backend = SimpleNamespace(validate_segment_length=lengths.append)

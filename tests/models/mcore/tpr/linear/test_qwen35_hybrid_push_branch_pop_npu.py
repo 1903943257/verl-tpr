@@ -356,7 +356,7 @@ def _run_engine(model, plan, monkeypatch):
     from tensordict import TensorDict
     from verl.utils import tensordict_utils as tu
     from verl.models.mcore.tpr import TPR_REQUEST_KEY, TPRForwardBackwardRequest
-    from verl.models.mcore.tpr import megatron_adapter
+    from verl.experimental.tpr.legacy import megatron_adapter
     from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
 
     instances = []

@@ -62,7 +62,7 @@ def _engine_run(model, plan, executor_type, runtime, monkeypatch):
     from tensordict import TensorDict
     from verl.utils import tensordict_utils as tu
     from verl.experimental.tpr.legacy.engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
-    from verl.models.mcore.tpr import megatron_adapter
+    from verl.experimental.tpr.legacy import megatron_adapter
 
     # Same thin-entry fixture as Stage 3.3: runtime already installed MindSpeed.
     # Suppress only the unrelated eager engine repatcher during import.

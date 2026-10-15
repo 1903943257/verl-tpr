@@ -100,7 +100,7 @@ class _Profile:
 
     def install(self, patch, model):
         from verl.experimental.tpr import allgather_attention as ag
-        from verl.models.mcore.tpr import segment_executor as se
+        from verl.experimental.tpr.legacy import segment_executor as se
         from verl.experimental.tpr.gdn.prefix_state import GDNPrefixState, KVPrefixState
         from verl.workers.engine.megatron.tpr.state import KVStack
 

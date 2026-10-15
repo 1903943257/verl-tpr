@@ -429,7 +429,7 @@ def _tpr_ppo_nll_run(
         # Phase-4 patch is a test FAILURE, not a skip or silent fallback to
         # the direct TPR adapter.
         from unittest.mock import patch
-        from verl.models.mcore.tpr import megatron_adapter
+        from verl.experimental.tpr.legacy import megatron_adapter
 
         hits = {"route": 0}
         original = megatron_adapter.run_tpr_forward_backward_batch
