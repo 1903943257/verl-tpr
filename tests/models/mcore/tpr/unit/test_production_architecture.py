@@ -69,3 +69,16 @@ def test_single_ring_module_alias() -> None:
 def test_engine_routes_to_new_adapter() -> None:
     engine = (ROOT / "verl/workers/engine/megatron/transformer_impl.py").read_text(encoding="utf-8")
     assert "from verl.workers.engine.megatron.tpr.adapter import" in engine
+
+
+def test_single_sequence_shard_implementation() -> None:
+    from pathlib import Path
+
+    source = (MODEL / "shard.py").read_text(encoding="utf-8")
+    ring = _source("ring")
+    assert 'tpr.ring' in source
+    assert 'class PaddedSequenceShard:' in ring
+    assert 'class RangeSequenceShard:' in ring
+    assert 'class PrefixShard:' in ring
+    assert "from .state import KVStack" not in ring
+

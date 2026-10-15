@@ -67,11 +67,10 @@ native GPTModel layers using a ContextVar. It is **not** the persistent KV cache
 Ring CP uses the MindSpeed two-range zigzag placement. Logical Segment tokens
 are distinct from physically padded tokens (multiple of `2*CP`): a physical
 query/KV must not receive an unintended padded loss or attention score.
-The current production `ring.py` owns **Ring communication, per-block validity
-mask and CP runtime**; the shared `models/mcore/tpr/shard.py` still owns
-low-level logical/physical sequence mapping. Consolidating that last mapping
-into RingLayout is pending its NPU parity gate. This is explicitly not a claim
-that all padding code has already been merged.
+`ring.py` now owns Ring communication, the physical/logical SequenceShard,
+zigzag layout, padding metadata and block validity masks. The historical
+`models/mcore/tpr/shard.py` is a module alias, not another implementation.
+Padding numerical correctness still needs the NPU CP2/CP4 parity gate.
 
 ### Optional experiments
 

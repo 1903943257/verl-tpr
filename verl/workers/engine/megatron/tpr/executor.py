@@ -28,15 +28,13 @@ from torch import Tensor, nn
 
 from verl.models.mcore.tpr.context import KVPair, TPRAttentionContext, use_tpr_attention_context
 from .state import KVStack
-from .ring import RingCPBackend
+from .ring import RingCPBackend, PrefixShard, SequenceShard, resolve_cp_group
 from .state import (
     ShardedPastKVAnchors,
     accumulate_sharded_past_anchor_gradients,
     build_sharded_past_anchors,
-    resolve_cp_group,
 )
 from verl.models.mcore.tpr.segment_plan import SegmentEvent, SegmentEventKind, SegmentId, SegmentPlan, SegmentSpec
-from verl.models.mcore.tpr.shard import PrefixShard, SequenceShard
 
 
 class _RotaryEmbedding(Protocol):

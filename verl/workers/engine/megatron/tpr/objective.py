@@ -17,7 +17,7 @@ import torch
 from torch import Tensor
 
 from verl.models.mcore.tpr.segment_plan import SegmentSpec
-from verl.models.mcore.tpr.shard import SequenceShard
+from .ring import SequenceShard
 from .tree import SegmentObjectiveRef, TreeExecutionPlan
 
 
