@@ -1,0 +1,34 @@
+name: TPR refactor structural checks
+on:
+  push:
+    branches:
+      - refactor/tpr-ppo-engine-ring-turn-20261015
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  syntax-and-architecture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile refactored Python source without NPU dependencies
+        run: |
+          python3 -m compileall -q             verl/models/mcore/tpr             verl/workers/engine/megatron/tpr             verl/experimental/tpr             tests/models/mcore/tpr/unit/test_production_architecture.py
+      - name: Run stdlib-only structural tests
+        run: |
+          python3 - <<'PY'
+          import runpy
+          from pathlib import Path
+          test_file = Path("tests/models/mcore/tpr/unit/test_production_architecture.py")
+          tests = runpy.run_path(str(test_file))
+          total = 0
+          for name, fn in sorted(tests.items()):
+              if name.startswith("test_") and callable(fn):
+                  fn()
+                  print("PASS", name)
+                  total += 1
+          assert total >= 7, f"Expected architecture tests, found {total}"
+          print(f"PASS all {total} TPR refactor structural checks")
+          PY
