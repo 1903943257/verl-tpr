@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 import pytest
 
-from verl.models.mcore.tpr.megatron_adapter import (
+from verl.experimental.tpr.legacy.megatron_adapter import (
     _validate_tpr_parallel_sizes,
     _validate_tpr_cp_combination,
 )

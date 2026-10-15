@@ -24,7 +24,7 @@ from verl.models.mcore.tpr import (
     SegmentSpec,
     get_tpr_attention_context,
 )
-from verl.models.mcore.tpr.segment_executor import _compact_kv_cache
+from verl.experimental.tpr.legacy.segment_executor import _compact_kv_cache
 
 
 class _FakeRotaryEmbedding:

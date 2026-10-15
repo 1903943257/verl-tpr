@@ -2,12 +2,12 @@
 import torch
 import pytest
 
-from verl.models.mcore.tpr.trajectory_tree import build_trajectory_trees
-from verl.models.mcore.tpr.trajectory_tree_turn import (
+from verl.experimental.tpr.legacy.trajectory_tree import build_trajectory_trees
+from verl.experimental.tpr.legacy.trajectory_tree_turn import (
     QWEN3_IM_END_TOKEN_ID,
     build_trajectory_trees_turn,
 )
-from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
 
 
 EOT = QWEN3_IM_END_TOKEN_ID

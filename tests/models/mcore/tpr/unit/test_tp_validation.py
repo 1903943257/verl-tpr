@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl.models.mcore.tpr.segment_plan import (
+from verl.workers.engine.megatron.tpr.tree import (
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,
@@ -17,7 +17,7 @@ from verl.workers.engine.megatron.tpr.tree import (
     digest_forest_plan,
     digest_segment_plan,
 )
-from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
 
 
 def _plan(left=4, right=5):

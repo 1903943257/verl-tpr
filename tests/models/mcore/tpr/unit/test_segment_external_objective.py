@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-from verl.models.mcore.tpr.segment_plan import SegmentPlan, SegmentSpec
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
 
 
 def _segment():

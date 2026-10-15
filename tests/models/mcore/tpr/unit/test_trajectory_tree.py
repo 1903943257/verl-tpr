@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr.trajectory_tree import (
+from verl.experimental.tpr.legacy.trajectory_tree import (
     build_prompt_sibling_trees,
     build_trajectory_trees,
 )
