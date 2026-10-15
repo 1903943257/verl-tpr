@@ -129,14 +129,14 @@ def test_cp2_scheduler_reuses_prefix_across_unequal_siblings_and_pops(cp_runtime
         parameter_count += 1
     assert parameter_count > 0
 
-    expected_all_gathers = _LAYER_COUNT * 12
-    expected_reduce_scatters = _LAYER_COUNT * 10
+    expected_ring_forwards = _LAYER_COUNT * 6
+    expected_ring_backwards = _LAYER_COUNT * 5
     assert counts == {
-        "all_gather": expected_all_gathers,
-        "reduce_scatter": expected_reduce_scatters,
+        "ring_forward": expected_ring_forwards,
+        "ring_backward": expected_ring_backwards,
     }
     local_counts = torch.tensor(
-        [counts["all_gather"], counts["reduce_scatter"]],
+        [counts["ring_forward"], counts["ring_backward"]],
         device=runtime.device,
         dtype=torch.int64,
     )
@@ -173,8 +173,8 @@ def test_cp2_scheduler_reuses_prefix_across_unequal_siblings_and_pops(cp_runtime
             f"  topology: P={_PREFIX_LENGTH}, S1={_FIRST_SUFFIX_LENGTH}, "
             f"S2={_SECOND_SUFFIX_LENGTH}\n"
             f"  layers: {_LAYER_COUNT}\n"
-            f"  collectives/rank: AllGather={counts['all_gather']}, "
-            f"ReduceScatter={counts['reduce_scatter']}\n"
+            f"  Ring traversal/rank: forward={counts['ring_forward']}, "
+            f"backward={counts['ring_backward']}\n"
             f"  global loss: {global_normalized_loss.item():.9f}\n"
             f"  parameter tensors with gradients: {parameter_count}"
         )

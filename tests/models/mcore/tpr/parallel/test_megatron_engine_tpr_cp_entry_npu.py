@@ -229,7 +229,7 @@ def _run_engine_equivalence(
     ("prefix_length", "first_suffix_length", "second_suffix_length"),
     _CP2_ENGINE_CASES,
 )
-@pytest.mark.parametrize("backend", ("allgather", "ulysses", "ring"))
+@pytest.mark.parametrize("backend", ("ring",))
 def test_cp2_megatron_engine_tpr_matches_independent_cp(
     cp_runtime,
     prefix_length,
@@ -246,20 +246,3 @@ def test_cp2_megatron_engine_tpr_matches_independent_cp(
     )
 
 
-@pytest.mark.parametrize(
-    ("prefix_length", "first_suffix_length", "second_suffix_length"),
-    _CP4_ENGINE_CASES,
-)
-def test_cp4_megatron_engine_hybrid_tpr_matches_independent_cp(
-    hybrid_cp_runtime,
-    prefix_length,
-    first_suffix_length,
-    second_suffix_length,
-):
-    _run_engine_equivalence(
-        hybrid_cp_runtime,
-        prefix_length,
-        first_suffix_length,
-        second_suffix_length,
-        "hybrid",
-    )

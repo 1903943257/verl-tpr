@@ -610,7 +610,7 @@ def _run_independent_segmented_cp_reference(
     logical_indices,
     logical_count,
     *,
-    cp_backend="allgather",
+    cp_backend="ring",
     expected_layer_numbers=None,
 ):
     """Run P -> S1 and P -> S2 as independent, shape-matched CP trees.
@@ -695,7 +695,7 @@ def _run_tpr_cp(
     logical_indices,
     logical_count,
     *,
-    cp_backend="allgather",
+    cp_backend="ring",
     expected_layer_numbers=None,
 ):
     model.zero_grad(set_to_none=True)
@@ -726,8 +726,26 @@ def _run_tpr_cp(
 
 @contextmanager
 def _collective_probe():
-    pytest.skip("AllGather CP was removed from this Ring-only branch")
-    yield {}
+    """Count Ring streaming traversals, not retired AllGather collectives."""
+    original_forward = ring_attention._circulate_kv
+    original_backward = ring_attention._reduce_ring_gradients_to_owner
+    counts = {"ring_forward": 0, "ring_backward": 0}
+
+    def forward(*args, **kwargs):
+        counts["ring_forward"] += 1
+        return original_forward(*args, **kwargs)
+
+    def backward(*args, **kwargs):
+        counts["ring_backward"] += 1
+        return original_backward(*args, **kwargs)
+
+    ring_attention._circulate_kv = forward
+    ring_attention._reduce_ring_gradients_to_owner = backward
+    try:
+        yield counts
+    finally:
+        ring_attention._circulate_kv = original_forward
+        ring_attention._reduce_ring_gradients_to_owner = original_backward
 
 
 @contextmanager
