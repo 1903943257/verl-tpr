@@ -79,7 +79,7 @@ Padding numerical correctness still needs the NPU CP2/CP4 parity gate.
 `verl/experimental/tpr/` contains AllGather, Ulysses, Hybrid, GDN and activation
 offload experiments. Their old paths are compatibility imports for historical
 tests. **Production PPO must never import these experimental backends.** The
-existing `models/mcore/tpr/parallel/backend.py` factory is legacy/testing only.
+old model-side parallel/backend.py factory is now a thin alias to an experimental-only factory.
 The `ring_attention.py` compatibility import is the **same module object** as
 Engine `ring.py`: there is only one maintained Ring implementation.
 
@@ -91,6 +91,20 @@ optimizer steps, policy clipping, process-group lifecycle or normal distributed
 synchronization. Future support for TP4, TP+SP+CP, non-Qwen turn formats or DP2
 needs separate explicit numeric and training acceptance, not feature flags that
 silently disable checks.
+
+### Source reduction guarantees
+
+The Engine owns all Dense training state and Segment plans. Model-side files
+retain Attention, Context and CANN helpers. To keep historical tests useful,
+legacy import paths remain short compatibility aliases rather than duplicate
+implementations.
+
+The query/KV coalescing optimization (qkvmerge) is intentionally retained.
+The Ring implementation still includes _can_coalesce_prefix_query,
+_prefix_full_slices and its online-softmax path. It should become the default
+only after numerical and throughput parity. Ring layout, validity mask and
+logical/physical Padding share one canonical implementation, but padded CP
+backward still requires an NPU parity gate.
 
 ### Validation gate
 

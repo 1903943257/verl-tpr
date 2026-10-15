@@ -92,3 +92,60 @@ def test_dense_prefix_state_is_engine_owned() -> None:
     assert "GDNPrefixState" not in state
     assert "def __getattr__(name):" in compat
 
+
+
+def test_compatibility_aliases_have_live_targets() -> None:
+    """Moved Python module aliases must refer to files in this checkout."""
+    paths = [
+        MODEL / "shard.py",
+        MODEL / "segment_plan.py",
+        MODEL / "rope.py",
+        MODEL / "kv_stack.py",
+        MODEL / "prefix_state.py",
+        MODEL / "megatron_adapter.py",
+        MODEL / "segment_executor.py",
+        MODEL / "objective_adapter.py",
+        MODEL / "fixed_topology_scheduler.py",
+        MODEL / "tree_plan_builder.py",
+        MODEL / "trajectory_tree.py",
+        MODEL / "trajectory_tree_turn.py",
+        MODEL / "tpr_batch_runner.py",
+        MODEL / "engine_adapter.py",
+        MODEL / "parallel/backend.py",
+        MODEL / "parallel/execution_context.py",
+        MODEL / "parallel/engine_runtime.py",
+        MODEL / "parallel/ring_attention.py",
+        MODEL / "parallel/allgather_attention.py",
+        MODEL / "parallel/ulysses_attention.py",
+        MODEL / "parallel/hybrid_attention.py",
+    ]
+    for path in paths:
+        source = path.read_text(encoding="utf-8")
+        assert len(source.splitlines()) < 100, f"Compatibility file should be thin: {path}"
+        tree = ast.parse(source)
+        targets = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_import_module":
+                if node.args and isinstance(node.args[0], ast.Constant):
+                    targets.append(node.args[0].value)
+        for module in targets:
+            candidate = ROOT / (module.replace(".", "/") + ".py")
+            assert candidate.is_file(), f"{path} points to nonexistent {module}"
+
+
+def test_ring_retains_qkvmerge_and_padding_contract() -> None:
+    source = _source("ring")
+    assert "def _can_coalesce_prefix_query(" in source
+    assert "def _prefix_full_slices(" in source
+    assert "def _physical_block_attention_mask(" in source
+    assert "class PaddedSequenceShard:" in source
+    assert "def iter_valid_sequence_slices(" in source
+    assert "class RingCPBackend:" in source
+
+
+def test_optional_cp_factories_outside_model_implementation() -> None:
+    old_parallel = MODEL / "parallel"
+    for name in ("backend", "engine_runtime", "execution_context"):
+        source = (old_parallel / f"{name}.py").read_text(encoding="utf-8")
+        assert len(source.splitlines()) <= 20, name
+        assert "experimental.tpr.legacy.cp." in source
