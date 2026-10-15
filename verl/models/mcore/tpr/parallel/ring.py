@@ -35,7 +35,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from ..kv_stack import KVStack
+from ..kv_stack import KVStack, ShardedPastKVAnchors
 from ..rectangular_attention import _compressed_causal_mask
 from ..shard import (
     RangeSequenceShard,
@@ -45,13 +45,17 @@ from ..shard import (
     physical_sequence_shard,
     round_up_sequence_length,
 )
-from ..kv_stack import ShardedPastKVAnchors
 def _group_world_size_and_rank(process_group: Any) -> tuple[int, int]:
     if not dist.is_available() or not dist.is_initialized():
         if process_group is not None:
             raise RuntimeError("a CP process group requires torch.distributed to be initialized")
         return 1, 0
     return dist.get_world_size(process_group), dist.get_rank(process_group)
+
+
+def resolve_cp_group(process_group: Any) -> tuple[int, int]:
+    """CP coordinates from an initialized process group (size, local rank)."""
+    return _group_world_size_and_rank(process_group)
 
 _TND_LAYOUT = "TND"
 _RIGHT_DOWN_CAUSAL_MODE = 3
@@ -187,7 +191,7 @@ def _load_mindspeed_ring_primitives():
     try:
         from mindspeed.core.context_parallel.utils import RingP2P
     except ImportError as exc:  # pragma: no cover - requires the server MindSpeed runtime
-        raise RuntimeError("MindSpeed RingP2P and online-softmax utilities are required") from exc
+        raise RuntimeError("MindSpeed RingP2P is required") from exc
     return RingP2P
 
 
