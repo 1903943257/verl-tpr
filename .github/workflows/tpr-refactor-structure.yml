@@ -35,6 +35,13 @@ jobs:
           assert total >= 7, f"Expected architecture tests, found {total}"
           print(f"PASS all {total} TPR refactor structural checks")
           PY
+      - name: Run dependency-free Ring and Offload regressions
+        run: |
+          python3 -m unittest -v \
+            tests.models.mcore.tpr.unit.test_ring_coalescing_schedule \
+            tests.models.mcore.tpr.unit.test_ring_streaming_transport \
+            tests.models.mcore.tpr.unit.test_offload_b_gate \
+            tests.models.mcore.tpr.unit.test_activation_offload_adapter
       - name: Audit legacy model imports
         run: |
           python3 - <<'PY'
