@@ -117,7 +117,9 @@ def test_lazy_exports_resolve_to_real_modules() -> None:
         for entries in assignments.values():
             for symbol, module in entries.items():
                 candidate = ROOT / (module.replace(".", "/") + ".py")
-                assert candidate.is_file() or (candidate.parent / candidate.stem / "__init__.py").is_file(), (\n                    f"{path} export {symbol} points to missing {module}"\n                )
+                assert candidate.is_file() or (candidate.parent / candidate.stem / "__init__.py").is_file(), (
+                    f"{path} export {symbol} points to missing {module}"
+                )
 
 
 def test_ring_retains_qkvmerge_and_padding_contract() -> None:
