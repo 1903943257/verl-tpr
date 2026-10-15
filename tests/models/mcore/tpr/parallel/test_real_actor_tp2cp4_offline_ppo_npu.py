@@ -79,42 +79,16 @@ def _runtime():
             expert_model_parallel_size=1,
         )
     args = get_full_args()
-    # MindSpeed's TransformerConfig wrapper dynamically turns every unknown
-    # get_full_args() entry into a dataclass field. With the pytest/torchrun
-    # launcher it can expose an empty-name string key that is not a legal
-    # config attribute and crashes make_dataclass(). Remove ONLY this
-    # impossible-to-consume key; never mask other malformed arguments.
+    # MindSpeed repatch can inject an invalid empty-name entry under this
+    # pytest/torchrun launcher. It cannot represent a dataclass config field.
     full_args = vars(args)
-    invalid_before = [
-        (repr(key), type(value).__name__)
-        for key, value in full_args.items()
-        if not isinstance(key, str) or not key.isidentifier()
-    ]
     if "" in full_args:
-        empty_value = full_args[""]
-        if not isinstance(empty_value, str):
-            raise RuntimeError(
-                "Unexpected non-string value for MindSpeed empty argument key: "
-                f"{type(empty_value).__name__}"
-            )
+        if not isinstance(full_args[""], str):
+            raise RuntimeError("Unexpected MindSpeed empty argument value type")
         del full_args[""]
-    invalid_after = [
-        (repr(key), type(value).__name__)
-        for key, value in full_args.items()
-        if not isinstance(key, str) or not key.isidentifier()
-    ]
-    print(
-        f"TPR_MINDSPEED_ARGS_AUDIT rank={dist.get_rank()} "
-        f"invalid_before={invalid_before} invalid_after={invalid_after} "
-        f"removed_empty_string_key={any(name == repr('') for name, _ in invalid_before)} "
-        f"total={len(full_args)}",
-        flush=True,
-    )
-    if invalid_after:
-        raise RuntimeError(
-            "MindSpeed get_full_args() has unexpected invalid keys after "
-            f"removing the known empty string key: {invalid_after}"
-        )
+    malformed = [repr(key) for key in full_args if not isinstance(key, str) or not key.isidentifier()]
+    if malformed:
+        raise RuntimeError(f"Invalid MindSpeed argument names after repatch: {malformed}")
     assert args.context_parallel_algo == "megatron_cp_algo"
     tp_group = parallel_state.get_tensor_model_parallel_group()
     cp_group = parallel_state.get_context_parallel_group()
@@ -314,9 +288,7 @@ def test_recorded_full_vs_tpr_one_step():
     try:
         from verl.workers.utils.losses import ppo_loss
         batch, real_keys, count, data_sha = _load_real_pair(source, rows, mode)
-        # Build TransformerConfig before importing the new Engine package.
-        # Its parent package __init__ imports MindSpeed engines and can
-        # affect MindSpeed's get_full_args() global configuration state.
+        # Construct the model before importing the PPO Engine adapter.
         model, hf = make_real_qwen3_tp_model(
             runtime, model_path=checkpoint, tp_size=2, cp_size=4,
             sequence_parallel=False, profile="4b",

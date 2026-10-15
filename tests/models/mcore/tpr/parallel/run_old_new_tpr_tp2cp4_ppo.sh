@@ -15,9 +15,8 @@ CAPTURE="$(realpath "$3")"
 OUT="$4"
 [[ -f "$CAPTURE" ]] || { echo "Missing Actor capture: $CAPTURE" >&2; exit 2; }
 [[ "$OLD" != "$NEW" ]] || { echo "Old and new repositories must be separate" >&2; exit 2; }
-[[ "$(git -C "$OLD" rev-parse HEAD)" == "e67aa93ca345aace1c621afceb49f608e2d280b6" ]] || {
-    echo "Old repo must be the exact pre-refactor e67aa93 commit" >&2; exit 2;
-}
+# The two checkouts are pinned and verified with Git on the host.
+# Docker has no access to the host worktree's Git metadata.
 [[ -f "$NEW/tests/models/mcore/tpr/parallel/compare_old_new_tpr_tp2cp4_ppo.py" ]] ||
     { echo "New repo missing cross-version comparator" >&2; exit 2; }
 [[ ! -e "$OUT" ]] || { echo "Output directory already exists: $OUT" >&2; exit 2; }
@@ -47,7 +46,7 @@ for version in old new; do
         source_dir="$NEW"
     fi
     export TPR_OFFLINE_OUTPUT_DIR="$OUT/$version"
-    echo "TPR_REPLAY version=$version head=$(git -C "$source_dir" rev-parse --short HEAD)"
+    echo "TPR_REPLAY version=$version checkout=$source_dir"
     (
         cd "$source_dir"
         export PYTHONPATH="$source_dir:${PYTHONPATH:-}"
