@@ -79,25 +79,41 @@ def _runtime():
             expert_model_parallel_size=1,
         )
     args = get_full_args()
-    # MindSpeed's transformer_config_init_wrapper creates dataclass fields
-    # from every unknown get_full_args() key. An empty/invalid key raises
-    # TypeError deep inside dataclasses.make_dataclass; diagnose at source.
-    invalid = [
+    # MindSpeed's TransformerConfig wrapper dynamically turns every unknown
+    # get_full_args() entry into a dataclass field. With the pytest/torchrun
+    # launcher it can expose an empty-name string key that is not a legal
+    # config attribute and crashes make_dataclass(). Remove ONLY this
+    # impossible-to-consume key; never mask other malformed arguments.
+    full_args = vars(args)
+    invalid_before = [
         (repr(key), type(value).__name__)
-        for key, value in vars(args).items()
+        for key, value in full_args.items()
+        if not isinstance(key, str) or not key.isidentifier()
+    ]
+    if "" in full_args:
+        empty_value = full_args[""]
+        if not isinstance(empty_value, str):
+            raise RuntimeError(
+                "Unexpected non-string value for MindSpeed empty argument key: "
+                f"{type(empty_value).__name__}"
+            )
+        del full_args[""]
+    invalid_after = [
+        (repr(key), type(value).__name__)
+        for key, value in full_args.items()
         if not isinstance(key, str) or not key.isidentifier()
     ]
     print(
         f"TPR_MINDSPEED_ARGS_AUDIT rank={dist.get_rank()} "
-        f"invalid={invalid} total={len(vars(args))} "
-        f"empty_key_present={'' in vars(args)}",
+        f"invalid_before={invalid_before} invalid_after={invalid_after} "
+        f"removed_empty_string_key={any(name == repr('') for name, _ in invalid_before)} "
+        f"total={len(full_args)}",
         flush=True,
     )
-    if invalid:
+    if invalid_after:
         raise RuntimeError(
-            "MindSpeed get_full_args() contains invalid configuration keys "
-            f"immediately after repatch: {invalid}. "
-            "Do not construct TransformerConfig until the origin is fixed."
+            "MindSpeed get_full_args() has unexpected invalid keys after "
+            f"removing the known empty string key: {invalid_after}"
         )
     assert args.context_parallel_algo == "megatron_cp_algo"
     tp_group = parallel_state.get_tensor_model_parallel_group()
