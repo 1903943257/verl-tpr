@@ -91,7 +91,7 @@ def _assert_layers(actual: Mapping[int, object], expected: Iterable[int], *, kin
         )
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, weakref_slot=True)
 class TPRAttentionContext:
     """One Segment forward: Prefix KV in, RoPE/backend in, per-layer new KV out."""
 
