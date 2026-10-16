@@ -10,7 +10,9 @@ not changed.
 
 ## Design
 
-Based on main ce6387c; the production TPR implementation is now in\n`verl/workers/engine/megatron/tpr/{adapter,executor,state,ring}.py`.\nThe regular TPR Push/Visit/Pop schedule is unchanged.
+Based on main `ce6387c`; the production TPR implementation is now in
+`verl/workers/engine/megatron/tpr/{adapter,executor,state,ring}.py`.
+The regular TPR Push/Visit/Pop schedule is unchanged.
 
 - Push runs graph-free and exports detached prefix KV, as before.
 - Visit/Pop call Megatron's Full Uniform(1) TransformerBlock path.
@@ -72,3 +74,28 @@ full-model accuracy. A successful CPU primitive repro is not the NPU gate.
   installed on the training server.
 - Measure how much peak memory is due to permanently live prefix KV versus
   layer activations; recompute cannot eliminate prefix-state residency.
+
+## Log organization on this development branch
+
+All test console logs for this branch belong under `/workspace/tpr_log/recompute/`.
+The offline TP2xCP4 wrapper automatically sets `TPR_TREE_POLICY=qwen_turn`
+and writes `offline_tp2cp4_tpr.log`, `offline_tp2cp4_full.log`, and the
+comparison log there. `TPR_OFFLINE_OUTPUT_DIR` still controls captured tensors
+and comparison artifacts, not the console log location. The offline script is
+**a non-recompute TPR baseline**: its model factory sets
+`model.config.recompute_granularity = None` and does not install the
+recompute adapter. Do not use its PASS as a recompute correctness claim.
+
+```bash
+mkdir -p /workspace/tpr_log/recompute
+cd /workspace/verl-tpr-recompute
+set -o pipefail
+python -m pytest -q -x tests/models/mcore/tpr/unit/test_tpr_full_recompute_cpu.py \
+  2>&1 | tee /workspace/tpr_log/recompute/cpu_contract.log
+
+TPR_RUN_KV_CHECKPOINT_REPLAY=1 torchrun --nproc_per_node=1 \
+  --master_addr=127.0.0.1 --master_port=29661 \
+  -m pytest -s -v -x \
+  tests/models/mcore/tpr/correctness/test_tpr_kv_checkpoint_replay_npu.py \
+  2>&1 | tee /workspace/tpr_log/recompute/npu_checkpoint_contract.log
+```
