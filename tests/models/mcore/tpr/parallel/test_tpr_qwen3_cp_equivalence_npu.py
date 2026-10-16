@@ -47,13 +47,10 @@ from transformers import AutoConfig, PretrainedConfig
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from verl.models.mcore.config_converter import get_hf_rope_theta, hf_to_mcore_config_dense
-from verl.models.mcore.tpr import (
-    PhysicalExecutionKind,
-    SegmentExecutor,
-    SegmentPlan,
-    TPRSelfAttention,
-    replace_self_attention_with_tpr,
-)
+from verl.experimental.tpr.legacy.fixed_topology_scheduler import PhysicalExecutionKind
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+from verl.experimental.tpr.legacy.plan import SegmentPlan
+from verl.models.mcore.tpr import TPRSelfAttention, replace_self_attention_with_tpr
 from verl.utils.device import is_torch_npu_available
 
 from ..correctness.test_tpr_qwen3_compatibility_npu import (

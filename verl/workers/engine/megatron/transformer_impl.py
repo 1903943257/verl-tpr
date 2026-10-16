@@ -483,7 +483,7 @@ class MegatronEngine(BaseEngine):
         override_ddp_config = self._resolve_override_ddp_config()
 
         if self.engine_config.tpr_enabled:
-            from verl.models.mcore.tpr.megatron_adapter import install_tpr_module_spec
+            from verl.workers.engine.megatron.tpr.adapter import install_tpr_module_spec
 
             install_tpr_module_spec(self.provider, bridge=self.bridge)
 
@@ -869,7 +869,7 @@ class MegatronEngine(BaseEngine):
         # Native batch_num_tokens / dp_size have already been attached.
         # Must run before native prepare_micro_batches or DCP scheduling.
         if self.engine_config.tpr_enabled and not forward_only:
-            from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
+            from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
 
             return run_tpr_forward_backward_batch(
                 self, data, loss_function, forward_only=forward_only

@@ -1,5 +1,4 @@
-"""Dependency-free regression tests for Phase B's numerical noise budget."""
-
+"""Dependency-free tests for current Phase-B calibrated gradient-noise gate."""
 import importlib.util
 from pathlib import Path
 import unittest
@@ -10,8 +9,9 @@ gate = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gate)
 
 
-def metrics(l2=0.006, absolute=0.001, fraction=0.02, finite=True):
-    return dict(relative_l2=l2, max_abs=absolute, mismatch_fraction=fraction, finite=finite)
+def metrics(l2=0.006, *, finite=True, mismatched=10, elements=8192):
+    return dict(relative_l2=l2, finite=finite,
+                mismatched=mismatched, elements=elements)
 
 
 class GateTest(unittest.TestCase):
@@ -20,30 +20,34 @@ class GateTest(unittest.TestCase):
                                       (0.0123, 0.0117, 0.0119),
                                       (0.0108, 0.0116, 0.0105)):
             for value in (on, repeated):
-                self.assertTrue(gate.parameter_gate(metrics(value), metrics(baseline))[0])
+                self.assertTrue(gate.gradient_gate(metrics(value), metrics(baseline))[0])
 
-    def test_each_metric_can_fail_independently(self):
-        baseline = metrics()
-        for key in gate.NOISE_FLOORS:
-            actual = baseline.copy()
-            actual[key] *= 3
-            self.assertFalse(gate.parameter_gate(actual, baseline)[0], key)
+    def test_relative_l2_can_fail_calibrated_noise_budget(self):
+        baseline = metrics(0.006)
+        passed, limits, severity = gate.gradient_gate(metrics(0.018), baseline)
+        self.assertFalse(passed)
+        self.assertGreater(severity, 1.0)
+        self.assertAlmostEqual(limits["relative_l2"], 0.009)
+        self.assertFalse(gate.gradient_gate(metrics(0.004), baseline)[1].get("max_abs"))
 
     def test_zero_noise_does_not_produce_zero_budget(self):
-        baseline = metrics(0, 0, 0)
-        passed, limits, _ = gate.parameter_gate(dict(finite=True, **gate.NOISE_FLOORS), baseline)
-        self.assertTrue(passed)
-        self.assertEqual(limits, gate.NOISE_FLOORS)
-        self.assertFalse(gate.parameter_gate(metrics(0.003, 0, 0), baseline)[0])
+        baseline = metrics(0)
+        self.assertTrue(gate.gradient_gate(metrics(0.002), baseline)[0])
+        self.assertFalse(gate.gradient_gate(metrics(0.003), baseline)[0])
+        self.assertTrue(gate.gradient_gate(metrics(0.015, elements=1024), baseline)[0])
 
-    def test_nonfinite_reference_baseline_or_actual_always_fails(self):
-        for invalid in (metrics(finite=False), metrics(float("nan")), metrics(float("inf"))):
-            self.assertFalse(gate.parameter_gate(invalid, None)[0])
-            self.assertFalse(gate.parameter_gate(invalid, metrics())[0])
-            self.assertFalse(gate.parameter_gate(metrics(), invalid)[0])
+    def test_nonfinite_reference_or_actual_fails(self):
+        for invalid in (metrics(float("nan")), metrics(float("inf")), metrics(finite=False)):
+            self.assertFalse(gate.gradient_gate(invalid, None)[0])
+            self.assertFalse(gate.gradient_gate(invalid, metrics())[0])
+            self.assertFalse(gate.gradient_gate(metrics(), invalid)[0])
 
-    def test_calibration_does_not_apply_pointwise_gate(self):
-        self.assertTrue(gate.parameter_gate(metrics(0.0123), None)[0])
+    def test_calibration_requires_baseline_except_elementwise_pass(self):
+        self.assertFalse(gate.gradient_gate(metrics(0.0123), None)[0])
+        self.assertTrue(gate.gradient_gate(metrics(0.0123, mismatched=0), None)[0])
+        earlier = gate.merge_baseline(metrics(0.006), metrics(0.009))
+        self.assertEqual(earlier["relative_l2"], 0.009)
+        self.assertEqual(gate.merge_baseline(earlier, metrics(0.005)), earlier)
 
 
 if __name__ == "__main__":

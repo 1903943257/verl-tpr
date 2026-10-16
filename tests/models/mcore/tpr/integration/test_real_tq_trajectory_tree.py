@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from verl.models.mcore.tpr.trajectory_tree import build_trajectory_trees
+from verl.experimental.tpr.legacy.trajectory_tree import build_trajectory_trees
 
 
 _DEFAULT_TQ_DUMP = Path(

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
 
 
 def _batch():

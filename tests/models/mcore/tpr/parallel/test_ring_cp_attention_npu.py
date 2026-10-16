@@ -31,7 +31,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-import verl.models.mcore.tpr.parallel.ring_attention as ring
+import verl.workers.engine.megatron.tpr.ring as ring
 from verl.models.mcore.tpr import RingLocalKVBlock, make_ring_sequence_shard
 from verl.utils.device import is_torch_npu_available
 

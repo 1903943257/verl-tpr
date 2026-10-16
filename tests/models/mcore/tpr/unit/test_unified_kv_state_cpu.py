@@ -1,0 +1,86 @@
+"""Unified local/Ring anchors must relay the same branched prefix gradients."""
+
+import pytest
+import torch
+
+from verl.workers.engine.megatron.tpr.ring import SequenceShard, make_ring_sequence_shard
+from verl.workers.engine.megatron.tpr.state import KVPrefixState, KVStack
+from verl.workers.engine.megatron.tpr.tree import SegmentSpec
+
+
+def _segment(segment_id, parent, length, offset):
+    return SegmentSpec(segment_id, parent, torch.arange(length), offset, offset)
+
+
+def _kv(length):
+    return {layer: tuple(torch.randn(length, 1, 2, 3, dtype=torch.float64) for _ in range(2))
+            for layer in (1, 3)}
+
+
+@pytest.mark.parametrize("cp_size,cp_rank", [(1, 0), (2, 0), (2, 1)])
+def test_unified_anchors_match_direct_multilevel_branch_gradients(cp_size, cp_rank):
+    torch.manual_seed(831)
+    stack, direct = KVStack(), []
+    for segment_id, length, offset in ((0, 7, 0), (1, 5, 7)):
+        shard = (SequenceShard.full(length) if cp_size == 1 else
+                 make_ring_sequence_shard(length, cp_size=cp_size, cp_rank=cp_rank))
+        key_values = _kv(shard.local_length)
+        direct.append({layer: tuple(t.clone().requires_grad_() for t in pair)
+                       for layer, pair in key_values.items()})
+        stack.push(_segment(segment_id, None if segment_id == 0 else 0, length, offset), key_values, shard=shard)
+
+    for factor in (2.0, 3.0):
+        anchors = stack.build_past_anchors()
+        assert anchors.prefix_length == anchors.global_prefix_length == 12
+        if cp_size == 1:
+            observed = anchors.key_values
+        else:
+            with pytest.raises(RuntimeError, match="sharded KV"):
+                _ = anchors.key_values
+            observed = {layer: tuple(torch.cat([entry.key_values[layer][i] for entry in anchors.entries])
+                                     for i in (0, 1)) for layer in (1, 3)}
+        expected = {layer: tuple(torch.cat([entry[layer][i] for entry in direct])
+                                 for i in (0, 1)) for layer in (1, 3)}
+        for pairs in (observed, expected):
+            loss = torch.zeros((), dtype=torch.float64)
+            for layer, (key, value) in pairs.items():
+                weights = torch.arange(key.numel(), dtype=key.dtype).reshape_as(key) + factor + layer
+                loss = loss + ((key + 2 * value).square() * weights).sum()
+            loss.backward()
+        stack.accumulate_anchor_gradients(anchors)
+
+    for segment_id, originals in enumerate(direct):
+        for layer, gradients in stack.get(segment_id).kv.consume_gradients().items():
+            for gradient, tensor in zip(gradients, originals[layer], strict=True):
+                torch.testing.assert_close(gradient, tensor.grad, rtol=1e-14, atol=1e-14)
+    with pytest.raises(RuntimeError, match="stale"):
+        stack.accumulate_anchor_gradients(anchors)
+
+
+def test_anchor_generation_rejects_replaced_state_with_same_segment_id():
+    stack = KVStack()
+    root = _segment(0, None, 3, 0)
+    stack.push(root, _kv(3))
+    anchors = stack.build_past_anchors()
+    for key, value in anchors.entries[0].key_values.values():
+        (key + value).sum().backward()
+    stack.pop(0).kv.release()
+    stack.push(root, _kv(3))
+    with pytest.raises(RuntimeError, match="stale"):
+        stack.accumulate_anchor_gradients(anchors)
+
+
+def test_cached_view_is_compact_graph_free_and_released_with_its_gradients():
+    backing = torch.randn(100, 1, 2, 3)
+    state = KVPrefixState(0, 3, {1: (backing[10:13], backing[40:43])})
+    for tensor in state.key_values[1]:
+        assert tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
+        assert tensor.untyped_storage().data_ptr() != backing.untyped_storage().data_ptr()
+        assert not tensor.requires_grad and tensor.grad_fn is None
+    anchors = state.make_anchors()
+    (anchors.key_values[1][0] + anchors.key_values[1][1]).sum().backward()
+    state.accumulate_anchor_gradients(anchors)
+    state.release()
+    assert state.released and not state._key_values and not state._gradients
+    with pytest.raises(RuntimeError, match="released"):
+        state.consume_gradients()

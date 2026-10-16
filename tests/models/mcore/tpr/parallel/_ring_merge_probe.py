@@ -31,7 +31,7 @@ def block_reference(query, key, value, *, scale, causal, mask):
 
 @contextmanager
 def ring_merge_probe():
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.experimental.tpr import ring_attention as ring
 
     original_block, original_merge = ring._block_attention_forward, ring._merge_attention
     state = {"groups": [], "block_errors": [], "dtypes": set()}

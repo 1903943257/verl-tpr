@@ -40,7 +40,11 @@ def runtime():
 
 
 def _plans(n, p, s):
-    from verl.models.mcore.tpr.segment_plan import SegmentPlan, SegmentSpec, SegmentLossTerm
+    from verl.experimental.tpr.legacy.plan import (
+        SegmentPlan,
+        SegmentSpec,
+        SegmentLossTerm,
+    )
 
     gen = torch.Generator().manual_seed(450001 + p * 101 + s)
     prefix = torch.randint(1, baseline.VOCAB_SIZE, (p,), generator=gen)
@@ -99,10 +103,10 @@ class _Profile:
         patch.setattr(owner, attr, wrapped)
 
     def install(self, patch, model):
-        from verl.models.mcore.tpr.parallel import allgather_attention as ag
-        from verl.models.mcore.tpr import segment_executor as se
-        from verl.models.mcore.tpr.prefix_state import GDNPrefixState, KVPrefixState
-        from verl.models.mcore.tpr.kv_stack import KVStack
+        from verl.experimental.tpr import allgather_attention as ag
+        from verl.experimental.tpr.legacy import segment_executor as se
+        from verl.experimental.tpr.gdn.prefix_state import GDNPrefixState, KVPrefixState
+        from verl.workers.engine.megatron.tpr.state import KVStack
 
         self.wrap(patch, model, "forward", "model_forward")
         self.wrap(patch, torch.autograd, "backward", "backward")
@@ -174,8 +178,8 @@ class _PhaseEvents:
 
 
 def _execute(model, runtime, refs, tree, mode, profile, events, trace=None):
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-    from verl.models.mcore.tpr.fixed_topology_scheduler import FixedTopologyScheduler
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.legacy.fixed_topology_scheduler import FixedTopologyScheduler
 
     class Executor(SegmentExecutor):
         def _forward(self, segment, **kwargs):
@@ -221,7 +225,7 @@ def _rank_max(values, runtime):
 
 def _sample(model, runtime, refs, tree, mode, patch, profiled, trace=None):
     import mindspeed.core.ssm.gated_delta_net as gdn
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.experimental.tpr import ring_attention as ring
 
     model.zero_grad(set_to_none=True)
     profile = _Profile() if profiled else None
@@ -235,7 +239,7 @@ def _sample(model, runtime, refs, tree, mode, patch, profiled, trace=None):
 
         local_patch.setattr(transport, "async_send_recv", forbidden_ring)
         if trace:
-            from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+            from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
             trace.install(local_patch, SegmentExecutor, torch.autograd)
             if os.getenv("STAGE45_OPS_TRACE", "0") == "1":
                 from ._stateful_ops_probe import install_ops_probe

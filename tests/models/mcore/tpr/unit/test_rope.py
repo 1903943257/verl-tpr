@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr.rope import disable_bound_context_parallel_sharding
+from verl.workers.engine.megatron.tpr.executor import disable_bound_context_parallel_sharding
 from verl.models.mcore.tpr import (
     AllGatherCPBackend,
     RangeSequenceShard,

@@ -79,7 +79,7 @@ def test_derived_capture_truncates_all_response_labels_without_mutating_source(t
         for key in ("response_mask", "loss_mask", "old_log_probs", "advantages"):
             assert torch.equal(cropped[key][row], original[key][row][:5])
     assert stats["ppo_tokens"] == 40
-    assert len(before["input_ids"][0]) == 10
+    assert len(before["tensordict"]["input_ids"][0]) == 10
 
 
 def test_derived_capture_rejects_prompt_longer_than_cap(tmp_path):

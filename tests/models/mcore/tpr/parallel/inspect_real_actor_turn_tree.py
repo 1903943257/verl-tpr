@@ -10,7 +10,7 @@ from pathlib import Path
 
 import torch
 from verl.utils import tensordict_utils as tu
-from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans
 
 
 def _supervision(forest):

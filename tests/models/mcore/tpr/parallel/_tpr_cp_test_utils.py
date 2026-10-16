@@ -32,18 +32,17 @@ from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.transformer_config import TransformerConfig
-import verl.models.mcore.tpr.parallel.allgather_attention as cp_attention
-import verl.models.mcore.tpr.parallel.ring_attention as ring_attention
-import verl.models.mcore.tpr.parallel.ulysses_attention as ulysses_attention
-from verl.models.mcore.tpr import (
-    FixedTopologyScheduler,
-    PhysicalExecutionKind,
-    SegmentExecutor,
+import verl.experimental.tpr.allgather as cp_attention
+import verl.workers.engine.megatron.tpr.ring as ring_attention
+import verl.experimental.tpr.ulysses as ulysses_attention
+from verl.experimental.tpr.legacy.fixed_topology_scheduler import FixedTopologyScheduler, PhysicalExecutionKind
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+from verl.experimental.tpr.legacy.plan import (
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,
-    replace_self_attention_with_tpr,
 )
+from verl.models.mcore.tpr import replace_self_attention_with_tpr
 
 from ._cp_gdn_test_utils import (
     assert_named_tensors_finite,

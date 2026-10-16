@@ -315,7 +315,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     import os as _tpr_actor_capture_os
                     _tpr_actor_dir = _tpr_actor_capture_os.environ.get("TPR_CAPTURE_ACTOR_MINIBATCH_DIR")
                     if _tpr_actor_dir:
-                        from verl.models.mcore.tpr.actor_capture import capture_real_actor_update_minibatch
+                        from verl.experimental.tpr.actor_capture import capture_real_actor_update_minibatch
                         _tpr_capture_index = getattr(self, "_tpr_actor_capture_index", 0)
                         capture_real_actor_update_minibatch(
                             mini_batch_td, _tpr_actor_dir, batch_idx=batch_idx, capture_index=_tpr_capture_index

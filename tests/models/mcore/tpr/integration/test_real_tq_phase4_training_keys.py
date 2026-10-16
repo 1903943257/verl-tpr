@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from verl.models.mcore.tpr.megatron_adapter import _trajectory_keys_from_minibatch
-from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+from verl.workers.engine.megatron.tpr.adapter import _trajectory_keys_from_minibatch
+from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans
 from verl.utils import tensordict_utils as tu
 
 _DEFAULT = Path(

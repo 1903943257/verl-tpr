@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import verl.models.mcore.tpr.parallel.backend as backend_module
+import verl.experimental.tpr.legacy.cp.backend as backend_module
 from verl.models.mcore.tpr import (
     ALLGATHER_CP_BACKEND,
     AllGatherCPBackend,
@@ -25,10 +25,11 @@ from verl.models.mcore.tpr import (
     PrefixShard,
     RangeSequenceShard,
     RingCPBackend,
+    SequenceShard,
     TPRCPBackend,
     UlyssesCPBackend,
 )
-from verl.models.mcore.tpr.parallel import resolve_tpr_cp_backend
+from verl.experimental.tpr import resolve_tpr_cp_backend
 
 
 class _CustomBackend:
@@ -113,8 +114,9 @@ def test_resolver_constructs_the_ring_adapter(name):
     )
 
     assert isinstance(backend, RingCPBackend)
+    assert backend_module.RingCPBackend is RingCPBackend
     assert backend.backend_name == "ring"
-    assert backend.make_sequence_shard(16) == RangeSequenceShard(
+    assert backend.make_sequence_shard(16) == SequenceShard(
         16,
         ((0, 4), (12, 16)),
         cp_rank=0,

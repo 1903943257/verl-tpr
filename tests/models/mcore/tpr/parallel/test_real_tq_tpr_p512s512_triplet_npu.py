@@ -102,8 +102,8 @@ def _run_one_node_tpr(model, tokens):
     Isolates native-without-context vs TPR rectangular Attention at the
     *same* physical GEMM M. There is only a root leaf and no cached KV relay.
     """
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-    from verl.models.mcore.tpr.segment_plan import SegmentPlan, SegmentSpec
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.legacy.plan import SegmentPlan, SegmentSpec
     from verl.models.mcore.tpr.attention import TPRSelfAttention
 
     root = SegmentSpec(
@@ -150,8 +150,8 @@ def _run_one_node_tpr(model, tokens):
 
 
 def _run_two_node_tpr(model, tokens):
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-    from verl.models.mcore.tpr.segment_plan import SegmentPlan, SegmentSpec
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.legacy.plan import SegmentPlan, SegmentSpec
     from verl.models.mcore.tpr.attention import TPRSelfAttention
 
     # Real Prefix/Suffix boundaries. This is a *chain*, not a synthetic

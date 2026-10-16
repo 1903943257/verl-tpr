@@ -317,7 +317,7 @@ def _compare_grads(reference, actual):
 
 def _logprob_diagnostics(batch, captured, reference_lp):
     """Inspect exact real-token ownership without modifying acceptance criteria."""
-    from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+    from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
 
     keys = tu.get_non_tensor_data(batch, "tpr_trajectory_keys", default=None)
     if keys is None:
@@ -451,8 +451,8 @@ def _probe_whole_segment_tpr_forward(model, batch, reference_lp, *, row: int):
     TPR uses identical token IDs and absolute position IDs as native.
     """
     from verl.models.mcore.tpr.attention import TPRSelfAttention
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-    from verl.models.mcore.tpr.segment_plan import (
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.legacy.plan import (
         SegmentLossTerm,
         SegmentPlan,
         SegmentSpec,
@@ -650,7 +650,7 @@ def _print_attention_layer_drift(reference, segmented, positions):
 
 def _get_trace_owner_segments(batch, *, row=0, response_offsets=(6, 13)):
     """Exact row-path mapping, never assume branch IDs based on one run log."""
-    from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+    from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
     keys = tu.get_non_tensor_data(batch, key="tpr_trajectory_keys", default=None)
     forest = build_tree_execution_plans(tuple(keys), batch)
     offsets = set(response_offsets)
@@ -758,8 +758,12 @@ def _tpr_single_segment_cutoff_controls(model, batch, original_logprobs, owners)
     rectangular suffix query/KV concatenation.
     """
     from verl.models.mcore.tpr.attention import TPRSelfAttention
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-    from verl.models.mcore.tpr.segment_plan import SegmentLossTerm, SegmentPlan, SegmentSpec
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.legacy.plan import (
+        SegmentLossTerm,
+        SegmentPlan,
+        SegmentSpec,
+    )
     from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
 
     row = 0
@@ -821,7 +825,7 @@ def _native_cutoff_oracle_per_segment(model, batch, *, max_length=256):
     or a substitute for Native-full PPO. It is disabled for long sequences to
     prevent duplicating the already observed single-NPU OOM.
     """
-    from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+    from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
     from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
 
     keys = tu.get_non_tensor_data(batch, key="tpr_trajectory_keys", default=None)

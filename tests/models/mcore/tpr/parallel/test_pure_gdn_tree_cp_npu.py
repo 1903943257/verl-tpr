@@ -44,7 +44,7 @@ def _loss(output, target, weight):
 
 
 def _boundary(states, *, clone=False):
-    from verl.models.mcore.tpr.prefix_state import GDNLayerState
+    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
 
     if not clone:
         return {f"{number}.{kind}": tensor for number, state in states.items()
@@ -90,7 +90,7 @@ def _connected(model, inputs, targets):
     total.backward()
     dstate = {}
     for sid, boundary in boundaries.items():
-        from verl.models.mcore.tpr.prefix_state import GDNLayerState
+        from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
 
         dstate[sid] = {}
         for number, state in boundary.items():
@@ -103,8 +103,8 @@ def _connected(model, inputs, targets):
 
 
 def _tree(model, inputs, targets):
-    from verl.models.mcore.tpr.parallel.gdn_tree import GDNCPBranchExecutor
-    from verl.models.mcore.tpr.prefix_state import GDNLayerState
+    from verl.experimental.tpr.gdn.tree import GDNCPBranchExecutor
+    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
 
     model.zero_grad(set_to_none=True)
     executor = GDNCPBranchExecutor(model)
@@ -159,7 +159,7 @@ def _finish_cp(model, result, runtime):
 
 def test_three_gdn_cp2_push_branch_pop(runtime):
     import mindspeed.core.ssm.gated_delta_net as native
-    from verl.models.mcore.tpr.parallel.gdn_tree import GDNCPStack
+    from verl.experimental.tpr.gdn.tree import GDNCPStack
 
     torch.manual_seed(420001)
     ref = GDNCPStack([_model(runtime, 1, i) for i in range(1, LAYERS+1)])

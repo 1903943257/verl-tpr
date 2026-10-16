@@ -19,7 +19,11 @@ from .test_small_hybrid_tree_cp_npu import _communication_probe
 
 
 def plans():
-    from verl.models.mcore.tpr.segment_plan import SegmentPlan, SegmentSpec, SegmentLossTerm
+    from verl.experimental.tpr.legacy.plan import (
+        SegmentPlan,
+        SegmentSpec,
+        SegmentLossTerm,
+    )
     p = torch.arange(64) * 17 + 23
     s = torch.arange(64) * 19 + 101
     terms = lambda shift: tuple(SegmentLossTerm(i+shift, int(s[i+1])) for i in range(63))
@@ -58,10 +62,10 @@ def projection_control(model, patch, enabled):
 
 
 def execute(model, runtime, *, cp, segmented):
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-    from verl.models.mcore.tpr.prefix_state import KVPrefixAnchors
-    from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
-    from verl.models.mcore.tpr.parallel.ring_attention import make_ring_sequence_shard
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.gdn.prefix_state import KVPrefixAnchors
+    from verl.experimental.tpr.legacy.cp.execution_context import ShardedPastKVAnchors
+    from verl.workers.engine.megatron.tpr.ring import make_ring_sequence_shard
     whole, split = plans()
     plan = split if segmented else whole
     executor = SegmentExecutor(model, plan, expected_layer_numbers=(4, 8, 12, 16, 20, 24),

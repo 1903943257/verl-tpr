@@ -61,12 +61,11 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
 
-import verl.models.mcore.tpr.parallel.ring_attention as ring_attention
+import verl.workers.engine.megatron.tpr.ring as ring_attention
 import verl.models.mcore.tpr.attention as local_attention
-from verl.models.mcore.tpr import (
-    FixedTopologyScheduler,
-    PhysicalExecutionKind,
-    SegmentExecutor,
+from verl.experimental.tpr.legacy.fixed_topology_scheduler import FixedTopologyScheduler, PhysicalExecutionKind
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+from verl.experimental.tpr.legacy.plan import (
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,

@@ -61,8 +61,8 @@ def _cpu(tensors):
 def _engine_run(model, plan, executor_type, runtime, monkeypatch):
     from tensordict import TensorDict
     from verl.utils import tensordict_utils as tu
-    from verl.models.mcore.tpr.engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
-    from verl.models.mcore.tpr import megatron_adapter
+    from verl.experimental.tpr.legacy.engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
+    from verl.experimental.tpr.legacy import megatron_adapter
 
     # Same thin-entry fixture as Stage 3.3: runtime already installed MindSpeed.
     # Suppress only the unrelated eager engine repatcher during import.
@@ -119,9 +119,9 @@ def _engine_run(model, plan, executor_type, runtime, monkeypatch):
 
 
 def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False, fa_replay=False, gdn_capture=None, closure_capture=None, fa_transport=None):
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-    from verl.models.mcore.tpr.prefix_state import GDNLayerState, KVPrefixAnchors
-    from verl.models.mcore.tpr.parallel.execution_context import ShardedPastKVAnchors
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState, KVPrefixAnchors
+    from verl.experimental.tpr.legacy.cp.execution_context import ShardedPastKVAnchors
 
     gdn_layers, fa_layers = assert_hybrid_architecture(model)
     gdn_numbers = tuple(layer.layer_number for layer in gdn_layers)
@@ -364,7 +364,7 @@ def _relay_diagnostic(label, reference, actual, *, rank):
 
 def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
     from verl.models.mcore.tpr.attention import TPRSelfAttention
-    from verl.models.mcore.tpr.gated_delta_net import TPRGatedDeltaNet
+    from verl.experimental.tpr.gdn.model import TPRGatedDeltaNet
     from ._full_linear_shape_control import full_linear_shape_control
 
     fa_backend = os.getenv("STAGE44_FA_BACKEND", "ring")

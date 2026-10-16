@@ -319,8 +319,8 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
         from .test_qwen3_1_7b_real_tq_ppo_npu import (
             _native_core_square_vs_rectangular_oracle,
         )
-        from verl.models.mcore.tpr.megatron_adapter import _trajectory_keys_from_minibatch
-        from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+        from verl.experimental.tpr.legacy.megatron_adapter import _trajectory_keys_from_minibatch
+        from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
 
         core_row = int(os.getenv("TPR_QWEN17_WEAK_E2E_CORE_ROW", "5"))
         if not 0 <= core_row < len(lengths):
@@ -551,11 +551,11 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
         )
         from verl.models.mcore.tpr.attention import TPRSelfAttention
         from verl.models.mcore.tpr import attention as tpr_attention_module
-        from verl.models.mcore.tpr.megatron_adapter import (
+        from verl.experimental.tpr.legacy.megatron_adapter import (
             _trajectory_keys_from_minibatch,
         )
-        from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-        from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+        from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+        from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
 
         row = int(os.getenv("TPR_QWEN17_WEAK_E2E_TRACE_ROW", "5"))
         response_offset = int(os.getenv("TPR_QWEN17_WEAK_E2E_TRACE_OFFSET", "62"))
@@ -926,8 +926,8 @@ def test_real_tq_qwen17_default_bf16_weak_actor_optimizer_step():
     target.assert_model_scale(tpr)
     tpr.zero_grad(set_to_none=True)
     engine = _make_training_engine(tpr)
-    from verl.models.mcore.tpr.megatron_adapter import _trajectory_keys_from_minibatch
-    from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+    from verl.experimental.tpr.legacy.megatron_adapter import _trajectory_keys_from_minibatch
+    from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
     # Reuse EXACTLY the production TPR Engine's trajectory-key resolver,
     # including its required tu.get_non_tensor_data(..., default=None)
     # contract. The real TQ loader preserves these identities.

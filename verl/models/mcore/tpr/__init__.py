@@ -1,175 +1,106 @@
-# Copyright 2026 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+"""Model-side TPR Attention/Context/CANN and lazy backwards exports."""
+from importlib import import_module
 
-"""Model-side primitives for depth-first tree-prefix-reuse training."""
+# Public TPR model/runtime exports; no optional/legacy symbols in __all__.
+_PRODUCTION_EXPORTS = {
+    "build_sharded_rotary_pos_emb": "verl.workers.engine.megatron.tpr.executor",
+    "build_suffix_rotary_pos_emb": "verl.workers.engine.megatron.tpr.executor",
+    "classify_ring_block": "verl.workers.engine.megatron.tpr.ring",
+    "get_tpr_attention_context": "verl.models.mcore.tpr.context",
+    "iter_valid_sequence_slices": "verl.workers.engine.megatron.tpr.ring",
+    "KVPrefixAnchors": "verl.workers.engine.megatron.tpr.state",
+    "KVPrefixState": "verl.workers.engine.megatron.tpr.state",
+    "KVStack": "verl.workers.engine.megatron.tpr.state",
+    "KVStackEntry": "verl.workers.engine.megatron.tpr.state",
+    "make_ring_sequence_shard": "verl.workers.engine.megatron.tpr.ring",
+    "make_tpr_module_spec_provider": "verl.workers.engine.megatron.tpr.adapter",
+    "PastKVAnchors": "verl.workers.engine.megatron.tpr.state",
+    "rectangular_causal_attention": "verl.models.mcore.tpr.rectangular_attention",
+    "replace_self_attention_with_tpr": "verl.workers.engine.megatron.tpr.adapter",
+    "ring_cp_attention": "verl.workers.engine.megatron.tpr.ring",
+    "RingBlockKind": "verl.workers.engine.megatron.tpr.ring",
+    "RingCPAttentionBackend": "verl.workers.engine.megatron.tpr.ring",
+    "RingCPBackend": "verl.workers.engine.megatron.tpr.ring",
+    "RingLocalKVBlock": "verl.workers.engine.megatron.tpr.ring",
+    "round_up_sequence_length": "verl.workers.engine.megatron.tpr.ring",
+    "SegmentExecutor": "verl.workers.engine.megatron.tpr.executor",
+    "SequenceShard": "verl.workers.engine.megatron.tpr.ring",
+    "TPRAttentionBackend": "verl.models.mcore.tpr.context",
+    "TPRAttentionContext": "verl.models.mcore.tpr.context",
+    "TPRSelfAttention": "verl.models.mcore.tpr.attention",
+    "use_tpr_attention_context": "verl.models.mcore.tpr.context",
+}
+# Transitional explicit imports for historical tests; not part of public __all__.
+_LEGACY_EXPORTS = {
+    "all_gather_sequence": "verl.experimental.tpr.allgather",
+    "ALLGATHER_CP_BACKEND": "verl.experimental.tpr.legacy.cp.backend",
+    "allgather_cp_rectangular_attention": "verl.experimental.tpr.allgather",
+    "AllGatherCPAttentionBackend": "verl.experimental.tpr.legacy.cp.execution_context",
+    "AllGatherCPBackend": "verl.experimental.tpr.legacy.cp.backend",
+    "FixedTopologyScheduler": "verl.experimental.tpr.legacy.fixed_topology_scheduler",
+    "GDNLayerState": "verl.experimental.tpr.gdn.prefix_state",
+    "GDNPrefixAnchors": "verl.experimental.tpr.gdn.prefix_state",
+    "GDNPrefixState": "verl.experimental.tpr.gdn.prefix_state",
+    "HYBRID_CP_BACKEND": "verl.experimental.tpr.legacy.cp.backend",
+    "hybrid_cp_rectangular_attention": "verl.experimental.tpr.hybrid",
+    "HybridCPAttentionBackend": "verl.experimental.tpr.hybrid",
+    "HybridCPBackend": "verl.experimental.tpr.legacy.cp.backend",
+    "HybridCPTopology": "verl.experimental.tpr.hybrid",
+    "HybridLocalKVBlock": "verl.experimental.tpr.hybrid",
+    "LeafVisitResult": "verl.experimental.tpr.legacy.segment_executor",
+    "LocalKVBlock": "verl.experimental.tpr.allgather",
+    "make_hybrid_sequence_shard": "verl.experimental.tpr.hybrid",
+    "PaddedSequenceShard": "verl.experimental.tpr.shard",
+    "PastKVSlice": "verl.experimental.tpr.legacy.state",
+    "physical_sequence_shard": "verl.experimental.tpr.shard",
+    "PhysicalExecution": "verl.experimental.tpr.legacy.fixed_topology_scheduler",
+    "PhysicalExecutionKind": "verl.experimental.tpr.legacy.fixed_topology_scheduler",
+    "PopSegment": "verl.experimental.tpr.legacy.plan",
+    "PrefixShard": "verl.experimental.tpr.shard",
+    "PrefixState": "verl.experimental.tpr.legacy.state",
+    "PrefixStateEntry": "verl.experimental.tpr.legacy.state",
+    "PrefixStateStack": "verl.experimental.tpr.legacy.state",
+    "PushSegment": "verl.experimental.tpr.legacy.plan",
+    "RangeSequenceShard": "verl.experimental.tpr.shard",
+    "resolve_mindspeed_hybrid_topology": "verl.experimental.tpr.hybrid",
+    "resolve_tpr_cp_backend": "verl.experimental.tpr.legacy.cp.backend",
+    "RING_CP_BACKEND": "verl.experimental.tpr.legacy.cp.backend",
+    "SchedulerState": "verl.experimental.tpr.legacy.fixed_topology_scheduler",
+    "SegmentBackwardResult": "verl.experimental.tpr.legacy.segment_executor",
+    "SegmentEvent": "verl.experimental.tpr.legacy.plan",
+    "SegmentEventKind": "verl.experimental.tpr.legacy.plan",
+    "SegmentForwardResult": "verl.experimental.tpr.legacy.segment_executor",
+    "SegmentKV": "verl.experimental.tpr.legacy.state",
+    "SegmentLossTerm": "verl.experimental.tpr.legacy.plan",
+    "SegmentPlan": "verl.experimental.tpr.legacy.plan",
+    "SegmentSpec": "verl.experimental.tpr.legacy.plan",
+    "ShardedPastKVAnchors": "verl.experimental.tpr.legacy.state",
+    "TPR_REQUEST_KEY": "verl.experimental.tpr.legacy.engine_adapter",
+    "TPRCPBackend": "verl.experimental.tpr.legacy.cp.backend",
+    "TPRForwardBackwardRequest": "verl.experimental.tpr.legacy.engine_adapter",
+    "TreeScheduleResult": "verl.experimental.tpr.legacy.fixed_topology_scheduler",
+    "ULYSSES_CP_BACKEND": "verl.experimental.tpr.legacy.cp.backend",
+    "ulysses_cp_rectangular_attention": "verl.experimental.tpr.ulysses",
+    "UlyssesCPAttentionBackend": "verl.experimental.tpr.ulysses",
+    "UlyssesCPBackend": "verl.experimental.tpr.legacy.cp.backend",
+}
+_EXPORTS = {**_PRODUCTION_EXPORTS, **_LEGACY_EXPORTS}
+_MODULES = {
+    "parallel": "verl.experimental.tpr",
+}
+__all__ = sorted(_PRODUCTION_EXPORTS)
 
-from .attention import TPRSelfAttention
-from .context import (
-    TPRAttentionBackend,
-    TPRAttentionContext,
-    get_tpr_attention_context,
-    use_tpr_attention_context,
-)
-from .engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
-from .fixed_topology_scheduler import (
-    FixedTopologyScheduler,
-    PhysicalExecution,
-    PhysicalExecutionKind,
-    SchedulerState,
-    TreeScheduleResult,
-)
-from .kv_stack import KVStack, KVStackEntry, PastKVAnchors, PastKVSlice, SegmentKV
-from .module_spec import make_tpr_module_spec_provider, replace_self_attention_with_tpr
-from .parallel import (
-    ALLGATHER_CP_BACKEND,
-    HYBRID_CP_BACKEND,
-    RING_CP_BACKEND,
-    ULYSSES_CP_BACKEND,
-    AllGatherCPBackend,
-    AllGatherCPAttentionBackend,
-    HybridCPAttentionBackend,
-    HybridCPBackend,
-    HybridCPTopology,
-    HybridLocalKVBlock,
-    LocalKVBlock,
-    RingBlockKind,
-    RingCPAttentionBackend,
-    RingCPBackend,
-    RingLocalKVBlock,
-    ShardedPastKVAnchors,
-    TPRCPBackend,
-    UlyssesCPAttentionBackend,
-    UlyssesCPBackend,
-    all_gather_sequence,
-    allgather_cp_rectangular_attention,
-    classify_ring_block,
-    hybrid_cp_rectangular_attention,
-    make_hybrid_sequence_shard,
-    make_ring_sequence_shard,
-    resolve_tpr_cp_backend,
-    resolve_mindspeed_hybrid_topology,
-    ring_cp_attention,
-    ulysses_cp_rectangular_attention,
-)
-from .prefix_state import (
-    GDNLayerState,
-    GDNPrefixAnchors,
-    GDNPrefixState,
-    KVPrefixAnchors,
-    KVPrefixState,
-    PrefixState,
-    PrefixStateEntry,
-    PrefixStateStack,
-)
-from .rectangular_attention import rectangular_causal_attention
-from .rope import build_sharded_rotary_pos_emb, build_suffix_rotary_pos_emb
-from .shard import (
-    PaddedSequenceShard,
-    PrefixShard,
-    RangeSequenceShard,
-    SequenceShard,
-    iter_valid_sequence_slices,
-    physical_sequence_shard,
-    round_up_sequence_length,
-)
-from .segment_executor import LeafVisitResult, SegmentBackwardResult, SegmentExecutor, SegmentForwardResult
-from .segment_plan import (
-    PopSegment,
-    PushSegment,
-    SegmentEvent,
-    SegmentEventKind,
-    SegmentLossTerm,
-    SegmentPlan,
-    SegmentSpec,
-)
 
-__all__ = [
-    "ALLGATHER_CP_BACKEND",
-    "HYBRID_CP_BACKEND",
-    "RING_CP_BACKEND",
-    "ULYSSES_CP_BACKEND",
-    "TPRSelfAttention",
-    "TPRForwardBackwardRequest",
-    "TPR_REQUEST_KEY",
-    "AllGatherCPAttentionBackend",
-    "AllGatherCPBackend",
-    "HybridCPAttentionBackend",
-    "HybridCPBackend",
-    "HybridCPTopology",
-    "HybridLocalKVBlock",
-    "FixedTopologyScheduler",
-    "GDNLayerState",
-    "GDNPrefixAnchors",
-    "GDNPrefixState",
-    "KVStack",
-    "KVStackEntry",
-    "KVPrefixAnchors",
-    "KVPrefixState",
-    "LocalKVBlock",
-    "LeafVisitResult",
-    "PastKVAnchors",
-    "PastKVSlice",
-    "PhysicalExecution",
-    "PhysicalExecutionKind",
-    "PaddedSequenceShard",
-    "PrefixShard",
-    "RangeSequenceShard",
-    "RingBlockKind",
-    "RingCPAttentionBackend",
-    "RingCPBackend",
-    "RingLocalKVBlock",
-    "PrefixState",
-    "PrefixStateEntry",
-    "PrefixStateStack",
-    "SegmentKV",
-    "ShardedPastKVAnchors",
-    "SequenceShard",
-    "SchedulerState",
-    "TPRAttentionContext",
-    "TPRAttentionBackend",
-    "TPRCPBackend",
-    "UlyssesCPAttentionBackend",
-    "UlyssesCPBackend",
-    "TreeScheduleResult",
-    "PopSegment",
-    "PushSegment",
-    "SegmentEvent",
-    "SegmentEventKind",
-    "SegmentBackwardResult",
-    "SegmentExecutor",
-    "SegmentForwardResult",
-    "SegmentLossTerm",
-    "SegmentPlan",
-    "SegmentSpec",
-    "all_gather_sequence",
-    "allgather_cp_rectangular_attention",
-    "build_sharded_rotary_pos_emb",
-    "build_suffix_rotary_pos_emb",
-    "classify_ring_block",
-    "hybrid_cp_rectangular_attention",
-    "iter_valid_sequence_slices",
-    "get_tpr_attention_context",
-    "make_tpr_module_spec_provider",
-    "make_hybrid_sequence_shard",
-    "make_ring_sequence_shard",
-    "physical_sequence_shard",
-    "rectangular_causal_attention",
-    "resolve_tpr_cp_backend",
-    "resolve_mindspeed_hybrid_topology",
-    "round_up_sequence_length",
-    "ring_cp_attention",
-    "replace_self_attention_with_tpr",
-    "use_tpr_attention_context",
-    "ulysses_cp_rectangular_attention",
-]
+def __getattr__(name):
+    if name in _MODULES:
+        value = import_module(_MODULES[name])
+    elif name in _EXPORTS:
+        value = getattr(import_module(_EXPORTS[name]), name)
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

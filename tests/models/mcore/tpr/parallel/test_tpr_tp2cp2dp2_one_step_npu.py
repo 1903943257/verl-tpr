@@ -22,8 +22,8 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
 
-from verl.models.mcore.tpr.dp_placement import plan_tpr_dta_dp
-from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
+from verl.workers.engine.megatron.tpr.placement import plan_tpr_dta_dp
+from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
 from verl.utils import tensordict_utils as tu
 
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model

@@ -24,8 +24,6 @@ from verl.models.mcore.config_converter import (
     get_hf_rope_theta,
     hf_to_mcore_config_dense,
 )
-from verl.models.mcore.tpr import replace_self_attention_with_tpr
-from verl.models.mcore.tpr.module_spec import _get_layer_specs
 from ..profiling.test_tpr_engine_profile_npu import _ProfileFusedCausalAttention
 
 from ..correctness.test_tpr_qwen3_compatibility_npu import (
@@ -268,6 +266,9 @@ def make_real_qwen3_tp_model(
     vanilla_spec = get_gpt_decoder_block_spec(
         config, use_transformer_engine=False, pp_rank=0
     )
+    # Keep Engine dependencies local to the model construction path.
+    from verl.models.mcore.tpr import replace_self_attention_with_tpr
+    from verl.workers.engine.megatron.tpr.adapter import _get_layer_specs
     spec = vanilla_spec if native_attention else replace_self_attention_with_tpr(vanilla_spec)
     # For CP>1, the ordinary square-CANN reference core is invalid because
     # its DotProductAttention parent constructor only supports CP=1.

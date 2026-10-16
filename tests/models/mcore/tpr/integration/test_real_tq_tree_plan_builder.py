@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
 
 
 _DEFAULT_TQ_DUMP = Path(

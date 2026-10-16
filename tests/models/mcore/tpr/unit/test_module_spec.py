@@ -18,7 +18,7 @@ import pytest
 
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
-from verl.models.mcore.tpr.module_spec import _get_layer_specs
+from verl.experimental.tpr.gdn.module_spec import _get_layer_specs
 from verl.models.mcore.tpr import (
     TPRSelfAttention,
     make_tpr_module_spec_provider,
@@ -145,6 +145,7 @@ def test_replacement_is_idempotent():
 
 
 def test_hybrid_spec_dispatch_preserves_pattern_and_is_idempotent(monkeypatch):
+    from verl.experimental.tpr.gdn.module_spec import replace_self_attention_with_tpr
     import sys
     from types import ModuleType
 
@@ -156,7 +157,7 @@ def test_hybrid_spec_dispatch_preserves_pattern_and_is_idempotent(monkeypatch):
 
     native = ModuleType("mindspeed.core.ssm.gated_delta_net")
     native.GatedDeltaNet = GatedDeltaNet
-    adapted = ModuleType("verl.models.mcore.tpr.gated_delta_net")
+    adapted = ModuleType("verl.experimental.tpr.gdn.model")
     adapted.TPRGatedDeltaNet = TPRGatedDeltaNet
     monkeypatch.setitem(sys.modules, native.__name__, native)
     monkeypatch.setitem(sys.modules, adapted.__name__, adapted)

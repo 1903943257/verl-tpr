@@ -6,9 +6,9 @@ import torch
 pytest.importorskip("tensordict")
 from tensordict import TensorDict
 
-from verl.models.mcore.tpr.objective_adapter import SegmentPPOObjectiveAdapter
-from verl.models.mcore.tpr.segment_plan import SegmentSpec
-from verl.models.mcore.tpr.tree_plan_builder import SegmentObjectiveRef
+from verl.experimental.tpr.legacy.objective_adapter import SegmentPPOObjectiveAdapter
+from verl.workers.engine.megatron.tpr.tree import SegmentSpec
+from verl.experimental.tpr.legacy.tree_plan_builder import SegmentObjectiveRef
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.losses import ppo_loss
 
@@ -172,7 +172,7 @@ def test_same_query_can_predict_different_branch_targets():
 
 
 def test_bind_tree_exposes_loss_hook_and_ref_counts():
-    from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+    from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
 
     topology_batch = {
         "input_ids": [torch.tensor([0, 1, 2]), torch.tensor([0, 1, 3])],

@@ -192,7 +192,7 @@ def _tpr_engine_run(model, runtime, plan):
     # This test is specifically the TP2 correctness gate for the explicit
     # TPR thin entry. Full Engine interception is a SEPARATE integration
     # gate; do not mislabel this as an E2E engine-routing success.
-    from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward
+    from verl.experimental.tpr.legacy.megatron_adapter import run_tpr_forward_backward
 
     output = run_tpr_forward_backward(
         engine, request, forward_only=False
@@ -309,7 +309,7 @@ def _tpr_ppo_nll_run(
     including its native loss_mask/token-count preamble. It is NOT equivalent to
     merely invoking run_tpr_forward_backward_batch directly.
     """
-    from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
+    from verl.experimental.tpr.legacy.megatron_adapter import run_tpr_forward_backward_batch
 
     rows = [
         torch.cat((prefix, first_suffix)),
@@ -429,7 +429,7 @@ def _tpr_ppo_nll_run(
         # Phase-4 patch is a test FAILURE, not a skip or silent fallback to
         # the direct TPR adapter.
         from unittest.mock import patch
-        from verl.models.mcore.tpr import megatron_adapter
+        from verl.experimental.tpr.legacy import megatron_adapter
 
         hits = {"route": 0}
         original = megatron_adapter.run_tpr_forward_backward_batch

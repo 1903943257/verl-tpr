@@ -52,7 +52,7 @@ def runtime():
 @pytest.fixture
 def native_args(runtime, monkeypatch):
     from mindspeed.args_utils import get_full_args
-    from verl.models.mcore.tpr import activation_offload
+    from verl.experimental.tpr import offload as activation_offload
     args = SimpleNamespace(**vars(get_full_args()))
     vars(args).update(swap_attention=False, context_parallel_size=runtime.cp_size,
                       pipeline_model_parallel_size=1, eval_interval=0, curr_iteration=1,
@@ -96,7 +96,7 @@ def _model(runtime, length, native_args):
 
 def _plan(prefix, suffix, *, sparse=False):
     from .test_tpr_qwen3_ring_cp_profile_npu import _ProfileCase, _make_case_plans
-    from verl.models.mcore.tpr.segment_plan import SegmentPlan
+    from verl.experimental.tpr.legacy.plan import SegmentPlan
     _, plan = _make_case_plans(_ProfileCase(prefix, suffix, 2), vocab_size=2048)
     if sparse:
         # Only the owner of query zero has local loss; all ranks still backward.
@@ -110,7 +110,7 @@ class _Probe:
 
     def __init__(self, monkeypatch, *, timing=False, stage="capacity", synchronize=False):
         from mindspeed.core.memory.swap_attention.prefetch import SwapTensor
-        from verl.models.mcore.tpr.parallel import ring_attention
+        from verl.experimental.tpr import ring_attention
         self.phase = "setup"
         self.stage = stage
         self.synchronize = synchronize
@@ -217,7 +217,7 @@ class _Probe:
 
 
 def _run(model, plan, runtime, probe, *, observe):
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
     from .test_tpr_qwen3_ring_cp_profile_npu import _finalize_cp_parameter_gradients
     logs = {}
 

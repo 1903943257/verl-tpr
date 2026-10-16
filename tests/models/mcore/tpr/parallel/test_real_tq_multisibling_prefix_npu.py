@@ -272,9 +272,9 @@ def _full(model, siblings, kind, clip, *, backwards):
 
 def _tpr(model, siblings, kind, clip):
     from verl.models.mcore.tpr.attention import TPRSelfAttention
-    from verl.models.mcore.tpr.segment_plan import SegmentPlan, SegmentSpec
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-    from verl.models.mcore.tpr.prefix_state import KVPrefixState
+    from verl.experimental.tpr.legacy.plan import SegmentPlan, SegmentSpec
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.gdn.prefix_state import KVPrefixState
 
     total = sum(int(r["mask"].sum()) for r in siblings)
     root = SegmentSpec(0, None, siblings[0]["prefix"], 0, 0)

@@ -2,7 +2,7 @@
 
 
 def install_ordinary_ring(patch):
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.experimental.tpr import ring_attention as ring
 
     def whole(query, current_key, current_value, *, prefix_blocks=(), **kwargs):
         if prefix_blocks:

@@ -4,8 +4,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl.models.mcore.tpr.tpr_batch_runner import TPRBatchRunner
-from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+from verl.experimental.tpr.legacy.tpr_batch_runner import TPRBatchRunner
+from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
 
 
 def _forest():

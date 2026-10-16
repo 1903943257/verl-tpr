@@ -20,7 +20,8 @@ ORDINAL_FIELDS = ("trajectory_index", "trajectory_idx", "tq_trajectory_index")
 
 
 def _column(batch, key: str, n: int, *, required: bool = False):
-    raw = tu.get(batch, key, default=None)
+    # Isolated selector tests may supply a plain dict; production uses TensorDict.
+    raw = batch.get(key) if isinstance(batch, dict) else tu.get(batch, key, default=None)
     if raw is None:
         if required:
             raise ValueError(

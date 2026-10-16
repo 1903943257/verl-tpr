@@ -23,6 +23,11 @@ from verl.models.mcore.tpr import (
     SegmentLossTerm,
     SegmentSpec,
 )
+from verl.workers.engine.megatron.tpr.state import KVStack
+from verl.experimental.tpr.legacy.state import (
+    accumulate_sharded_past_anchor_gradients,
+    build_sharded_past_anchors,
+)
 
 
 def _segment(segment_id, parent_id, length, prefix_length):
@@ -212,3 +217,41 @@ def test_prefix_state_stack_rejects_mismatched_or_released_state():
 def test_invalid_kv_prefix_state_is_rejected(state_factory, match):
     with pytest.raises(ValueError, match=match):
         state_factory()
+
+
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_rank_local_anchors_relay_branch_gradients_and_track_state_generation(cp_size):
+    stack = KVStack()
+    shard = PrefixShard.contiguous(4, cp_rank=0, cp_size=cp_size)
+    entry = stack.push(_segment(0, None, 4, 0), _kv(shard.local_length), shard=shard)
+
+    for factor in (2.0, 3.0):
+        anchors = build_sharded_past_anchors(stack)
+        assert anchors.global_prefix_length == 4
+        for key, value in anchors.entries[0].key_values.values():
+            (key * factor + value * (factor + 1)).sum().backward()
+        accumulate_sharded_past_anchor_gradients(stack, anchors)
+
+    for key_grad, value_grad in entry.kv.consume_gradients().values():
+        torch.testing.assert_close(key_grad, torch.full_like(key_grad, 5.0))
+        torch.testing.assert_close(value_grad, torch.full_like(value_grad, 7.0))
+    # The active path is unchanged, but consuming gradients invalidates leaves
+    # from its previous recomputation generation.
+    with pytest.raises(RuntimeError, match="stale"):
+        accumulate_sharded_past_anchor_gradients(stack, anchors)
+
+    fresh = build_sharded_past_anchors(stack)
+    stack.pop(0).kv.release()
+    with pytest.raises(RuntimeError, match="signature"):
+        accumulate_sharded_past_anchor_gradients(stack, fresh)
+    assert entry.kv.released
+    stack.assert_empty()
+
+
+def test_kv_stack_does_not_expose_generic_experimental_push():
+    stack = KVStack()
+    assert not hasattr(stack, "push_state")
+    generic = PrefixStateStack()
+    entry = generic.push_state(_segment(0, None, 2, 0), KVPrefixState(0, 2, _kv(2)))
+    assert generic.pop_state(0) is entry
+    generic.assert_empty()

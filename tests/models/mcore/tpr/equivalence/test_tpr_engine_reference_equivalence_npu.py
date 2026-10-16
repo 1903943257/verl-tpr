@@ -36,15 +36,14 @@ from .test_segment_push_pop_npu import (
     _install_single_rank_runtime,
     _parameter_grads,
 )
-from verl.models.mcore.tpr import (
-    TPR_REQUEST_KEY,
-    TPRForwardBackwardRequest,
-    SegmentExecutor,
+from verl.experimental.tpr.legacy.engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+from verl.experimental.tpr.legacy.plan import (
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,
-    replace_self_attention_with_tpr,
 )
+from verl.models.mcore.tpr import replace_self_attention_with_tpr
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from verl.models.mcore.tpr.megatron_adapter import _validate_tpr_parallel_sizes
+from verl.experimental.tpr.legacy.megatron_adapter import _validate_tpr_parallel_sizes
 
 
 def _sizes(*, tp=2, cp=2, dp=2, pp=1, ep=1):

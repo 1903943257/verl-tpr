@@ -5,7 +5,7 @@ import os
 import pytest
 import torch
 
-from verl.models.mcore.tpr import SegmentExecutor
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
 from ..profiling.test_tpr_qwen3_ring_cp_profile_npu import profile_runtime
 from . import _tpr_cp_test_utils as utils
 

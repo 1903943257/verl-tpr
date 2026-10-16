@@ -112,7 +112,7 @@ def test_vector_metrics_detect_opposite_direction():
 
 
 def test_10k_dp2_isolation_gate_does_not_open_production_dp(monkeypatch):
-    from verl.models.mcore.tpr.megatron_adapter import _validate_tpr_parallel_sizes
+    from verl.experimental.tpr.legacy.megatron_adapter import _validate_tpr_parallel_sizes
     sizes = {"TP":2, "CP":1, "DP":2, "PP":1, "EP":1}
     for key in (
         "TPR_EXPERIMENTAL_OFFLINE_DP2",

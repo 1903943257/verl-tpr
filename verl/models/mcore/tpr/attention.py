@@ -57,36 +57,24 @@ class TPRSelfAttention(SelfAttention):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> tuple[Tensor, Tensor | None]:
-        context = get_tpr_attention_context()
-        if context is None:
-            return super().forward(
-                hidden_states,
-                attention_mask,
-                key_value_states=key_value_states,
-                inference_context=inference_context,
-                rotary_pos_emb=rotary_pos_emb,
-                rotary_pos_cos=rotary_pos_cos,
-                rotary_pos_sin=rotary_pos_sin,
-                rotary_pos_cos_sin=rotary_pos_cos_sin,
-                attention_bias=attention_bias,
-                packed_seq_params=packed_seq_params,
-                sequence_len_offset=sequence_len_offset,
-                inference_params=inference_params,
-            )
-
-        self._validate_tree_forward(
-            context=context,
-            hidden_states=hidden_states,
+        options = dict(
             key_value_states=key_value_states,
             inference_context=inference_context,
-            inference_params=inference_params,
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
             rotary_pos_cos_sin=rotary_pos_cos_sin,
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            inference_params=inference_params,
         )
+        context = get_tpr_attention_context()
+        if context is None:
+            return super().forward(
+                hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb, **options,
+            )
+
+        self._validate_tree_forward(context=context, hidden_states=hidden_states, **options)
         return self._tree_forward(hidden_states, context)
 
     def _tree_forward(
@@ -180,15 +168,7 @@ class TPRSelfAttention(SelfAttention):
         *,
         context: TPRAttentionContext,
         hidden_states: Tensor,
-        key_value_states: Optional[Tensor],
-        inference_context: Optional[BaseInferenceContext],
-        inference_params: Optional[BaseInferenceContext],
-        rotary_pos_cos: Optional[Tensor],
-        rotary_pos_sin: Optional[Tensor],
-        rotary_pos_cos_sin: Optional[Tensor],
-        attention_bias: Optional[Tensor],
-        packed_seq_params: Optional[PackedSeqParams],
-        sequence_len_offset: Optional[int],
+        **unsupported: object,
     ) -> None:
         if not self.training:
             raise RuntimeError("TPR external-KV mode is restricted to training")
@@ -223,17 +203,6 @@ class TPRSelfAttention(SelfAttention):
             raise ValueError("TPRAttentionContext.suffix_rotary_pos_emb is required in TPR mode")
         _validate_rotary_sequence_length(context.suffix_rotary_pos_emb, context.local_suffix_length)
 
-        unsupported = {
-            "key_value_states": key_value_states,
-            "inference_context": inference_context,
-            "inference_params": inference_params,
-            "rotary_pos_cos": rotary_pos_cos,
-            "rotary_pos_sin": rotary_pos_sin,
-            "rotary_pos_cos_sin": rotary_pos_cos_sin,
-            "attention_bias": attention_bias,
-            "packed_seq_params": packed_seq_params,
-            "sequence_len_offset": sequence_len_offset,
-        }
         active = [name for name, value in unsupported.items() if value is not None]
         if active:
             raise NotImplementedError(f"TPR external-KV MVP does not support: {', '.join(active)}")

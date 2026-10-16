@@ -94,7 +94,7 @@ def six_fa_backward_clamp(
     """
     from verl.models.mcore.tpr import attention
     from verl.models.mcore.tpr.context import TPRAttentionContext
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.experimental.tpr import ring_attention as ring
 
     active = []
     handles = []
@@ -341,9 +341,9 @@ def _run_backward_path(
     cp,
     reference,
 ):
-    from verl.models.mcore.tpr.segment_executor import SegmentExecutor
-    from verl.models.mcore.tpr.prefix_state import KVPrefixAnchors
-    from verl.models.mcore.tpr.parallel.execution_context import (
+    from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+    from verl.experimental.tpr.gdn.prefix_state import KVPrefixAnchors
+    from verl.experimental.tpr.legacy.cp.execution_context import (
         ShardedPastKVAnchors,
     )
 
@@ -550,7 +550,7 @@ def _compare_forward_layers(
     runtime,
     label,
 ):
-    from verl.models.mcore.tpr.parallel.ring_attention import (
+    from verl.workers.engine.megatron.tpr.ring import (
         make_ring_sequence_shard,
     )
 

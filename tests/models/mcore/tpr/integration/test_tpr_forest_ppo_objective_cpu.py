@@ -15,9 +15,9 @@ import torch
 pytest.importorskip("tensordict")
 from tensordict import TensorDict
 
-from verl.models.mcore.tpr.objective_adapter import SegmentPPOObjectiveAdapter
-from verl.models.mcore.tpr.tpr_batch_runner import TPRBatchRunner
-from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
+from verl.experimental.tpr.legacy.objective_adapter import SegmentPPOObjectiveAdapter
+from verl.experimental.tpr.legacy.tpr_batch_runner import TPRBatchRunner
+from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.losses import ppo_loss
 

@@ -31,7 +31,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-import verl.models.mcore.tpr.parallel.ulysses_attention as ulysses
+import verl.experimental.tpr.ulysses as ulysses
 from verl.models.mcore.tpr import AllGatherCPBackend, LocalKVBlock, SequenceShard
 from verl.utils.device import is_torch_npu_available
 

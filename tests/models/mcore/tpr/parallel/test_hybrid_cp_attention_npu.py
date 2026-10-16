@@ -31,9 +31,9 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-import verl.models.mcore.tpr.parallel.hybrid_attention as hybrid
-import verl.models.mcore.tpr.parallel.ring_attention as ring
-import verl.models.mcore.tpr.parallel.ulysses_attention as ulysses
+import verl.experimental.tpr.hybrid as hybrid
+import verl.workers.engine.megatron.tpr.ring as ring
+import verl.experimental.tpr.ulysses as ulysses
 from verl.models.mcore.tpr import (
     HybridCPTopology,
     HybridLocalKVBlock,

@@ -24,7 +24,6 @@ import torch.distributed as dist
 from megatron.core import parallel_state
 
 from verl.utils import tensordict_utils as tu
-from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 
 pytestmark = pytest.mark.skipif(
@@ -80,6 +79,16 @@ def _runtime():
             expert_model_parallel_size=1,
         )
     args = get_full_args()
+    # MindSpeed repatch can inject an invalid empty-name entry under this
+    # pytest/torchrun launcher. It cannot represent a dataclass config field.
+    full_args = vars(args)
+    if "" in full_args:
+        if not isinstance(full_args[""], str):
+            raise RuntimeError("Unexpected MindSpeed empty argument value type")
+        del full_args[""]
+    malformed = [repr(key) for key in full_args if not isinstance(key, str) or not key.isidentifier()]
+    if malformed:
+        raise RuntimeError(f"Invalid MindSpeed argument names after repatch: {malformed}")
     assert args.context_parallel_algo == "megatron_cp_algo"
     tp_group = parallel_state.get_tensor_model_parallel_group()
     cp_group = parallel_state.get_context_parallel_group()
@@ -228,7 +237,7 @@ def _install_offline_full_ring_backend(mode: str) -> str:
         raise ValueError("TPR_OFFLINE_FULL_RING_BACKEND must be custom or native")
     if mode != "full" or chosen == "custom":
         return "tpr_custom_ring"
-    from verl.models.mcore.tpr.parallel import ring_attention as ring
+    from verl.experimental.tpr import ring_attention as ring
 
     def native_full_attention(query, current_key, current_value, *,
                               prefix_blocks=(), **kwargs):
@@ -279,8 +288,15 @@ def test_recorded_full_vs_tpr_one_step():
     try:
         from verl.workers.utils.losses import ppo_loss
         batch, real_keys, count, data_sha = _load_real_pair(source, rows, mode)
-        from verl.models.mcore.tpr.tree_plan_builder import build_tree_execution_plans
-        from verl.models.mcore.tpr.megatron_adapter import _trajectory_keys_from_minibatch
+        # Construct the model before importing the PPO Engine adapter.
+        model, hf = make_real_qwen3_tp_model(
+            runtime, model_path=checkpoint, tp_size=2, cp_size=4,
+            sequence_parallel=False, profile="4b",
+        )
+        from verl.workers.engine.megatron.tpr.adapter import (
+            run_tpr_forward_backward_batch, _trajectory_keys_from_minibatch,
+        )
+        from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans
         forest = build_tree_execution_plans(
             _trajectory_keys_from_minibatch(batch), batch,
             tree_policy=os.getenv("TPR_TREE_POLICY", "exact"),
@@ -292,13 +308,8 @@ def test_recorded_full_vs_tpr_one_step():
         if mode == "tpr" and os.getenv("TPR_TREE_POLICY", "exact") == "exact":
             if len(forest.trees) != 1 or forest.segment_count <= len(rows):
                 raise AssertionError("Exact TPR mode did not create expected shared tree")
-        # Turn mode is allowed to produce multiple trees if there is no valid
-        # complete-turn common prefix. Never invent shared KV for such rows.
+        # Turn mode can yield multiple trees without shared complete turns.
         ring_impl = _install_offline_full_ring_backend(mode)
-        model, hf = make_real_qwen3_tp_model(
-            runtime, model_path=checkpoint, tp_size=2, cp_size=4,
-            sequence_parallel=False, profile="4b",
-        )
         if hf.num_hidden_layers != 36:
             raise AssertionError("Not the real Qwen3-4B")
         model.config.no_sync_func = None

@@ -23,9 +23,9 @@ from .test_segment_push_pop_npu import (
     _make_model,
     _parameter_grads,
 )
-from verl.models.mcore.tpr import (
-    FixedTopologyScheduler,
-    SegmentExecutor,
+from verl.experimental.tpr.legacy.fixed_topology_scheduler import FixedTopologyScheduler
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+from verl.experimental.tpr.legacy.plan import (
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,

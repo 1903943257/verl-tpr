@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import verl.models.mcore.tpr.parallel.engine_runtime as runtime_module
+import verl.experimental.tpr.legacy.cp.engine_runtime as runtime_module
 
 
 class _Backend:

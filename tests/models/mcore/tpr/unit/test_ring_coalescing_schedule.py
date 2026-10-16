@@ -90,12 +90,12 @@ def shard(length, *, cp_rank, cp_size, padded_length=None):
 
 
 def load_dispatch():
-    source = Path(__file__).resolve().parents[5] / "verl/models/mcore/tpr/parallel/ring_attention.py"
+    source = Path(__file__).resolve().parents[5] / "verl/workers/engine/megatron/tpr/ring.py"
     wanted = {"RingBlockKind", "_RingRangeSlice", "_iter_range_slices", "_prefix_full_slices",
               "classify_ring_block", "_physical_block_attention_mask", "_RingTPRAttention",
               "_can_coalesce_prefix_query", "_slice_tnd_result", "_trace_merged_query",
               "_source_schedule"}
-    nodes = [node for node in ast.parse(source.read_text()).body
+    nodes = [node for node in ast.parse(source.read_text(encoding="utf-8")).body
              if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in wanted]
     preamble = ast.parse("from __future__ import annotations").body
     ns = dict(dataclass=dataclass, Enum=Enum,
