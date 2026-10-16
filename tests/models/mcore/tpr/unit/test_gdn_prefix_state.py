@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr import GDNLayerState, GDNPrefixState
+from verl.experimental.tpr.gdn.prefix_state import GDNLayerState, GDNPrefixState
 
 
 def _layer_state(*, value=1.0, requires_grad=False):
