@@ -1384,60 +1384,24 @@ class RingCPAttentionBackend:
         )
 
 
-def _cached_blocks(kv_stack: KVStack, layer_number: int) -> tuple[RingLocalKVBlock, ...]:
-    blocks = []
-    for segment_id in kv_stack.segment_ids:
-        state = kv_stack.get(segment_id).kv
-        blocks.append(
-            RingLocalKVBlock(
-                segment_id,
-                state.shard,
-                *state.key_values[layer_number],
-            )
-        )
-    return tuple(blocks)
-
-
-def make_cached_ring_cp_backend(
+def _prefix_blocks_by_layer(
     kv_stack: KVStack,
-    *,
+    anchors: PastKVAnchors | None,
     expected_layer_numbers: tuple[int, ...],
-    current_shard: SequenceShard,
-    cp_group: Any,
-) -> RingCPAttentionBackend:
-    return RingCPAttentionBackend(
-        global_prefix_length=kv_stack.prefix_length,
-        current_shard=current_shard,
-        prefix_blocks_by_layer={
-            layer: _cached_blocks(kv_stack, layer) for layer in expected_layer_numbers
-        },
-        cp_group=cp_group,
+) -> dict[int, tuple[RingLocalKVBlock, ...]]:
+    """Select one ordered ancestor path; preserve original or anchored KV leaves."""
+    sources = (
+        tuple((segment_id, kv_stack.get(segment_id).kv) for segment_id in kv_stack.segment_ids)
+        if anchors is None
+        else tuple((entry.segment_id, entry) for entry in anchors.entries)
     )
-
-
-def make_anchored_ring_cp_backend(
-    anchors: PastKVAnchors,
-    *,
-    expected_layer_numbers: tuple[int, ...],
-    current_shard: SequenceShard,
-    cp_group: Any,
-) -> RingCPAttentionBackend:
-    return RingCPAttentionBackend(
-        global_prefix_length=anchors.global_prefix_length,
-        current_shard=current_shard,
-        prefix_blocks_by_layer={
-            layer: tuple(
-                RingLocalKVBlock(
-                    entry.segment_id,
-                    entry.shard,
-                    *entry.key_values[layer],
-                )
-                for entry in anchors.entries
-            )
-            for layer in expected_layer_numbers
-        },
-        cp_group=cp_group,
-    )
+    return {
+        layer: tuple(
+            RingLocalKVBlock(segment_id, state.shard, *state.key_values[layer])
+            for segment_id, state in sources
+        )
+        for layer in expected_layer_numbers
+    }
 
 
 # Production CP policy: only the Prefix-aware Ring implementation is admitted.
@@ -1475,14 +1439,16 @@ class RingCPBackend:
         self, kv_stack: KVStack, *, expected_layer_numbers: tuple[int, ...],
         current_shard: SequenceShard, past_anchors: PastKVAnchors | None,
     ) -> RingCPAttentionBackend:
-        if past_anchors is None:
-            return make_cached_ring_cp_backend(
-                kv_stack, expected_layer_numbers=expected_layer_numbers,
-                current_shard=current_shard, cp_group=self._cp_group,
-            )
-        return make_anchored_ring_cp_backend(
-            past_anchors, expected_layer_numbers=expected_layer_numbers,
-            current_shard=current_shard, cp_group=self._cp_group,
+        return RingCPAttentionBackend(
+            global_prefix_length=(
+                kv_stack.prefix_length if past_anchors is None
+                else past_anchors.global_prefix_length
+            ),
+            current_shard=current_shard,
+            prefix_blocks_by_layer=_prefix_blocks_by_layer(
+                kv_stack, past_anchors, expected_layer_numbers,
+            ),
+            cp_group=self._cp_group,
         )
 
 
