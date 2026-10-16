@@ -158,3 +158,32 @@ def test_cp_loss_scaling_and_empty_rank_connected_zero(cp_size, owned):
     scaled.backward()
     expected = logits.detach() * (16 * cp_size / 13) if owned else torch.zeros_like(logits)
     torch.testing.assert_close(logits.grad, expected)
+
+
+def test_push_caches_compact_detached_kv_in_state():
+    """Push relies on KVPrefixState for storage ownership, not executor clones."""
+    model = _PrefixModel()
+    forest = build_tree_execution_plans(
+        tuple(f"sample_tpr_{row}" for row in range(5)),
+        _batch(),
+        turn_min_segment_tokens=1,
+    )
+    tree = forest.trees[0]
+    executor = SegmentExecutor(
+        model,
+        tree.segment_plan,
+        expected_layer_numbers=(1,),
+        segment_loss_fn=lambda segment, logits: (logits.sum(), {}),
+        segment_loss_term_counts={
+            segment_id: len(tree.refs_for_segment(segment_id))
+            for segment_id in tree.segment_plan.segments
+        },
+    )
+    executor.push(tree.segment_plan.root_id)
+    for key, value in executor.kv_stack.top().kv.key_values.values():
+        for tensor in (key, value):
+            assert tensor.grad_fn is None and not tensor.requires_grad
+            assert tensor.is_contiguous()
+            assert tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
+    executor.kv_stack.pop(tree.segment_plan.root_id).kv.release()
+    executor.kv_stack.assert_empty()
