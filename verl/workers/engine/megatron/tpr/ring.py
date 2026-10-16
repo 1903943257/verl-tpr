@@ -273,6 +273,7 @@ class _RingAttentionConfig:
     softmax_scale: float
     coalesce_prefix_full: bool = False
     coalesce_prefix_query: bool = False
+    coalesce_prefix_padded: bool = False
     trace_layer: int | None = None
 
 
@@ -557,6 +558,7 @@ def _normalize_inputs(
         softmax_scale=float(scale),
         coalesce_prefix_full=os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "0") == "1",
         coalesce_prefix_query=os.getenv("TPR_RING_COALESCE_PREFIX_QUERY", "0") == "1",
+        coalesce_prefix_padded=os.getenv("TPR_RING_COALESCE_PREFIX_PADDED", "0") == "1",
         trace_layer=_trace_layer if cp_rank == 0 else None,
     )
     return blocks, config
@@ -618,18 +620,27 @@ def _iter_range_slices(
     return tuple(result)
 
 
-def _prefix_full_slices(tensor, shard, *, enabled):
-    """View one fully valid source buffer as a single FULL-attention KV block.
+def _can_coalesce_prefix_kv(global_length, padded_length, config):
+    return config.coalesce_prefix_full and (
+        global_length == padded_length or config.coalesce_prefix_padded
+    )
 
-    Logical zigzag ranges are non-adjacent, but their physical storage is
-    adjacent. FULL visibility is independent of their logical positions.
-    Synthetic ranges below describe packed positions only; callers must never
-    use them for causal classification. Padded shards keep the original path.
-    The local slice also maps dK/dV directly into the original source buffer.
+
+def _prefix_full_slices(tensor, shard, *, enabled):
+    """Combine one source's Prefix Zigzag chunks without copying K/V.
+
+    For Ring's sorted two-range layout, valid local tokens precede virtual
+    right-padding. The padded opt-in uses only that valid prefix for FULL FA;
+    the returned local slice scatters dK/dV into the original physical buffer.
+    Fully padded source ranks produce no FA blocks.
     """
-    if enabled and shard.global_length == shard.padded_length:
-        length = shard.local_length
-        return (_RingRangeSlice((0, length), (0, length), slice(0, length), tensor),)
+    if enabled:
+        length = shard.valid_local_length
+        if not length:
+            return ()
+        # A zero-copy view: physical right-padding is never an attention key.
+        span = slice(0, length)
+        return (_RingRangeSlice((0, length), (0, length), span, tensor[span]),)
     return _iter_range_slices(tensor, shard)
 
 
@@ -1031,7 +1042,7 @@ def _source_schedule(query_slices, source_key, source_value, config,
         global_length, cp_rank=source_rank, cp_size=config.cp_size,
         padded_length=padded_length,
     )
-    coalesced = is_prefix and config.coalesce_prefix_full and global_length == padded_length
+    coalesced = is_prefix and _can_coalesce_prefix_kv(global_length, padded_length, config)
     key_slices = _prefix_full_slices(source_key.squeeze(1), source_shard, enabled=coalesced)
     value_slices = _prefix_full_slices(source_value.squeeze(1), source_shard, enabled=coalesced)
     for query_index, query_item in enumerate(query_slices):
@@ -1100,7 +1111,11 @@ def _emit_ring_block_stats(
         "current_padded_length": config.current_shard.padded_length,
         "kv_merge_requested": config.coalesce_prefix_full,
         "query_merge_requested": config.coalesce_prefix_query,
-        "kv_merge_eligible_segments": sum(a == b for a, b in zip(prefix_lengths, prefix_padded, strict=True)),
+        "padded_kv_merge_requested": config.coalesce_prefix_padded,
+        "kv_merge_eligible_segments": sum(
+            a == b or config.coalesce_prefix_padded
+            for a, b in zip(prefix_lengths, prefix_padded, strict=True)
+        ),
         "query_merge_eligible": query_merged,
         "fa_prefix_regular": counts["prefix_regular"],
         "fa_prefix_kv_merged": counts["prefix_kv"],
@@ -1131,8 +1146,10 @@ class _RingTPRAttention(torch.autograd.Function):
         for segment_index in range(len(config.segment_lengths)):
             is_prefix = segment_index + 1 < len(config.segment_lengths)
             merged_query = ctx.query_coalesced and is_prefix
-            kv_merged = (is_prefix and config.coalesce_prefix_full
-                         and config.segment_lengths[segment_index] == config.segment_padded_lengths[segment_index])
+            kv_merged = is_prefix and _can_coalesce_prefix_kv(
+                config.segment_lengths[segment_index],
+                config.segment_padded_lengths[segment_index], config,
+            )
             if ctx.query_coalesced and not merged_query:
                 query_results = [_slice_tnd_result(prefix_result, item.local_slice) for item in query_slices]
                 prefix_result = None
@@ -1231,8 +1248,10 @@ class _RingTPRAttention(torch.autograd.Function):
         for segment_index in range(len(config.segment_lengths)):
             is_prefix = segment_index + 1 < len(config.segment_lengths)
             merged_query = ctx.query_coalesced and is_prefix
-            kv_merged = (is_prefix and config.coalesce_prefix_full
-                         and config.segment_lengths[segment_index] == config.segment_padded_lengths[segment_index])
+            kv_merged = is_prefix and _can_coalesce_prefix_kv(
+                config.segment_lengths[segment_index],
+                config.segment_padded_lengths[segment_index], config,
+            )
 
             def consume(source_rank, key, value, key_buffer, value_buffer):
                 if merged_query:
