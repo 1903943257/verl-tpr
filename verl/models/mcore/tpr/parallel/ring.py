@@ -1148,9 +1148,7 @@ class RingCPBackend:
         return self._parallel_rank
 
     def validate_segment_length(self, global_length: int) -> None:
-        make_ring_sequence_shard(
-            global_length, cp_rank=self.parallel_rank, cp_size=self.parallel_size,
-        )
+        self.make_sequence_shard(global_length)
 
     def make_sequence_shard(self, global_length: int) -> SequenceShard:
         return make_ring_sequence_shard(
