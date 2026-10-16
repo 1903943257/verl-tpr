@@ -11,7 +11,7 @@ def _segment():
     return SegmentSpec(
         segment_id=0,
         parent_id=None,
-        token_ids=torch.tensor([2, 3, 4], dtype=torch.long),
+        token_ids=torch.tensor([2, 3, 4], dtype=torch.long, device="cpu"),
         position_start=0,
         prefix_length=0,
     )
@@ -30,7 +30,7 @@ def _executor_for_empty_loss():
 
 
 def test_empty_objective_is_scalar_connected_zero_for_all_logits():
-    logits = torch.randn(1, 3, 8, dtype=torch.float32, requires_grad=True)
+    logits = torch.randn(1, 3, 8, dtype=torch.float32, requires_grad=True, device="cpu")
     executor = _executor_for_empty_loss()
     loss = executor._compute_loss(_segment(), logits)
     backward_loss = executor._prepare_backward_loss(
@@ -47,7 +47,7 @@ def test_empty_objective_does_not_convert_whole_logits_to_float():
     # The old zero path upcast all logits to FP32, which allocates ~1.63 GiB
     # for a sufficiently large real CP4 logits shard. Verify no full-matrix
     # dtype conversion, while retaining a scalar autograd link.
-    x = torch.randn(1, 3, 16, dtype=torch.bfloat16, requires_grad=True)
+    x = torch.randn(1, 3, 16, dtype=torch.bfloat16, requires_grad=True, device="cpu")
     executor = _executor_for_empty_loss()
     # torch.autograd.profiler is broken on some torch/torch_npu binary
     # combinations. Intercept only the Python .float() boundary instead:
