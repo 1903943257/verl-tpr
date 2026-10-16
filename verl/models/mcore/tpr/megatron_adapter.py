@@ -144,9 +144,9 @@ def run_tpr_forward_backward(
     wrapped_model = engine.module[0]
     model = unwrap_model(wrapped_model)
     config = get_model_config(wrapped_model)
+    assert_tpr_full_recompute_installed(model, config)
     restrictions = {
         "calculate_per_token_loss": getattr(config, "calculate_per_token_loss", False),
-        "activation recomputation": getattr(config, "recompute_granularity", None) is not None,
         "CUDA graph": getattr(config, "cuda_graph_impl", "none") not in (None, "none"),
         "CPU offload": getattr(config, "cpu_offloading", False),
         "FP8": getattr(config, "fp8", None) is not None,
@@ -315,8 +315,8 @@ def run_tpr_forward_backward_batch(
     config = get_model_config(wrapped_model)
     if not model.training:
         raise RuntimeError("TPR PPO requires model.train()")
+    assert_tpr_full_recompute_installed(model, config)
     unsupported = {
-        "Megatron recompute": getattr(config, "recompute_granularity", None) is not None,
         "calculate_per_token_loss": getattr(config, "calculate_per_token_loss", False),
         "FP8": getattr(config, "fp8", None) not in (None, False),
         "MoE": getattr(config, "num_moe_experts", None) is not None,
