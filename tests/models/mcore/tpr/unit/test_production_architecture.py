@@ -187,31 +187,9 @@ def test_internal_relative_imports_resolve_after_relocation() -> None:
                     f"{file} has unresolved relative import: level={item.level} module={item.module}"
                 )
 
-def test_public_dense_symbols_resolve_to_canonical_engine() -> None:
-    """No exported production executor or Ring type may point to legacy copies."""
-    import ast
-
+def _model_public_exports() -> dict[str, str]:
     syntax = ast.parse((MODEL / "__init__.py").read_text(encoding="utf-8"))
-    exports = next(ast.literal_eval(node.value) for node in syntax.body if
-                   isinstance(node, ast.Assign) and
-                   any(isinstance(target, ast.Name) and target.id == "_PRODUCTION_EXPORTS" for target in node.targets))
-    engine_expected = {
-        "RingCPBackend": "ring",
-        "SegmentExecutor": "executor",
-        "PastKVAnchors": "state",
-        "KVStack": "state",
-        "SequenceShard": "ring",
-    }
-    for name, module in engine_expected.items():
-        assert exports[name] == "verl.workers.engine.megatron.tpr." + module, name
-
-
-
-def test_model_public_api_has_no_legacy_exports() -> None:
-    """The public model package exposes only canonical production TPR types."""
-    source = (MODEL / "__init__.py").read_text(encoding="utf-8")
-    syntax = ast.parse(source)
-    exports = next(
+    return next(
         ast.literal_eval(node.value)
         for node in syntax.body
         if isinstance(node, ast.Assign)
@@ -220,29 +198,31 @@ def test_model_public_api_has_no_legacy_exports() -> None:
             for target in node.targets
         )
     )
-    assert "_LEGACY_EXPORTS" not in source
-    assert "_MODULES" not in source
+
+
+def test_model_public_api_has_only_canonical_exports() -> None:
+    """Expose the production engine directly, without transitional aliases."""
+    source = (MODEL / "__init__.py").read_text(encoding="utf-8")
+    exports = _model_public_exports()
+    assert "_LEGACY_EXPORTS" not in source and "_MODULES" not in source
     assert not any(module.startswith("verl.experimental.tpr") for module in exports.values())
-    assert exports["RingCPBackend"] == "verl.workers.engine.megatron.tpr.ring"
-    assert exports["SegmentExecutor"] == "verl.workers.engine.megatron.tpr.executor"
     assert "SegmentPlan" not in exports and "SegmentSpec" not in exports
+    engine_expected = {
+        "RingCPBackend": "ring",
+        "SegmentExecutor": "executor",
+        "PastKVAnchors": "state",
+        "KVStack": "state",
+        "SequenceShard": "ring",
+    }
+    for symbol, module in engine_expected.items():
+        assert exports[symbol] == f"verl.workers.engine.megatron.tpr.{module}", symbol
 
 
 def test_historical_tests_use_explicit_experimental_imports() -> None:
     """Do not accidentally reintroduce top-level legacy aliases."""
     package_root = "verl.models.mcore.tpr"
     model_submodules = {"attention", "context", "rectangular_attention"}
-    source = (MODEL / "__init__.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    public = next(
-        ast.literal_eval(node.value)
-        for node in tree.body
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "_PRODUCTION_EXPORTS"
-            for target in node.targets
-        )
-    )
+    public = _model_public_exports()
     obsolete = []
     for root in (ROOT / "verl", ROOT / "tests/models/mcore/tpr"):
         for file in root.rglob("*.py"):
