@@ -122,7 +122,9 @@ def test_lazy_exports_resolve_to_real_modules() -> None:
         assignments = {}
         for n in syntax.body:
             if isinstance(n, ast.Assign) and len(n.targets) == 1 and isinstance(n.targets[0], ast.Name):
-                if n.targets[0].id in ("_EXPORTS", "_MODULES"):
+                if n.targets[0].id in ("_PRODUCTION_EXPORTS", "_LEGACY_EXPORTS", "_MODULES"):
+                    assignments[n.targets[0].id] = ast.literal_eval(n.value)
+                elif n.targets[0].id == "_EXPORTS" and path != MODEL / "__init__.py":
                     assignments[n.targets[0].id] = ast.literal_eval(n.value)
         for entries in assignments.values():
             for symbol, module in entries.items():
@@ -190,7 +192,7 @@ def test_public_dense_symbols_resolve_to_canonical_engine() -> None:
     syntax = ast.parse((MODEL / "__init__.py").read_text(encoding="utf-8"))
     exports = next(ast.literal_eval(node.value) for node in syntax.body if
                    isinstance(node, ast.Assign) and
-                   any(isinstance(target, ast.Name) and target.id == "_EXPORTS" for target in node.targets))
+                   any(isinstance(target, ast.Name) and target.id == "_PRODUCTION_EXPORTS" for target in node.targets))
     engine_expected = {
         "RingCPBackend": "ring",
         "SegmentExecutor": "executor",
