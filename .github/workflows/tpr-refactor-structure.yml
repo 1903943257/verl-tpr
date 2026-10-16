@@ -63,6 +63,52 @@ jobs:
             tests.models.mcore.tpr.unit.test_ring_streaming_transport \
             tests.models.mcore.tpr.unit.test_offload_b_gate \
             tests.models.mcore.tpr.unit.test_activation_offload_adapter
+      - name: Verify UID-scoped DP placement against exhaustive prefix oracle
+        run: |
+          python3 - <<'PY'
+          import importlib.util
+          import itertools
+          import sys
+          from pathlib import Path
+
+          path = Path("verl/workers/engine/megatron/tpr/placement.py")
+          spec = importlib.util.spec_from_file_location("tpr_placement_ci", path)
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+
+          cases = (
+              ([[1, 2, 3], [1, 2, 4], [1, 2, 3], [9, 8], [9, 7], [9, 8]],
+               ["A", "A", "A", "B", "B", "B"], 2),
+              ([[1, 2, 3], [1, 2, 4], [1, 2, 3], [1, 2, 3], [1, 2, 4], [1, 2, 3]],
+               ["A", "A", "A", "B", "B", "B"], 3),
+              ([[4, 5], [4, 6], [7, 8], [7, 8, 9], [2, 3], [2, 3, 4]],
+               ["A", "A", "B", "B", "C", "C"], 2),
+          )
+          for sequences, uids, dp_size in cases:
+              plan = module.plan_dta_dfs(
+                  sequences, dp_size, enforce_equal_rows=False, uid_list=uids
+              )
+              def cost(rows):
+                  return len({
+                      (uids[i], tuple(sequences[i][:j]))
+                      for i in rows
+                      for j in range(1, len(sequences[i]) + 1)
+                  })
+              assert len(plan.partitions) == dp_size
+              assert sorted(i for p in plan.partitions for i in p) == list(range(len(sequences)))
+              assert plan.tree_tokens_by_rank == tuple(cost(p) for p in plan.partitions)
+              assert plan.global_tree_tokens == cost(range(len(sequences)))
+              assert plan.duplicated_tree_tokens == sum(plan.tree_tokens_by_rank) - plan.global_tree_tokens
+              order = sorted(range(len(sequences)), key=lambda i: (uids[i], sequences[i], i))
+              optimal = min(
+                  max(cost(order[a:b]) for a, b in zip((0, *cuts), (*cuts, len(order))))
+                  for cuts in itertools.combinations(range(1, len(order)), dp_size - 1)
+              )
+              assert plan.max_tree_tokens == optimal
+              print(f"PASS UID-scoped DP{dp_size}: rows={plan.partitions} "
+                    f"global_tokens={plan.global_tree_tokens} duplicated={plan.duplicated_tree_tokens}")
+          PY
       - name: Audit legacy model imports
         run: |
           python3 - <<'PY'
