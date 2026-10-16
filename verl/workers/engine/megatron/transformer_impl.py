@@ -499,6 +499,13 @@ class MegatronEngine(BaseEngine):
             peft_config=self.model_config.get("lora", None),
         )
         self.tf_config = updated_tf_config
+        if self.engine_config.tpr_enabled:
+            from verl.models.mcore.tpr.recompute import install_tpr_full_recompute
+            from verl.utils.megatron_utils import unwrap_model
+
+            # No global MindSpeed/Megatron patch: only the TPR model instance
+            # is allowed to export KV checkpoint side outputs.
+            install_tpr_full_recompute(unwrap_model(module[0]), updated_tf_config)
         print(f"module: {len(module)}")
 
         if self.engine_config.use_dist_checkpointing:
