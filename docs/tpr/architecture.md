@@ -115,9 +115,15 @@ the Prefix KV coalescing fast path requires an unpadded Prefix. For experiments,
 `TPR_RING_COALESCE_PREFIX_FULL=1` allows the **valid** zero-copy portion of
 each source rank's padded Prefix KV to participate in one FULL FA call.
 Communication buffers remain physically padded; gradient slices map back into
-their original source buffers. Query coalescing retains its stricter
-all-Segments-unpadded requirement. Both Merge optimizations remain **off by
-default**; padded KV Merge is experimental until CP2/CP4 NPU correctness passes.
+their original source buffers. With all three flags enabled,
+`TPR_RING_COALESCE_PREFIX_QUERY=1` now merges the physical local Query for
+Prefix FULL FA even if the Current Segment is padded. The Query path masks
+virtual-Query upstream gradients and dQ; Prefix dK/dV updates only valid
+source KV slices. Ranks with an entirely padded local Query chunk fall back
+to the two-range Query schedule, and a Prefix source with no real tokens
+skips its FULL FA without changing Ring transport. Neither optimization
+changes Current causal FA. All Merge optimizations remain **off by default**
+and padded Query+KV Merge is experimental until CP2/CP4 NPU correctness passes.
 
 Set `TPR_RING_BLOCK_STATS=1` to print JSON `TPR_RING_BLOCK_STATS` records on
 CP rank zero, for the first transformer layer of each executed Segment.
@@ -144,6 +150,40 @@ ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 torchrun --master_addr=localhost --master_po
   --nproc_per_node=4 -m pytest -xvs \
   tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py \
   -k padded_prefix_full_coalescing_off_on
+```
+
+To exercise padded **joint Query+KV Merge** on a real Actor capture, set:
+
+```bash
+TPR_RING_BLOCK_STATS=1 \
+TPR_RING_COALESCE_PREFIX_FULL=1 \
+TPR_RING_COALESCE_PREFIX_PADDED=1 \
+TPR_RING_COALESCE_PREFIX_QUERY=1 \
+TPR_OFFLINE_RUN_MODES=tpr \
+TPR_TREE_POLICY=qwen_turn \
+TPR_OFFLINE_OUTPUT_DIR=/workspace/tpr_ring_qkv_padded_on \
+bash tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_offline_ppo.sh
+```
+
+For CP4 and a single Prefix with all four source ranks owning real
+KV, enabling only padded KV Merge changes a leaf's Prefix FA calls
+from 16 to 8. Adding padded Query Merge reduces them further to 4
+(total 25 -> 13 including nine unchanged Current FA calls).
+Enable `TPR_RING_BLOCK_STATS=1` to **verify the actual call counts**,
+not infer eligibility from environment variables. A low-level CPU contract
+does not establish Ascend NPU numerical parity.
+
+CP2/CP4 NPU Query+KV OFF/ON verification:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=8,9 torchrun --master_addr=localhost --master_port=29507 \
+  --nproc_per_node=2 -m pytest -xvs \
+  tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py \
+  -k padded_prefix_query_kv_coalescing_off_on
+ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 torchrun --master_addr=localhost --master_port=29508 \
+  --nproc_per_node=4 -m pytest -xvs \
+  tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py \
+  -k padded_prefix_query_kv_coalescing_off_on
 ```
 
 For the existing eight-rank captured PPO replay, enable
