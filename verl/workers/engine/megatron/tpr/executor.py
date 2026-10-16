@@ -453,7 +453,10 @@ class SegmentExecutor:
     def _compute_loss(self, segment: SegmentSpec, logits: Tensor) -> Tensor:
         """Delegate all policy math to VERL's original PPO callback."""
         if not self._owned_loss_count(segment):
-            return logits.float().sum() * 0.0
+            # Preserve a differentiable zero on ranks with no supervised tokens,
+            # without materializing FP32 [local_seq, vocab] logits. Ring CP
+            # backward still traverses the entire graph with zero dlogits.
+            return logits[0, 0, 0].float() * 0.0
         loss, metrics = self.segment_loss_fn(segment, logits)
         if not isinstance(loss, Tensor) or loss.numel() != 1 or not loss.requires_grad:
             raise TypeError("PPO objective must return a differentiable scalar Tensor")
@@ -470,7 +473,7 @@ class SegmentExecutor:
         logits: Tensor,
         has_owned_loss: bool,
     ) -> Tensor:
-        backward_loss = normalized_loss * self.cp_size if has_owned_loss else logits.float().sum() * 0.0
+        backward_loss = normalized_loss * self.cp_size if has_owned_loss else logits[0, 0, 0].float() * 0.0
         if self.loss_scale_func is not None:
             backward_loss = self.loss_scale_func(backward_loss)
         if not isinstance(backward_loss, Tensor) or backward_loss.numel() != 1:
