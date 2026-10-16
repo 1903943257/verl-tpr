@@ -13,6 +13,42 @@ This branch deliberately has no changes to main, no PR update, and no fallback t
 - CP Anchor state management lives in `kv_stack.py`, Engine CP glue in `megatron_cp.py`.
 - The whole-sequence MindSpeed native Ring oracle lives under tests, not the production CP module. Test-only AllGather oracle is used only in historical whole-FA diagnostics, not the TPR engine.
 
+## Second-pass Ring reduction (2026-10-16)
+
+Only the current `refactor/tpr-cp-ring-only-qkvmerge-20261015` branch changed;
+neither `main` nor the separate Engine/framework refactor branch is updated.
+
+- `ring.py`: **1,233 -> 1,199 lines** (source lines including comments/blanks).
+- Removed duplicate cached/anchored Ring attention factories and the cached
+  per-layer block builder. One `_prefix_blocks_by_layer` now materializes
+  either original cached Prefix K/V or gradient-connected anchor K/V, preserving
+  ancestor order and the original tensor objects.
+- Ring segment-length validation now delegates to canonical
+  `make_sequence_shard()` rather than rebuilding the same shard twice in
+  separately maintained code.
+- Added CPU contracts verifying ancestor order, multiple layers, exact cached
+  versus anchored tensor ownership and nonzero anchor leaf gradients. These
+  tests **have not been executed** in the connected GitHub-only environment.
+- Verified by exact source comparison against the branch before this pass:
+  `_normalize_inputs`, streaming Ring P2P, FULL/CAUSAL/SKIP schedule,
+  CANN FA forward/backward, FP32 online softmax, Padding masks, Q/KV merging,
+  and the core `_RingTPRAttention` are unchanged.
+
+### Remaining code is not automatically redundant
+
+The Ring file still includes the exact block trace hooks required by existing
+NPU and scheduling probes, distinct physical/logical Padding checks, the
+streaming dKV owner reduction, and a per-Segment layer binding object.
+These are deliberately retained until an actual NPU CP2/CP4 parity run;
+deleting them or rewriting the backward would make correctness harder to
+establish for a small line-count benefit.
+
+The 1,732-line Engine framework branch is **not** a comparable Ring-core size:
+it includes around 425 lines of generic SequenceShard/Padding infrastructure,
+plus CP Engine runtime and a Native Whole Ring reference. Our branch holds
+those outside the single production Ring Attention file. Neither layout
+represents a second production Ring implementation.
+
 ## Follow-up numerical acceptance (NOT yet run on NPU in this branch)
 
 1. CPU ring-only configuration/padding and streaming/coalescing dispatch:
