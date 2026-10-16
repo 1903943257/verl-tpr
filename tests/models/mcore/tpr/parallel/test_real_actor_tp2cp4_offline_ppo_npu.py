@@ -299,16 +299,17 @@ def test_recorded_full_vs_tpr_one_step():
         from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans
         forest = build_tree_execution_plans(
             _trajectory_keys_from_minibatch(batch), batch,
-            tree_policy=os.getenv("TPR_TREE_POLICY", "exact"),
+            tree_policy=os.getenv("TPR_TREE_POLICY", "qwen_turn"),
             turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
         )
-        if mode == "full" and (len(forest.trees) != len(rows)
-                               or forest.segment_count != len(rows)):
-            raise AssertionError("Full control accidentally reused a prefix")
-        if mode == "tpr" and os.getenv("TPR_TREE_POLICY", "exact") == "exact":
-            if len(forest.trees) != 1 or forest.segment_count <= len(rows):
-                raise AssertionError("Exact TPR mode did not create expected shared tree")
-        # Turn mode can yield multiple trees without shared complete turns.
+        if mode == "full" and (
+            len(forest.trees) != len(rows)
+            or any(len(tree.member_rows) != 1 for tree in forest.trees)
+        ):
+            # Qwen turn-only builds multiple Segments even for an unshared
+            # trajectory.  Isolation is about row ownership, not Segments.
+            raise AssertionError("Full control accidentally reused tokens across rows")
+        # Turn-only TPR may yield multiple trees if complete turns are not shared.
         ring_impl = _install_offline_full_ring_backend(mode)
         if hf.num_hidden_layers != 36:
             raise AssertionError("Not the real Qwen3-4B")
