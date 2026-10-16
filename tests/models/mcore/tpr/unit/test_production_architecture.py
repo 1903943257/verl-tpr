@@ -51,6 +51,7 @@ def test_turn_tree_is_only_production_builder() -> None:
     assert "class _TrieNode" not in source
     assert "def build_trajectory_trees(" not in source
     assert "class SegmentObjectiveRef" in source
+    assert "def tree(self)" not in source
 
 
 def test_ppo_executor_no_legacy_ce_gdn_paths() -> None:
@@ -90,6 +91,7 @@ def test_engine_owns_shard_tree_state() -> None:
     assert not eager_state_imports
     assert "class KVPrefixState:" in state
     assert "class KVStack:" in state
+    assert "sequence_length = global_length" not in state
     assert "class PrefixStateStack:" not in state
     assert "class ShardedPastKVAnchors" not in state
     assert "GDNPrefixState" not in state
