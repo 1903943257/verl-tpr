@@ -26,11 +26,8 @@ from verl.experimental.tpr.legacy.plan import (
     SegmentPlan,
     SegmentSpec,
 )
-from verl.models.mcore.tpr import (
-    RangeSequenceShard,
-    TPRAttentionContext,
-    get_tpr_attention_context,
-)
+from verl.experimental.tpr.shard import RangeSequenceShard
+from verl.models.mcore.tpr import TPRAttentionContext, get_tpr_attention_context
 
 
 class _FakeGroup:
