@@ -33,7 +33,7 @@ class _FakeLayer(nn.Module):
         super().__init__()
         self.layer_number = layer_number
         self.self_attention = _FakeAttention()
-        self.scale = nn.Parameter(torch.tensor(0.7 + layer_number * 0.1))
+        self.scale = nn.Parameter(torch.tensor(0.7 + layer_number * 0.1, device="cpu"))
         self.observed_contexts = []
 
     def forward(self, *, hidden_states, **kwargs):
@@ -94,14 +94,14 @@ def _run(*, adapted: bool, monkeypatch):
         assert recompute.install_tpr_full_recompute(blocks, blocks[0].config) == 2
         recompute.assert_tpr_full_recompute_installed(blocks, blocks[0].config)
 
-    prefix = torch.randn(4, 1, 1, 8, requires_grad=True)
+    prefix = torch.randn(4, 1, 1, 8, requires_grad=True, device="cpu")
     ctx = TPRAttentionContext(
         prefix_length=4,
         suffix_length=4,
         past_key_values={i: (prefix, prefix) for i in (1, 2)},
-        suffix_rotary_pos_emb=torch.zeros(4, 1, 1, 8),
+        suffix_rotary_pos_emb=torch.zeros(4, 1, 1, 8, device="cpu"),
     )
-    x = torch.randn(4, 1, 8, requires_grad=True)
+    x = torch.randn(4, 1, 8, requires_grad=True, device="cpu")
     with use_tpr_attention_context(ctx):
         h = x
         for b in blocks:
@@ -140,14 +140,14 @@ def test_push_under_no_grad_exports_graph_free_kv(monkeypatch):
     monkeypatch.setattr(recompute, "TPRSelfAttention", _FakeAttention)
     block = _FakeBlock(_FakeLayer(1))
     recompute.install_tpr_full_recompute(block, block.config)
-    prefix = torch.zeros(4, 1, 1, 8)
+    prefix = torch.zeros(4, 1, 1, 8, device="cpu")
     ctx = TPRAttentionContext(
         prefix_length=4, suffix_length=4,
         past_key_values={1: (prefix, prefix)},
-        suffix_rotary_pos_emb=torch.zeros(4, 1, 1, 8),
+        suffix_rotary_pos_emb=torch.zeros(4, 1, 1, 8, device="cpu"),
     )
     with torch.no_grad(), use_tpr_attention_context(ctx):
-        block(torch.ones(4, 1, 8))
+        block(torch.ones(4, 1, 8, device="cpu"))
     assert set(ctx.new_key_values) == {1}
     assert not ctx.new_key_values[1][0].requires_grad
 
@@ -160,3 +160,41 @@ def test_unsupported_recompute_is_rejected():
 
     with pytest.raises(NotImplementedError, match="full/uniform/1"):
         recompute.validate_tpr_recompute_config(Config())
+
+
+def test_checkpoint_run_function_does_not_capture_outer_context(monkeypatch):
+    """Prevent ctx -> run_function -> outer -> checkpoint KV -> ctx cycles."""
+    monkeypatch.setattr(recompute, "TPRSelfAttention", _FakeAttention)
+    checkpoint_functions = []
+
+    def record_checkpoint(fn, _distributed, *args):
+        checkpoint_functions.append(fn)
+        return checkpoint(fn, *args, use_reentrant=True)
+
+    monkeypatch.setattr(recompute.tensor_parallel, "checkpoint", record_checkpoint)
+    block = _FakeBlock(_FakeLayer(1))
+    assert recompute.install_tpr_full_recompute(block, block.config) == 1
+
+    prefix = torch.randn(4, 1, 1, 8, device="cpu", requires_grad=True)
+    context = TPRAttentionContext(
+        prefix_length=4,
+        suffix_length=4,
+        past_key_values={1: (prefix, prefix)},
+        suffix_rotary_pos_emb=torch.zeros(4, 1, 1, 8, device="cpu"),
+    )
+    x = torch.randn(4, 1, 8, device="cpu", requires_grad=True)
+    with use_tpr_attention_context(context):
+        output = block(x)
+    assert checkpoint_functions
+    for fn in checkpoint_functions:
+        # Megatron's CheckpointFunction holds fn until backward. It must not
+        # hold the outer context strongly because it owns returned KV tensors.
+        assert "outer" not in fn.__code__.co_freevars
+        assert "outer_ref" in fn.__code__.co_freevars
+    roots = [output.sum()]
+    grad_tensors = [None]
+    for k, v in context.new_key_values.values():
+        roots.extend((k, v))
+        grad_tensors.extend((torch.ones_like(k), torch.ones_like(v)))
+    torch.autograd.backward(roots, grad_tensors=grad_tensors)
+    assert x.grad is not None and prefix.grad is not None
