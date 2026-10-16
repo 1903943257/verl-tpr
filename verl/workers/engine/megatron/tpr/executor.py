@@ -316,9 +316,9 @@ class SegmentExecutor:
             )
             del logits
             self._assert_collected_layers(context)
-            cached_key_values = _compact_kv_cache(context.new_key_values)
-            del context
-            self.kv_stack.push(segment, cached_key_values, shard=self._segment_shard(segment))
+            # KVPrefixState is the single owner of cache normalization and
+            # compact storage; avoid cloning each KV twice across boundaries.
+            self.kv_stack.push(segment, context.new_key_values, shard=self._segment_shard(segment))
 
     def pop(self, segment_id: SegmentId) -> Tensor:
         """Recompute current KV and relay gradients from descendant Segments."""
@@ -500,17 +500,6 @@ class SegmentExecutor:
     def _assert_collected_layers(self, context: TPRAttentionContext) -> None:
         context.assert_new_kv_layers(self.expected_layer_numbers)
 
-
-def _compact_kv_cache(key_values: Mapping[int, KVPair]) -> dict[int, KVPair]:
-    """Copy no-grad KV views into compact, independently owned storage."""
-
-    return {
-        layer_number: (
-            key.detach().clone(memory_format=torch.contiguous_format),
-            value.detach().clone(memory_format=torch.contiguous_format),
-        )
-        for layer_number, (key, value) in key_values.items()
-    }
 
 
 def _model_device(model: nn.Module) -> torch.device:
