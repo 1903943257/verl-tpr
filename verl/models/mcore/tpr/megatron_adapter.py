@@ -29,6 +29,7 @@ from .fixed_topology_scheduler import FixedTopologyScheduler
 from .module_spec import install_tpr_vanilla_mbridge_spec, make_tpr_module_spec_provider
 from .parallel.engine_runtime import aggregate_cp_loss, resolve_engine_cp_runtime
 from .segment_executor import SegmentExecutor
+from .recompute import assert_tpr_full_recompute_installed
 
 if TYPE_CHECKING:
     from verl.workers.engine.megatron.transformer_impl import MegatronEngine
