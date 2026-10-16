@@ -153,6 +153,22 @@ class TPRAttentionContext:
     def local_suffix_length(self) -> int:
         return self.suffix_length if self.attention_backend is None else self.attention_backend.local_suffix_length
 
+    def new_collector(self) -> TPRAttentionContext:
+        """Reuse immutable Prefix inputs but isolate checkpoint replay's KV writes.
+
+        External past KV / Ring backend may carry differentiable ancestor anchors:
+        do not clone or detach them. Only per-call side-output dictionaries reset.
+        """
+        return TPRAttentionContext(
+            prefix_length=self.prefix_length,
+            suffix_length=self.suffix_length,
+            past_key_values=self.past_key_values,
+            suffix_rotary_pos_emb=self.suffix_rotary_pos_emb,
+            attention_backend=self.attention_backend,
+            initial_gdn_states=self.initial_gdn_states,
+            capture_gdn_final_state=self.capture_gdn_final_state,
+        )
+
     @property
     def new_key_values(self) -> Mapping[int, KVPair]:
         return MappingProxyType(self._new_key_values)
