@@ -1,5 +1,7 @@
 # TPR 本地审计修复（2026-10-16）
 
+Last updated: 10/16/2026.
+
 基线：PR #7 `0de0542d84b9f2a655ec62530c32c63311ea91a2`。
 本地开发分支：`fix/tpr-audit-20261016`；提交目标为现有 PR #7。
 不直接更新远端 main，PR 保持 Draft，等待人工审阅与服务器验收。
@@ -40,6 +42,9 @@ git diff --check
 执行结果：隔离 CPU 回归 **470 passed, 1 skipped**；独立 unittest **32 passed, 1 skipped**；
 286 个 Python 文件语法检查、15 项独立架构检查和两份 replay shell 语法检查通过。
 对应提交的 GitHub CI 状态以 PR Checks 为准；本地验证不代表 GitHub CI 已通过。
+提交 `93e2368e` 的 [TPR GitHub Actions](https://github.com/1903943257/verl-tpr/actions/runs/38900850183)
+随后在 Linux / TensorDict `0.10.0` 上完成 **471 passed**，包含真实双进程 Gloo 测试；
+结构检查也通过。这仍不覆盖 NPU/HCCL。
 
 隔离 runner 只跳过 Ray/Engine 包初始化，并提供未安装的 Megatron 接口桩；
 实际 TPR、PyTorch autograd、TensorDict 和 loss 对照均是真实执行。

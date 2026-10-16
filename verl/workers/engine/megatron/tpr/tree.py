@@ -369,9 +369,11 @@ def assert_tp_plan_agreement(digest: str, *, tp_size: int, cp_size: int = 1) -> 
     # HCCL AllGather supports int64, so store SHA256 as eight int64 words
     # (each word is a non-negative 32-bit unsigned value).
     words = [int(digest[i:i + 8], 16) for i in range(0, 64, 8)]
-    backend = dist.get_backend(group)
-    device = (torch.device("npu", torch.npu.current_device()) if backend == "hccl" else
-              torch.device("cuda", torch.cuda.current_device()) if backend == "nccl" else torch.device("cpu"))
+    device = torch.device("cpu")
+    if dist.get_backend(group) != "gloo":
+        from verl.utils.device import get_device_id, get_device_name
+
+        device = torch.device(get_device_name(), get_device_id())
     local = torch.tensor(words, dtype=torch.int64, device=device)
     signatures = [torch.empty_like(local) for _ in range(size)]
     dist.all_gather(signatures, local, group=group)
