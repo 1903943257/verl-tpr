@@ -82,9 +82,10 @@ The offline TP2xCP4 wrapper automatically sets `TPR_TREE_POLICY=qwen_turn`
 and writes `offline_tp2cp4_tpr.log`, `offline_tp2cp4_full.log`, and the
 comparison log there. `TPR_OFFLINE_OUTPUT_DIR` still controls captured tensors
 and comparison artifacts, not the console log location. The offline script is
-**a non-recompute TPR baseline**: its model factory sets
-`model.config.recompute_granularity = None` and does not install the
-recompute adapter. Do not use its PASS as a recompute correctness claim.
+**OFF by default**: with `TPR_OFFLINE_RECOMPUTE=0`, it sets
+`model.config.recompute_granularity = None`. With `=1`, it installs
+the KV-aware checkpoint adapter and selects Full Uniform(1). A PASS from
+the old OFF baseline is not a recompute correctness claim.
 
 ```bash
 mkdir -p /workspace/tpr_log/recompute
