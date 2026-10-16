@@ -156,7 +156,15 @@ def test_optional_cp_factories_are_experimental() -> None:
 
 def test_context_is_thin_and_has_no_eager_engine_imports() -> None:
     source = (MODEL / "context.py").read_text(encoding="utf-8")
-    assert len(source.splitlines()) <= 230
+    # Guard responsibilities rather than formatting/line count: the shared
+    # compact-storage helper is needed before each Push layer releases QKV.
+    definitions = {node.name for node in ast.parse(source).body
+                   if isinstance(node, (ast.ClassDef, ast.FunctionDef))}
+    assert definitions == {
+        "TPRAttentionBackend", "TPRAttentionContext", "_compact_kv_tensor",
+        "_validate_layer_number", "_validate_kv_pair", "_assert_layers",
+        "_validate_gdn_layer_state", "get_tpr_attention_context", "use_tpr_attention_context",
+    }
     assert "class TPRAttentionContext:" in source
     assert "def use_tpr_attention_context(" in source
     assert "def get_past_kv(" in source

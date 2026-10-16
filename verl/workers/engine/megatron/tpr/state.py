@@ -25,6 +25,7 @@ import torch
 from torch import Tensor
 
 from verl.models.mcore.tpr.context import KVPair
+from verl.models.mcore.tpr.context import _compact_kv_tensor as _compact_graph_free_tensor
 
 from .ring import SequenceShard
 from .tree import SegmentId, SegmentSpec, _validate_segment_id
@@ -35,15 +36,6 @@ _generations = count()
 def _validate_layer_number(layer_number: int) -> None:
     if not isinstance(layer_number, int) or isinstance(layer_number, bool) or layer_number <= 0:
         raise ValueError(f"layer_number must be a positive integer, got {layer_number!r}")
-
-
-def _compact_graph_free_tensor(tensor: Tensor) -> Tensor:
-    if (
-        tensor.is_contiguous() and tensor.storage_offset() == 0
-        and tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
-    ):
-        return tensor
-    return tensor.clone(memory_format=torch.contiguous_format)
 
 
 def _normalize_local_kv(key_values: Mapping[int, KVPair], *, local_length: int) -> dict[int, KVPair]:
@@ -195,16 +187,36 @@ class KVPrefixState:
             for buffer, gradient in zip(self._gradients[layer_number], gradients, strict=True):
                 buffer.add_(gradient.detach())
 
-    def accumulate_anchor_gradients(self, anchors: KVPrefixAnchors) -> None:
+    def accumulate_anchor_gradients(self, anchors: KVPrefixAnchors, *, consume: bool = False) -> None:
+        """Accumulate dKV, optionally taking ownership of executor-only grads."""
         self._ensure_live()
         if (anchors.segment_id, anchors.shard, anchors.generation) != (self.segment_id, self.shard, self._generation):
             raise RuntimeError(f"KV prefix anchors for segment {anchors.segment_id} are stale")
         if tuple(anchors.key_values) != self.layer_numbers:
             raise RuntimeError(f"KV prefix anchor layers must be {self.layer_numbers}")
+        owned_storage = {
+            (tensor.device, tensor.untyped_storage().data_ptr())
+            for mapping in (self._key_values, self._gradients)
+            for pair in mapping.values() for tensor in pair
+        } if consume else set()
         for layer, (key, value) in anchors.key_values.items():
             if key.grad is None or value.grad is None:
                 raise RuntimeError(f"layer {layer} KV prefix anchor gradient is missing")
-            self.accumulate_layer_gradients(layer, key.grad, value.grad)
+            if consume and layer not in self._gradients:
+                buffers = []
+                for gradient in (key.grad, value.grad):
+                    buffer = _compact_graph_free_tensor(gradient.detach())
+                    # Custom backward functions may reuse a buffer for K/V or
+                    # multiple layers. Future accumulation needs separate owners.
+                    if (buffer.device, buffer.untyped_storage().data_ptr()) in owned_storage:
+                        buffer = buffer.clone(memory_format=torch.contiguous_format)
+                    owned_storage.add((buffer.device, buffer.untyped_storage().data_ptr()))
+                    buffers.append(buffer)
+                self._gradients[layer] = tuple(buffers)
+            else:
+                self.accumulate_layer_gradients(layer, key.grad, value.grad)
+            if consume:
+                key.grad = value.grad = None
 
     def consume_gradients(self) -> Mapping[int, KVPair]:
         self._ensure_live()
@@ -299,13 +311,13 @@ class KVStack:
     def build_past_anchors(self) -> PastKVAnchors:
         return PastKVAnchors(tuple(entry.kv.make_anchors() for entry in self._entries.values()), self.segment_ids)
 
-    def accumulate_anchor_gradients(self, anchors: PastKVAnchors) -> None:
+    def accumulate_anchor_gradients(self, anchors: PastKVAnchors, *, consume: bool = False) -> None:
         if anchors.stack_signature != self.segment_ids:
             raise RuntimeError("stale Prefix anchor stack signature")
         if tuple(entry.segment_id for entry in anchors.entries) != self.segment_ids:
             raise RuntimeError("Prefix anchor entries do not match stack signature")
         for entry in anchors.entries:
-            self.get(entry.segment_id).kv.accumulate_anchor_gradients(entry)
+            self.get(entry.segment_id).kv.accumulate_anchor_gradients(entry, consume=consume)
 
     def get_new_kv_gradients(self, segment_id: SegmentId) -> Mapping[int, KVPair]:
         return self.get(segment_id).gradients

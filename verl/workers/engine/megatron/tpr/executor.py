@@ -203,6 +203,7 @@ class SegmentExecutor:
             raise TypeError(f"plan must be SegmentPlan, got {type(plan).__name__}")
         if not hasattr(model, "rotary_pos_emb") or not callable(model.rotary_pos_emb):
             raise TypeError("model must expose a callable rotary_pos_emb")
+        _assert_deterministic_replay(model)
         if expected_layer_numbers is None:
             expected_layer_numbers = _infer_layer_numbers(model)
         expected_layer_numbers = tuple(expected_layer_numbers)
@@ -275,6 +276,7 @@ class SegmentExecutor:
         """Execute each branch, then replay its ancestors in postorder."""
         if self._ran:
             raise RuntimeError("SegmentExecutor.run is single-use")
+        _assert_deterministic_replay(self.model)
         self._ran = True
         losses = []
         with self._operation():
@@ -388,18 +390,22 @@ class SegmentExecutor:
         count = self._owned_loss_count(segment)
         roots, gradients = [], []
         # Empty CP objectives must still traverse Attention's collectives.
-        # Leaves always backpropagate, while a CP1 Pop may relay dKV alone.
+        # Frozen current KV, however, has no graph to relay through.
         if leaf or count or self.cp_enabled:
-            roots.append(self._prepare_backward_loss(
+            loss_root = self._prepare_backward_loss(
                 normalized_loss, logits=logits, has_owned_loss=count > 0,
-            ))
-            gradients.append(None)
+            )
+            if loss_root.requires_grad:
+                roots.append(loss_root)
+                gradients.append(None)
         for layer, gradient in relayed_gradients.items():
-            roots.extend(context.new_key_values[layer])
-            gradients.extend(gradient)
+            for root, grad in zip(context.new_key_values[layer], gradient, strict=True):
+                if root.requires_grad:
+                    roots.append(root)
+                    gradients.append(grad)
         if roots:
             torch.autograd.backward(roots, grad_tensors=gradients)
-            self.kv_stack.accumulate_anchor_gradients(anchors)
+            self.kv_stack.accumulate_anchor_gradients(anchors, consume=True)
         return normalized_loss.detach()
 
     def _forward(
@@ -438,6 +444,7 @@ class SegmentExecutor:
                 disable_context_parallel_sharding=self.cp_enabled,
             ),
             attention_backend=attention_backend,
+            compact_new_kv=no_grad,
         )
         rope_context = (
             disable_bound_context_parallel_sharding(self.model.rotary_pos_emb)
@@ -457,7 +464,7 @@ class SegmentExecutor:
     def _compute_loss(self, segment: SegmentSpec, logits: Tensor) -> Tensor:
         """Delegate all policy math to VERL's original PPO callback."""
         if not self._owned_loss_count(segment):
-            return logits.float().sum() * 0.0
+            return _connected_zero(logits)
         loss, metrics = self.segment_loss_fn(segment, logits)
         if not isinstance(loss, Tensor) or loss.numel() != 1 or not loss.requires_grad:
             raise TypeError("PPO objective must return a differentiable scalar Tensor")
@@ -474,7 +481,7 @@ class SegmentExecutor:
         logits: Tensor,
         has_owned_loss: bool,
     ) -> Tensor:
-        backward_loss = normalized_loss * self.cp_size if has_owned_loss else logits.float().sum() * 0.0
+        backward_loss = normalized_loss * self.cp_size if has_owned_loss else _connected_zero(logits)
         if self.loss_scale_func is not None:
             backward_loss = self.loss_scale_func(backward_loss)
         if not isinstance(backward_loss, Tensor) or backward_loss.numel() != 1:
@@ -511,6 +518,24 @@ def _model_device(model: nn.Module) -> torch.device:
         return next(model.parameters()).device
     except StopIteration as exc:
         raise ValueError("model must contain at least one parameter") from exc
+
+
+def _connected_zero(logits: Tensor) -> Tensor:
+    # A zero-width view keeps the entire logits graph reachable (including CP
+    # collectives), without casting/reducing the vocabulary or reading NaNs.
+    return logits[..., :0].sum()
+
+
+def _assert_deterministic_replay(model: nn.Module) -> None:
+    """Push and Pop must see the same KV; RNG replay is not implemented."""
+    for module in model.modules():
+        config = getattr(module, "config", None)
+        for name in ("hidden_dropout", "embedding_dropout", "attention_dropout"):
+            value = getattr(config, name, 0.0)
+            if value is not None and float(value) != 0.0:
+                raise ValueError(f"TPR replay requires {name}=0; stochastic Push/Pop is unsupported")
+        if isinstance(module, nn.modules.dropout._DropoutNd) and module.training and module.p != 0:
+            raise ValueError("TPR replay requires training Dropout p=0; stochastic Push/Pop is unsupported")
 
 
 def _infer_layer_numbers(model: nn.Module) -> tuple[int, ...]:

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from enum import Enum
 from types import SimpleNamespace
 
 import pytest
@@ -367,3 +368,60 @@ def test_tp2_sp_requires_qkv_allgather():
     context = TPRAttentionContext(0, 4, suffix_rotary_pos_emb=torch.zeros(4, 1, 1, 8))
     with use_tpr_attention_context(context), pytest.raises(ValueError, match="restore the full"):
         attn(torch.empty(2, 1, 32), attention_mask=None)
+
+
+@pytest.mark.parametrize(
+    ("owner", "name", "value", "match"),
+    [
+        ("config", "window_size", (4096, 0), "window_size"),
+        ("config", "softmax_type", "off-by-one", "softmax_type"),
+        ("config", "softmax_type", "learnable", "softmax_type"),
+        ("attention", "attention_type", "cross", "self-attention"),
+        ("attention", "attn_mask_type", "no_mask", "causal attention"),
+        ("attention", "attn_mask_type", "padding", "causal attention"),
+        ("attention", "attn_mask_type", "arbitrary", "causal attention"),
+    ],
+)
+def test_tree_mode_rejects_semantics_the_custom_kernel_would_ignore(owner, name, value, match):
+    attention = _StubTPRSelfAttention(None, None, None)
+    setattr(attention.config if owner == "config" else attention, name, value)
+    context = TPRAttentionContext(0, 3, suffix_rotary_pos_emb=torch.zeros(3, 1, 1, 8))
+    with use_tpr_attention_context(context), pytest.raises(NotImplementedError, match=match):
+        attention(torch.empty(3, 1, 32), attention_mask=None)
+
+
+def test_tree_mode_rejects_an_explicit_attention_mask_instead_of_ignoring_it():
+    attention = _StubTPRSelfAttention(None, None, None)
+    context = TPRAttentionContext(0, 3, suffix_rotary_pos_emb=torch.zeros(3, 1, 1, 8))
+    with use_tpr_attention_context(context), pytest.raises(NotImplementedError, match="attention_mask"):
+        attention(torch.empty(3, 1, 32), attention_mask=torch.zeros(3, 3, dtype=torch.bool))
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+@pytest.mark.parametrize("name", ["pse", "softmax_offset"])
+def test_tree_mode_rejects_bias_or_sink_parameters_on_bypassed_core_attention(name, wrapped):
+    attention = _StubTPRSelfAttention(None, None, None)
+    setattr(attention.core_attention, name, torch.zeros(4))
+    if wrapped:
+        attention.core_attention = SimpleNamespace(local_attn=attention.core_attention)
+    context = TPRAttentionContext(0, 3, suffix_rotary_pos_emb=torch.zeros(3, 1, 1, 8))
+    with use_tpr_attention_context(context), pytest.raises(NotImplementedError, match=name):
+        attention(torch.empty(3, 1, 32), attention_mask=None)
+
+
+def test_tree_mode_accepts_megatron_causal_mask_enums():
+    mask_type = Enum("AttnMaskType", {"causal": 2})
+    attention = _StubTPRSelfAttention(None, None, None)
+    attention.attn_mask_type = mask_type.causal
+    context = TPRAttentionContext(0, 3, suffix_rotary_pos_emb=torch.zeros(3, 1, 1, 8))
+    attention._validate_tree_forward(context=context, hidden_states=torch.empty(3, 1, 32))
+
+
+def test_native_path_preserves_unsupported_tree_configuration(monkeypatch):
+    sentinel = (object(), None)
+    monkeypatch.setattr(SelfAttention, "forward", lambda self, *args, **kwargs: sentinel)
+    attention = _StubTPRSelfAttention(None, None, None)
+    attention.config.window_size = (4096, 0)
+    attention.config.softmax_type = "learnable"
+    attention.attn_mask_type = "no_mask"
+    assert attention(torch.empty(3, 1, 32), attention_mask=None) is sentinel

@@ -74,7 +74,9 @@ class TPRSelfAttention(SelfAttention):
                 hidden_states, attention_mask, rotary_pos_emb=rotary_pos_emb, **options,
             )
 
-        self._validate_tree_forward(context=context, hidden_states=hidden_states, **options)
+        self._validate_tree_forward(
+            context=context, hidden_states=hidden_states, attention_mask=attention_mask, **options,
+        )
         return self._tree_forward(hidden_states, context)
 
     def _tree_forward(
@@ -154,8 +156,8 @@ class TPRSelfAttention(SelfAttention):
             )
 
         trace("AFTER_ATTENTION")
-        # Collect post-RoPE K and raw V without detach/clone, preserving the
-        # graph both for descendants and for gradients into an external prefix.
+        # Pop retains post-RoPE K/raw V graphs. Push compacts graph-free views
+        # now, so later layers do not keep this layer's full QKV storage alive.
         context.set_new_kv(self.layer_number, new_key, new_value)
         if gate is not None:
             core_attn_out = self._apply_output_gate(core_attn_out, gate)
@@ -218,6 +220,21 @@ class TPRSelfAttention(SelfAttention):
         enabled = [name for name, value in boolean_restrictions.items() if value]
         if enabled:
             raise NotImplementedError(f"TPR external-KV MVP does not support: {', '.join(enabled)}")
+
+        if getattr(self, "attention_type", "self") != "self":
+            raise NotImplementedError("TPR external-KV mode requires self-attention")
+        mask_type = getattr(self, "attn_mask_type", "causal")
+        mask_name = getattr(mask_type, "name", mask_type)
+        if mask_name not in ("causal", "causal_bottom_right"):
+            raise NotImplementedError(f"TPR external-KV mode requires causal attention, got {mask_type!r}")
+        if getattr(self.config, "window_size", None) is not None:
+            raise NotImplementedError("TPR external-KV mode does not support window_size (sliding-window attention)")
+        if getattr(self.config, "softmax_type", "vanilla") != "vanilla":
+            raise NotImplementedError("TPR external-KV mode requires softmax_type='vanilla'; sink softmax is unsupported")
+        core_attention = getattr(self.core_attention, "local_attn", self.core_attention)
+        for name in ("softmax_offset", "pse"):
+            if getattr(core_attention, name, None) is not None:
+                raise NotImplementedError(f"TPR external-KV mode does not support core-attention {name}")
 
         if float(getattr(self.config, "attention_dropout", 0.0)) != 0.0:
             raise ValueError("TPR external-KV MVP requires attention_dropout=0")
