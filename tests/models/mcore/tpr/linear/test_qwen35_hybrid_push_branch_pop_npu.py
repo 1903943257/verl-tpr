@@ -216,7 +216,10 @@ def _native_reference(model, plan, device, *, tpr_context=False, probe=None):
         positions = torch.arange(tokens.numel(), device=device).unsqueeze(0)
         context_manager = nullcontext()
         if tpr_context:
-            from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
+            from verl.models.mcore.tpr.context import (
+                TPRAttentionContext,
+                use_tpr_attention_context,
+            )
             from verl.workers.engine.megatron.tpr.executor import build_suffix_rotary_pos_emb
 
             context = TPRAttentionContext(
@@ -359,7 +362,10 @@ def _no_cp_probe(monkeypatch):
 def _run_engine(model, plan, monkeypatch):
     from tensordict import TensorDict
     from verl.utils import tensordict_utils as tu
-    from verl.experimental.tpr.legacy.engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
+    from verl.experimental.tpr.legacy.engine_adapter import (
+        TPR_REQUEST_KEY,
+        TPRForwardBackwardRequest,
+    )
     from verl.experimental.tpr.legacy import megatron_adapter
     from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
 
