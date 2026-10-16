@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import sys
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -402,3 +404,65 @@ def test_prepared_ring_layout_rejects_cross_layer_shard_mismatch(monkeypatch):
             prefix_blocks_by_layer={1: (block(regular),), 2: (block(padded),)},
             cp_group=group,
         )
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize("length", [1, 7, 17, 127])
+def test_padded_prefix_kv_merge_uses_zero_copy_valid_view(cp_size, length):
+    """Local valid Zigzag tokens precede virtual tail-padding on every source rank."""
+    full = torch.arange(length, dtype=torch.float32)
+    for rank in range(cp_size):
+        shard = make_ring_sequence_shard(length, cp_rank=rank, cp_size=cp_size)
+        local = shard.select(full).detach().requires_grad_()
+        chunks = ring._prefix_full_slices(local, shard, enabled=True)
+        valid = shard.valid_local_length
+        if valid == 0:
+            assert chunks == ()
+            continue
+        assert len(chunks) == 1
+        block = chunks[0]
+        assert block.logical_range == block.physical_range == (0, valid)
+        assert block.local_slice == slice(0, valid)
+        assert block.tensor.untyped_storage().data_ptr() == local.untyped_storage().data_ptr()
+        torch.testing.assert_close(block.tensor, local[:valid], rtol=0, atol=0)
+        # No Padding K/V position gets an attention gradient.
+        grad = torch.autograd.grad(block.tensor.sum(), local)[0]
+        torch.testing.assert_close(grad[:valid], torch.ones_like(grad[:valid]))
+        torch.testing.assert_close(grad[valid:], torch.zeros_like(grad[valid:]))
+
+
+def test_padded_prefix_merge_requires_both_explicit_flags():
+    cfg = SimpleNamespace(coalesce_prefix_full=True, coalesce_prefix_padded=False)
+    assert ring._can_coalesce_prefix_kv(128, 128, cfg)
+    assert not ring._can_coalesce_prefix_kv(127, 128, cfg)
+    cfg.coalesce_prefix_padded = True
+    assert ring._can_coalesce_prefix_kv(127, 128, cfg)
+    cfg.coalesce_prefix_full = False
+    assert not ring._can_coalesce_prefix_kv(127, 128, cfg)
+
+
+def test_ring_block_stats_report_effective_fa_counts(capsys):
+    current_shard = make_ring_sequence_shard(64, cp_rank=0, cp_size=2)
+    cfg = ring._RingAttentionConfig(
+        cp_group=None, global_ranks=(0, 1), cp_size=2, cp_rank=0,
+        segment_lengths=(127, 64), segment_padded_lengths=(128, 64),
+        current_shard=current_shard, query_heads=4, head_dim=8,
+        softmax_scale=8**-0.5, coalesce_prefix_full=True,
+        coalesce_prefix_padded=True, trace_layer=1,
+    )
+    ring._emit_ring_block_stats(
+        cfg, Counter(prefix_kv=4, current=5), phase="forward", query_merged=False,
+    )
+    line = capsys.readouterr().out.strip()
+    assert line.startswith("TPR_RING_BLOCK_STATS ")
+    report = json.loads(line.removeprefix("TPR_RING_BLOCK_STATS "))
+    assert report["prefix_lengths"] == [127]
+    assert report["prefix_padded_lengths"] == [128]
+    assert report["kv_merge_requested"] is True
+    assert report["padded_kv_merge_requested"] is True
+    assert report["query_merge_eligible"] is False
+    assert report["fa_prefix_unmerged_reference"] == 8
+    assert report["fa_prefix_kv_merged"] == 4
+    assert report["fa_current"] == 5
+    assert report["fa_total"] == 9
+    assert report["fa_prefix_calls_saved"] == 4
