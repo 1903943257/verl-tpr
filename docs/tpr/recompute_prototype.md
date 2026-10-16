@@ -99,3 +99,50 @@ TPR_RUN_KV_CHECKPOINT_REPLAY=1 torchrun --nproc_per_node=1 \
   tests/models/mcore/tpr/correctness/test_tpr_kv_checkpoint_replay_npu.py \
   2>&1 | tee /workspace/tpr_log/recompute/npu_checkpoint_contract.log
 ```
+
+## Real actor Qwen3-4B TP2×CP4 OFF/ON toggle
+
+The existing eight-NPU offline actor PPO launcher supports
+`TPR_OFFLINE_RECOMPUTE=0` (default) or `1` for **TPR mode**.
+ON configures `full/uniform/1`, calls
+`install_tpr_full_recompute(model, model.config)` on the real Qwen model,
+and verifies that every TransformerBlock shares the configured model state
+and is patched. The saved rank snapshots include recompute mode and patch
+count. The OFF control remains the same TPR source capture and tree policy.
+
+The two runs must have different `TPR_OFFLINE_OUTPUT_DIR` values because
+snapshots intentionally fail on existing output files. Console logs always
+go to `/workspace/tpr_log/recompute/`.
+
+```bash
+cd /workspace/verl-tpr-recompute
+mkdir -p /workspace/tpr_log/recompute
+set -o pipefail
+export TPR_OFFLINE_RUN_MODES=tpr
+export TPR_OFFLINE_ROWS=4,6
+export TPR_TREE_POLICY=qwen_turn
+
+TPR_OFFLINE_RECOMPUTE=0 \
+TPR_OFFLINE_OUTPUT_DIR=/workspace/tpr_recompute_off_v1 \
+bash tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_offline_ppo.sh \
+  2>&1 | tee /workspace/tpr_log/recompute/off_wrapper.log
+
+TPR_OFFLINE_RECOMPUTE=1 \
+TPR_OFFLINE_OUTPUT_DIR=/workspace/tpr_recompute_on_v1 \
+bash tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_offline_ppo.sh \
+  2>&1 | tee /workspace/tpr_log/recompute/on_wrapper.log
+
+python tests/models/mcore/tpr/parallel/compare_tpr_recompute_off_on.py \
+  /workspace/tpr_recompute_off_v1 /workspace/tpr_recompute_on_v1 \
+  2>&1 | tee /workspace/tpr_log/recompute/off_on_compare.log
+```
+
+For a **full** parameter-gradient test, set `TPR_OFFLINE_SAVE_FULL_GRADS=1`
+for **both** runs and include `--require-full-grads` in the comparison
+command. The existing baseline replay without that flag contains gradient
+samples and an exact scalar global norm, but not complete tensors.
+
+The default runner uses `TPR_OFFLINE_RECOMPUTE=0`; the ON path has **not**
+yet passed the NPU/Ring backward gate. The first ON execution is a gate for
+adapter compatibility, HCCL replay, prefix gradient correctness and peak
+memory. A result from the existing OFF baseline is not a recompute result.
