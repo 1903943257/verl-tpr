@@ -170,3 +170,49 @@ def test_tpr_dp_key_contract():
         plan_tpr_dta_dp([[1], [1]], ["a_b_0", "a_b_0"], 1)
     with pytest.raises(ValueError, match="trajectory key"):
         plan_tpr_dta_dp([[1]], ["invalid"], 1)
+
+
+@pytest.mark.parametrize(
+    "sequences,uids,dp_size",
+    [
+        (
+            [[1, 2, 3], [1, 2, 4], [1, 2, 3], [9, 8], [9, 7], [9, 8]],
+            ["A", "A", "A", "B", "B", "B"],
+            2,
+        ),
+        (
+            [[1, 2, 3], [1, 2, 4], [1, 2, 3], [1, 2, 3], [1, 2, 4], [1, 2, 3]],
+            ["A", "A", "A", "B", "B", "B"],
+            3,
+        ),
+        (
+            [[4, 5], [4, 6], [7, 8], [7, 8, 9], [2, 3], [2, 3, 4]],
+            ["A", "A", "B", "B", "C", "C"],
+            2,
+        ),
+    ],
+)
+def test_tpr_uid_dp_minimax_matches_independent_prefix_oracle(sequences, uids, dp_size):
+    """Verify UID-isolated DFS minimax and duplication without using the planner's cost helper."""
+    keys = [f"{uid}_rollout_{row}" for row, uid in enumerate(uids)]
+    plan = plan_tpr_dta_dp(sequences, keys, dp_size, enforce_equal_rows=False)
+    _assert_exact_coverage(plan, len(sequences), dp_size)
+
+    def actual_unique_prefixes(rows):
+        return len({
+            (uids[row], tuple(sequences[row][:stop]))
+            for row in rows
+            for stop in range(1, len(sequences[row]) + 1)
+        })
+
+    assert plan.global_tree_tokens == actual_unique_prefixes(range(len(sequences)))
+    assert plan.tree_tokens_by_rank == tuple(actual_unique_prefixes(part) for part in plan.partitions)
+    assert plan.duplicated_tree_tokens == sum(plan.tree_tokens_by_rank) - plan.global_tree_tokens
+
+    order = sorted(range(len(sequences)), key=lambda row: (uids[row], sequences[row], row))
+    candidates = (
+        max(actual_unique_prefixes(order[a:b])
+            for a, b in zip((0, *cuts), (*cuts, len(order)), strict=True))
+        for cuts in combinations(range(1, len(order)), dp_size - 1)
+    )
+    assert plan.max_tree_tokens == min(candidates)
