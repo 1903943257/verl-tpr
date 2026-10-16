@@ -135,11 +135,6 @@ class TreeExecutionPlan:
     def key(self) -> str:
         return f"{self.uid}:{self.tree_index}"
 
-    @property
-    def tree(self) -> TreeExecutionPlan:
-        """Metadata alias for callers formerly reading a separate topology."""
-        return self
-
     def refs_for_segment(self, segment_id: int) -> tuple[SegmentObjectiveRef, ...]:
         self.segment_plan.get(segment_id)
         return tuple(ref for ref in self.objective_refs if ref.segment_id == segment_id)
