@@ -505,3 +505,84 @@ and after GC. **A CPU syntax/functional PASS alone does not validate
 NPU memory stabilization.** If the repeated NPU run passes with flat
 live memory, next rerun with both `TPR_BENCH_MEM_AUDIT=0` and
 `TPR_RECOMPUTE_REF_AUDIT=0` to obtain fair timing.
+
+## 2026-10-16: 40K 8-Session leak fixed, stable TPR checkpoint replay
+
+User-reported TP2×CP4 8-trajectory 40K Step 6 fixed-shape replay
+after the checkpoint closure fix (commit `fad3506`) and dataclass
+weak-reference slot fix (`41bdd46`).
+
+**Recompute ON TPR, 1 warmup + 3 measured repetitions:**
+
+| Iteration | Critical fwd/bwd seconds | Peak allocated GiB | Live allocated before GC GiB | Live allocated after GC GiB | Weakly live checkpoint closures/contexts |
+| --- | ---: | ---: | ---: | ---: | --- |
+| warmup 0 | 32.374836 | 14.862 | 7.621 | 7.621 | 0 / 0 |
+| 1 | 29.944529 | 14.865 | 7.620 | 7.620 | 0 / 0 |
+| 2 | 29.913969 | 14.865 | 7.620 | 7.620 | 0 / 0 |
+| 3 | 29.772104 | 14.865 | 7.620 | 7.620 | 0 / 0 |
+
+Median TPR ON **29.913969 seconds**. PPO loss unchanged at
+`0.0999025851`; SHA prefix `81c1375b1e575e5b`.
+Saved file:
+`/workspace/tpr_recompute_fixed40k_step6_weakref_v2/step6_tpr_recompute_on_fixed_shape.json`.
+
+**Comparable 40K Step 6 reference data** (same input SHA, model,
+mesh, PPO data, 1 warmup + 3 measured):
+
+| Mode | Recompute | Median seconds | Peak allocated GiB | PPO loss |
+| --- | --- | ---: | ---: | ---: |
+| Native Megatron Full | OFF | 23.137812 | 43.616 | 0.0998954326 |
+| TPR | OFF | 21.802193 | 31.173 | 0.0999025851 |
+| Native Megatron Full | ON | 32.829754 | 13.746 | 0.0998954326 |
+| TPR | ON + GC/weakref diagnostics | 29.913969 | 14.865 | 0.0999025851 |
+
+With recompute OFF, Full/TPR median runtime ratio is **1.06126×**.
+With recompute ON, the ratio is **1.09747×** (TPR takes **8.88% less
+time**), but the ON TPR result uses diagnostic GC between measured
+iterations: it is provisional until audited-off steady-state re-run.
+ON TPR memory is **1.119 GiB higher** than Native Full ON; versus TPR
+OFF, TPR ON saves about **52.31%** peak allocated. Native Full ON versus
+Full OFF saves about **68.48%**.
+
+**Leak conclusion:** prior diagnostic grew from live allocations
+21.134 → 34.650 → 48.165 GiB after each iteration (~13.516
+GiB per iteration), unaffected by `gc.collect()`, and OOMed.
+Following the weak-reference change to the Checkpoint run function,
+live memory remains **7.620 GiB** and peak **14.865 GiB** across all
+three measured iterations, with no live checkpoint closures or
+attention contexts according to the opt-in weak-reference counters.
+This strongly corroborates the strong-outer-context closure cycle as
+root cause; no extra Python GC is needed to reduce live allocations.
+This is a server-reported experimental result, not a locally rerun NPU test.
+
+**Final confirmation without diagnostic side effects**, fresh output
+folder; do not overwrite earlier snapshots:
+
+```bash
+cd /workspace/verl-tpr-recompute
+mkdir -p /workspace/tpr_log/recompute
+export TPR_OFFLINE_CAPTURE_MANIFEST=/workspace/tpr_offline_run5_first8_40k_v1/capture_manifest.json
+export TPR_BENCH_SOURCE_STEP=6
+export TPR_BENCH_OUTPUT_DIR=/workspace/tpr_recompute_fixed40k_step6_final_v1
+export TPR_RUN_FIXED_SHAPE_40K_BENCH=1
+export TPR_BENCH_RECOMPUTE=1
+export TPR_BENCH_MEM_AUDIT=0
+export TPR_RECOMPUTE_REF_AUDIT=0
+export TPR_BENCH_WARMUPS=1
+export TPR_BENCH_REPEATS=3
+export TPR_BENCH_CAPTURE_LOGPROBS=1
+export TPR_TREE_POLICY=qwen_turn
+export TPR_EXEC_PROFILE=0
+export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
+unset TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS
+set -o pipefail
+TPR_OFFLINE_MODE=tpr torchrun --nproc_per_node=8 \
+  --master_addr=127.0.0.1 --master_port=29795 \
+  -m pytest -s -x \
+  tests/models/mcore/tpr/parallel/test_tpr_fixed_shape_40k_benchmark_npu.py \
+  2>&1 | tee /workspace/tpr_log/recompute/step6_tpr_recompute_final.log
+```
+
+After stabilization in no-audit mode, verify Full/TPR logprob
+alignment and full parameter-gradient parity separately; small scalar
+PPO loss differences do not establish training-gradient equivalence.
