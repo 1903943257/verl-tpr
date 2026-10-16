@@ -241,12 +241,13 @@ def test_historical_tests_use_explicit_experimental_imports() -> None:
             for target in node.targets
         )
     )
+    obsolete = []
     for root in (ROOT / "verl", ROOT / "tests/models/mcore/tpr"):
         for file in root.rglob("*.py"):
             tree = ast.parse(file.read_text(encoding="utf-8"), filename=str(file))
             for node in ast.walk(tree):
                 if isinstance(node, ast.ImportFrom) and node.module == package_root:
                     for symbol in node.names:
-                        assert symbol.name in public or symbol.name in model_submodules, (
-                            f"{file} imports obsolete top-level TPR symbol {symbol.name}"
-                        )
+                        if symbol.name not in public and symbol.name not in model_submodules:
+                            obsolete.append(f"{file}: {symbol.name}")
+    assert not obsolete, "Obsolete TPR model imports:\\n" + "\\n".join(sorted(obsolete))
