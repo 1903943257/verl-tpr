@@ -147,3 +147,40 @@ The default runner uses `TPR_OFFLINE_RECOMPUTE=0`; the ON path has **not**
 yet passed the NPU/Ring backward gate. The first ON execution is a gate for
 adapter compatibility, HCCL replay, prefix gradient correctness and peak
 memory. A result from the existing OFF baseline is not a recompute result.
+
+## 2026-10-16: first TP2×RingCP4 real Actor PPO ON/OFF replay
+
+**User-reported server run** (not independently repeated from the connector).
+Captured rows `(4, 6)`, 4,616 PPO tokens, Qwen3-4B (36 layers);
+eight ranks TP2×CP4; same initial sampled parameter weights.
+OFF: `/workspace/tpr_recompute_baseline_v2`.
+ON: `/workspace/tpr_recompute_on_v1`.
+The ON snapshots confirm `enabled=True, granularity=full, method=uniform,
+num_layers=1, installed_blocks=1`; all eight NPU ranks passed.
+
+| Statistic | OFF | ON |
+| --- | ---: | ---: |
+| PPO loss | -1.7545651197433472 | -1.7545651197433472 |
+| Logprob relative L2 / max_abs | 0 / 0 | 0 / 0 |
+| Global BF16 gradient norm | 8.456138610839844 | 8.454642295837402 |
+| Critical forward+backward (s) | 7.447827 | 8.577214 |
+| Worst peak allocated (GiB) | 27.231803 | 14.538741 |
+| Worst peak reserved (GiB) | 30.148438 | 16.574219 |
+
+The ON result saves **12.693 GiB (46.61%) peak allocated** and
+**13.574 GiB (45.02%) peak reserved**, at the cost of **1.129s
+(15.16%)** longer critical forward+backward. Global BF16 gradient norm
+relative gap is about **0.01770%**, but **sampled parameter gradient
+relative L2 = 0.015527614 (1.55%)**. Post-SGD sampled weight L2 is
+zero, which is not a sufficient gradient-parity witness for BF16
+small-learning-rate updates.
+
+**Gate still pending:** `complete_grad=None`. The observed losses
+and logprobs are exactly equal, but full BF16 gradient relative L2,
+cosine, top tensor contributors and ancestor prefix-anchor gradient
+parity have not been independently established. Run OFF and ON with
+`TPR_OFFLINE_SAVE_FULL_GRADS=1` and compare using
+`compare_tpr_recompute_off_on.py --require-full-grads`. All console
+logs must remain under `/workspace/tpr_log/recompute/`.
+
+No changes should be made to `main` on the basis of this single replay.
