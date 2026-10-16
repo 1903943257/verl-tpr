@@ -17,20 +17,20 @@ from verl.workers.engine.megatron.tpr.tree import (
 
 
 def _records(forest):
-    """Compare the actual schedule, tokens and refs, without type identity."""
-    return [
-        (
-            getattr(tree, "tree", tree).uid, getattr(tree, "tree", tree).tree_index,
-            getattr(tree, "tree", tree).member_rows,
+    """Compare the same physical schedule and refs across legacy and production."""
+    result = []
+    for item in forest.trees:
+        # Only the reference builder still exposes the obsolete .tree alias.
+        tree = getattr(item, "tree", item)
+        result.append((
+            tree.uid, tree.tree_index, tree.member_rows,
             [(segment.segment_id, segment.parent_id, segment.position_start,
               segment.prefix_length, segment.token_ids.tolist())
-             for segment in tree.segment_plan.segments.values()],
+             for segment in item.segment_plan.segments.values()],
             [(ref.segment_id, ref.query_offset, ref.target_token_id,
-              ref.sample_row, ref.response_offset) for ref in tree.objective_refs],
-        )
-        for tree in forest.trees
-    ]
-
+              ref.sample_row, ref.response_offset) for ref in item.objective_refs],
+        ))
+    return result
 
 @pytest.mark.parametrize("seed", range(48))
 @pytest.mark.parametrize("with_prompts", (False, True))
