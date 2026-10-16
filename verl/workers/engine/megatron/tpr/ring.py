@@ -23,8 +23,10 @@ schedule and gradient routing.
 
 from __future__ import annotations
 
+import json
 import math
 import os
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -271,6 +273,7 @@ class _RingAttentionConfig:
     softmax_scale: float
     coalesce_prefix_full: bool = False
     coalesce_prefix_query: bool = False
+    trace_layer: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,6 +481,7 @@ def _normalize_inputs(
     cp_group: Any,
     softmax_scale: float | None,
     _layout: _RingStaticLayout | None = None,
+    _trace_layer: int | None = None,
 ) -> tuple[tuple[RingLocalKVBlock, ...], _RingAttentionConfig]:
     if _layout is None:
         cp_size, cp_rank = _group_world_size_and_rank(cp_group)
@@ -553,6 +557,7 @@ def _normalize_inputs(
         softmax_scale=float(scale),
         coalesce_prefix_full=os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "0") == "1",
         coalesce_prefix_query=os.getenv("TPR_RING_COALESCE_PREFIX_QUERY", "0") == "1",
+        trace_layer=_trace_layer if cp_rank == 0 else None,
     )
     return blocks, config
 
@@ -1057,6 +1062,57 @@ def _source_schedule(query_slices, source_key, source_value, config,
                 yield query_index, query_item, key_item, value_item, block_kind
 
 
+def _emit_ring_block_stats(
+    config: _RingAttentionConfig,
+    counts: Counter[str],
+    *,
+    phase: str,
+    query_merged: bool,
+) -> None:
+    """Untimed, first-layer-per-Segment summary of actual FA calls.
+
+    Reference calls use the same valid Zigzag ranges as the unmerged path.
+    No NPU synchronization or extra tensor storage is introduced.
+    """
+    if config.trace_layer is None:
+        return
+    prefix_lengths = config.segment_lengths[:-1]
+    prefix_padded = config.segment_padded_lengths[:-1]
+    query_chunks = len(config.current_shard.global_ranges)
+    baseline_prefix = sum(
+        query_chunks * sum(
+            len(make_ring_sequence_shard(
+                length, cp_rank=source, cp_size=config.cp_size,
+                padded_length=padded,
+            ).global_ranges)
+            for source in range(config.cp_size)
+        )
+        for length, padded in zip(prefix_lengths, prefix_padded, strict=True)
+    )
+    executed_prefix = sum(counts[name] for name in ("prefix_regular", "prefix_kv", "prefix_query"))
+    report = {
+        "phase": phase,
+        "cp_rank": config.cp_rank,
+        "layer": config.trace_layer,
+        "prefix_lengths": prefix_lengths,
+        "prefix_padded_lengths": prefix_padded,
+        "current_length": config.current_shard.global_length,
+        "current_padded_length": config.current_shard.padded_length,
+        "kv_merge_requested": config.coalesce_prefix_full,
+        "query_merge_requested": config.coalesce_prefix_query,
+        "kv_merge_eligible_segments": sum(a == b for a, b in zip(prefix_lengths, prefix_padded, strict=True)),
+        "query_merge_eligible": query_merged,
+        "fa_prefix_regular": counts["prefix_regular"],
+        "fa_prefix_kv_merged": counts["prefix_kv"],
+        "fa_prefix_query_merged": counts["prefix_query"],
+        "fa_current": counts["current"],
+        "fa_total": executed_prefix + counts["current"],
+        "fa_prefix_unmerged_reference": baseline_prefix,
+        "fa_prefix_calls_saved": baseline_prefix - executed_prefix,
+    }
+    print("TPR_RING_BLOCK_STATS " + json.dumps(report, sort_keys=True), flush=True)
+
+
 class _RingTPRAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query: Tensor, *tensor_args: Any) -> Tensor:
@@ -1067,12 +1123,16 @@ class _RingTPRAttention(torch.autograd.Function):
         if len(local_kv) != 2 * len(config.segment_lengths):
             raise RuntimeError("Ring attention K/V argument count does not match Segment metadata")
         ctx.query_coalesced = _can_coalesce_prefix_query(query, config)
+        stats = Counter() if config.trace_layer is not None else None
         query_tnd = query.squeeze(1).contiguous()
         query_slices = _iter_range_slices(query_tnd, config.current_shard)
         query_results = [None] * len(query_slices)
         prefix_result = None
         for segment_index in range(len(config.segment_lengths)):
-            merged_query = ctx.query_coalesced and segment_index + 1 < len(config.segment_lengths)
+            is_prefix = segment_index + 1 < len(config.segment_lengths)
+            merged_query = ctx.query_coalesced and is_prefix
+            kv_merged = (is_prefix and config.coalesce_prefix_full
+                         and config.segment_lengths[segment_index] == config.segment_padded_lengths[segment_index])
             if ctx.query_coalesced and not merged_query:
                 query_results = [_slice_tnd_result(prefix_result, item.local_slice) for item in query_slices]
                 prefix_result = None
@@ -1087,6 +1147,8 @@ class _RingTPRAttention(torch.autograd.Function):
                         block_kind=RingBlockKind.FULL, attention_mask=None,
                     )
                     prefix_result = _merge_attention(prefix_result, current, query_length=query_tnd.shape[0])
+                    if stats is not None:
+                        stats["prefix_query"] += 1
                     return
                 for index, q_item, k_item, v_item, kind in _source_schedule(
                     query_slices, key, value, config, segment_index, source_rank, "forward"
@@ -1100,8 +1162,12 @@ class _RingTPRAttention(torch.autograd.Function):
                     query_results[index] = _merge_attention(
                         query_results[index], current, query_length=q_item.physical_length,
                     )
+                    if stats is not None:
+                        stats["current" if not is_prefix else "prefix_kv" if kv_merged else "prefix_regular"] += 1
 
             _circulate_kv(local_kv[2 * segment_index], local_kv[2 * segment_index + 1], config, consume)
+        if stats is not None:
+            _emit_ring_block_stats(config, stats, phase="forward", query_merged=ctx.query_coalesced)
         if any(result is None for result in query_results):
             raise RuntimeError("query range has no visible KV block")
         query_results = [_finalize_attention_result(result, dtype=query.dtype) for result in query_results]
@@ -1161,8 +1227,12 @@ class _RingTPRAttention(torch.autograd.Function):
                     or q_item.local_slice != g_item.local_slice):
                 raise RuntimeError("Ring query/gradient physical slices differ")
         local_gradients = []
+        stats = Counter() if config.trace_layer is not None else None
         for segment_index in range(len(config.segment_lengths)):
-            merged_query = ctx.query_coalesced and segment_index + 1 < len(config.segment_lengths)
+            is_prefix = segment_index + 1 < len(config.segment_lengths)
+            merged_query = ctx.query_coalesced and is_prefix
+            kv_merged = (is_prefix and config.coalesce_prefix_full
+                         and config.segment_lengths[segment_index] == config.segment_padded_lengths[segment_index])
 
             def consume(source_rank, key, value, key_buffer, value_buffer):
                 if merged_query:
@@ -1177,6 +1247,8 @@ class _RingTPRAttention(torch.autograd.Function):
                     query_gradient.add_(dq)
                     key_buffer.add_(dk.unsqueeze(1))
                     value_buffer.add_(dv.unsqueeze(1))
+                    if stats is not None:
+                        stats["prefix_query"] += 1
                     return
                 for index, q_item, k_item, v_item, kind in _source_schedule(
                     query_slices, key, value, config, segment_index, source_rank, "backward"
@@ -1200,11 +1272,15 @@ class _RingTPRAttention(torch.autograd.Function):
                     query_gradient[q_item.local_slice].add_(dq)
                     key_buffer[k_item.local_slice].add_(dk.unsqueeze(1))
                     value_buffer[k_item.local_slice].add_(dv.unsqueeze(1))
+                    if stats is not None:
+                        stats["current" if not is_prefix else "prefix_kv" if kv_merged else "prefix_regular"] += 1
 
             gradients = _reduce_ring_gradients_to_owner(
                 local_kv[2 * segment_index], local_kv[2 * segment_index + 1], config, consume,
             )
             local_gradients.extend(gradients)
+        if stats is not None:
+            _emit_ring_block_stats(config, stats, phase="backward", query_merged=ctx.query_coalesced)
         return (query_gradient.unsqueeze(1), *local_gradients, None)
 
 
@@ -1277,6 +1353,7 @@ def ring_cp_attention(
     cp_group: Any,
     softmax_scale: float | None = None,
     _layout: _RingStaticLayout | None = None,
+    _trace_layer: int | None = None,
 ) -> Tensor:
     """Run blockwise TPR attention over MindSpeed causal Ring shards."""
 
@@ -1289,6 +1366,7 @@ def ring_cp_attention(
         cp_group=cp_group,
         softmax_scale=softmax_scale,
         _layout=_layout,
+        _trace_layer=_trace_layer,
     )
     flat_kv = []
     for block in blocks:
@@ -1342,6 +1420,7 @@ class RingCPAttentionBackend:
         self._prefix_blocks_by_layer = MappingProxyType(normalized)
         self._cp_group = cp_group
         self._parallel_size = layout.cp_size
+        self._first_layer = min(normalized)
 
     @property
     def global_prefix_length(self) -> int:
@@ -1381,6 +1460,10 @@ class RingCPAttentionBackend:
             cp_group=self._cp_group,
             softmax_scale=softmax_scale,
             _layout=self._ring_layout,
+            _trace_layer=(
+                layer_number if os.getenv("TPR_RING_BLOCK_STATS", "0") == "1"
+                and layer_number == self._first_layer else None
+            ),
         )
 
 
