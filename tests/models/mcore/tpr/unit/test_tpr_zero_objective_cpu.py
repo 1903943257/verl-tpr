@@ -48,7 +48,7 @@ def test_empty_objective_does_not_convert_whole_logits_to_float():
     # dtype conversion, while retaining a scalar autograd link.
     x = torch.randn(1, 3, 16, dtype=torch.bfloat16, requires_grad=True)
     executor = _executor_for_empty_loss()
-    with torch.autograd.profiler.profile(use_cpu=True) as profile:
+    with torch.autograd.profiler.profile(use_cpu=True, record_shapes=True) as profile:
         loss = executor._compute_loss(_segment(), x)
         backward_loss = executor._prepare_backward_loss(
             loss, logits=x, has_owned_loss=False
