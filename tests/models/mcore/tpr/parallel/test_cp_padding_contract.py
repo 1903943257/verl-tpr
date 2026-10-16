@@ -15,7 +15,12 @@
 import torch
 
 from verl.experimental.tpr.legacy.cp.backend import AllGatherCPBackend
-from verl.models.mcore.tpr import KVPrefixState, iter_valid_sequence_slices, make_ring_sequence_shard, round_up_sequence_length
+from verl.models.mcore.tpr import (
+    KVPrefixState,
+    iter_valid_sequence_slices,
+    make_ring_sequence_shard,
+    round_up_sequence_length,
+)
 from verl.experimental.tpr.shard import PaddedSequenceShard
 from verl.experimental.tpr.hybrid import make_hybrid_sequence_shard
 
