@@ -25,12 +25,8 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from verl.workers.engine.megatron.tpr.ring import (
-    PrefixShard,
-    SequenceShard,
-    iter_valid_sequence_slices,
-    physical_sequence_shard,
-)
+from verl.workers.engine.megatron.tpr.ring import SequenceShard, iter_valid_sequence_slices
+from verl.experimental.tpr.shard import PrefixShard, physical_sequence_shard
 from verl.models.mcore.tpr.rectangular_attention import rectangular_causal_attention
 
 

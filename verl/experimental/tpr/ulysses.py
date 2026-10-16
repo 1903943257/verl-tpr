@@ -25,7 +25,8 @@ from torch import Tensor
 
 from verl.workers.engine.megatron.tpr.state import KVStack
 from verl.models.mcore.tpr.rectangular_attention import rectangular_causal_attention
-from verl.workers.engine.megatron.tpr.ring import PrefixShard, SequenceShard, physical_sequence_shard
+from verl.workers.engine.megatron.tpr.ring import SequenceShard
+from verl.experimental.tpr.shard import PrefixShard, physical_sequence_shard
 from .allgather import (
     LocalKVBlock,
     _group_world_size_and_rank,

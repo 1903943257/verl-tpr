@@ -6,7 +6,7 @@ from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
 import verl.workers.engine.megatron.tpr.ring as ring
-from verl.models.mcore.tpr import SegmentExecutor
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
 
 
 @contextmanager

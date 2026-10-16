@@ -40,7 +40,11 @@ def runtime():
 
 
 def _plans(n, p, s):
-    from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec, SegmentLossTerm
+    from verl.experimental.tpr.legacy.plan import (
+        SegmentPlan,
+        SegmentSpec,
+        SegmentLossTerm,
+    )
 
     gen = torch.Generator().manual_seed(450001 + p * 101 + s)
     prefix = torch.randint(1, baseline.VOCAB_SIZE, (p,), generator=gen)

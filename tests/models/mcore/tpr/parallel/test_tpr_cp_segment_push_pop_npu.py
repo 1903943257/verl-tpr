@@ -26,11 +26,8 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from verl.models.mcore.tpr import (
-    FixedTopologyScheduler,
-    PhysicalExecutionKind,
-    SegmentExecutor,
-)
+from verl.experimental.tpr.legacy.fixed_topology_scheduler import FixedTopologyScheduler, PhysicalExecutionKind
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
 from verl.utils.device import is_torch_npu_available
 
 from ._tpr_cp_test_utils import (

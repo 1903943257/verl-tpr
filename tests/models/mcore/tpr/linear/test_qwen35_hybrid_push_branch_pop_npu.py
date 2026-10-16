@@ -71,7 +71,11 @@ def runtime():
 
 
 def _plan(length=64, *, owned=True, offload_tokens=False):
-    from verl.workers.engine.megatron.tpr.tree import SegmentLossTerm, SegmentPlan, SegmentSpec
+    from verl.experimental.tpr.legacy.plan import (
+        SegmentLossTerm,
+        SegmentPlan,
+        SegmentSpec,
+    )
 
     tokens = [(torch.arange(length) * step + start) % VOCAB_SIZE
               for step, start in ((17, 23), (19, 101), (23, 307))]

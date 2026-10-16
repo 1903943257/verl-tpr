@@ -12,7 +12,7 @@ import torch
 from torch import Tensor
 
 from verl.workers.engine.megatron.tpr.tree import SegmentId
-from verl.workers.engine.megatron.tpr.state import (
+from verl.experimental.tpr.legacy.state import (
     PrefixState,
     KVPrefixAnchors,
     KVPrefixState,

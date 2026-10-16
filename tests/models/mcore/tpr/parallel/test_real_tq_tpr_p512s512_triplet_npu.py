@@ -103,7 +103,7 @@ def _run_one_node_tpr(model, tokens):
     *same* physical GEMM M. There is only a root leaf and no cached KV relay.
     """
     from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
-    from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
+    from verl.experimental.tpr.legacy.plan import SegmentPlan, SegmentSpec
     from verl.models.mcore.tpr.attention import TPRSelfAttention
 
     root = SegmentSpec(
@@ -151,7 +151,7 @@ def _run_one_node_tpr(model, tokens):
 
 def _run_two_node_tpr(model, tokens):
     from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
-    from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
+    from verl.experimental.tpr.legacy.plan import SegmentPlan, SegmentSpec
     from verl.models.mcore.tpr.attention import TPRSelfAttention
 
     # Real Prefix/Suffix boundaries. This is a *chain*, not a synthetic

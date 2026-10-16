@@ -272,7 +272,7 @@ def _full(model, siblings, kind, clip, *, backwards):
 
 def _tpr(model, siblings, kind, clip):
     from verl.models.mcore.tpr.attention import TPRSelfAttention
-    from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
+    from verl.experimental.tpr.legacy.plan import SegmentPlan, SegmentSpec
     from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
     from verl.experimental.tpr.gdn.prefix_state import KVPrefixState
 

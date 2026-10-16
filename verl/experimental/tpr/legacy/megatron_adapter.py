@@ -173,7 +173,8 @@ def run_tpr_forward_backward(
     )
     scheduler = FixedTopologyScheduler(request.plan, executor, events=request.events)
     if tp_size > 1:
-        from verl.workers.engine.megatron.tpr.tree import assert_tp_plan_agreement, digest_segment_plan
+        from verl.workers.engine.megatron.tpr.tree import assert_tp_plan_agreement
+        from .plan import digest_segment_plan
 
         assert_tp_plan_agreement(
             digest_segment_plan(request.plan, scheduler.events), tp_size=tp_size
@@ -364,7 +365,8 @@ def run_tpr_forward_backward_batch(
         stage_ms["tree_build_cpu_ms"] = (time.perf_counter()-profile_origin)*1000
     tp_check_start = time.perf_counter()
     if tp_size > 1:
-        from verl.workers.engine.megatron.tpr.tree import assert_tp_plan_agreement, digest_forest_plan
+        from verl.workers.engine.megatron.tpr.tree import assert_tp_plan_agreement
+        from .plan import digest_forest_plan
 
         assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size)
     if detailed_profile:

@@ -7,16 +7,13 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from verl.workers.engine.megatron.tpr.tree import (
+from verl.experimental.tpr.legacy.plan import (
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,
 )
-from verl.workers.engine.megatron.tpr.tree import (
-    assert_tp_plan_agreement,
-    digest_forest_plan,
-    digest_segment_plan,
-)
+from verl.workers.engine.megatron.tpr.tree import assert_tp_plan_agreement
+from verl.experimental.tpr.legacy.plan import digest_forest_plan, digest_segment_plan
 from verl.experimental.tpr.legacy.tree_plan_builder import build_tree_execution_plans
 
 

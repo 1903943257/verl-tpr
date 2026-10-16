@@ -26,7 +26,7 @@ from enum import Enum
 from torch import Tensor
 
 from .segment_executor import LeafVisitResult, SegmentBackwardResult, SegmentExecutor, SegmentForwardResult
-from verl.workers.engine.megatron.tpr.tree import SegmentEvent, SegmentEventKind, SegmentPlan
+from .plan import SegmentEvent, SegmentEventKind, SegmentPlan
 
 
 class SchedulerState(str, Enum):

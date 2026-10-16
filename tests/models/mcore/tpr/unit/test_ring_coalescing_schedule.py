@@ -95,7 +95,7 @@ def load_dispatch():
               "classify_ring_block", "_physical_block_attention_mask", "_RingTPRAttention",
               "_can_coalesce_prefix_query", "_slice_tnd_result", "_trace_merged_query",
               "_source_schedule"}
-    nodes = [node for node in ast.parse(source.read_text()).body
+    nodes = [node for node in ast.parse(source.read_text(encoding="utf-8")).body
              if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in wanted]
     preamble = ast.parse("from __future__ import annotations").body
     ns = dict(dataclass=dataclass, Enum=Enum,

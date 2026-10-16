@@ -75,3 +75,25 @@ def test_kv_prefix_state_accepts_a_backend_neutral_sequence_shard():
     assert state.shard is shard
     assert state.local_length == 4
     assert anchors.shard is shard
+
+
+@pytest.mark.parametrize("shard", [
+    PrefixShard.full(8),
+    PrefixShard.contiguous(8, cp_rank=1, cp_size=2),
+    RangeSequenceShard(8, ((0, 2), (6, 8)), cp_rank=0, cp_size=2),
+])
+def test_shard_selection_preserves_gradients_and_offset_round_trips(shard):
+    source = torch.randn(2, 8, dtype=torch.float64, requires_grad=True)
+    selected = shard.select(source, dim=-1)
+    indices = shard.global_indices()
+    torch.testing.assert_close(selected, source.index_select(1, indices))
+    selected.sum().backward()
+    expected_grad = torch.zeros_like(source)
+    expected_grad[:, indices] = 1
+    torch.testing.assert_close(source.grad, expected_grad)
+    for local, global_offset in enumerate(indices.tolist()):
+        assert shard.owns(global_offset)
+        assert shard.global_to_local(global_offset) == local
+        assert shard.local_to_global(local) == global_offset
+    if len(shard.global_ranges) == 1:
+        assert selected.untyped_storage().data_ptr() == source.untyped_storage().data_ptr()

@@ -20,14 +20,8 @@ from typing import Any, Protocol, runtime_checkable
 
 from verl.models.mcore.tpr.context import TPRAttentionBackend
 from verl.workers.engine.megatron.tpr.state import KVStack
-from verl.workers.engine.megatron.tpr.ring import (
-    PrefixShard,
-    RangeSequenceShard,
-    SequenceShard,
-    maybe_pad_sequence_shard,
-    physical_sequence_shard,
-    round_up_sequence_length,
-)
+from verl.workers.engine.megatron.tpr.ring import SequenceShard, round_up_sequence_length
+from verl.experimental.tpr.shard import PrefixShard, RangeSequenceShard, maybe_pad_sequence_shard, physical_sequence_shard
 from .execution_context import (
     ShardedPastKVAnchors,
     make_anchored_allgather_cp_backend,
@@ -42,9 +36,7 @@ from verl.experimental.tpr.hybrid import (
     resolve_mindspeed_hybrid_topology,
 )
 from verl.workers.engine.megatron.tpr.ring import (
-    make_anchored_ring_cp_backend,
-    make_cached_ring_cp_backend,
-    make_ring_sequence_shard,
+    RingCPBackend,
 )
 from verl.experimental.tpr.ulysses import (
     make_anchored_ulysses_cp_backend,
@@ -192,53 +184,6 @@ class UlyssesCPBackend(AllGatherCPBackend):
                 cp_group=self._cp_group,
             )
         return make_anchored_ulysses_cp_backend(
-            past_anchors,
-            expected_layer_numbers=expected_layer_numbers,
-            current_shard=current_shard,
-            cp_group=self._cp_group,
-        )
-
-
-class RingCPBackend(AllGatherCPBackend):
-    """TPR policy using MindSpeed's symmetric causal Ring layout and P2P."""
-
-    backend_name = RING_CP_BACKEND
-
-    def validate_segment_length(self, global_length: int) -> None:
-        make_ring_sequence_shard(
-            global_length,
-            cp_rank=self.parallel_rank,
-            cp_size=self.parallel_size,
-        )
-
-    def make_sequence_shard(self, global_length: int) -> SequenceShard:
-        return make_ring_sequence_shard(
-            global_length,
-            cp_rank=self.parallel_rank,
-            cp_size=self.parallel_size,
-        )
-
-    def make_attention_backend(
-        self,
-        kv_stack: KVStack,
-        *,
-        expected_layer_numbers: tuple[int, ...],
-        current_shard: SequenceShard,
-        past_anchors: ShardedPastKVAnchors | None,
-    ) -> TPRAttentionBackend:
-        if not isinstance(physical_sequence_shard(current_shard), RangeSequenceShard):
-            raise TypeError(
-                "Ring CP requires a RangeSequenceShard, "
-                f"got {type(current_shard).__name__}"
-            )
-        if past_anchors is None:
-            return make_cached_ring_cp_backend(
-                kv_stack,
-                expected_layer_numbers=expected_layer_numbers,
-                current_shard=current_shard,
-                cp_group=self._cp_group,
-            )
-        return make_anchored_ring_cp_backend(
             past_anchors,
             expected_layer_numbers=expected_layer_numbers,
             current_shard=current_shard,

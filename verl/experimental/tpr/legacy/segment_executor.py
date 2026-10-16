@@ -42,8 +42,9 @@ from verl.workers.engine.megatron.tpr.executor import (
     build_sharded_rotary_pos_emb,
     disable_bound_context_parallel_sharding,
 )
-from verl.workers.engine.megatron.tpr.tree import SegmentId, SegmentLossTerm, SegmentPlan, SegmentSpec
-from verl.workers.engine.megatron.tpr.ring import PrefixShard, SequenceShard
+from .plan import SegmentId, SegmentLossTerm, SegmentPlan, SegmentSpec
+from verl.workers.engine.megatron.tpr.ring import SequenceShard
+from verl.experimental.tpr.shard import PrefixShard
 
 
 @dataclass(frozen=True, slots=True)

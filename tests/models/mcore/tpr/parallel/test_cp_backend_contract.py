@@ -25,6 +25,7 @@ from verl.models.mcore.tpr import (
     PrefixShard,
     RangeSequenceShard,
     RingCPBackend,
+    SequenceShard,
     TPRCPBackend,
     UlyssesCPBackend,
 )
@@ -113,8 +114,9 @@ def test_resolver_constructs_the_ring_adapter(name):
     )
 
     assert isinstance(backend, RingCPBackend)
+    assert backend_module.RingCPBackend is RingCPBackend
     assert backend.backend_name == "ring"
-    assert backend.make_sequence_shard(16) == RangeSequenceShard(
+    assert backend.make_sequence_shard(16) == SequenceShard(
         16,
         ((0, 4), (12, 16)),
         cp_rank=0,

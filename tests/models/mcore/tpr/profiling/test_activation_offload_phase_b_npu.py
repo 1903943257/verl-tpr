@@ -96,7 +96,7 @@ def _model(runtime, length, native_args):
 
 def _plan(prefix, suffix, *, sparse=False):
     from .test_tpr_qwen3_ring_cp_profile_npu import _ProfileCase, _make_case_plans
-    from verl.workers.engine.megatron.tpr.tree import SegmentPlan
+    from verl.experimental.tpr.legacy.plan import SegmentPlan
     _, plan = _make_case_plans(_ProfileCase(prefix, suffix, 2), vocab_size=2048)
     if sparse:
         # Only the owner of query zero has local loss; all ranks still backward.

@@ -19,7 +19,11 @@ from .test_small_hybrid_tree_cp_npu import _communication_probe
 
 
 def plans():
-    from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec, SegmentLossTerm
+    from verl.experimental.tpr.legacy.plan import (
+        SegmentPlan,
+        SegmentSpec,
+        SegmentLossTerm,
+    )
     p = torch.arange(64) * 17 + 23
     s = torch.arange(64) * 19 + 101
     terms = lambda shift: tuple(SegmentLossTerm(i+shift, int(s[i+1])) for i in range(63))

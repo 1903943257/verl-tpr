@@ -20,12 +20,14 @@ from torch import nn
 
 import verl.experimental.tpr.legacy.cp.execution_context as cp_execution
 import verl.experimental.tpr.legacy.segment_executor as segment_execution
-from verl.models.mcore.tpr import (
-    RangeSequenceShard,
-    SegmentExecutor,
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+from verl.experimental.tpr.legacy.plan import (
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,
+)
+from verl.models.mcore.tpr import (
+    RangeSequenceShard,
     TPRAttentionContext,
     get_tpr_attention_context,
 )
@@ -314,7 +316,7 @@ def test_tpr_context_rejects_mismatched_sharded_backend_lengths():
         parallel_size=2,
         attention=lambda *args, **kwargs: None,
     )
-    with pytest.raises(ValueError, match="prefix length"):
+    with pytest.raises(ValueError, match="[Pp]refix.*length"):
         TPRAttentionContext(
             prefix_length=6,
             suffix_length=8,

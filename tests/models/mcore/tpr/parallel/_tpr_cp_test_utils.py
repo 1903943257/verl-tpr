@@ -35,15 +35,14 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 import verl.experimental.tpr.allgather as cp_attention
 import verl.workers.engine.megatron.tpr.ring as ring_attention
 import verl.experimental.tpr.ulysses as ulysses_attention
-from verl.models.mcore.tpr import (
-    FixedTopologyScheduler,
-    PhysicalExecutionKind,
-    SegmentExecutor,
+from verl.experimental.tpr.legacy.fixed_topology_scheduler import FixedTopologyScheduler, PhysicalExecutionKind
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+from verl.experimental.tpr.legacy.plan import (
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,
-    replace_self_attention_with_tpr,
 )
+from verl.models.mcore.tpr import replace_self_attention_with_tpr
 
 from ._cp_gdn_test_utils import (
     assert_named_tensors_finite,

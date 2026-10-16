@@ -44,7 +44,10 @@ def test_no_experimental_backend_in_production_imports() -> None:
 def test_turn_tree_is_only_production_builder() -> None:
     source = _source("tree")
     assert 'tree_policy: str = "qwen_turn"' in source
-    assert "def build_trajectory_trees_turn(" in source
+    assert "def build_tree_execution_plans(" in source
+    assert "class TrajectoryTree" not in source
+    assert "class SegmentLossTerm" not in source
+    assert "class SegmentEvent" not in source
     assert "class _TrieNode" not in source
     assert "def build_trajectory_trees(" not in source
     assert "class SegmentObjectiveRef" in source
@@ -53,7 +56,10 @@ def test_turn_tree_is_only_production_builder() -> None:
 def test_ppo_executor_no_legacy_ce_gdn_paths() -> None:
     source = _source("executor")
     assert "class SegmentExecutor:" in source
-    assert "class FixedTopologyScheduler:" in source
+    assert "class FixedTopologyScheduler:" not in source
+    assert "class SchedulerState" not in source
+    assert "class PhysicalExecution" not in source
+    assert "def run(self," in source
     assert "_ChunkedLanguageModelOutput" not in source
     assert "SegmentLossTerm" not in source
     assert "with_activation_offload" not in source
@@ -76,12 +82,16 @@ def test_engine_owns_shard_tree_state() -> None:
     ring = _source("ring")
     state = _source("state")
     tree = _source("tree")
-    assert "class PaddedSequenceShard:" in ring
-    assert "class RangeSequenceShard:" in ring
-    assert "class PrefixShard:" in ring
-    assert "from .state import KVStack" not in ring
+    ring_classes = {node.name for node in ast.parse(ring).body if isinstance(node, ast.ClassDef)}
+    assert "SequenceShard" in ring_classes
+    assert not {"PaddedSequenceShard", "RangeSequenceShard", "PrefixShard"} & ring_classes
+    eager_state_imports = [node for node in ast.parse(ring).body
+                           if isinstance(node, ast.ImportFrom) and node.module == "state"]
+    assert not eager_state_imports
     assert "class KVPrefixState:" in state
-    assert "class PrefixStateStack:" in state
+    assert "class KVStack:" in state
+    assert "class PrefixStateStack:" not in state
+    assert "class ShardedPastKVAnchors" not in state
     assert "GDNPrefixState" not in state
     assert "class SegmentPlan:" in tree
     assert "class SegmentObjectiveRef:" in tree
@@ -127,7 +137,8 @@ def test_ring_retains_qkvmerge_and_padding_contract() -> None:
     assert "def _can_coalesce_prefix_query(" in source
     assert "def _prefix_full_slices(" in source
     assert "def _physical_block_attention_mask(" in source
-    assert "class PaddedSequenceShard:" in source
+    assert "padded_length" in source
+    assert "physical_global_ranges" in source
     assert "def iter_valid_sequence_slices(" in source
     assert "class RingCPBackend:" in source
 
@@ -183,9 +194,9 @@ def test_public_dense_symbols_resolve_to_canonical_engine() -> None:
     engine_expected = {
         "RingCPBackend": "ring",
         "SegmentExecutor": "executor",
-        "FixedTopologyScheduler": "executor",
-        "ShardedPastKVAnchors": "state",
-        "SegmentBackwardResult": "executor",
+        "PastKVAnchors": "state",
+        "KVStack": "state",
+        "SequenceShard": "ring",
     }
     for name, module in engine_expected.items():
         assert exports[name] == "verl.workers.engine.megatron.tpr." + module, name

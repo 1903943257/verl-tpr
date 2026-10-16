@@ -32,7 +32,11 @@ def runtime():
 
 
 def _plan():
-    from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec, SegmentLossTerm
+    from verl.experimental.tpr.legacy.plan import (
+        SegmentPlan,
+        SegmentSpec,
+        SegmentLossTerm,
+    )
 
     pieces = [(torch.arange(128) * step + start) % VOCAB_SIZE
               for step, start in ((17, 23), (19, 101), (23, 307))]

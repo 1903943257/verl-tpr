@@ -16,93 +16,84 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-from collections.abc import Callable
-from dataclasses import dataclass
-from torch import Tensor
-from .tree import ForestExecutionPlan, TreeExecutionPlan, digest_forest_plan, assert_tp_plan_agreement
-from typing import TYPE_CHECKING, Any
-
-from megatron.core.utils import get_model_config
-
-from verl.utils.megatron_utils import unwrap_model
-
-from verl.models.mcore.tpr.attention import TPRSelfAttention
 import copy
 import inspect
+import os
+import time
+from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import replace
 from functools import wraps
-from typing import TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
+
+import torch
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec, get_module
+from megatron.core.utils import get_model_config
+from torch import Tensor
+
+from verl.models.mcore.tpr.attention import TPRSelfAttention
+from verl.utils import tensordict_utils as tu
+from verl.utils.megatron_utils import unwrap_model
+from verl.utils.metric import AggregationType, Metric
+
+from .executor import SegmentExecutor, SegmentEventProfiler
 from .ring import aggregate_cp_loss, resolve_engine_cp_runtime
-from .executor import FixedTopologyScheduler, SegmentExecutor, SegmentEventProfiler
+from .tree import ForestExecutionPlan, TreeExecutionPlan, assert_tp_plan_agreement, digest_forest_plan
 
 if TYPE_CHECKING:
     from verl.workers.engine.megatron.transformer_impl import MegatronEngine
 
 
-@dataclass(frozen=True, slots=True)
-class TPRBatchResult:
-    tree_results: tuple[Any, ...]
-    normalized_loss: Tensor
-    tree_count: int
-    segment_count: int
-    logical_loss_tokens: int
+def run_forest(
+    forest: ForestExecutionPlan,
+    run_tree: Callable[[TreeExecutionPlan], Tensor],
+    finalize_gradients: Callable[[], None],
+    no_sync_context: Callable[[], Any] | None = None,
+) -> Tensor:
+    """Run all trees under one native no-sync scope and finalize once."""
+    if not forest.trees:
+        raise ValueError("forest must contain at least one executable tree")
+    total = None
+    with nullcontext() if no_sync_context is None else no_sync_context():
+        for tree in forest.trees:
+            loss = run_tree(tree)
+            if not isinstance(loss, Tensor) or loss.numel() != 1:
+                raise TypeError("run_tree must return a scalar Tensor")
+            total = loss.detach() if total is None else total + loss.detach()
+    # A failed tree never reaches native gradient finalization.
+    finalize_gradients()
+    return total
 
 
-class TPRBatchRunner:
-    """Execute a complete PPO mini-batch as a forest under one grad-sync scope.
+class _PPOMetrics:
+    """Preserve native SUM metrics and weight segment MEANs by logical tokens."""
 
-    run_tree(plan) must execute a full single-tree F/B schedule and return an
-    object with a scalar normalized_loss attribute. Its loss values must
-    already use the SAME original mini-batch global denominator. The runner
-    never normalizes again, and must not finalize per tree.
-    """
+    def __init__(self):
+        self.values: dict[str, list[Any]] = {}
+        self.kinds: dict[str, set[bool]] = {}
 
-    def __init__(
-        self,
-        *,
-        run_tree: Callable[[TreeExecutionPlan], Any],
-        finalize_gradients: Callable[[], None],
-        no_sync_context: Callable[[], Any] | None = None,
-    ) -> None:
-        if not callable(run_tree) or not callable(finalize_gradients):
-            raise TypeError("run_tree and finalize_gradients must be callable")
-        self.run_tree = run_tree
-        self.finalize_gradients = finalize_gradients
-        self.no_sync_context = no_sync_context
-        self._ran = False
+    def add(self, metrics, token_weight):
+        for name, value in metrics.items():
+            wrapped = isinstance(value, Metric)
+            self.kinds.setdefault(name, set()).add(wrapped)
+            if wrapped:
+                if value.aggregation is AggregationType.MEAN:
+                    value = value.aggregate() * token_weight
+                elif value.aggregation is not AggregationType.SUM:
+                    raise NotImplementedError(f"TPR PPO metric {name} requires unsupported {value.aggregation}")
+            self.values.setdefault(name, []).append(value)
 
-    def run(self, forest: ForestExecutionPlan) -> TPRBatchResult:
-        if self._ran:
-            raise RuntimeError("TPRBatchRunner is single-use for one optimizer mini-batch")
-        self._ran = True
-        if not isinstance(forest, ForestExecutionPlan) or not forest.trees:
-            raise ValueError("forest must contain at least one executable tree")
-
-        results = []
-        accumulated_loss: Tensor | None = None
-        context = nullcontext() if self.no_sync_context is None else self.no_sync_context()
-        with context:
-            for tree_plan in forest.trees:
-                output = self.run_tree(tree_plan)
-                loss = getattr(output, "normalized_loss", None)
-                if not isinstance(loss, Tensor) or loss.numel() != 1:
-                    raise TypeError("run_tree must return an object with scalar Tensor normalized_loss")
-                results.append(output)
-                accumulated_loss = loss.detach() if accumulated_loss is None else accumulated_loss + loss.detach()
-
-        # No finalization if any tree failed or produced an invalid loss.
-        self.finalize_gradients()
-        assert accumulated_loss is not None
-        return TPRBatchResult(
-            tree_results=tuple(results),
-            normalized_loss=accumulated_loss,
-            tree_count=len(forest.trees),
-            segment_count=forest.segment_count,
-            logical_loss_tokens=forest.logical_loss_tokens,
-        )
+    def scalar_lists(self):
+        # V1 Trainer uses np.mean(list), so wrapped metrics must return ONE
+        # additive scalar. Plain numeric diagnostics retain their list semantics.
+        result = {}
+        for name, values in self.values.items():
+            if len(self.kinds[name]) != 1:
+                raise TypeError(f"TPR metric {name} mixes Metric and numeric values")
+            values = [float(value.aggregate() if isinstance(value, Metric) else value) for value in values]
+            result[name] = [sum(values)] if True in self.kinds[name] else values
+        return result
 
 
 def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None:
@@ -127,19 +118,15 @@ def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None
 
 def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
     """Keep DP1 production scope; explicitly gate isolated DP2 parity experiments."""
-    import os
-
     tp, cp = sizes["TP"], sizes["CP"]
+    offline_dp2 = ppo and sizes["DP"] == 2 and os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") == "1"
     existing_dp2 = (
-        ppo and tp == 2 and cp == 2 and sizes["DP"] == 2
-        and os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") == "1"
-        and os.getenv("TPR_RUN_TP2CP2DP2_ONE_STEP") == "1"
+        offline_dp2 and tp == cp == 2 and os.getenv("TPR_RUN_TP2CP2DP2_ONE_STEP") == "1"
     )
     # Isolated 10K correctness matrix only. This deliberately does NOT
     # expand the supported production VERL DP topology.
     parity_10k_dp2 = (
-        ppo and tp in (1, 2) and cp in (1, 2) and sizes["DP"] == 2
-        and os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") == "1"
+        offline_dp2 and tp in (1, 2) and cp in (1, 2)
         and os.getenv("TPR_RUN_10K_PARALLEL_PARITY") == "1"
         and os.getenv("TPR_10K_PARITY_ONLY") == "1"
     )
@@ -184,8 +171,6 @@ def _trajectory_keys_from_minibatch(data: Any) -> tuple[str, ...]:
     provides the shared-sample grouping boundary, while row numbers guarantee
     unique trajectory keys after mini-batch sampling/shuffling.
     """
-    from verl.utils import tensordict_utils as tu
-
     count = len(data["input_ids"])
     explicit = tu.get_non_tensor_data(data, key="tpr_trajectory_keys", default=None)
     if explicit is not None:
@@ -242,11 +227,6 @@ def run_tpr_forward_backward_batch(
     Vanilla token-mean PPO; no native /M schedule
     scaling is applied because SegmentExecutor performs autograd itself.
     """
-    import torch
-
-    from verl.utils import tensordict_utils as tu
-    from verl.utils.megatron_utils import unwrap_model
-
     from .objective import SegmentPPOObjectiveAdapter
     from .tree import build_tree_execution_plans
 
@@ -307,12 +287,14 @@ def run_tpr_forward_backward_batch(
             f"actual dp_size={sizes['DP']} before TPR routing"
         )
 
-    import os
-    import time
-
     detailed_profile = os.getenv("TPR_EXEC_PROFILE", "0") == "1"
     stage_ms = {}
     profile_origin = time.perf_counter()
+
+    def record_stage(name, start):
+        if detailed_profile:
+            stage_ms[name] = stage_ms.get(name, 0.0) + (time.perf_counter() - start) * 1000
+
     tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
     try:
         turn_min_tokens = int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128"))
@@ -325,13 +307,11 @@ def run_tpr_forward_backward_batch(
     )
     if not forest.trees or not forest.logical_loss_tokens:
         raise ValueError("TPR PPO mini-batch has no supervised response tokens")
-    if detailed_profile:
-        stage_ms["tree_build_cpu_ms"] = (time.perf_counter()-profile_origin)*1000
+    record_stage("tree_build_cpu_ms", profile_origin)
     tp_check_start = time.perf_counter()
     if tp_size > 1:
         assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size)
-    if detailed_profile:
-        stage_ms["tp_plan_collective_ms"] = (time.perf_counter()-tp_check_start)*1000
+    record_stage("tp_plan_collective_ms", tp_check_start)
     cp_runtime = resolve_engine_cp_runtime(engine, config)
     _validate_tpr_cp_combination(tp_size, cp_runtime, config, ppo=True)
     # DP2+CP2 has twice the per-rank local sequence of the CP4 baseline.
@@ -359,16 +339,17 @@ def run_tpr_forward_backward_batch(
     if not callable(finalize):
         raise RuntimeError("TPR PPO requires native finalize_model_grads_func")
 
-    metric_lists: dict[str, list[Any]] = {}
+    metrics = _PPOMetrics()
     event_profiler = SegmentEventProfiler() if detailed_profile else None
-    setup_ms = 0.0
-    metrics_ms = 0.0
     tree_number = 0
 
     def run_one_tree(tree_plan):
-        nonlocal setup_ms, metrics_ms, tree_number
+        nonlocal tree_number
         setup_start = time.perf_counter() if detailed_profile else None
-        shard_for_segment = None if cp_runtime.backend is None else lambda segment: cp_runtime.backend.make_sequence_shard(segment.length)
+        shard_for_segment = (
+            None if cp_runtime.backend is None
+            else lambda segment: cp_runtime.backend.make_sequence_shard(segment.length)
+        )
         callback, counts = objective.bind_tree(tree_plan, shard_for_segment=shard_for_segment)
         executor = SegmentExecutor(
             model,
@@ -380,54 +361,26 @@ def run_tpr_forward_backward_batch(
             cp_group=cp_runtime.group,
             cp_backend=cp_runtime.backend,
         )
-        if detailed_profile:
-            setup_ms += (time.perf_counter()-setup_start)*1000
-        result = FixedTopologyScheduler(
-            tree_plan.segment_plan, executor,
-            event_profiler=event_profiler, tree_index=tree_number,
-        ).run()
+        record_stage("executor_setup_cpu_ms", setup_start)
+        loss = executor.run(event_profiler=event_profiler, tree_index=tree_number)
         tree_number += 1
         metrics_start = time.perf_counter() if detailed_profile else None
-        if not bool(torch.isfinite(result.normalized_loss).item()):
+        if not bool(torch.isfinite(loss).item()):
             raise FloatingPointError("non-finite TPR PPO tree loss; gradients will not be finalized")
-        from verl.utils.metric import AggregationType, Metric
-
-        for segment_id, metrics in executor.segment_loss_metrics:
+        for segment_id, segment_metrics in executor.segment_loss_metrics:
             token_weight = counts[segment_id] / forest.logical_loss_tokens
-            for name, value in metrics.items():
-                if isinstance(value, Metric) and value.aggregation is AggregationType.MEAN:
-                    # PPO reports e.g. clipfrac and approx-KL as per-segment
-                    # token means. A simple mean across physical segments
-                    # would be biased by their extremely unequal lengths.
-                    # Convert to additive weighted contributions, preserving
-                    # the original logical token-mean reporting semantics.
-                    value = Metric(
-                        aggregation=AggregationType.SUM,
-                        value=value.aggregate() * token_weight,
-                    )
-                elif isinstance(value, Metric) and value.aggregation not in (
-                    AggregationType.SUM, AggregationType.MEAN
-                ):
-                    raise NotImplementedError(
-                        f"TPR PPO metric {name} requires unsupported {value.aggregation}"
-                    )
-                metric_lists.setdefault(name, []).append(value)
-        if detailed_profile:
-            metrics_ms += (time.perf_counter()-metrics_start)*1000
-        return result
+            metrics.add(segment_metrics, token_weight)
+        record_stage("segment_metrics_cpu_ms", metrics_start)
+        return loss
 
-    runner = TPRBatchRunner(
-        run_tree=run_one_tree,
-        finalize_gradients=lambda: finalize(engine.module, None, force_all_reduce=True),
-        no_sync_context=no_sync_func,
-    )
     run_start = time.perf_counter() if detailed_profile else None
-    result = runner.run(forest)
-    if detailed_profile:
-        stage_ms["executor_setup_cpu_ms"] = setup_ms
-        stage_ms["segment_metrics_cpu_ms"] = metrics_ms
-        stage_ms["tree_run_and_finalize_host_ms"] = (time.perf_counter()-run_start)*1000
-    if not bool(torch.isfinite(result.normalized_loss).item()):
+    loss = run_forest(
+        forest, run_one_tree,
+        lambda: finalize(engine.module, None, force_all_reduce=True),
+        no_sync_func,
+    )
+    record_stage("tree_run_and_finalize_host_ms", run_start)
+    if not bool(torch.isfinite(loss).item()):
         raise FloatingPointError("non-finite TPR PPO mini-batch loss")
     if objective.capture_log_probs:
         # Explicitly opt-in through tpr_capture_log_probs for numerical gates.
@@ -441,45 +394,29 @@ def run_tpr_forward_backward_batch(
         segment.length for tree in forest.trees
         for segment in tree.segment_plan.segments.values()
     )
-    # TPRBatchResult exposes normalized_loss only; all segment PPO losses
-    # already share the original global batch denominator. The helper's
-    # first (loss_sum) return is unused here, so pass the same additive
-    # local objective to both reduction slots.
+    # All segments share the original global batch denominator. Pass the
+    # same additive objective to both legacy reduction slots.
     _, global_normalized_loss = aggregate_cp_loss(
-        result.normalized_loss, result.normalized_loss, cp_runtime
+        loss, loss, cp_runtime
     )
     loss = float(global_normalized_loss.item())
     if detailed_profile:
-        stage_ms["whole_entry_host_ms"] = (time.perf_counter()-profile_origin)*1000
+        record_stage("whole_entry_host_ms", profile_origin)
         # NPU events must only be materialized after caller's one final NPU sync.
         engine._tpr_segment_event_profiler = event_profiler
         engine._tpr_stage_profile = stage_ms
         engine._tpr_segment_peak_allocated_bytes = event_profiler.max_allocated_bytes
         engine._tpr_segment_peak_reserved_bytes = event_profiler.max_reserved_bytes
-    metric_lists.update({
-        "tpr/forest_trees": [result.tree_count],
-        "tpr/physical_segments": [result.segment_count],
-        "tpr/logical_loss_tokens": [result.logical_loss_tokens],
-        "tpr/logical_input_tokens": [logical_input_tokens],
-        "tpr/unique_tree_tokens": [unique_tree_tokens],
-        "tpr/topology_token_reuse_ratio": [logical_input_tokens / unique_tree_tokens],
-    })
-    # The V1 Trainer reduces list-valued metrics via numpy.mean, which cannot
-    # add VERL Metric wrappers. Collapse weighted segment contributions to
-    # numeric scalars before returning them across the worker boundary.
-    for name, values in metric_lists.items():
-        from verl.utils.metric import Metric
-
-        if any(isinstance(value, Metric) for value in values):
-            if not all(isinstance(value, Metric) for value in values):
-                raise TypeError(f"TPR metric {name} mixes Metric and numeric values")
-            # Segment Metric(MEAN) values were converted to SUM contributions
-            # weighted by their share of the original global response tokens.
-            # The trainer later uses np.mean(list), so return ONE aggregate
-            # numeric value, not separate weighted contributions.
-            metric_lists[name] = [sum(float(value.aggregate()) for value in values)]
-        else:
-            metric_lists[name] = [float(value) for value in values]
+    diagnostics = {
+        "tpr/forest_trees": len(forest.trees),
+        "tpr/physical_segments": forest.segment_count,
+        "tpr/logical_loss_tokens": forest.logical_loss_tokens,
+        "tpr/logical_input_tokens": logical_input_tokens,
+        "tpr/unique_tree_tokens": unique_tree_tokens,
+        "tpr/topology_token_reuse_ratio": logical_input_tokens / unique_tree_tokens,
+    }
+    metric_lists = metrics.scalar_lists()
+    metric_lists.update({name: [float(value)] for name, value in diagnostics.items()})
 
     # VERL postprocess expects list-valued micro-batch metrics and a list of
     # loss contributions. The sum of all physical segment objectives is the
@@ -496,7 +433,7 @@ _SpecT = TypeVar("_SpecT")
 
 
 def replace_self_attention_with_tpr(transformer_layer_spec: _SpecT) -> _SpecT:
-    """Copy a spec, dispatching FA/GDN to their respective TPR attention classes.
+    """Copy a dense attention spec while preserving its configuration.
 
     Both forms used by the local verl model builders are accepted: a single
     TransformerLayer ``ModuleSpec`` and a TransformerBlock submodule object
@@ -517,7 +454,7 @@ def replace_self_attention_with_tpr(transformer_layer_spec: _SpecT) -> _SpecT:
                 f"got {type(layer_spec).__name__}"
             )
         layer_submodules = layer_spec.submodules
-        if layer_submodules is None or not hasattr(layer_submodules, "self_attention"):
+        if not hasattr(layer_submodules, "self_attention"):
             raise ValueError(f"layer_specs[{index}] does not define self_attention submodules")
 
         attention_spec = layer_submodules.self_attention
@@ -587,19 +524,17 @@ def install_tpr_vanilla_mbridge_spec(bridge: Any) -> None:
 
 
 def _get_layer_specs(transformer_layer_spec: object) -> list[ModuleSpec]:
-    if isinstance(transformer_layer_spec, ModuleSpec):
-        submodules = transformer_layer_spec.submodules
-        if submodules is not None and hasattr(submodules, "layer_specs"):
-            layer_specs = submodules.layer_specs
-        elif submodules is not None and hasattr(submodules, "self_attention"):
-            layer_specs = [transformer_layer_spec]
-        else:
-            raise ValueError(
-                "ModuleSpec must describe either a TransformerLayer with self_attention "
-                "or a TransformerBlock with layer_specs"
-            )
-    elif hasattr(transformer_layer_spec, "layer_specs"):
-        layer_specs = transformer_layer_spec.layer_specs
+    is_spec = isinstance(transformer_layer_spec, ModuleSpec)
+    container = transformer_layer_spec.submodules if is_spec else transformer_layer_spec
+    if hasattr(container, "layer_specs"):
+        layer_specs = container.layer_specs
+    elif is_spec and hasattr(container, "self_attention"):
+        layer_specs = [transformer_layer_spec]
+    elif is_spec:
+        raise ValueError(
+            "ModuleSpec must describe either a TransformerLayer with self_attention "
+            "or a TransformerBlock with layer_specs"
+        )
     else:
         raise TypeError(
             "transformer_layer_spec must be a TransformerLayer ModuleSpec or an object "

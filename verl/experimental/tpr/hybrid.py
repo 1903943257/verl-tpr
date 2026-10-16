@@ -26,13 +26,8 @@ import torch.distributed as dist
 from torch import Tensor
 
 from verl.workers.engine.megatron.tpr.state import KVStack
-from verl.workers.engine.megatron.tpr.ring import (
-    RangeSequenceShard,
-    SequenceShard,
-    maybe_pad_sequence_shard,
-    physical_sequence_shard,
-    round_up_sequence_length,
-)
+from verl.workers.engine.megatron.tpr.ring import SequenceShard, round_up_sequence_length
+from verl.experimental.tpr.shard import RangeSequenceShard, maybe_pad_sequence_shard, physical_sequence_shard
 from .allgather import _group_world_size_and_rank
 from verl.experimental.tpr.legacy.cp.execution_context import ShardedPastKVAnchors
 from verl.workers.engine.megatron.tpr.ring import RingLocalKVBlock, make_ring_sequence_shard, ring_cp_attention

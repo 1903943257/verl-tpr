@@ -4,8 +4,8 @@
 
 Only **DP placement** follows DTA's DFS-contiguous minimax idea:
 https://github.com/areal-project/AReaL/blob/feat/dta/areal/experimental/dta/dp.py
-Tree construction and training stay with the existing TPR TrajectoryTree,
-SegmentPlan and FixedTopologyScheduler. No DTA runtime or trie is installed.
+Tree construction and training use the Turn SegmentPlan and SegmentExecutor.
+No DTA runtime or trie is installed.
 
 This module intentionally does not touch Megatron process groups, split a
 TensorDict, or override VERL's gradient/optimizer synchronization.  In

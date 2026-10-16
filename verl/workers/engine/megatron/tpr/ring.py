@@ -29,13 +29,16 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
 
 from verl.models.mcore.tpr.rectangular_attention import _compressed_causal_mask
+
+if TYPE_CHECKING:
+    from .state import KVStack, PastKVAnchors
 
 SequenceRange = tuple[int, int]
 
@@ -69,213 +72,66 @@ def _validate_global_offset(global_offset: int, global_length: int) -> None:
         raise ValueError(f"global_offset must be in [0, {global_length}), got {global_offset}")
 
 
-@runtime_checkable
-class SequenceShard(Protocol):
-    """Logical placement of one global Segment on a single CP rank.
+@dataclass(frozen=True, slots=True)
+class SequenceShard:
+    """A Segment's logical length and ordered physical ranges on one CP rank.
 
-    The contract describes data ownership only. Ring steps, communication
-    ranks, block identifiers, and head-sharded layouts belong to CP backends.
+    CP1 and Ring use the same metadata. Tail padding stays in the physical
+    ranges so every rank has equal-shaped tensors; logical ranges exclude it.
     """
-
-    @property
-    def global_length(self) -> int: ...
-
-    @property
-    def padded_length(self) -> int: ...
-
-    @property
-    def local_length(self) -> int: ...
-
-    @property
-    def valid_local_length(self) -> int: ...
-
-    @property
-    def cp_rank(self) -> int: ...
-
-    @property
-    def cp_size(self) -> int: ...
-
-    @property
-    def global_ranges(self) -> tuple[SequenceRange, ...]: ...
-
-    @property
-    def physical_global_ranges(self) -> tuple[SequenceRange, ...]: ...
-
-    @property
-    def is_full(self) -> bool: ...
-
-    def select(self, tensor: Tensor, *, dim: int = 0) -> Tensor: ...
-
-    def global_indices(self, *, device: torch.device | str | None = None) -> Tensor: ...
-
-    def physical_global_indices(self, *, device: torch.device | str | None = None) -> Tensor: ...
-
-    def owns(self, global_offset: int) -> bool: ...
-
-    def global_to_local(self, global_offset: int) -> int | None: ...
-
-    def local_to_global(self, local_offset: int) -> int: ...
-
-
-@dataclass(frozen=True, slots=True)
-class PrefixShard:
-    """Uniform contiguous sequence shard retained for AllGather compatibility."""
-
-    global_length: int
-    local_start: int
-    local_end: int
-    cp_rank: int = 0
-    cp_size: int = 1
-
-    def __post_init__(self) -> None:
-        _validate_integer("global_length", self.global_length, minimum=1)
-        _validate_integer("local_start", self.local_start, minimum=0)
-        _validate_integer("local_end", self.local_end, minimum=0)
-        _validate_parallel_coordinates(self.cp_rank, self.cp_size)
-        if self.global_length % self.cp_size != 0:
-            raise ValueError(
-                f"global_length {self.global_length} must be divisible by cp_size {self.cp_size}"
-            )
-
-        expected_local_length = self.global_length // self.cp_size
-        expected_start = self.cp_rank * expected_local_length
-        expected_end = expected_start + expected_local_length
-        if (self.local_start, self.local_end) != (expected_start, expected_end):
-            raise ValueError(
-                "contiguous shard range mismatch: "
-                f"rank {self.cp_rank}/{self.cp_size} must own [{expected_start}, {expected_end}), "
-                f"got [{self.local_start}, {self.local_end})"
-            )
-
-    @classmethod
-    def full(cls, global_length: int) -> PrefixShard:
-        return cls(global_length, 0, global_length)
-
-    @classmethod
-    def contiguous(cls, global_length: int, *, cp_rank: int, cp_size: int) -> PrefixShard:
-        _validate_integer("global_length", global_length, minimum=1)
-        _validate_parallel_coordinates(cp_rank, cp_size)
-        if global_length % cp_size != 0:
-            raise ValueError(f"global_length {global_length} must be divisible by cp_size {cp_size}")
-        local_length = global_length // cp_size
-        return cls(
-            global_length,
-            cp_rank * local_length,
-            (cp_rank + 1) * local_length,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-        )
-
-    @property
-    def local_length(self) -> int:
-        return self.local_end - self.local_start
-
-    @property
-    def padded_length(self) -> int:
-        return self.global_length
-
-    @property
-    def valid_local_length(self) -> int:
-        return self.local_length
-
-    @property
-    def global_ranges(self) -> tuple[SequenceRange, ...]:
-        return ((self.local_start, self.local_end),)
-
-    @property
-    def physical_global_ranges(self) -> tuple[SequenceRange, ...]:
-        return self.global_ranges
-
-    @property
-    def is_full(self) -> bool:
-        return self.cp_size == 1
-
-    def select(self, tensor: Tensor, *, dim: int = 0) -> Tensor:
-        dim = _normalize_dimension(tensor, dim)
-        if tensor.shape[dim] != self.global_length:
-            raise ValueError(
-                f"tensor sequence dimension must be {self.global_length}, got {tensor.shape[dim]}"
-            )
-        return tensor.narrow(dim, self.local_start, self.local_length)
-
-    def global_indices(self, *, device: torch.device | str | None = None) -> Tensor:
-        return torch.arange(self.local_start, self.local_end, dtype=torch.long, device=device)
-
-    def physical_global_indices(self, *, device: torch.device | str | None = None) -> Tensor:
-        return self.global_indices(device=device)
-
-    def owns(self, global_offset: int) -> bool:
-        _validate_global_offset(global_offset, self.global_length)
-        return self.local_start <= global_offset < self.local_end
-
-    def global_to_local(self, global_offset: int) -> int | None:
-        if not self.owns(global_offset):
-            return None
-        return global_offset - self.local_start
-
-    def local_to_global(self, local_offset: int) -> int:
-        _validate_integer("local_offset", local_offset, minimum=0)
-        if local_offset >= self.local_length:
-            raise ValueError(f"local_offset must be in [0, {self.local_length}), got {local_offset}")
-        return self.local_start + local_offset
-
-
-@dataclass(frozen=True, slots=True)
-class RangeSequenceShard:
-    """A backend-neutral shard composed of ordered, disjoint global ranges."""
 
     global_length: int
     ranges: tuple[SequenceRange, ...]
-    cp_rank: int
-    cp_size: int
+    cp_rank: int = 0
+    cp_size: int = 1
+    padded_length: int | None = None
 
     def __post_init__(self) -> None:
         _validate_integer("global_length", self.global_length, minimum=1)
         _validate_parallel_coordinates(self.cp_rank, self.cp_size)
-        normalized = tuple(tuple(item) for item in self.ranges)
-        if not normalized:
+        padded_length = self.global_length if self.padded_length is None else self.padded_length
+        _validate_integer("padded_length", padded_length, minimum=self.global_length)
+        ranges = tuple(tuple(item) for item in self.ranges)
+        if not ranges:
             raise ValueError("ranges must contain at least one non-empty range")
         previous_end = 0
-        for index, item in enumerate(normalized):
+        for index, item in enumerate(ranges):
             if len(item) != 2:
                 raise ValueError(f"ranges[{index}] must be a (start, end) pair, got {item!r}")
             start, end = item
             _validate_integer(f"ranges[{index}].start", start, minimum=0)
             _validate_integer(f"ranges[{index}].end", end, minimum=1)
-            if start >= end:
-                raise ValueError(f"ranges[{index}] must be non-empty, got [{start}, {end})")
-            if end > self.global_length:
-                raise ValueError(
-                    f"ranges[{index}] ends at {end}, beyond global_length {self.global_length}"
-                )
+            if start >= end or end > padded_length:
+                raise ValueError(f"ranges[{index}] must be non-empty and within [0, {padded_length})")
             if index and start < previous_end:
                 raise ValueError("ranges must be ordered and non-overlapping")
             previous_end = end
-        object.__setattr__(self, "ranges", normalized)
+        object.__setattr__(self, "ranges", ranges)
+        object.__setattr__(self, "padded_length", padded_length)
+
+    @classmethod
+    def full(cls, global_length: int) -> SequenceShard:
+        return cls(global_length, ((0, global_length),))
 
     @property
     def global_ranges(self) -> tuple[SequenceRange, ...]:
-        return self.ranges
+        return tuple((start, min(end, self.global_length)) for start, end in self.ranges if start < self.global_length)
 
     @property
     def local_length(self) -> int:
         return sum(end - start for start, end in self.ranges)
 
     @property
-    def padded_length(self) -> int:
-        return self.global_length
-
-    @property
     def valid_local_length(self) -> int:
-        return self.local_length
+        return sum(end - start for start, end in self.global_ranges)
 
     @property
     def physical_global_ranges(self) -> tuple[SequenceRange, ...]:
-        return self.global_ranges
+        return self.ranges
 
     @property
     def is_full(self) -> bool:
-        return self.ranges == ((0, self.global_length),)
+        return self.valid_local_length == self.global_length
 
     def select(self, tensor: Tensor, *, dim: int = 0) -> Tensor:
         dim = _normalize_dimension(tensor, dim)
@@ -283,21 +139,28 @@ class RangeSequenceShard:
             raise ValueError(
                 f"tensor sequence dimension must be {self.global_length}, got {tensor.shape[dim]}"
             )
-        chunks = tuple(tensor.narrow(dim, start, end - start) for start, end in self.ranges)
+        chunks = []
+        for start, end in self.ranges:
+            valid_start, valid_end = min(start, self.global_length), min(end, self.global_length)
+            chunk = tensor.narrow(dim, valid_start, valid_end - valid_start)
+            padding = end - start - (valid_end - valid_start)
+            if padding:
+                shape = list(tensor.shape)
+                shape[dim] = padding
+                # Retain an autograd edge even on ranks that own only padding.
+                chunk = torch.cat((chunk, tensor.new_zeros(shape)), dim=dim)
+            chunks.append(chunk)
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=dim)
 
     def global_indices(self, *, device: torch.device | str | None = None) -> Tensor:
-        chunks = tuple(
-            torch.arange(start, end, dtype=torch.long, device=device) for start, end in self.ranges
-        )
-        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+        return self.physical_global_indices(device=device).clamp_max(self.global_length - 1)
 
     def physical_global_indices(self, *, device: torch.device | str | None = None) -> Tensor:
-        return self.global_indices(device=device)
+        chunks = tuple(torch.arange(start, end, dtype=torch.long, device=device) for start, end in self.ranges)
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
 
     def owns(self, global_offset: int) -> bool:
-        _validate_global_offset(global_offset, self.global_length)
-        return any(start <= global_offset < end for start, end in self.ranges)
+        return self.global_to_local(global_offset) is not None
 
     def global_to_local(self, global_offset: int) -> int | None:
         _validate_global_offset(global_offset, self.global_length)
@@ -312,112 +175,14 @@ class RangeSequenceShard:
         _validate_integer("local_offset", local_offset, minimum=0)
         if local_offset >= self.local_length:
             raise ValueError(f"local_offset must be in [0, {self.local_length}), got {local_offset}")
-        remaining = local_offset
         for start, end in self.ranges:
-            length = end - start
-            if remaining < length:
-                return start + remaining
-            remaining -= length
+            if local_offset < end - start:
+                global_offset = start + local_offset
+                if global_offset >= self.global_length:
+                    raise ValueError(f"local offset {local_offset} refers to a padding token")
+                return global_offset
+            local_offset -= end - start
         raise AssertionError("validated local offset was not mapped")
-
-
-@dataclass(frozen=True, slots=True)
-class PaddedSequenceShard:
-    """Logical Segment ownership backed by an equally sized physical CP shard.
-
-    Padding is appended to the Segment-local global sequence.  The wrapped
-    physical shard owns positions in ``[0, padded_length)`` while all public
-    topology and loss operations remain restricted to ``[0, logical_length)``.
-    """
-
-    logical_length: int
-    physical_shard: PrefixShard | RangeSequenceShard
-
-    def __post_init__(self) -> None:
-        _validate_integer("logical_length", self.logical_length, minimum=1)
-        if not isinstance(self.physical_shard, (PrefixShard, RangeSequenceShard)):
-            raise TypeError(
-                "physical_shard must be PrefixShard or RangeSequenceShard, "
-                f"got {type(self.physical_shard).__name__}"
-            )
-        if self.logical_length >= self.physical_shard.global_length:
-            raise ValueError(
-                "PaddedSequenceShard requires logical_length smaller than the "
-                f"physical length, got {self.logical_length} and {self.physical_shard.global_length}"
-            )
-
-    @property
-    def global_length(self) -> int:
-        return self.logical_length
-
-    @property
-    def padded_length(self) -> int:
-        return self.physical_shard.global_length
-
-    @property
-    def local_length(self) -> int:
-        return self.physical_shard.local_length
-
-    @property
-    def valid_local_length(self) -> int:
-        return sum(end - start for start, end in self.global_ranges)
-
-    @property
-    def cp_rank(self) -> int:
-        return self.physical_shard.cp_rank
-
-    @property
-    def cp_size(self) -> int:
-        return self.physical_shard.cp_size
-
-    @property
-    def physical_global_ranges(self) -> tuple[SequenceRange, ...]:
-        return self.physical_shard.global_ranges
-
-    @property
-    def global_ranges(self) -> tuple[SequenceRange, ...]:
-        return tuple(
-            (start, min(end, self.logical_length))
-            for start, end in self.physical_global_ranges
-            if start < self.logical_length
-        )
-
-    @property
-    def is_full(self) -> bool:
-        return self.cp_size == 1 and self.valid_local_length == self.logical_length
-
-    def select(self, tensor: Tensor, *, dim: int = 0) -> Tensor:
-        dim = _normalize_dimension(tensor, dim)
-        if tensor.shape[dim] != self.logical_length:
-            raise ValueError(
-                f"tensor sequence dimension must be {self.logical_length}, got {tensor.shape[dim]}"
-            )
-        pad_shape = list(tensor.shape)
-        pad_shape[dim] = self.padded_length - self.logical_length
-        padding = tensor.new_zeros(pad_shape)
-        padded = torch.cat((tensor, padding), dim=dim)
-        return self.physical_shard.select(padded, dim=dim)
-
-    def global_indices(self, *, device: torch.device | str | None = None) -> Tensor:
-        physical = self.physical_global_indices(device=device)
-        return physical.clamp_max(self.logical_length - 1)
-
-    def physical_global_indices(self, *, device: torch.device | str | None = None) -> Tensor:
-        return self.physical_shard.global_indices(device=device)
-
-    def owns(self, global_offset: int) -> bool:
-        _validate_global_offset(global_offset, self.logical_length)
-        return self.physical_shard.owns(global_offset)
-
-    def global_to_local(self, global_offset: int) -> int | None:
-        _validate_global_offset(global_offset, self.logical_length)
-        return self.physical_shard.global_to_local(global_offset)
-
-    def local_to_global(self, local_offset: int) -> int:
-        global_offset = self.physical_shard.local_to_global(local_offset)
-        if global_offset >= self.logical_length:
-            raise ValueError(f"local offset {local_offset} refers to a padding token")
-        return global_offset
 
 
 def round_up_sequence_length(logical_length: int, alignment: int) -> int:
@@ -426,23 +191,6 @@ def round_up_sequence_length(logical_length: int, alignment: int) -> int:
     _validate_integer("logical_length", logical_length, minimum=1)
     _validate_integer("alignment", alignment, minimum=1)
     return ((logical_length + alignment - 1) // alignment) * alignment
-
-
-def maybe_pad_sequence_shard(
-    logical_length: int,
-    physical_shard: PrefixShard | RangeSequenceShard,
-) -> SequenceShard:
-    """Attach logical validity metadata when a physical CP shard contains padding."""
-
-    if logical_length == physical_shard.global_length:
-        return physical_shard
-    return PaddedSequenceShard(logical_length, physical_shard)
-
-
-def physical_sequence_shard(shard: SequenceShard) -> PrefixShard | RangeSequenceShard:
-    """Return the fixed-shape shard used by CP collectives."""
-
-    return shard.physical_shard if isinstance(shard, PaddedSequenceShard) else shard
 
 
 def iter_valid_sequence_slices(
@@ -569,16 +317,16 @@ def make_ring_sequence_shard(
     chunk_length = padded_length // chunk_count
     first_start = cp_rank * chunk_length
     second_start = (chunk_count - cp_rank - 1) * chunk_length
-    physical_shard = RangeSequenceShard(
-        padded_length,
+    return SequenceShard(
+        global_length,
         (
             (first_start, first_start + chunk_length),
             (second_start, second_start + chunk_length),
         ),
         cp_rank=cp_rank,
         cp_size=cp_size,
+        padded_length=padded_length,
     )
-    return maybe_pad_sequence_shard(global_length, physical_shard)
 
 
 def classify_ring_block(
@@ -639,15 +387,13 @@ def _validate_ring_shard(
 ) -> None:
     if not isinstance(shard, SequenceShard):
         raise TypeError(f"{name} shard must implement SequenceShard, got {type(shard).__name__}")
-    if not isinstance(physical_sequence_shard(shard), RangeSequenceShard):
-        raise TypeError(f"{name} shard must use Ring range placement")
     expected = make_ring_sequence_shard(
         shard.global_length,
         cp_rank=cp_rank,
         cp_size=cp_size,
         padded_length=shard.padded_length,
     )
-    if shard != expected:
+    if (shard.ranges, shard.cp_rank, shard.cp_size) != (expected.ranges, cp_rank, cp_size):
         raise ValueError(f"{name} shard must use the MindSpeed causal Ring layout")
 
 
@@ -1571,8 +1317,6 @@ def _cached_blocks(kv_stack: KVStack, layer_number: int) -> tuple[RingLocalKVBlo
     blocks = []
     for segment_id in kv_stack.segment_ids:
         state = kv_stack.get(segment_id).kv
-        if not isinstance(physical_sequence_shard(state.shard), RangeSequenceShard):
-            raise TypeError("Ring CP requires RangeSequenceShard Prefix states")
         blocks.append(
             RingLocalKVBlock(
                 segment_id,
@@ -1601,15 +1345,12 @@ def make_cached_ring_cp_backend(
 
 
 def make_anchored_ring_cp_backend(
-    anchors: ShardedPastKVAnchors,
+    anchors: PastKVAnchors,
     *,
     expected_layer_numbers: tuple[int, ...],
     current_shard: SequenceShard,
     cp_group: Any,
 ) -> RingCPAttentionBackend:
-    for entry in anchors.entries:
-        if not isinstance(physical_sequence_shard(entry.shard), RangeSequenceShard):
-            raise TypeError("Ring CP requires RangeSequenceShard Prefix anchors")
     return RingCPAttentionBackend(
         global_prefix_length=anchors.global_prefix_length,
         current_shard=current_shard,
@@ -1661,10 +1402,8 @@ class RingCPBackend:
 
     def make_attention_backend(
         self, kv_stack: KVStack, *, expected_layer_numbers: tuple[int, ...],
-        current_shard: SequenceShard, past_anchors: ShardedPastKVAnchors | None,
+        current_shard: SequenceShard, past_anchors: PastKVAnchors | None,
     ) -> RingCPAttentionBackend:
-        if not isinstance(physical_sequence_shard(current_shard), RangeSequenceShard):
-            raise TypeError("Ring CP requires a RangeSequenceShard")
         if past_anchors is None:
             return make_cached_ring_cp_backend(
                 kv_stack, expected_layer_numbers=expected_layer_numbers,

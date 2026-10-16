@@ -69,7 +69,7 @@ def _full_loss(model, row, *, backward):
 def _tpr_loss(model, row):
     from verl.models.mcore.tpr.attention import TPRSelfAttention
     from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
-    from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
+    from verl.experimental.tpr.legacy.plan import SegmentPlan, SegmentSpec
 
     tokens, mask = row["tokens"], row["mask"].bool()
     if tokens.numel() != SEQ_LEN or mask.numel() != RESPONSE_LEN:

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
-from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
+from verl.experimental.tpr.legacy.plan import SegmentPlan, SegmentSpec
 
 
 def _segment():

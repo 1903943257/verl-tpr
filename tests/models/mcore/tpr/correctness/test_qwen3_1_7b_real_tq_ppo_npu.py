@@ -452,7 +452,7 @@ def _probe_whole_segment_tpr_forward(model, batch, reference_lp, *, row: int):
     """
     from verl.models.mcore.tpr.attention import TPRSelfAttention
     from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
-    from verl.workers.engine.megatron.tpr.tree import (
+    from verl.experimental.tpr.legacy.plan import (
         SegmentLossTerm,
         SegmentPlan,
         SegmentSpec,
@@ -759,7 +759,11 @@ def _tpr_single_segment_cutoff_controls(model, batch, original_logprobs, owners)
     """
     from verl.models.mcore.tpr.attention import TPRSelfAttention
     from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
-    from verl.workers.engine.megatron.tpr.tree import SegmentLossTerm, SegmentPlan, SegmentSpec
+    from verl.experimental.tpr.legacy.plan import (
+        SegmentLossTerm,
+        SegmentPlan,
+        SegmentSpec,
+    )
     from verl.utils.megatron.tensor_parallel import vocab_parallel_log_probs_from_logits
 
     row = 0

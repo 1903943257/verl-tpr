@@ -16,9 +16,8 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from .tree import SegmentSpec
 from .ring import SequenceShard
-from .tree import SegmentObjectiveRef, TreeExecutionPlan
+from .tree import SegmentObjectiveRef, SegmentSpec, TreeExecutionPlan
 
 
 def _rows(batch: Any, key: str) -> list[Tensor]:
@@ -131,7 +130,8 @@ class SegmentPPOObjectiveAdapter:
             raise ValueError("tree has no supervised logical response tokens")
 
         def segment_loss_fn(segment: SegmentSpec, logits: Tensor):
-            return self.compute_loss(segment, logits, refs_by_segment[segment.segment_id], shard=None if shard_for_segment is None else shard_for_segment(segment))
+            shard = None if shard_for_segment is None else shard_for_segment(segment)
+            return self.compute_loss(segment, logits, refs_by_segment[segment.segment_id], shard=shard)
 
         return segment_loss_fn, counts
 
@@ -139,15 +139,11 @@ class SegmentPPOObjectiveAdapter:
         # TensorDict non-tensor metadata must be unwrapped via VERL accessor.
         temperature = _metadata(self.batch, "temperature", default=1.0)
         if isinstance(temperature, Tensor):
-            if temperature.numel() == 1:
-                values = [float(temperature.item())] * len(refs)
-            else:
-                flat = temperature.flatten()
-                values = [float(flat[ref.sample_row].item()) for ref in refs]
-        elif isinstance(temperature, (list, tuple)):
-            values = [float(temperature[ref.sample_row]) for ref in refs]
-        elif isinstance(temperature, (float, int)):
+            temperature = temperature.item() if temperature.numel() == 1 else temperature.flatten()
+        if isinstance(temperature, (float, int)):
             values = [float(temperature)] * len(refs)
+        elif isinstance(temperature, (Tensor, list, tuple)):
+            values = [float(temperature[ref.sample_row]) for ref in refs]
         else:
             raise TypeError(
                 "unsupported per-sample temperature type: "
@@ -289,11 +285,12 @@ class SegmentPPOObjectiveAdapter:
             if len(set(offsets)) != len(offsets):
                 raise ValueError(f"duplicate logical token ownership on row {row}")
 
-        old_rows = _rows(self.batch, "old_log_probs")
-        advantage_rows = _rows(self.batch, "advantages")
         response_rows = _rows(self.batch, "response_mask")
-        optional_fields = ("ref_log_prob", "rollout_is_weights")
-        optional_rows = {key: _rows(self.batch, key) for key in optional_fields if key in self.batch}
+        field_rows = {
+            key: _rows(self.batch, key)
+            for key in ("old_log_probs", "advantages", "ref_log_prob", "rollout_is_weights")
+            if key in ("old_log_probs", "advantages") or key in self.batch
+        }
         n = len(rows)
         max_r = max(len(by_row[row]) for row in rows)
         dev = logits.device
@@ -302,14 +299,14 @@ class SegmentPPOObjectiveAdapter:
             "responses": torch.zeros((n, max_r), dtype=torch.long, device=dev),
             "attention_mask": torch.zeros((n, 1 + max_r), dtype=torch.long, device=dev),
             "response_mask": torch.zeros((n, max_r), dtype=torch.bool, device=dev),
-            "old_log_probs": torch.zeros((n, max_r), dtype=log_probs.dtype, device=dev),
-            "advantages": torch.zeros((n, max_r), dtype=log_probs.dtype, device=dev),
         }
-        for name in optional_rows:
+        for name in field_rows:
             output_fields[name] = torch.zeros((n, max_r), dtype=log_probs.dtype, device=dev)
 
-        packed_lp: list[Tensor] = []
-        packed_entropy: list[Tensor] = []
+        token_outputs = {"log_probs": log_probs}
+        if entropy is not None:
+            token_outputs["entropy"] = entropy
+        packed = {key: [] for key in token_outputs}
         for local_row, row in enumerate(rows):
             selected = by_row[row]
             count = len(selected)
@@ -319,21 +316,17 @@ class SegmentPPOObjectiveAdapter:
             if not bool(response_rows[row][offsets].to(bool).all()):
                 raise ValueError(f"objective ref points to a masked token on row {row}")
             idx = torch.tensor(selected, dtype=torch.long, device=dev)
-            lp_row = log_probs.index_select(0, idx)
             output_fields["attention_mask"][local_row, :count+1] = 1
             output_fields["response_mask"][local_row, :count] = True
             output_fields["responses"][local_row, :count] = torch.tensor(
                 [refs[i].target_token_id for i in selected], device=dev
             )
-            indices = torch.tensor(offsets, dtype=torch.long, device=old_rows[row].device)
-            output_fields["old_log_probs"][local_row, :count] = old_rows[row].index_select(0, indices).to(dev)
-            output_fields["advantages"][local_row, :count] = advantage_rows[row].index_select(0, indices).to(dev)
-            for key, field_rows in optional_rows.items():
-                output_fields[key][local_row, :count] = field_rows[row].index_select(0, indices).to(dev)
-            packed_lp.extend((lp_row, lp_row.new_zeros(1)))
-            if entropy is not None:
-                e_row = entropy.index_select(0, idx)
-                packed_entropy.extend((e_row, e_row.new_zeros(1)))
+            indices = torch.tensor(offsets, dtype=torch.long, device=field_rows["old_log_probs"][row].device)
+            for key, source in field_rows.items():
+                output_fields[key][local_row, :count] = source[row].index_select(0, indices).to(dev)
+            for key, values in token_outputs.items():
+                values = values.index_select(0, idx)
+                packed[key].extend((values, values.new_zeros(1)))
 
         compact = TensorDict(output_fields, batch_size=[n], device=dev)
         tu.assign_non_tensor(
@@ -342,27 +335,19 @@ class SegmentPPOObjectiveAdapter:
             batch_num_tokens=_metadata(self.batch, "batch_num_tokens"),
             global_batch_size=_metadata(self.batch, "global_batch_size", None),
         )
-        model_output = {"log_probs": torch.cat(packed_lp, dim=0)}
-        if entropy is not None:
-            model_output["entropy"] = torch.cat(packed_entropy, dim=0)
+        model_output = {key: torch.cat(values, dim=0) for key, values in packed.items()}
         # Fail at the TPR/native-PPO boundary with the actual local shapes,
         # rather than inside no_padding_2_padding's opaque offsets assert.
         packed_lengths = output_fields["attention_mask"].sum(dim=1, dtype=torch.int64)
         expected_packed = int(packed_lengths.sum().item())
-        actual_packed = int(model_output["log_probs"].shape[0])
-        if actual_packed != expected_packed:
-            raise RuntimeError(
-                "TPR compact PPO logprob pack mismatch: "
-                f"actual={actual_packed} expected={expected_packed} "
-                f"row_lengths={packed_lengths.tolist()} "
-                f"refs={len(refs)} rows={rows} "
-                f"logprob_shape={tuple(model_output['log_probs'].shape)}"
-            )
-        if entropy is not None and int(model_output["entropy"].shape[0]) != expected_packed:
-            raise RuntimeError(
-                "TPR compact PPO entropy pack mismatch: "
-                f"actual={int(model_output['entropy'].shape[0])} expected={expected_packed}"
-            )
+        for key, values in model_output.items():
+            if values.shape[0] != expected_packed:
+                raise RuntimeError(
+                    f"TPR compact PPO {key} pack mismatch: "
+                    f"actual={values.shape[0]} expected={expected_packed} "
+                    f"row_lengths={packed_lengths.tolist()} refs={len(refs)} rows={rows} "
+                    f"shape={tuple(values.shape)}"
+                )
         loss, metrics = self.loss_function(
             model_output=model_output,
             data=compact,

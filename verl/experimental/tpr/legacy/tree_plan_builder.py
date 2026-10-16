@@ -14,7 +14,7 @@ from typing import Any
 
 import torch
 
-from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
+from .plan import SegmentPlan, SegmentSpec
 from .trajectory_tree import TrajectoryTree, build_trajectory_trees
 
 

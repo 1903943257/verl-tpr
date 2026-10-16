@@ -12,26 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""KV path stack and gradient relay buffers for TPR segment execution."""
+"""Graph-free KV on the DFS path, with one gradient relay per segment."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import count
 from types import MappingProxyType
-from typing import Any, Protocol, runtime_checkable
 
 import torch
 from torch import Tensor
 
 from verl.models.mcore.tpr.context import KVPair
-from .tree import SegmentId, SegmentSpec
-from .ring import PrefixShard, SequenceShard
 
+from .ring import SequenceShard
+from .tree import SegmentId, SegmentSpec, _validate_segment_id
 
-def _validate_segment_id(segment_id: SegmentId) -> None:
-    if not isinstance(segment_id, int) or isinstance(segment_id, bool) or segment_id < 0:
-        raise ValueError(f"segment_id must be a non-negative integer, got {segment_id!r}")
+_generations = count()
 
 
 def _validate_layer_number(layer_number: int) -> None:
@@ -39,51 +37,46 @@ def _validate_layer_number(layer_number: int) -> None:
         raise ValueError(f"layer_number must be a positive integer, got {layer_number!r}")
 
 
-@runtime_checkable
-class PrefixState(Protocol):
-    """Minimal state contract consumed by the TPR path stack.
-
-    Concrete state types own local tensors and gradient buffers. Distributed
-    communication deliberately belongs to a separate CP backend.
-    """
-
-    @property
-    def segment_id(self) -> SegmentId: ...
-
-    @property
-    def state_kind(self) -> str: ...
-
-    @property
-    def shard(self) -> SequenceShard: ...
-
-    @property
-    def global_length(self) -> int: ...
-
-    @property
-    def local_length(self) -> int: ...
-
-    @property
-    def layer_numbers(self) -> tuple[int, ...]: ...
-
-    @property
-    def released(self) -> bool: ...
-
-    def validate(self) -> None: ...
-
-    def make_anchors(self) -> Any: ...
-
-    def accumulate_anchor_gradients(self, anchors: Any) -> None: ...
-
-    def consume_gradients(self) -> Any: ...
-
-    def release(self) -> None: ...
+def _compact_graph_free_tensor(tensor: Tensor) -> Tensor:
+    if (
+        tensor.is_contiguous() and tensor.storage_offset() == 0
+        and tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
+    ):
+        return tensor
+    return tensor.clone(memory_format=torch.contiguous_format)
 
 
+def _normalize_local_kv(key_values: Mapping[int, KVPair], *, local_length: int) -> dict[int, KVPair]:
+    if not isinstance(key_values, Mapping) or not key_values:
+        raise ValueError("key_values must be a non-empty mapping")
+    normalized, placement = {}, None
+    for layer, pair in key_values.items():
+        _validate_layer_number(layer)
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            raise TypeError(f"layer {layer} KV must be a (key, value) tuple")
+        key, value = pair
+        if not isinstance(key, Tensor) or not isinstance(value, Tensor):
+            raise TypeError(f"layer {layer} K/V must be torch tensors")
+        if key.ndim != 4 or key.shape != value.shape:
+            raise ValueError(f"layer {layer} K/V shapes must match [sequence, batch, heads, head_dim]")
+        if key.shape[0] != local_length:
+            raise ValueError(f"layer {layer} KV local sequence length must be {local_length}, got {key.shape[0]}")
+        if key.shape[1] != 1:
+            raise ValueError(f"layer {layer} KV batch size must be 1, got {key.shape[1]}")
+        if (key.device, key.dtype) != (value.device, value.dtype):
+            raise ValueError(f"layer {layer} K/V device and dtype must match")
+        if any(t.requires_grad or t.grad_fn is not None for t in pair):
+            raise ValueError(f"layer {layer} cached K/V must be detached and graph-free")
+        if placement is not None and placement != (key.device, key.dtype):
+            raise ValueError("all KV layers in a prefix state must use the same device and dtype")
+        placement = key.device, key.dtype
+        normalized[layer] = tuple(_compact_graph_free_tensor(t) for t in pair)
+    return dict(sorted(normalized.items()))
 
 
 @dataclass(frozen=True, slots=True)
 class KVPrefixAnchors:
-    """Autograd leaves for one local KV prefix state."""
+    """Independent autograd leaves sharing one segment's compact KV storage."""
 
     segment_id: SegmentId
     shard: SequenceShard
@@ -91,129 +84,74 @@ class KVPrefixAnchors:
     key_values: Mapping[int, KVPair]
 
 
-def _compact_graph_free_tensor(tensor: Tensor) -> Tensor:
-    required_storage_bytes = tensor.numel() * tensor.element_size()
-    storage_bytes = tensor.untyped_storage().nbytes()
-    if tensor.is_contiguous() and tensor.storage_offset() == 0 and storage_bytes == required_storage_bytes:
-        return tensor
-    return tensor.clone(memory_format=torch.contiguous_format)
+@dataclass(frozen=True, slots=True)
+class PastKVAnchors:
+    """The same per-segment anchors serve both local and Ring attention.
+
+    Local attention concatenates the leaves through autograd. Ring attention
+    consumes each entry directly; both relay gradients through the same stack.
+    """
+
+    entries: tuple[KVPrefixAnchors, ...]
+    stack_signature: tuple[SegmentId, ...]
+
+    @property
+    def prefix_length(self) -> int:
+        return sum(entry.shard.global_length for entry in self.entries)
+
+    global_prefix_length = prefix_length
+
+    @property
+    def key_values(self) -> Mapping[int, KVPair]:
+        return _concatenate_kv(tuple((entry.shard, entry.key_values) for entry in self.entries))
 
 
-def _normalize_local_kv(
-    key_values: Mapping[int, KVPair],
-    *,
-    local_length: int,
-) -> dict[int, KVPair]:
-    if not isinstance(key_values, Mapping) or not key_values:
-        raise ValueError("key_values must be a non-empty mapping")
-
-    normalized: dict[int, KVPair] = {}
-    reference_device: torch.device | None = None
-    reference_dtype: torch.dtype | None = None
-    for layer_number, pair in key_values.items():
-        _validate_layer_number(layer_number)
-        if not isinstance(pair, tuple) or len(pair) != 2:
-            raise TypeError(f"layer {layer_number} KV must be a (key, value) tuple")
-        key, value = pair
-        if not isinstance(key, Tensor) or not isinstance(value, Tensor):
-            raise TypeError(f"layer {layer_number} K/V must be torch tensors")
-        if key.ndim != 4 or value.ndim != 4:
-            raise ValueError(
-                f"layer {layer_number} K/V must have shape [sequence, batch, heads, head_dim], "
-                f"got K={tuple(key.shape)}, V={tuple(value.shape)}"
-            )
-        if key.shape != value.shape:
-            raise ValueError(f"layer {layer_number} K/V shapes must match, got K={key.shape}, V={value.shape}")
-        if key.shape[0] != local_length:
-            raise ValueError(
-                f"layer {layer_number} KV local sequence length must be {local_length}, got {key.shape[0]}"
-            )
-        if key.shape[1] != 1:
-            raise ValueError(f"layer {layer_number} KV batch size must be 1, got {key.shape[1]}")
-        if key.device != value.device or key.dtype != value.dtype:
-            raise ValueError(
-                f"layer {layer_number} K/V device and dtype must match, "
-                f"got K=({key.device}, {key.dtype}), V=({value.device}, {value.dtype})"
-            )
-        if key.requires_grad or value.requires_grad or key.grad_fn or value.grad_fn:
-            raise ValueError(f"layer {layer_number} cached K/V must be detached and graph-free")
-        if reference_device is None:
-            reference_device, reference_dtype = key.device, key.dtype
-        elif key.device != reference_device or key.dtype != reference_dtype:
-            raise ValueError("all KV layers in a prefix state must use the same device and dtype")
-        normalized[layer_number] = (
-            _compact_graph_free_tensor(key),
-            _compact_graph_free_tensor(value),
-        )
-    return dict(sorted(normalized.items()))
+def _concatenate_kv(entries: tuple[tuple[SequenceShard, Mapping[int, KVPair]], ...]) -> Mapping[int, KVPair]:
+    if any(shard.cp_size != 1 for shard, _ in entries):
+        raise RuntimeError("sharded KV must be consumed through a context-parallel attention backend")
+    if len(entries) <= 1:
+        return entries[0][1] if entries else MappingProxyType({})
+    return MappingProxyType(
+        {
+            layer: tuple(torch.cat([kv[layer][index] for _, kv in entries], dim=0) for index in (0, 1))
+            for layer in entries[0][1]
+        }
+    )
 
 
 class KVPrefixState:
-    """Local post-RoPE KV shards and delayed local gradients for one segment."""
+    """One segment's compact post-RoPE KV and delayed descendant gradients."""
 
     state_kind = "kv"
 
     def __init__(
-        self,
-        segment_id: SegmentId,
-        sequence_length: int,
-        key_values: Mapping[int, KVPair],
-        *,
-        shard: SequenceShard | None = None,
+        self, segment_id: SegmentId, sequence_length: int, key_values: Mapping[int, KVPair],
+        *, shard: SequenceShard | None = None,
     ) -> None:
         _validate_segment_id(segment_id)
-        if (
-            not isinstance(sequence_length, int)
-            or isinstance(sequence_length, bool)
-            or sequence_length <= 0
-        ):
+        if not isinstance(sequence_length, int) or isinstance(sequence_length, bool) or sequence_length <= 0:
             raise ValueError(f"sequence_length must be positive, got {sequence_length!r}")
-        if shard is None:
-            shard = PrefixShard.full(sequence_length)
-        elif not isinstance(shard, SequenceShard):
-            raise TypeError(f"shard must implement SequenceShard, got {type(shard).__name__}")
-        elif shard.global_length != sequence_length:
-            raise ValueError(
-                f"sequence_length {sequence_length} must match shard global_length {shard.global_length}"
-            )
-
-        self._segment_id = segment_id
-        self._shard = shard
-        self._key_values = _normalize_local_kv(key_values, local_length=shard.local_length)
-        self._layer_numbers = tuple(self._key_values)
+        self.segment_id = segment_id
+        self.shard = SequenceShard.full(sequence_length) if shard is None else shard
+        if not isinstance(self.shard, SequenceShard):
+            raise TypeError(f"shard must implement SequenceShard, got {type(self.shard).__name__}")
+        if self.shard.global_length != sequence_length:
+            raise ValueError("sequence_length must match shard global_length")
+        self._key_values = _normalize_local_kv(key_values, local_length=self.local_length)
+        self.layer_numbers = tuple(self._key_values)
         self._gradients: dict[int, KVPair] = {}
-        self._released = False
-        self._generation = 0
-
-    @property
-    def segment_id(self) -> SegmentId:
-        return self._segment_id
-
-    @property
-    def shard(self) -> SequenceShard:
-        return self._shard
-
-    @property
-    def sequence_length(self) -> int:
-        """Compatibility alias for the global segment length."""
-
-        return self.global_length
+        self.released = False
+        self._generation = next(_generations)
 
     @property
     def global_length(self) -> int:
-        return self._shard.global_length
+        return self.shard.global_length
+
+    sequence_length = global_length
 
     @property
     def local_length(self) -> int:
-        return self._shard.local_length
-
-    @property
-    def layer_numbers(self) -> tuple[int, ...]:
-        return self._layer_numbers
-
-    @property
-    def released(self) -> bool:
-        return self._released
+        return self.shard.local_length
 
     @property
     def key_values(self) -> Mapping[int, KVPair]:
@@ -228,401 +166,152 @@ class KVPrefixState:
     def validate(self) -> None:
         self._ensure_live()
         normalized = _normalize_local_kv(self._key_values, local_length=self.local_length)
-        if tuple(normalized) != self.layer_numbers:
-            raise RuntimeError(
-                f"segment {self.segment_id} KV layers changed from {self.layer_numbers} to {tuple(normalized)}"
-            )
-        for layer_number, pair in normalized.items():
-            stored_pair = self._key_values[layer_number]
-            if pair[0] is not stored_pair[0] or pair[1] is not stored_pair[1]:
-                raise RuntimeError(
-                    f"segment {self.segment_id} layer {layer_number} KV storage is no longer compact"
-                )
+        if tuple(normalized) != self.layer_numbers or any(
+            old is not new for layer, pair in normalized.items()
+            for old, new in zip(self._key_values[layer], pair, strict=True)
+        ):
+            raise RuntimeError(f"segment {self.segment_id} KV storage or layers changed")
 
     def make_anchors(self) -> KVPrefixAnchors:
-        self._ensure_live()
-        anchors = {
-            layer_number: (
-                key.detach().requires_grad_(True),
-                value.detach().requires_grad_(True),
-            )
-            for layer_number, (key, value) in self._key_values.items()
-        }
-        return KVPrefixAnchors(
-            segment_id=self.segment_id,
-            shard=self.shard,
-            generation=self._generation,
-            key_values=MappingProxyType(anchors),
+        leaves = MappingProxyType(
+            {
+                layer: tuple(t.detach().requires_grad_(True) for t in pair)
+                for layer, pair in self.key_values.items()
+            }
         )
+        return KVPrefixAnchors(self.segment_id, self.shard, self._generation, leaves)
 
-    def accumulate_layer_gradients(
-        self,
-        layer_number: int,
-        key_grad: Tensor,
-        value_grad: Tensor,
-    ) -> None:
-        self._ensure_live()
-        if layer_number not in self._key_values:
-            raise KeyError(f"segment {self.segment_id} has no KV for layer {layer_number}")
-        key, value = self._key_values[layer_number]
-        if key_grad.shape != key.shape or value_grad.shape != value.shape:
-            raise ValueError(
-                f"segment {self.segment_id} layer {layer_number} gradient shape mismatch: "
-                f"expected {key.shape}, got dK={key_grad.shape}, dV={value_grad.shape}"
-            )
-        if key_grad.device != key.device or value_grad.device != value.device:
-            raise ValueError(f"segment {self.segment_id} layer {layer_number} gradient device mismatch")
-        if key_grad.dtype != key.dtype or value_grad.dtype != value.dtype:
-            raise ValueError(f"segment {self.segment_id} layer {layer_number} gradient dtype mismatch")
+    def accumulate_layer_gradients(self, layer_number: int, key_grad: Tensor, value_grad: Tensor) -> None:
+        pair = self.key_values[layer_number]
+        gradients = key_grad, value_grad
+        for tensor, gradient in zip(pair, gradients, strict=True):
+            if gradient.shape != tensor.shape:
+                raise ValueError(f"segment {self.segment_id} layer {layer_number} gradient shape mismatch")
+            if (gradient.device, gradient.dtype) != (tensor.device, tensor.dtype):
+                raise ValueError(f"segment {self.segment_id} layer {layer_number} gradient device or dtype mismatch")
         if layer_number not in self._gradients:
-            self._gradients[layer_number] = (
-                key_grad.detach().clone(memory_format=torch.contiguous_format),
-                value_grad.detach().clone(memory_format=torch.contiguous_format),
+            self._gradients[layer_number] = tuple(
+                t.detach().clone(memory_format=torch.contiguous_format) for t in gradients
             )
         else:
-            accumulated_key, accumulated_value = self._gradients[layer_number]
-            accumulated_key.add_(key_grad.detach())
-            accumulated_value.add_(value_grad.detach())
+            for buffer, gradient in zip(self._gradients[layer_number], gradients, strict=True):
+                buffer.add_(gradient.detach())
 
     def accumulate_anchor_gradients(self, anchors: KVPrefixAnchors) -> None:
         self._ensure_live()
-        if not isinstance(anchors, KVPrefixAnchors):
-            raise TypeError(f"anchors must be KVPrefixAnchors, got {type(anchors).__name__}")
-        if (
-            anchors.segment_id != self.segment_id
-            or anchors.shard != self.shard
-            or anchors.generation != self._generation
-        ):
+        if (anchors.segment_id, anchors.shard, anchors.generation) != (self.segment_id, self.shard, self._generation):
             raise RuntimeError(f"KV prefix anchors for segment {anchors.segment_id} are stale")
         if tuple(anchors.key_values) != self.layer_numbers:
-            raise RuntimeError(
-                f"KV prefix anchor layers must be {self.layer_numbers}, got {tuple(anchors.key_values)}"
-            )
-        for layer_number, (key_anchor, value_anchor) in anchors.key_values.items():
-            if key_anchor.grad is None or value_anchor.grad is None:
-                raise RuntimeError(f"layer {layer_number} KV prefix anchor gradient is missing")
-            self.accumulate_layer_gradients(layer_number, key_anchor.grad, value_anchor.grad)
+            raise RuntimeError(f"KV prefix anchor layers must be {self.layer_numbers}")
+        for layer, (key, value) in anchors.key_values.items():
+            if key.grad is None or value.grad is None:
+                raise RuntimeError(f"layer {layer} KV prefix anchor gradient is missing")
+            self.accumulate_layer_gradients(layer, key.grad, value.grad)
 
     def consume_gradients(self) -> Mapping[int, KVPair]:
         self._ensure_live()
-        if self._gradients and tuple(self._gradients) != self.layer_numbers:
-            raise RuntimeError(
-                f"segment {self.segment_id} gradient layers must be {self.layer_numbers}, "
-                f"got {tuple(self._gradients)}"
-            )
-        gradients = self._gradients
-        self._gradients = {}
-        self._generation += 1
+        if self._gradients and set(self._gradients) != set(self.layer_numbers):
+            raise RuntimeError(f"segment {self.segment_id} gradient layers must be {self.layer_numbers}")
+        gradients, self._gradients = self._gradients, {}
+        self._generation = next(_generations)
         return MappingProxyType(gradients)
 
     def release(self) -> None:
-        if self._released:
-            return
         self._key_values.clear()
         self._gradients.clear()
-        self._released = True
-        self._generation += 1
+        self.released = True
+        self._generation = next(_generations)
 
     def _ensure_live(self) -> None:
-        if self._released:
+        if self.released:
             raise RuntimeError(f"KV prefix state for segment {self.segment_id} has been released")
 
 
 @dataclass(slots=True)
-class PrefixStateEntry:
+class KVStackEntry:
     segment: SegmentSpec
-    state: PrefixState
+    kv: KVPrefixState
+
+    @property
+    def gradients(self) -> Mapping[int, KVPair]:
+        return self.kv.gradients
 
 
-class PrefixStateStack:
-    """Topology-only stack for heterogeneous prefix-state implementations."""
+class KVStack:
+    """Own only the active root-to-parent path and its delayed dKV."""
 
     def __init__(self) -> None:
-        self._entries: list[PrefixStateEntry] = []
-        self._by_segment_id: dict[SegmentId, PrefixStateEntry] = {}
+        self._entries: dict[SegmentId, KVStackEntry] = {}
 
     def __len__(self) -> int:
         return len(self._entries)
 
     @property
     def segment_ids(self) -> tuple[SegmentId, ...]:
-        return tuple(entry.segment.segment_id for entry in self._entries)
+        return tuple(self._entries)
 
     @property
     def prefix_length(self) -> int:
-        return sum(entry.state.global_length for entry in self._entries)
-
-    def top(self) -> PrefixStateEntry:
-        if not self._entries:
-            raise RuntimeError("prefix-state stack is empty")
-        return self._entries[-1]
-
-    def get(self, segment_id: SegmentId) -> PrefixStateEntry:
-        try:
-            return self._by_segment_id[segment_id]
-        except KeyError as exc:
-            raise KeyError(f"segment {segment_id} is not on the prefix-state stack") from exc
-
-    def push_state(
-        self,
-        segment: SegmentSpec,
-        state: PrefixState,
-        *,
-        entry_type: type[PrefixStateEntry] = PrefixStateEntry,
-    ) -> PrefixStateEntry:
-        if not isinstance(segment, SegmentSpec):
-            raise TypeError(f"segment must be SegmentSpec, got {type(segment).__name__}")
-        if not isinstance(state, PrefixState):
-            raise TypeError(f"state must implement PrefixState, got {type(state).__name__}")
-        state.validate()
-        if state.released:
-            raise RuntimeError(f"cannot push released state for segment {segment.segment_id}")
-        if state.segment_id != segment.segment_id:
-            raise ValueError(
-                f"state segment_id {state.segment_id} does not match segment {segment.segment_id}"
-            )
-        if state.global_length != segment.length:
-            raise ValueError(
-                f"segment {segment.segment_id} state global length must be {segment.length}, "
-                f"got {state.global_length}"
-            )
-        if segment.segment_id in self._by_segment_id:
-            raise RuntimeError(f"segment {segment.segment_id} is already on the prefix-state stack")
-        expected_parent = self._entries[-1].segment.segment_id if self._entries else None
-        if segment.parent_id != expected_parent:
-            raise ValueError(
-                f"cannot push segment {segment.segment_id}: expected parent {expected_parent}, got {segment.parent_id}"
-            )
-        if segment.prefix_length != self.prefix_length or segment.position_start != self.prefix_length:
-            raise ValueError(
-                f"cannot push segment {segment.segment_id}: stack prefix length is {self.prefix_length}, "
-                f"got prefix_length={segment.prefix_length}, position_start={segment.position_start}"
-            )
-
-        entry = entry_type(segment, state)
-        self._entries.append(entry)
-        self._by_segment_id[segment.segment_id] = entry
-        return entry
-
-    def pop_state(self, segment_id: SegmentId) -> PrefixStateEntry:
-        if not self._entries:
-            raise RuntimeError("cannot pop an empty prefix-state stack")
-        if self._entries[-1].segment.segment_id != segment_id:
-            raise RuntimeError(
-                f"cannot pop segment {segment_id}: stack top is {self._entries[-1].segment.segment_id}"
-            )
-        entry = self._entries.pop()
-        del self._by_segment_id[segment_id]
-        return entry
-
-    def assert_empty(self) -> None:
-        if self._entries or self._by_segment_id:
-            raise RuntimeError(f"prefix-state stack is not empty: {self.segment_ids}")
-
-
-# Compatibility name retained for existing executor and profiling imports.
-SegmentKV = KVPrefixState
-
-
-@dataclass(frozen=True, slots=True)
-class PastKVSlice:
-    """Location of one segment inside concatenated past KV anchors."""
-
-    segment_id: SegmentId
-    start: int
-    end: int
-
-
-@dataclass(frozen=True, slots=True)
-class PastKVAnchors:
-    """Leaf past-KV tensors plus metadata needed to relay their gradients."""
-
-    key_values: Mapping[int, KVPair]
-    slices: tuple[PastKVSlice, ...]
-    stack_signature: tuple[SegmentId, ...]
-
-    @property
-    def prefix_length(self) -> int:
-        return 0 if not self.slices else self.slices[-1].end
-
-
-class KVStackEntry(PrefixStateEntry):
-    """KV-specialized compatibility entry over a generic PrefixStateEntry."""
-
-    __slots__ = ()
-
-    @property
-    def kv(self) -> KVPrefixState:
-        if not isinstance(self.state, KVPrefixState):
-            raise TypeError(f"KVStackEntry requires KVPrefixState, got {type(self.state).__name__}")
-        return self.state
-
-    @property
-    def gradients(self) -> Mapping[int, KVPair]:
-        return self.kv.gradients
-
-    def accumulate(self, layer_number: int, key_grad: Tensor, value_grad: Tensor) -> None:
-        self.kv.accumulate_layer_gradients(layer_number, key_grad, value_grad)
-
-
-class KVStack(PrefixStateStack):
-    """Own the graph-free KV and relayed KV gradients on the active DFS path."""
-
-    def __init__(self) -> None:
-        super().__init__()
+        return sum(entry.segment.length for entry in self._entries.values())
 
     def top(self) -> KVStackEntry:
-        entry = super().top()
-        if not isinstance(entry, KVStackEntry):
-            raise TypeError(f"KVStack contains {type(entry).__name__}")
-        return entry
+        if not self._entries:
+            raise RuntimeError("KV stack is empty")
+        return next(reversed(self._entries.values()))
 
     def get(self, segment_id: SegmentId) -> KVStackEntry:
         try:
-            entry = super().get(segment_id)
+            return self._entries[segment_id]
         except KeyError as exc:
             raise KeyError(f"segment {segment_id} is not on the KV stack") from exc
-        if not isinstance(entry, KVStackEntry):
-            raise TypeError(f"KVStack contains {type(entry).__name__}")
-        return entry
 
     def push(
-        self,
-        segment: SegmentSpec,
-        key_values: Mapping[int, KVPair],
-        *,
-        shard: SequenceShard | None = None,
+        self, segment: SegmentSpec, key_values: Mapping[int, KVPair],
+        *, shard: SequenceShard | None = None,
     ) -> KVStackEntry:
+        if segment.segment_id in self._entries:
+            raise RuntimeError(f"segment {segment.segment_id} is already on the KV stack")
+        parent = self.top() if self._entries else None
+        if segment.parent_id != (parent.segment.segment_id if parent else None):
+            raise ValueError(f"cannot push segment {segment.segment_id}: wrong parent {segment.parent_id}")
+        if segment.prefix_length != self.prefix_length or segment.position_start != self.prefix_length:
+            raise ValueError(f"cannot push segment {segment.segment_id}: stack prefix length is {self.prefix_length}")
         kv = KVPrefixState(segment.segment_id, segment.length, key_values, shard=shard)
-        if self._entries:
-            first = self._entries[0]
-            previous = self._entries[-1]
-            if not isinstance(first, KVStackEntry) or not isinstance(previous, KVStackEntry):
-                raise TypeError("KVStack contains a non-KV entry")
-            expected_layers = first.kv.layer_numbers
-            if kv.layer_numbers != expected_layers:
-                raise ValueError(
-                    f"segment {segment.segment_id} KV layers must be {expected_layers}, got {kv.layer_numbers}"
-                )
-            for layer_number in expected_layers:
-                previous_key, _ = previous.kv.key_values[layer_number]
-                current_key, _ = kv.key_values[layer_number]
-                if previous_key.shape[1:] != current_key.shape[1:]:
-                    raise ValueError(f"layer {layer_number} KV non-sequence shape differs across segments")
-                if previous_key.device != current_key.device or previous_key.dtype != current_key.dtype:
-                    raise ValueError(f"layer {layer_number} KV device or dtype differs across segments")
-
-        entry = self.push_state(segment, kv, entry_type=KVStackEntry)
-        if not isinstance(entry, KVStackEntry):
-            raise TypeError(f"KVStack created {type(entry).__name__}")
+        if parent:
+            if kv.layer_numbers != parent.kv.layer_numbers:
+                raise ValueError(f"segment {segment.segment_id} KV layers must be {parent.kv.layer_numbers}")
+            for layer, (key, _) in kv.key_values.items():
+                previous = parent.kv.key_values[layer][0]
+                if key.shape[1:] != previous.shape[1:]:
+                    raise ValueError(f"layer {layer} KV non-sequence shape differs across segments")
+                if (key.device, key.dtype) != (previous.device, previous.dtype):
+                    raise ValueError(f"layer {layer} KV device or dtype differs across segments")
+        entry = KVStackEntry(segment, kv)
+        self._entries[segment.segment_id] = entry
         return entry
 
     def pop(self, segment_id: SegmentId) -> KVStackEntry:
-        try:
-            entry = self.pop_state(segment_id)
-        except RuntimeError as exc:
-            message = str(exc).replace("prefix-state stack", "KV stack")
-            raise RuntimeError(message) from exc
-        if not isinstance(entry, KVStackEntry):
-            raise TypeError(f"KVStack contains {type(entry).__name__}")
-        return entry
+        if self.top().segment.segment_id != segment_id:
+            raise RuntimeError(f"cannot pop segment {segment_id}: stack top is {self.top().segment.segment_id}")
+        return self._entries.pop(segment_id)
 
     def build_past_key_values(self) -> Mapping[int, KVPair]:
-        """Concatenate graph-free KV on the active root-to-parent path."""
-
-        if not self._entries:
-            return MappingProxyType({})
-        if any(entry.kv.shard.cp_size != 1 for entry in self._entries if isinstance(entry, KVStackEntry)):
-            raise RuntimeError("sharded KV must be consumed through a context-parallel attention backend")
-        result: dict[int, KVPair] = {}
-        for layer_number in self._entries[0].kv.layer_numbers:
-            entries = [entry for entry in self._entries if isinstance(entry, KVStackEntry)]
-            if len(entries) != len(self._entries):
-                raise TypeError("KVStack contains a non-KV entry")
-            keys = [entry.kv.key_values[layer_number][0] for entry in entries]
-            values = [entry.kv.key_values[layer_number][1] for entry in entries]
-            result[layer_number] = (torch.cat(keys, dim=0), torch.cat(values, dim=0))
-        return MappingProxyType(result)
+        return _concatenate_kv(tuple((entry.kv.shard, entry.kv.key_values) for entry in self._entries.values()))
 
     def build_past_anchors(self) -> PastKVAnchors:
-        """Build detached leaf tensors whose grads can be split back to ancestors."""
-
-        concatenated = self.build_past_key_values()
-        anchors = {
-            layer_number: (
-                key.detach().requires_grad_(True),
-                value.detach().requires_grad_(True),
-            )
-            for layer_number, (key, value) in concatenated.items()
-        }
-        slices: list[PastKVSlice] = []
-        offset = 0
-        for entry in self._entries:
-            end = offset + entry.segment.length
-            slices.append(PastKVSlice(entry.segment.segment_id, offset, end))
-            offset = end
-        return PastKVAnchors(MappingProxyType(anchors), tuple(slices), self.segment_ids)
+        return PastKVAnchors(tuple(entry.kv.make_anchors() for entry in self._entries.values()), self.segment_ids)
 
     def accumulate_anchor_gradients(self, anchors: PastKVAnchors) -> None:
-        """Split full-prefix anchor grads and add them to ancestor buffers."""
-
-        if not isinstance(anchors, PastKVAnchors):
-            raise TypeError(f"anchors must be PastKVAnchors, got {type(anchors).__name__}")
         if anchors.stack_signature != self.segment_ids:
-            raise RuntimeError(
-                f"past KV anchors are stale: built for {anchors.stack_signature}, current stack is {self.segment_ids}"
-            )
-        if not self._entries:
-            if anchors.key_values or anchors.slices:
-                raise RuntimeError("empty stack received non-empty past KV anchors")
-            return
-
-        expected_layers = self._entries[0].kv.layer_numbers
-        if tuple(anchors.key_values) != expected_layers:
-            raise RuntimeError(
-                f"past KV anchor layers must be {expected_layers}, got {tuple(anchors.key_values)}"
-            )
-        for layer_number, (key_anchor, value_anchor) in anchors.key_values.items():
-            if key_anchor.grad is None or value_anchor.grad is None:
-                raise RuntimeError(f"layer {layer_number} past KV anchor gradient is missing")
-            for kv_slice in anchors.slices:
-                entry = self.get(kv_slice.segment_id)
-                entry.accumulate(
-                    layer_number,
-                    key_anchor.grad[kv_slice.start : kv_slice.end],
-                    value_anchor.grad[kv_slice.start : kv_slice.end],
-                )
+            raise RuntimeError("stale Prefix anchor stack signature")
+        if tuple(entry.segment_id for entry in anchors.entries) != self.segment_ids:
+            raise RuntimeError("Prefix anchor entries do not match stack signature")
+        for entry in anchors.entries:
+            self.get(entry.segment_id).kv.accumulate_anchor_gradients(entry)
 
     def get_new_kv_gradients(self, segment_id: SegmentId) -> Mapping[int, KVPair]:
         return self.get(segment_id).gradients
 
     def assert_empty(self) -> None:
-        try:
-            super().assert_empty()
-        except RuntimeError as exc:
-            raise RuntimeError(str(exc).replace("prefix-state stack", "KV stack")) from exc
-
-
-# CP rank-local Prefix anchors; independent of any AllGather attention backend.
-@dataclass(frozen=True, slots=True)
-class ShardedPastKVAnchors:
-    entries: tuple[KVPrefixAnchors, ...]
-    stack_signature: tuple[int, ...]
-
-    @property
-    def global_prefix_length(self) -> int:
-        return sum(entry.shard.global_length for entry in self.entries)
-
-
-def build_sharded_past_anchors(kv_stack: KVStack) -> ShardedPastKVAnchors:
-    entries = tuple(kv_stack.get(i).kv.make_anchors() for i in kv_stack.segment_ids)
-    return ShardedPastKVAnchors(entries=entries, stack_signature=kv_stack.segment_ids)
-
-
-def accumulate_sharded_past_anchor_gradients(kv_stack: KVStack, anchors: ShardedPastKVAnchors) -> None:
-    if not isinstance(anchors, ShardedPastKVAnchors):
-        raise TypeError(f"expected ShardedPastKVAnchors, got {type(anchors).__name__}")
-    if anchors.stack_signature != kv_stack.segment_ids:
-        raise RuntimeError("stale Prefix anchor stack signature")
-    for entry in anchors.entries:
-        kv_stack.get(entry.segment_id).kv.accumulate_anchor_gradients(entry)
+        if self._entries:
+            raise RuntimeError(f"KV stack is not empty: {self.segment_ids}")

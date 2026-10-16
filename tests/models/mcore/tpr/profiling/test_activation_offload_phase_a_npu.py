@@ -107,7 +107,7 @@ def _make_real_qwen_model(runtime, monkeypatch, *, max_sequence_length, tpr=True
 
 def _plan(prefix=1024, suffix=1024, owned=True):
     from ..equivalence.test_tpr_engine_reference_equivalence_npu import _make_plan
-    from verl.workers.engine.megatron.tpr.tree import SegmentPlan
+    from verl.experimental.tpr.legacy.plan import SegmentPlan
 
     plan = _make_plan(torch.arange(prefix) % 2048,
                       (torch.arange(suffix) + 37) % 2048,

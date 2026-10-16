@@ -14,19 +14,22 @@
 
 import pytest
 import torch
-from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
-from verl.experimental.tpr.legacy.fixed_topology_scheduler import (
-    FixedTopologyScheduler, PhysicalExecution, PhysicalExecutionKind, SchedulerState,
-)
 
 from .test_segment_executor import _FakeTPRModel
-from verl.models.mcore.tpr import (
+from verl.experimental.tpr.legacy.fixed_topology_scheduler import (
+    FixedTopologyScheduler,
+    PhysicalExecution,
+    PhysicalExecutionKind,
+    SchedulerState,
+)
+from verl.experimental.tpr.legacy.plan import (
     PopSegment,
     PushSegment,
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,
 )
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
 
 _PREFIX_LENGTH = 1024
 _SUFFIX_1_LENGTH = 512

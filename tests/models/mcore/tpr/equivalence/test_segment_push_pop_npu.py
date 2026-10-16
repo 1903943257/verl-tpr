@@ -25,13 +25,13 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel import layers as tensor_parallel_layers
 from megatron.core.tensor_parallel import mappings as tensor_parallel_mappings
 from megatron.core.transformer.transformer_config import TransformerConfig
-from verl.models.mcore.tpr import (
-    SegmentExecutor,
+from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
+from verl.experimental.tpr.legacy.plan import (
     SegmentLossTerm,
     SegmentPlan,
     SegmentSpec,
-    replace_self_attention_with_tpr,
 )
+from verl.models.mcore.tpr import replace_self_attention_with_tpr
 from verl.utils.device import is_torch_npu_available
 
 if not is_torch_npu_available(check_device=True):

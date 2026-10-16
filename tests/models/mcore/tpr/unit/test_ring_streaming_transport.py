@@ -38,7 +38,7 @@ class TransportTest(unittest.TestCase):
     def run_ring(self, cp, backward):
         queues = [Queue() for _ in range(cp)]
         path = Path(__file__).resolve().parents[5] / "verl/workers/engine/megatron/tpr/ring.py"
-        nodes = [n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef)
+        nodes = [n for n in ast.parse(path.read_text(encoding="utf-8")).body if isinstance(n, ast.FunctionDef)
                  and n.name in ("_circulate_kv", "_reduce_ring_gradients_to_owner")]
 
         def worker(rank):
