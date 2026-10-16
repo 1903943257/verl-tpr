@@ -393,7 +393,7 @@ def _diagnose_operator_boundaries(model, prefix, suffix, prefix_target, suffix_t
 
 
 def test_single_gdn_push_branch_pop_matches_materialized_paths(runtime):
-    from verl.models.mcore.tpr import GDNLayerState, GDNPrefixState
+    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState, GDNPrefixState
 
     torch.manual_seed(32001)
     reference_model = _make_gdn(runtime)
