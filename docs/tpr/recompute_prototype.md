@@ -305,3 +305,64 @@ controlled four cases, optionally enable full BF16-gradient capture
 for each run and compare per-parameter gradients/cosines. No main
 change or claim of native Full recompute validation follows from
 this result.
+
+## 2026-10-16: matched 40K 8-Session Step 6 Full/TPR Recompute ON
+
+The original warm-shape benchmark
+`test_tpr_fixed_shape_40k_benchmark_npu.py` now accepts
+`TPR_BENCH_RECOMPUTE=0|1` (default OFF) on **both** independent launch
+modes, without changing capture selection, Megatron mesh, PPO objective,
+warmups/repeats, or existing non-recompute file names.
+
+- Native Full ON: real `native_attention=True`, Megatron
+  `get_forward_backward_func()` schedule, native
+  `full/uniform/1` checkpoint method; zero TPR patches.
+- TPR ON: real `TPRSelfAttention`, production Ring/SegmentExecutor,
+  `full/uniform/1` plus installed explicit-KV checkpoint adapter on
+  each TransformerBlock. The existing engine-builder clears recompute
+  during configuration; this benchmark intentionally re-enables and
+  patches **after** the builder returns.
+- ON output suffix `_recompute_on_fixed_shape.json` ensures OFF
+  artifacts `_fixed_shape.json` remain untouched. Each output records
+  the actual recompute config and TPR adapter install count.
+- The native model factory consults
+  `TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS` at construction. The benchmark
+  requires that inherited variable to be unset/zero, then controls it
+  exclusively via `TPR_BENCH_RECOMPUTE` (Native ON selects 1;
+  TPR ON selects 0 native layers and installs its separate adapter).
+
+Run after updating the Docker worktree:
+
+```bash
+cd /workspace/verl-tpr-recompute
+mkdir -p /workspace/tpr_log/recompute
+export TPR_OFFLINE_CAPTURE_MANIFEST=/workspace/tpr_offline_run5_first8_40k_v1/capture_manifest.json
+export TPR_RUN_FIXED_SHAPE_40K_BENCH=1
+export TPR_BENCH_SOURCE_STEP=6
+export TPR_BENCH_OUTPUT_DIR=/workspace/tpr_recompute_fixed40k_step6_v1
+export TPR_BENCH_WARMUPS=1
+export TPR_BENCH_REPEATS=3
+export TPR_BENCH_CAPTURE_LOGPROBS=1
+export TPR_BENCH_RECOMPUTE=1
+export TPR_TREE_POLICY=qwen_turn
+export TPR_EXEC_PROFILE=0
+export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
+unset TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS
+set -o pipefail
+
+TPR_OFFLINE_MODE=full torchrun --nproc_per_node=8 \
+  --master_addr=127.0.0.1 --master_port=29795 \
+  -m pytest -s -x \
+  tests/models/mcore/tpr/parallel/test_tpr_fixed_shape_40k_benchmark_npu.py \
+  2>&1 | tee /workspace/tpr_log/recompute/fixed40k_step6_full_recompute_on.log
+
+TPR_OFFLINE_MODE=tpr torchrun --nproc_per_node=8 \
+  --master_addr=127.0.0.1 --master_port=29795 \
+  -m pytest -s -x \
+  tests/models/mcore/tpr/parallel/test_tpr_fixed_shape_40k_benchmark_npu.py \
+  2>&1 | tee /workspace/tpr_log/recompute/fixed40k_step6_tpr_recompute_on.log
+```
+
+Source/protocol and model remain the same as the previously verified
+Step 6 OFF benchmark. **The two ON runs still require real NPU validation**.
+A failure is not an implicit PASS or automatic fallback to OFF.
