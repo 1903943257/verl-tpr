@@ -49,6 +49,23 @@ class _PPO:
         return getattr(self, key, default)
 
 
+def _sanitize_mindspeed_repatch_args(args):
+    """Remove only the pytest/torchrun empty-key artifact before TransformerConfig.
+
+    MindSpeed turns unknown get_full_args() keys into dataclass fields.
+    A key named "" cannot be a field. Never silently discard other keys.
+    This helper is shared by TP2CP4 and TP2CP2DP2 offline replay runtimes.
+    """
+    full_args = vars(args)
+    if "" in full_args:
+        if not isinstance(full_args[""], str):
+            raise RuntimeError("Unexpected MindSpeed empty argument value type")
+        del full_args[""]
+    malformed = [repr(key) for key in full_args if not isinstance(key, str) or not key.isidentifier()]
+    if malformed:
+        raise RuntimeError(f"Invalid MindSpeed argument names after repatch: {malformed}")
+
+
 def _runtime():
     if int(os.getenv("WORLD_SIZE", "1")) != 8:
         raise AssertionError("offline replay requires exactly TP2 x RingCP4 x DP1 (8 ranks)")
@@ -79,16 +96,7 @@ def _runtime():
             expert_model_parallel_size=1,
         )
     args = get_full_args()
-    # MindSpeed repatch can inject an invalid empty-name entry under this
-    # pytest/torchrun launcher. It cannot represent a dataclass config field.
-    full_args = vars(args)
-    if "" in full_args:
-        if not isinstance(full_args[""], str):
-            raise RuntimeError("Unexpected MindSpeed empty argument value type")
-        del full_args[""]
-    malformed = [repr(key) for key in full_args if not isinstance(key, str) or not key.isidentifier()]
-    if malformed:
-        raise RuntimeError(f"Invalid MindSpeed argument names after repatch: {malformed}")
+    _sanitize_mindspeed_repatch_args(args)
     assert args.context_parallel_algo == "megatron_cp_algo"
     tp_group = parallel_state.get_tensor_model_parallel_group()
     cp_group = parallel_state.get_context_parallel_group()
