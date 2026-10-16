@@ -342,13 +342,33 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
     padded_merge = os.getenv("TPR_RING_COALESCE_PREFIX_PADDED", "0") == "1"
     query_merge = (coalesce and os.getenv("TPR_RING_COALESCE_PREFIX_QUERY", "0") == "1"
                    and bool(prefix_lengths) and not noncontiguous_query
-                   and all(length % (2 * _EXPECTED_WORLD_SIZE) == 0
-                           for length in (*prefix_lengths, current_length)))
-    expected_calls = 2 * _EXPECTED_WORLD_SIZE + 1 + sum(
-        (1 if query_merge else 2 if coalesce and (
-            padded_merge or length % (2 * _EXPECTED_WORLD_SIZE) == 0
-        ) else 4) * _EXPECTED_WORLD_SIZE for length in prefix_lengths
+                   and len(current_shard.global_ranges) == len(current_shard.ranges)
+                   and (padded_merge or all(
+                       length % (2 * _EXPECTED_WORLD_SIZE) == 0
+                       for length in (*prefix_lengths, current_length)
+                   )))
+    q_ranges = current_shard.global_ranges
+    expected_current = sum(
+        ring.classify_ring_block(qr, kr, is_prefix=False) is not ring.RingBlockKind.SKIP
+        for source in range(_EXPECTED_WORLD_SIZE)
+        for kr in make_ring_sequence_shard(
+            current_length, cp_rank=source, cp_size=_EXPECTED_WORLD_SIZE,
+        ).global_ranges
+        for qr in q_ranges
     )
+    expected_prefix = 0
+    for length in prefix_lengths:
+        for source in range(_EXPECTED_WORLD_SIZE):
+            shard = make_ring_sequence_shard(
+                length, cp_rank=source, cp_size=_EXPECTED_WORLD_SIZE,
+            )
+            if query_merge:
+                expected_prefix += int(shard.valid_local_length > 0)
+            elif coalesce and (padded_merge or length % (2 * _EXPECTED_WORLD_SIZE) == 0):
+                expected_prefix += len(q_ranges) * int(shard.valid_local_length > 0)
+            else:
+                expected_prefix += len(q_ranges) * len(shard.global_ranges)
+    expected_calls = expected_current + expected_prefix
     assert len(calls["forward"]) == expected_calls
     assert len(calls["backward"]) == expected_calls
     assert ring.RingBlockKind.CAUSAL in {
@@ -385,7 +405,9 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
         call["kv_length"] for phase in calls.values() for call in phase
     }.issubset(physical_kv_chunks)
     has_padding = current_shard.padded_length != current_shard.global_length or any(
-        length % (2 * _EXPECTED_WORLD_SIZE) != 0 for length in prefix_lengths
+        length % (2 * _EXPECTED_WORLD_SIZE) != 0
+        and not (coalesce and padded_merge)
+        for length in prefix_lengths
     )
     mask_phases = torch.tensor(
         [
@@ -420,6 +442,7 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
 
 @pytest.mark.parametrize("prefix_lengths,current_length", [((128,), 128), ((128, 64), 64), ((127,), 63)])
 def test_prefix_full_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths, current_length):
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_PADDED", "0")
     monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", "0")
     snapshots = []
     for enabled in ("0", "1"):
@@ -441,6 +464,7 @@ def test_prefix_full_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths, 
     ((128,), 63, False), ((128,), 128, True),
 ])
 def test_prefix_query_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths, current_length, noncontiguous):
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_PADDED", "0")
     monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", "1")
     snapshots = []
     for enabled in ("0", "1"):
@@ -479,3 +503,44 @@ def test_padded_prefix_full_coalescing_off_on(cp_runtime, monkeypatch, prefix_le
         _assert_close(actual, expected, gradient=True)
     saved = 2 * _EXPECTED_WORLD_SIZE * len(prefix_lengths)
     assert before[2] - after[2] == before[3] - after[3] == saved
+
+
+@pytest.mark.parametrize("prefix_lengths,current_length,noncontiguous", [
+    ((127,), 63, False),            # Both Prefix and Current padded
+    ((127,), 128, False),           # Only Prefix padded
+    ((128,), 63, False),            # Only Current padded
+    ((63, 31), 15, False),          # Two independent Prefix anchors
+    ((127,), 63, True),             # Non-contiguous Q: must fall back
+])
+def test_padded_prefix_query_kv_coalescing_off_on(
+    cp_runtime, monkeypatch, prefix_lengths, current_length, noncontiguous,
+):
+    """Padded joint Query+KV FULL FA matches original dQ/dK/dV and saves calls."""
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", "1")
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_PADDED", "1")
+    before = after = None
+    for enabled in ("0", "1"):
+        monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", enabled)
+        snapshot = _check_ring_cp_attention(
+            cp_runtime, prefix_lengths, current_length, 16, 8,
+            noncontiguous_query=noncontiguous, head_dim=128,
+        )
+        if enabled == "0":
+            before = snapshot
+        else:
+            after = snapshot
+    _assert_close(after[0], before[0])
+    for actual, reference in zip(after[1], before[1], strict=True):
+        _assert_close(actual, reference, gradient=True)
+    expected_saved = sum(
+        sum(
+            make_ring_sequence_shard(
+                length, cp_rank=source, cp_size=_EXPECTED_WORLD_SIZE,
+            ).valid_local_length > 0
+            for source in range(_EXPECTED_WORLD_SIZE)
+        )
+        for length in prefix_lengths
+    )
+    # KV Merge: two Q chunks/source; Joint Query Merge: one/source.
+    expected_saved = 0 if noncontiguous else expected_saved
+    assert before[2] - after[2] == before[3] - after[3] == expected_saved
