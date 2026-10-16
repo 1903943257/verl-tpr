@@ -16,7 +16,8 @@ import pytest
 import torch
 
 import verl.experimental.tpr.ulysses as ulysses
-from verl.models.mcore.tpr import LocalKVBlock, PaddedSequenceShard, PrefixShard
+from verl.experimental.tpr.allgather import LocalKVBlock
+from verl.experimental.tpr.shard import PaddedSequenceShard, PrefixShard
 
 
 def _tensor(length, heads, value=0.0):
