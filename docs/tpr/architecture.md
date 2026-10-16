@@ -107,6 +107,54 @@ only after numerical and throughput parity. Ring layout, validity mask and
 logical/physical Padding share one canonical implementation, but padded CP
 backward still requires an NPU parity gate.
 
+### Prefix FA call-count diagnostics (opt-in)
+
+Core Ring accepts physical right-padding and masks invalid tokens. By default,
+the Prefix KV coalescing fast path requires an unpadded Prefix. For experiments,
+`TPR_RING_COALESCE_PREFIX_PADDED=1` in combination with
+`TPR_RING_COALESCE_PREFIX_FULL=1` allows the **valid** zero-copy portion of
+each source rank's padded Prefix KV to participate in one FULL FA call.
+Communication buffers remain physically padded; gradient slices map back into
+their original source buffers. Query coalescing retains its stricter
+all-Segments-unpadded requirement. Both Merge optimizations remain **off by
+default**; padded KV Merge is experimental until CP2/CP4 NPU correctness passes.
+
+Set `TPR_RING_BLOCK_STATS=1` to print JSON `TPR_RING_BLOCK_STATS` records on
+CP rank zero, for the first transformer layer of each executed Segment.
+Forward and Backward are reported separately, including the effective
+`fa_prefix_kv_merged`, `fa_prefix_query_merged`,
+`fa_prefix_unmerged_reference` and `fa_prefix_calls_saved`. A requested
+flag with `fa_prefix_calls_saved=0` is **not** a Merge performance result.
+Counters are untimed, do not synchronize the NPU, and do not retain remote KV.
+
+CPU gate:
+
+```bash
+python -m pytest -q tests/models/mcore/tpr/parallel/test_ring_cp_attention_contract.py
+```
+
+NPU padded-KV-only gates with explicit localhost rendezvous:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=8,9 torchrun --master_addr=localhost --master_port=29505 \
+  --nproc_per_node=2 -m pytest -xvs \
+  tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py \
+  -k padded_prefix_full_coalescing_off_on
+ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 torchrun --master_addr=localhost --master_port=29506 \
+  --nproc_per_node=4 -m pytest -xvs \
+  tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py \
+  -k padded_prefix_full_coalescing_off_on
+```
+
+For the existing eight-rank captured PPO replay, enable
+`TPR_RING_BLOCK_STATS=1` and compare a baseline with
+`TPR_RING_COALESCE_PREFIX_FULL=0` against an experimental run with
+`TPR_RING_COALESCE_PREFIX_FULL=1`,
+`TPR_RING_COALESCE_PREFIX_PADDED=1` and
+`TPR_RING_COALESCE_PREFIX_QUERY=0`. Use separate output directories. The
+existing BF16 reproducibility/gradient gates must be interpreted separately
+from whether the number of actual FA launches decreased.
+
 ### Validation gate
 
 Before a production merge, compare **old TPR vs new TPR on identical actor
