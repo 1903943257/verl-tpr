@@ -3,6 +3,13 @@ on:
   push:
     branches:
       - refactor/tpr-ppo-engine-ring-turn-20261015
+  pull_request:
+    paths:
+      - 'verl/models/mcore/tpr/**'
+      - 'verl/workers/engine/megatron/tpr/**'
+      - 'verl/experimental/tpr/**'
+      - 'tests/models/mcore/tpr/**'
+      - '.github/workflows/tpr-refactor-structure.yml'
   workflow_dispatch:
 
 permissions:
