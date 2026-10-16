@@ -99,6 +99,34 @@ def test_cached_and_anchored_prefix_blocks_identical(monkeypatch):
             assert old.value is new.value
             assert old.key.requires_grad and old.value.requires_grad
 
+    # Real Prefix anchors are independent differentiable KV leaves; the
+    # unified builder must select those leaves, never silently use cached KV.
+    independent_entries = tuple(
+        SimpleNamespace(
+            segment_id=entry.segment_id,
+            shard=entry.shard,
+            key_values={
+                layer: tuple(t.detach().clone().requires_grad_() for t in pair)
+                for layer, pair in entry.key_values.items()
+            },
+        )
+        for entry in anchors.entries
+    )
+    independent_anchors = SimpleNamespace(
+        entries=independent_entries, global_prefix_length=192,
+    )
+    graph_backend = backend.make_attention_backend(
+        stack, expected_layer_numbers=(1, 2),
+        current_shard=current, past_anchors=independent_anchors,
+    )
+    actual = graph_backend._prefix_blocks_by_layer[1][0]
+    assert actual.key is independent_entries[0].key_values[1][0]
+    assert actual.key is not state_map[3].key_values[1][0]
+    (actual.key.sum() + actual.value.sum()).backward()
+    assert actual.key.grad is not None and actual.value.grad is not None
+    assert state_map[3].key_values[1][0].grad is None
+
+
 
 def test_prefix_block_builder_rejects_non_ring_shards():
     state = SimpleNamespace(
