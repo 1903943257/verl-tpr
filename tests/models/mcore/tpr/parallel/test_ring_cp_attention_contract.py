@@ -320,6 +320,13 @@ def test_prepared_ring_layout_matches_full_validation_without_rechecking_placeme
         cp_group=group, softmax_scale=None, _layout=prepared,
     )
     assert optimized == ordinary
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", "1")
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", "1")
+    _, with_merge = ring._normalize_inputs(
+        q, k, v, prefix_blocks=blocks, current_shard=current_shard,
+        cp_group=group, softmax_scale=None, _layout=prepared,
+    )
+    assert with_merge.coalesce_prefix_full and with_merge.coalesce_prefix_query
     with pytest.raises(ValueError, match="dtype and device"):
         ring._normalize_inputs(
             q, k.double(), v, prefix_blocks=blocks, current_shard=current_shard,
@@ -374,3 +381,24 @@ def test_unified_ring_prefix_builder_keeps_anchored_autograd_leaves(monkeypatch)
     (leaf.key.sum() + leaf.value.sum()).backward()
     assert all(t.grad is not None for t in leaves)
     assert all(t.grad is None for t in kv)
+
+
+def test_prepared_ring_layout_rejects_cross_layer_shard_mismatch(monkeypatch):
+    group = object()
+    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    regular = make_ring_sequence_shard(64, cp_rank=0, cp_size=2)
+    padded = make_ring_sequence_shard(64, cp_rank=0, cp_size=2, padded_length=96)
+    current = make_ring_sequence_shard(32, cp_rank=0, cp_size=2)
+    def block(shard):
+        return ring.RingLocalKVBlock(
+            4, shard,
+            torch.zeros(shard.local_length, 1, 2, 8),
+            torch.zeros(shard.local_length, 1, 2, 8),
+        )
+    with pytest.raises(ValueError, match="placement differs"):
+        ring.RingCPAttentionBackend(
+            global_prefix_length=64, current_shard=current,
+            prefix_blocks_by_layer={1: (block(regular),), 2: (block(padded),)},
+            cp_group=group,
+        )
