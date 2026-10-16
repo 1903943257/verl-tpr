@@ -339,13 +339,15 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
     transport = calls.pop("transport")
     assert transport == {"forward": len(prefix_lengths) + 1, "backward": len(prefix_lengths) + 1}
     coalesce = os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "0") == "1"
+    padded_merge = os.getenv("TPR_RING_COALESCE_PREFIX_PADDED", "0") == "1"
     query_merge = (coalesce and os.getenv("TPR_RING_COALESCE_PREFIX_QUERY", "0") == "1"
                    and bool(prefix_lengths) and not noncontiguous_query
                    and all(length % (2 * _EXPECTED_WORLD_SIZE) == 0
                            for length in (*prefix_lengths, current_length)))
     expected_calls = 2 * _EXPECTED_WORLD_SIZE + 1 + sum(
-        (1 if query_merge else 2 if coalesce and length % (2 * _EXPECTED_WORLD_SIZE) == 0 else 4)
-        * _EXPECTED_WORLD_SIZE for length in prefix_lengths
+        (1 if query_merge else 2 if coalesce and (
+            padded_merge or length % (2 * _EXPECTED_WORLD_SIZE) == 0
+        ) else 4) * _EXPECTED_WORLD_SIZE for length in prefix_lengths
     )
     assert len(calls["forward"]) == expected_calls
     assert len(calls["backward"]) == expected_calls
@@ -371,10 +373,14 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
             prefix_shard.padded_length // (2 * _EXPECTED_WORLD_SIZE)
         )
     if coalesce:
-        physical_kv_chunks.update(
-            length // _EXPECTED_WORLD_SIZE for length in prefix_lengths
-            if length % (2 * _EXPECTED_WORLD_SIZE) == 0
-        )
+        for length in prefix_lengths:
+            if padded_merge or length % (2 * _EXPECTED_WORLD_SIZE) == 0:
+                physical_kv_chunks.update(
+                    make_ring_sequence_shard(
+                        length, cp_rank=source, cp_size=_EXPECTED_WORLD_SIZE,
+                    ).valid_local_length
+                    for source in range(_EXPECTED_WORLD_SIZE)
+                )
     assert {
         call["kv_length"] for phase in calls.values() for call in phase
     }.issubset(physical_kv_chunks)
@@ -450,4 +456,26 @@ def test_prefix_query_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths,
     eligible = not noncontiguous and all(length % (2 * _EXPECTED_WORLD_SIZE) == 0
                                         for length in (*prefix_lengths, current_length))
     saved = _EXPECTED_WORLD_SIZE * len(prefix_lengths) if eligible else 0
+    assert before[2] - after[2] == before[3] - after[3] == saved
+
+
+@pytest.mark.parametrize("prefix_lengths,current_length", [
+    ((127,), 63),
+    ((63, 31), 15),
+])
+def test_padded_prefix_full_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths, current_length):
+    """The padded opt-in reduces FA blocks without losing padded dK/dV ownership."""
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_PADDED", "1")
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", "0")
+    snapshots = []
+    for enabled in ("0", "1"):
+        monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", enabled)
+        snapshots.append(_check_ring_cp_attention(
+            cp_runtime, prefix_lengths, current_length, 4, 2,
+        ))
+    before, after = snapshots
+    _assert_close(after[0], before[0])
+    for actual, expected in zip(after[1], before[1], strict=True):
+        _assert_close(actual, expected, gradient=True)
+    saved = 2 * _EXPECTED_WORLD_SIZE * len(prefix_lengths)
     assert before[2] - after[2] == before[3] - after[3] == saved
