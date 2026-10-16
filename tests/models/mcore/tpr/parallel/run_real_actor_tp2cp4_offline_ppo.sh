@@ -12,8 +12,15 @@ export TPR_QWEN_4B_PATH="${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}
 export TPR_TREE_POLICY=qwen_turn
 export TPR_RECOMPUTE_LOG_DIR="${TPR_RECOMPUTE_LOG_DIR:-/workspace/tpr_log/recompute}"
 mkdir -p "$TPR_RECOMPUTE_LOG_DIR"
+export TPR_OFFLINE_RECOMPUTE="${TPR_OFFLINE_RECOMPUTE:-0}"
+case "$TPR_OFFLINE_RECOMPUTE" in
+    0) recompute_label=off ;;
+    1) recompute_label=on ;;
+    *) echo "TPR_OFFLINE_RECOMPUTE must be 0 or 1" >&2; exit 2 ;;
+esac
 export TPR_OFFLINE_ROWS="${TPR_OFFLINE_ROWS:-4,6}"
-export TPR_OFFLINE_OUTPUT_DIR="${TPR_OFFLINE_OUTPUT_DIR:-/workspace/tpr_offline_qwen4b_tp2cp4_row4_row6}"
+# OFF and ON must not overwrite one another's saved gradients / witnesses.
+export TPR_OFFLINE_OUTPUT_DIR="${TPR_OFFLINE_OUTPUT_DIR:-/workspace/tpr_recompute_${recompute_label}_v1}"
 : "${ASCEND_RT_VISIBLE_DEVICES:=8,9,10,11,12,13,14,15}"
 export ASCEND_RT_VISIBLE_DEVICES
 if [[ "$ASCEND_RT_VISIBLE_DEVICES" != "8,9,10,11,12,13,14,15" ]]; then
@@ -30,15 +37,19 @@ case "${TPR_OFFLINE_RUN_MODES:-both}" in
    compare) modes=() ;;
    *) echo "Unknown TPR_OFFLINE_RUN_MODES" >&2; exit 2;;
 esac
+if [[ "$TPR_OFFLINE_RECOMPUTE" == "1" && "${TPR_OFFLINE_RUN_MODES:-both}" != "tpr" ]]; then
+    echo "Recompute ON requires TPR_OFFLINE_RUN_MODES=tpr" >&2
+    exit 2
+fi
 errors=()
 for mode in "${modes[@]}"; do
     export TPR_OFFLINE_MODE="$mode"
-    echo "TPR_OFFLINE_START mode=$mode rows=$TPR_OFFLINE_ROWS device=$ASCEND_RT_VISIBLE_DEVICES"
+    echo "TPR_OFFLINE_START mode=$mode recompute=$TPR_OFFLINE_RECOMPUTE rows=$TPR_OFFLINE_ROWS device=$ASCEND_RT_VISIBLE_DEVICES results=$TPR_OFFLINE_OUTPUT_DIR"
     # An OOM in Full must not prevent the independent TPR memory experiment.
     if torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29784 \
        -m pytest -vv -s -x \
        tests/models/mcore/tpr/parallel/test_real_actor_tp2cp4_offline_ppo_npu.py \
-       2>&1 | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_${mode}.log"; then
+       2>&1 | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_${mode}_recompute_${recompute_label}.log"; then
        echo "TPR_OFFLINE mode=$mode completed"
     else
        errors+=("$mode")
@@ -48,7 +59,7 @@ done
 if [[ "${#errors[@]}" == 0 ]] && \
    [[ "${TPR_OFFLINE_RUN_MODES:-both}" == "both" || "${TPR_OFFLINE_RUN_MODES:-both}" == "compare" ]]; then
     python tests/models/mcore/tpr/parallel/compare_real_actor_tp2cp4_offline_ppo.py \
-      "$TPR_OFFLINE_OUTPUT_DIR" | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_comparison.log"
+      "$TPR_OFFLINE_OUTPUT_DIR" | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_comparison_recompute_${recompute_label}.log"
 fi
 if (("${#errors[@]}" > 0)); then
     echo "TPR_OFFLINE failed_modes=${errors[*]} (logs preserved)" >&2
