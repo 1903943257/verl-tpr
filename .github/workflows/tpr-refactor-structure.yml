@@ -133,6 +133,52 @@ jobs:
           assert validate(sizes, ppo=True) == 2
           print("PASS production TP2CP2DP2 explicit offline gate")
           PY
+      - name: Regression-test shared MindSpeed empty-key sanitization
+        run: |
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          from types import SimpleNamespace
+
+          cp4_path = Path("tests/models/mcore/tpr/parallel/test_real_actor_tp2cp4_offline_ppo_npu.py")
+          dp2_path = Path("tests/models/mcore/tpr/parallel/test_tpr_tp2cp2dp2_one_step_npu.py")
+          cp4_tree = ast.parse(cp4_path.read_text())
+          dp2_tree = ast.parse(dp2_path.read_text())
+          helper = next(n for n in cp4_tree.body if isinstance(n, ast.FunctionDef)
+                        and n.name == "_sanitize_mindspeed_repatch_args")
+          for tree in (cp4_tree, dp2_tree):
+              runtime = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                             and n.name == "_runtime")
+              assert any(isinstance(n, ast.Call)
+                         and isinstance(n.func, ast.Name)
+                         and n.func.id == helper.name for n in ast.walk(runtime))
+          namespace = {}
+          exec(compile(ast.Module(body=[helper], type_ignores=[]), str(cp4_path), "exec"), namespace)
+          sanitize = namespace[helper.name]
+          args = SimpleNamespace(context_parallel_algo="megatron_cp_algo", preserved=42)
+          vars(args)[""] = "launcher-artifact"
+          sanitize(args)
+          assert vars(args) == {"context_parallel_algo": "megatron_cp_algo", "preserved": 42}
+          sanitize(args)  # idempotent
+          for value in (3, None):
+              bad = SimpleNamespace()
+              vars(bad)[""] = value
+              try:
+                  sanitize(bad)
+              except RuntimeError:
+                  pass
+              else:
+                  raise AssertionError("Non-string empty-key value must fail loudly")
+          bad = SimpleNamespace()
+          vars(bad)["non-key!"] = "unexpected"
+          try:
+              sanitize(bad)
+          except RuntimeError:
+              pass
+          else:
+              raise AssertionError("Unknown malformed key must never be silently dropped")
+          print("PASS MindSpeed args sanitizer; TP2CP4 and TP2CP2DP2 both covered")
+          PY
       - name: Audit legacy model imports
         run: |
           python3 - <<'PY'
