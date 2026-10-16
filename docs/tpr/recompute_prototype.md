@@ -431,3 +431,77 @@ TPR_OFFLINE_MODE=tpr torchrun --nproc_per_node=8 \
 Never compare a GC-audited critical section's repeated-step timings
 with historical steady-state medians without noting the altered
 between-iteration GC policy. Do not yet add to `main`.
+
+## 2026-10-16: repeated 40K leak diagnosis and checkpoint closure fix
+
+The GC probe confirmed a **real live allocation increase** on TPR
+Recompute ON at the end of each repetition (max across 8 NPU ranks):
+
+| Iteration | Peak allocated GiB | Live before GC GiB | Live after GC GiB |
+| ---: | ---: | ---: | ---: |
+| 0 (warmup) | 24.868 | 21.134 | 21.134 |
+| 1 | 38.380 | 34.650 | 34.650 |
+| 2 | 51.896 | 48.165 | 48.165 |
+
+Exactly ~13.516 GiB additional **live** memory per iteration,
+unaffected by diagnostic Python garbage collection. Recompute ON
+Native Full remained stable and passed. The reduced zero-loss logits
+upcast did **not** remove this accumulation.
+
+**Root-cause hypothesis grounded in the actual code:** Megatron
+`tensor_parallel.random.CheckpointFunction.forward()` sets
+`ctx.run_function = run_function`. The TPR `run_layer` closure used to
+capture the complete outer `TPRAttentionContext`; outer holds
+`new_key_values` containing the **outputs of that checkpoint node**.
+This forms a Python/C++ autograd cycle:
+`Checkpoint ctx → run_layer → outer → (key, value).grad_fn → Checkpoint ctx`.
+It can retain NPU activation memory that Python GC cannot reclaim.
+
+**Branch-only fix:** checkpoint `run_layer` captures
+`weakref.ref(outer)`, dereferences it only during forward/replay and
+fails explicitly if the surrounding SegmentExecutor context is not
+alive. The executor deliberately keeps its `context` local through
+the complete `torch.autograd.backward()`, so its legitimate lifetime
+is maintained. A CPU test statically asserts `outer` is no longer
+in the function's closure variables and verifies K/V gradient
+propagation. A separate CPU test no longer calls the broken
+`torch.autograd.profiler` in the deployed PyTorch/NPU environment:
+instead it rejects non-scalar calls to `.float()` in the zero-loss path.
+All test tensors explicitly specify `device="cpu"`.
+
+**Verification (not yet re-run on the user's NPU server):**
+
+```bash
+cd /workspace/verl-tpr-recompute
+mkdir -p /workspace/tpr_log/recompute
+set -o pipefail
+python -m pytest -q -x \
+  tests/models/mcore/tpr/unit/test_tpr_zero_objective_cpu.py \
+  tests/models/mcore/tpr/unit/test_tpr_full_recompute_cpu.py \
+  2>&1 | tee /workspace/tpr_log/recompute/cpu_recompute_cycle_fix.log
+
+export TPR_OFFLINE_CAPTURE_MANIFEST=/workspace/tpr_offline_run5_first8_40k_v1/capture_manifest.json
+export TPR_BENCH_SOURCE_STEP=6
+export TPR_BENCH_OUTPUT_DIR=/workspace/tpr_recompute_fixed40k_step6_weakref_v1
+export TPR_RUN_FIXED_SHAPE_40K_BENCH=1
+export TPR_BENCH_RECOMPUTE=1
+export TPR_BENCH_MEM_AUDIT=1
+export TPR_RECOMPUTE_REF_AUDIT=1
+export TPR_BENCH_WARMUPS=1
+export TPR_BENCH_REPEATS=3
+export TPR_BENCH_CAPTURE_LOGPROBS=1
+export TPR_TREE_POLICY=qwen_turn
+export TPR_EXEC_PROFILE=0
+export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
+unset TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS
+TPR_OFFLINE_MODE=tpr torchrun --nproc_per_node=8 \
+  --master_addr=127.0.0.1 --master_port=29795 -m pytest -s -x \
+  tests/models/mcore/tpr/parallel/test_tpr_fixed_shape_40k_benchmark_npu.py \
+  2>&1 | tee /workspace/tpr_log/recompute/step6_tpr_weakref_mem_audit.log
+```
+
+The diagnostic reports `live_recompute_refs` and allocated memory before
+and after GC. **A CPU syntax/functional PASS alone does not validate
+NPU memory stabilization.** If the repeated NPU run passes with flat
+live memory, next rerun with both `TPR_BENCH_MEM_AUDIT=0` and
+`TPR_RECOMPUTE_REF_AUDIT=0` to obtain fair timing.
