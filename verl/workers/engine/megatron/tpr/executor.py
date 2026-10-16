@@ -316,9 +316,13 @@ class SegmentExecutor:
             )
             del logits
             self._assert_collected_layers(context)
-            # KVPrefixState is the single owner of cache normalization and
-            # compact storage; avoid cloning each KV twice across boundaries.
-            self.kv_stack.push(segment, context.new_key_values, shard=self._segment_shard(segment))
+            # Detach here (as before); KVPrefixState alone decides whether a
+            # view needs copying into compact, independently owned storage.
+            graph_free_kv = {
+                layer: (key.detach(), value.detach())
+                for layer, (key, value) in context.new_key_values.items()
+            }
+            self.kv_stack.push(segment, graph_free_kv, shard=self._segment_shard(segment))
 
     def pop(self, segment_id: SegmentId) -> Tensor:
         """Recompute current KV and relay gradients from descendant Segments."""
