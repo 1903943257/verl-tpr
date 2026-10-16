@@ -201,3 +201,26 @@ def test_public_dense_symbols_resolve_to_canonical_engine() -> None:
     for name, module in engine_expected.items():
         assert exports[name] == "verl.workers.engine.megatron.tpr." + module, name
 
+
+
+def test_model_public_api_excludes_legacy_aliases() -> None:
+    """Production model exports stay canonical while old explicit imports transition."""
+    syntax = ast.parse((MODEL / "__init__.py").read_text(encoding="utf-8"))
+    maps = {
+        target.id: ast.literal_eval(node.value)
+        for node in syntax.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name) and target.id in ("_PRODUCTION_EXPORTS", "_LEGACY_EXPORTS")
+    }
+    public = maps["_PRODUCTION_EXPORTS"]
+    legacy = maps["_LEGACY_EXPORTS"]
+    assert not (public.keys() & legacy.keys())
+    assert all(not module.startswith("verl.experimental.tpr") for module in public.values())
+    assert all(module.startswith("verl.experimental.tpr") for module in legacy.values())
+    assert public["RingCPBackend"] == "verl.workers.engine.megatron.tpr.ring"
+    assert public["SegmentExecutor"] == "verl.workers.engine.megatron.tpr.executor"
+    assert "SegmentPlan" not in public and "SegmentSpec" not in public
+    assert legacy["SegmentPlan"] == "verl.experimental.tpr.legacy.plan"
+    assert legacy["SegmentSpec"] == "verl.experimental.tpr.legacy.plan"
+    assert "parallel" not in public
