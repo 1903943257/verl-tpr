@@ -320,7 +320,7 @@ def test_prepared_ring_layout_matches_full_validation_without_rechecking_placeme
         cp_group=group, softmax_scale=None, _layout=prepared,
     )
     assert optimized == ordinary
-    with pytest.raises(ValueError, match="dtype/device"):
+    with pytest.raises(ValueError, match="dtype and device"):
         ring._normalize_inputs(
             q, k.double(), v, prefix_blocks=blocks, current_shard=current_shard,
             cp_group=group, softmax_scale=None, _layout=prepared,
