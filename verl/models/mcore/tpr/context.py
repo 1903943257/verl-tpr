@@ -185,6 +185,23 @@ class TPRAttentionContext:
             normalized_gdn[layer_number] = state
         self.initial_gdn_states = MappingProxyType(dict(sorted(normalized_gdn.items())))
 
+    def new_collector(self) -> TPRAttentionContext:
+        """Reuse immutable prefix inputs but isolate checkpoint forward/replay side outputs.
+
+        Replay must never mutate the SegmentExecutor's exported K/V roots.
+        In particular, CP backends and differentiable ancestor anchors are
+        shared by reference, not cloned or detached.
+        """
+        return TPRAttentionContext(
+            prefix_length=self.prefix_length,
+            suffix_length=self.suffix_length,
+            past_key_values=self.past_key_values,
+            suffix_rotary_pos_emb=self.suffix_rotary_pos_emb,
+            attention_backend=self.attention_backend,
+            initial_gdn_states=self.initial_gdn_states,
+            capture_gdn_final_state=self.capture_gdn_final_state,
+        )
+
     @property
     def new_key_values(self) -> Mapping[int, KVPair]:
         """A read-only view of KV tensors produced by the current segment."""
