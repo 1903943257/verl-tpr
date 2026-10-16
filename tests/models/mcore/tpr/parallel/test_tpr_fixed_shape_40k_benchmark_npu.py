@@ -7,6 +7,7 @@ Never use these as sequential PPO training steps or online reward evidence.
 """
 from __future__ import annotations
 
+import gc
 import json
 import os
 import statistics
@@ -64,6 +65,9 @@ def test_fixed_shape_40k_one_mode():
     if recompute_setting not in ("0", "1"):
         raise ValueError("TPR_BENCH_RECOMPUTE must be 0 or 1")
     recompute_enabled = recompute_setting == "1"
+    if os.getenv("TPR_BENCH_MEM_AUDIT", "0") not in ("0", "1"):
+        raise ValueError("TPR_BENCH_MEM_AUDIT must be 0 or 1")
+    mem_audit = os.getenv("TPR_BENCH_MEM_AUDIT", "0") == "1"
     if not 0 <= warmups <= 10 or not 1 <= repeats <= 20:
         raise ValueError("Require 0..10 warmups and 1..20 measured repeats")
     # _qwen3_tp_checkpoint constructs native MCore recompute config before
@@ -248,6 +252,7 @@ def test_fixed_shape_40k_one_mode():
                 "recompute_installed_tpr_blocks": installed_blocks,
                 "updated_weights": False,
                 "profiler_enabled": os.getenv("TPR_EXEC_PROFILE", "0") == "1",
+                "mem_audit": mem_audit,
                 "capture_logprobs": capture_logprobs,
                 "profiles": profiles,
             }
@@ -261,6 +266,32 @@ def test_fixed_shape_40k_one_mode():
                     flush=True,
                 )
                 runs.append(record)
+            # Only opt-in diagnostics change the sequence of operations.
+            # gc.collect is intentionally outside the timed forward/backward:
+            # if allocated memory drops here, tensors were kept in Python
+            # reference cycles rather than being required by the next step.
+            if mem_audit:
+                torch.npu.synchronize()
+                live_before = torch.npu.memory_allocated()
+                collected = gc.collect()
+                torch.npu.synchronize()
+                live_after = torch.npu.memory_allocated()
+                audit = torch.tensor(
+                    [live_before / 2**30, live_after / 2**30],
+                    dtype=torch.float32, device=runtime.device,
+                )
+                dist.all_reduce(audit, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+                if dist.get_rank() == 0:
+                    record["live_alloc_before_gc_gib_worst"] = float(audit[0].item())
+                    record["live_alloc_after_gc_gib_worst"] = float(audit[1].item())
+                    print(
+                        f"TPR_FIXED_SHAPE_MEM_AUDIT mode={mode} "
+                        f"recompute={int(recompute_enabled)} iter={iteration} "
+                        f"live_before_gc_gib={float(audit[0]):.3f} "
+                        f"live_after_gc_gib={float(audit[1]):.3f} "
+                        f"local_collected_objects={collected}",
+                        flush=True,
+                    )
             dist.barrier()
         gradient_witness = None
         if os.getenv("TPR_BENCH_GRAD_WITNESS", "0") == "1":
