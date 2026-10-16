@@ -13,16 +13,28 @@ NEW="$(realpath "$2")"
 MANIFEST="$(realpath "$3")"
 OUT="$4"
 STEP="${5:-6}"
-[[ -d "$OLD/.git" || -f "$OLD/.git" ]] || { echo "Missing old checkout: $OLD" >&2; exit 2; }
-[[ -d "$NEW/.git" || -f "$NEW/.git" ]] || { echo "Missing new checkout: $NEW" >&2; exit 2; }
+[[ -f "$OLD/tests/models/mcore/tpr/parallel/run_tpr_tp2cp2dp2_one_step.sh" ]] || {
+  echo "Missing old test runner: $OLD" >&2; exit 2;
+}
+[[ -f "$NEW/tests/models/mcore/tpr/parallel/run_tpr_tp2cp2dp2_one_step.sh" ]] || {
+  echo "Missing new test runner: $NEW" >&2; exit 2;
+}
 [[ "$OLD" != "$NEW" ]] || { echo "Old and new checkouts must differ" >&2; exit 2; }
 [[ -f "$MANIFEST" ]] || { echo "Missing 40K manifest: $MANIFEST" >&2; exit 2; }
 [[ ! -e "$OUT" ]] || { echo "Output exists: $OUT" >&2; exit 2; }
 mkdir -p "$OUT"
 OUT="$(realpath "$OUT")"
-git -C "$OLD" rev-parse HEAD > "$OUT/old.sha"
-git -C "$NEW" rev-parse HEAD > "$OUT/new.sha"
-echo "TPR_OLD_NEW_DP2_REVISIONS old=$(cat "$OUT/old.sha") new=$(cat "$OUT/new.sha")"
+# Docker rsync checkouts may not include host .git metadata. The operator
+# pins and verifies both worktrees on the host before copying them to Docker.
+for version in old new; do
+  if [[ "$version" == old ]]; then root="$OLD"; else root="$NEW"; fi
+  if git -C "$root" rev-parse HEAD > "$OUT/$version.sha" 2>/dev/null; then
+    echo "TPR_DP2_REVISION version=$version sha=$(cat "$OUT/$version.sha")"
+  else
+    echo "git_metadata_not_mounted" > "$OUT/$version.sha"
+    echo "TPR_DP2_REVISION version=$version sha=unavailable_verify_on_host"
+  fi
+done
 
 # Hold all experimental knobs equal. No Fixed Tile and no Ring redesign here.
 export TPR_BENCH_WARMUPS=0
