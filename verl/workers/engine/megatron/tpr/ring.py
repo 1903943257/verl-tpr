@@ -505,10 +505,10 @@ def _normalize_inputs(
     for index, block in enumerate(blocks):
         if not isinstance(block, RingLocalKVBlock):
             raise TypeError(f"prefix_blocks[{index}] must be RingLocalKVBlock")
-        if block.segment_id in seen:
-            raise ValueError(f"duplicate Prefix segment_id {block.segment_id}")
-        seen.add(block.segment_id)
         if _layout is None:
+            if block.segment_id in seen:
+                raise ValueError(f"duplicate Prefix segment_id {block.segment_id}")
+            seen.add(block.segment_id)
             _validate_ring_shard(
                 block.shard, cp_size=cp_size, cp_rank=cp_rank,
                 name=f"Prefix block {block.segment_id}",
