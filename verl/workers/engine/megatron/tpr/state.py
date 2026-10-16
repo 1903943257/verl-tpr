@@ -147,8 +147,6 @@ class KVPrefixState:
     def global_length(self) -> int:
         return self.shard.global_length
 
-    sequence_length = global_length
-
     @property
     def local_length(self) -> int:
         return self.shard.local_length
