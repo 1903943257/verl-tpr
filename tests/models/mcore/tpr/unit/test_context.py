@@ -15,12 +15,8 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr import (
-    GDNLayerState,
-    TPRAttentionContext,
-    get_tpr_attention_context,
-    use_tpr_attention_context,
-)
+from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
+from verl.models.mcore.tpr import TPRAttentionContext, get_tpr_attention_context, use_tpr_attention_context
 
 
 def _kv(sequence_length: int, *, requires_grad: bool = False):
