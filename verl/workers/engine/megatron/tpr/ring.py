@@ -274,6 +274,20 @@ class _RingAttentionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class _RingStaticLayout:
+    """Validated once per Segment; independent of per-layer K/V tensors."""
+
+    cp_group: Any
+    cp_size: int
+    cp_rank: int
+    global_ranks: tuple[int, ...]
+    current_shard: SequenceShard
+    prefix_signature: tuple[tuple[int, SequenceShard], ...]
+    segment_lengths: tuple[int, ...]
+    segment_padded_lengths: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class _RingRangeSlice:
     """One physical Ring chunk plus its clipped logical validity range."""
 
@@ -420,6 +434,40 @@ def _validate_kv_pair(
         raise ValueError(f"{name} K/V must be floating point")
 
 
+def _prepare_ring_layout(
+    prefix_blocks: Sequence[RingLocalKVBlock],
+    current_shard: SequenceShard,
+    cp_group: Any,
+) -> _RingStaticLayout:
+    """Validate immutable CP placement once when creating a Segment context."""
+    cp_size, cp_rank = _group_world_size_and_rank(cp_group)
+    _validate_ring_shard(current_shard, cp_size=cp_size, cp_rank=cp_rank, name="current")
+    seen: set[int] = set()
+    signature = []
+    for index, block in enumerate(prefix_blocks):
+        if not isinstance(block, RingLocalKVBlock):
+            raise TypeError(f"prefix_blocks[{index}] must be RingLocalKVBlock")
+        if block.segment_id in seen:
+            raise ValueError(f"duplicate Prefix segment_id {block.segment_id}")
+        seen.add(block.segment_id)
+        _validate_ring_shard(
+            block.shard, cp_size=cp_size, cp_rank=cp_rank,
+            name=f"Prefix block {block.segment_id}",
+        )
+        signature.append((block.segment_id, block.shard))
+    shards = tuple(shard for _, shard in signature) + (current_shard,)
+    return _RingStaticLayout(
+        cp_group=cp_group,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        global_ranks=_process_group_global_ranks(cp_group),
+        current_shard=current_shard,
+        prefix_signature=tuple(signature),
+        segment_lengths=tuple(shard.global_length for shard in shards),
+        segment_padded_lengths=tuple(shard.padded_length for shard in shards),
+    )
+
+
 def _normalize_inputs(
     query: Tensor,
     current_key: Tensor,
@@ -429,9 +477,15 @@ def _normalize_inputs(
     current_shard: SequenceShard,
     cp_group: Any,
     softmax_scale: float | None,
+    _layout: _RingStaticLayout | None = None,
 ) -> tuple[tuple[RingLocalKVBlock, ...], _RingAttentionConfig]:
-    cp_size, cp_rank = _group_world_size_and_rank(cp_group)
-    _validate_ring_shard(current_shard, cp_size=cp_size, cp_rank=cp_rank, name="current")
+    if _layout is None:
+        cp_size, cp_rank = _group_world_size_and_rank(cp_group)
+        _validate_ring_shard(current_shard, cp_size=cp_size, cp_rank=cp_rank, name="current")
+    else:
+        if _layout.cp_group is not cp_group or _layout.current_shard != current_shard:
+            raise ValueError("prepared Ring layout does not match this CP group or Current shard")
+        cp_size, cp_rank = _layout.cp_size, _layout.cp_rank
     _validate_kv_pair(current_key, current_value, shard=current_shard, name="current")
     if not isinstance(query, Tensor) or query.ndim != 4:
         raise ValueError("query must have shape [sequence, batch, heads, head_dim]")
@@ -454,12 +508,11 @@ def _normalize_inputs(
         if block.segment_id in seen:
             raise ValueError(f"duplicate Prefix segment_id {block.segment_id}")
         seen.add(block.segment_id)
-        _validate_ring_shard(
-            block.shard,
-            cp_size=cp_size,
-            cp_rank=cp_rank,
-            name=f"Prefix block {block.segment_id}",
-        )
+        if _layout is None:
+            _validate_ring_shard(
+                block.shard, cp_size=cp_size, cp_rank=cp_rank,
+                name=f"Prefix block {block.segment_id}",
+            )
         _validate_kv_pair(
             block.key,
             block.value,
@@ -471,18 +524,29 @@ def _normalize_inputs(
         if block.key.dtype != current_key.dtype or block.key.device != current_key.device:
             raise ValueError(f"Prefix block {block.segment_id} dtype/device must match Current KV")
 
+    if _layout is not None and (
+        tuple((block.segment_id, block.shard) for block in blocks) != _layout.prefix_signature
+    ):
+        raise ValueError("prepared Ring layout does not match Prefix segment placement")
     scale = query.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
     if not isinstance(scale, (int, float)) or not math.isfinite(scale) or scale <= 0:
         raise ValueError(f"softmax_scale must be finite and positive, got {scale!r}")
+    if _layout is None:
+        global_ranks = _process_group_global_ranks(cp_group)
+        shards = tuple(block.shard for block in blocks) + (current_shard,)
+        lengths = tuple(shard.global_length for shard in shards)
+        padded_lengths = tuple(shard.padded_length for shard in shards)
+    else:
+        global_ranks = _layout.global_ranks
+        lengths = _layout.segment_lengths
+        padded_lengths = _layout.segment_padded_lengths
     config = _RingAttentionConfig(
         cp_group=cp_group,
-        global_ranks=_process_group_global_ranks(cp_group),
+        global_ranks=global_ranks,
         cp_size=cp_size,
         cp_rank=cp_rank,
-        segment_lengths=tuple(block.shard.global_length for block in blocks)
-        + (current_shard.global_length,),
-        segment_padded_lengths=tuple(block.shard.padded_length for block in blocks)
-        + (current_shard.padded_length,),
+        segment_lengths=lengths,
+        segment_padded_lengths=padded_lengths,
         current_shard=current_shard,
         query_heads=query.shape[2],
         head_dim=query.shape[-1],
@@ -1212,6 +1276,7 @@ def ring_cp_attention(
     current_shard: SequenceShard,
     cp_group: Any,
     softmax_scale: float | None = None,
+    _layout: _RingStaticLayout | None = None,
 ) -> Tensor:
     """Run blockwise TPR attention over MindSpeed causal Ring shards."""
 
@@ -1223,6 +1288,7 @@ def ring_cp_attention(
         current_shard=current_shard,
         cp_group=cp_group,
         softmax_scale=softmax_scale,
+        _layout=_layout,
     )
     flat_kv = []
     for block in blocks:
@@ -1248,8 +1314,6 @@ class RingCPAttentionBackend:
             or global_prefix_length < 0
         ):
             raise ValueError("global_prefix_length must be a non-negative integer")
-        cp_size, cp_rank = _group_world_size_and_rank(cp_group)
-        _validate_ring_shard(current_shard, cp_size=cp_size, cp_rank=cp_rank, name="current")
         normalized = {
             layer: tuple(blocks)
             for layer, blocks in sorted(prefix_blocks_by_layer.items())
@@ -1267,11 +1331,17 @@ class RingCPAttentionBackend:
                 raise ValueError("Prefix path must be identical across Ring attention layers")
             if sum(block.shard.global_length for block in blocks) != global_prefix_length:
                 raise ValueError(f"layer {layer} Prefix blocks do not cover the Prefix length")
+        first_blocks = next(iter(normalized.values()))
+        layout = _prepare_ring_layout(first_blocks, current_shard, cp_group)
+        for layer, blocks in normalized.items():
+            if tuple((block.segment_id, block.shard) for block in blocks) != layout.prefix_signature:
+                raise ValueError(f"layer {layer} Ring Prefix placement differs from other layers")
+        self._ring_layout = layout
         self._global_prefix_length = global_prefix_length
         self._current_shard = current_shard
         self._prefix_blocks_by_layer = MappingProxyType(normalized)
         self._cp_group = cp_group
-        self._parallel_size = cp_size
+        self._parallel_size = layout.cp_size
 
     @property
     def global_prefix_length(self) -> int:
@@ -1310,6 +1380,7 @@ class RingCPAttentionBackend:
             current_shard=self._current_shard,
             cp_group=self._cp_group,
             softmax_scale=softmax_scale,
+            _layout=self._ring_layout,
         )
 
 
