@@ -184,3 +184,75 @@ parity have not been independently established. Run OFF and ON with
 logs must remain under `/workspace/tpr_log/recompute/`.
 
 No changes should be made to `main` on the basis of this single replay.
+
+## 2026-10-16: complete TPR OFF/ON gradient gate
+
+**User-reported NPU run** with rows (4, 6), 4,616 PPO tokens, Qwen3-4B
+TP2×CP4, `TPR_OFFLINE_SAVE_FULL_GRADS=1`:
+- Equal loss -1.7545651197433472 and equal logical logprobs.
+- Whole-model BF16 gradient relative L2: **0.010247685665679882**;
+  cosine **0.9999474913094778**; exact global norms OFF
+  **8.456650538670567**, ON **8.456029583016793**.
+- Sampled gradient relative L2: 0.015617284133223113.
+- Critical fwd/bwd OFF **7.092767982976511s**, ON
+  **8.858999602030963s** (ON/OFF **1.2490187**).
+- Worst peak allocated OFF **27.290441 GiB**, ON **14.536106 GiB**
+  (**46.7% lower**); reserved OFF **30.148438 GiB**, ON **17.673828 GiB**.
+- Largest absolute gradient differences concentrate in some FC2 and QKV
+  tensors. A 1.025% whole-model gradient L2 gap remains; this is not a
+  bitwise/exact backward parity claim.
+
+## Controlled 2×2: unshared Full / shared TPR × recompute OFF / ON
+
+The recorded replay now supports `TPR_OFFLINE_RECOMPUTE=1` with
+`TPR_OFFLINE_RUN_MODES=full`, `tpr`, or `both`. For both modes,
+full/uniform/1 is enabled on the **same TPR-capable TransformerBlock**
+and installs the same explicit-KV checkpoint adapter. The *Full* case
+uses isolated trajectory trees and the same SegmentExecutor/Ring
+backend; it is **not** genuine native Megatron/VERL Full execution.
+It is a controlled test of prefix sharing vs no sharing with the same
+layer-recompute implementation. Use a separate Native Megatron test to
+quantify native checkpoint gains independently.
+
+To fill the missing Full OFF/ON cells while reusing previously saved
+TPR OFF/ON snapshots:
+
+```bash
+cd /workspace/verl-tpr-recompute
+mkdir -p /workspace/tpr_log/recompute
+set -o pipefail
+export TPR_OFFLINE_RUN_MODES=full
+export TPR_OFFLINE_ROWS=4,6
+export TPR_OFFLINE_SAVE_FULL_GRADS=0
+
+TPR_OFFLINE_RECOMPUTE=0 \
+TPR_OFFLINE_OUTPUT_DIR=/workspace/tpr_recompute_full_off_v1 \
+bash tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_offline_ppo.sh \
+  2>&1 | tee /workspace/tpr_log/recompute/full_off_wrapper.log
+
+TPR_OFFLINE_RECOMPUTE=1 \
+TPR_OFFLINE_OUTPUT_DIR=/workspace/tpr_recompute_full_on_v1 \
+bash tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_offline_ppo.sh \
+  2>&1 | tee /workspace/tpr_log/recompute/full_on_wrapper.log
+
+python tests/models/mcore/tpr/parallel/compare_tpr_recompute_matrix.py \
+  /workspace/tpr_recompute_full_off_v1 \
+  /workspace/tpr_recompute_full_on_v1 \
+  /workspace/tpr_recompute_baseline_v2 \
+  /workspace/tpr_recompute_on_v1 \
+  2>&1 | tee /workspace/tpr_log/recompute/recompute_matrix.log
+```
+
+The four-way tool checks matching source capture, rows, model, initial
+parameter witnesses and per-mode tree and Ring configuration. It prints
+latency, allocated/reserved peaks, loss, sampled-gradient gaps and
+per-mode Recompute OFF→ON savings. Optional
+`--full-gradients` computes complete BF16 gradients when **all four
+cases** have full gradient manifests.
+
+Alternatively run both checkpointed cases in fresh processes with
+`TPR_OFFLINE_RECOMPUTE=1 TPR_OFFLINE_RUN_MODES=both` and a new unique
+`TPR_OFFLINE_OUTPUT_DIR`. The standard Full-vs-TPR comparison in that
+mode is `--diagnostic-only --require-recompute`; legacy threshold gates
+are reported but not enforced. All console logs go under
+`/workspace/tpr_log/recompute/`.
