@@ -15,14 +15,10 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr import (
-    KVPrefixState,
-    PrefixShard,
-    PrefixState,
-    PrefixStateStack,
-    SegmentLossTerm,
-    SegmentSpec,
-)
+from verl.models.mcore.tpr import KVPrefixState
+from verl.experimental.tpr.shard import PrefixShard
+from verl.experimental.tpr.legacy.state import PrefixState, PrefixStateStack
+from verl.experimental.tpr.legacy.plan import SegmentLossTerm, SegmentSpec
 from verl.workers.engine.megatron.tpr.state import KVStack
 from verl.experimental.tpr.legacy.state import (
     accumulate_sharded_past_anchor_gradients,
