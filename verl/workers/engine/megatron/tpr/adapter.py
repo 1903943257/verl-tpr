@@ -39,6 +39,7 @@ from verl.utils.metric import AggregationType, Metric
 
 from .executor import SegmentExecutor, SegmentEventProfiler
 from .ring import aggregate_cp_loss, resolve_engine_cp_runtime
+from .recompute import assert_tpr_full_recompute_installed
 from .tree import ForestExecutionPlan, TreeExecutionPlan, assert_tp_plan_agreement, digest_forest_plan
 
 if TYPE_CHECKING:
@@ -257,8 +258,10 @@ def run_tpr_forward_backward_batch(
     config = get_model_config(wrapped_model)
     if not model.training:
         raise RuntimeError("TPR PPO requires model.train()")
+    # Native Full Checkpoint cannot export TPR KV autograd roots by itself.
+    # Only allow the isolated experimental adapter after installation checks.
+    assert_tpr_full_recompute_installed(model, config)
     unsupported = {
-        "Megatron recompute": getattr(config, "recompute_granularity", None) is not None,
         "calculate_per_token_loss": getattr(config, "calculate_per_token_loss", False),
         "FP8": getattr(config, "fp8", None) not in (None, False),
         "MoE": getattr(config, "num_moe_experts", None) is not None,
