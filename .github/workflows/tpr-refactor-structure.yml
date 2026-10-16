@@ -21,6 +21,18 @@ jobs:
         run: |
           bash -n tests/models/mcore/tpr/parallel/run_old_new_tpr_tp2cp4_ppo.sh
           bash -n tests/models/mcore/tpr/parallel/run_old_new_tpr_tp2cp2dp2_ppo.sh
+      - name: Check embedded DP2 old/new comparator syntax
+        run: |
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+          path = Path("tests/models/mcore/tpr/parallel/run_old_new_tpr_tp2cp2dp2_ppo.sh")
+          source = path.read_text(encoding="utf-8")
+          assert source.count("<<'PY'") == 1
+          embedded = source.split("<<'PY'\\n", 1)[1].split("\\nPY\\n", 1)[0]
+          ast.parse(embedded, filename=str(path) + ":comparator")
+          print("PASS DP2 old/new inline Python comparator syntax")
+          PY
       - name: Run stdlib-only structural tests
         run: |
           python3 - <<'PY'
