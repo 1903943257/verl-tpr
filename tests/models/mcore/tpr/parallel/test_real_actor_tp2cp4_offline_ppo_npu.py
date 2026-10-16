@@ -271,8 +271,9 @@ def test_recorded_full_vs_tpr_one_step():
     if recompute_setting not in ("0", "1"):
         raise ValueError("TPR_OFFLINE_RECOMPUTE must be 0 or 1")
     recompute_enabled = recompute_setting == "1"
-    if recompute_enabled and mode != "tpr":
-        raise ValueError("TPR_OFFLINE_RECOMPUTE=1 requires TPR_OFFLINE_MODE=tpr")
+    # ON supports both unshared Full (same TPR Ring/Executor without
+    # cross-trajectory sharing) and shared TPR. It does not turn this
+    # controlled Full comparator into a native Megatron Full run.
     rows_value = os.getenv("TPR_OFFLINE_ROWS", "4,6")
     if rows_value == "all":
         raw = torch.load(os.environ["TPR_REAL_ACTOR_MINIBATCH"],
