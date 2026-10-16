@@ -108,6 +108,30 @@ jobs:
               assert plan.max_tree_tokens == optimal
               print(f"PASS UID-scoped DP{dp_size}: rows={plan.partitions} "
                     f"global_tokens={plan.global_tree_tokens} duplicated={plan.duplicated_tree_tokens}")
+
+          import ast
+          import os
+          adapter_path = Path("verl/workers/engine/megatron/tpr/adapter.py")
+          tree = ast.parse(adapter_path.read_text())
+          fn = next(x for x in tree.body if isinstance(x, ast.FunctionDef)
+                    and x.name == "_validate_tpr_parallel_sizes")
+          namespace = {"os": os}
+          exec(compile(ast.Module(body=[fn], type_ignores=[]), str(adapter_path), "exec"), namespace)
+          validate = namespace["_validate_tpr_parallel_sizes"]
+          sizes = {"TP": 2, "CP": 2, "DP": 2, "PP": 1, "EP": 1}
+          for name in ("TPR_EXPERIMENTAL_OFFLINE_DP2", "TPR_RUN_TP2CP2DP2_ONE_STEP",
+                       "TPR_RUN_10K_PARALLEL_PARITY", "TPR_10K_PARITY_ONLY"):
+              os.environ.pop(name, None)
+          try:
+              validate(sizes, ppo=True)
+          except NotImplementedError:
+              pass
+          else:
+              raise AssertionError("Ungated production DP2 must be rejected")
+          os.environ["TPR_EXPERIMENTAL_OFFLINE_DP2"] = "1"
+          os.environ["TPR_RUN_TP2CP2DP2_ONE_STEP"] = "1"
+          assert validate(sizes, ppo=True) == 2
+          print("PASS production TP2CP2DP2 explicit offline gate")
           PY
       - name: Audit legacy model imports
         run: |
