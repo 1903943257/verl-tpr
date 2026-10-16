@@ -16,12 +16,9 @@ import pytest
 import torch
 
 from verl.workers.engine.megatron.tpr.executor import disable_bound_context_parallel_sharding
-from verl.models.mcore.tpr import (
-    AllGatherCPBackend,
-    RangeSequenceShard,
-    build_sharded_rotary_pos_emb,
-    build_suffix_rotary_pos_emb,
-)
+from verl.experimental.tpr.legacy.cp.backend import AllGatherCPBackend
+from verl.experimental.tpr.shard import RangeSequenceShard
+from verl.models.mcore.tpr import build_sharded_rotary_pos_emb, build_suffix_rotary_pos_emb
 
 
 class _RecordingRotaryEmbedding:
