@@ -64,6 +64,8 @@ class _FakeBlock(TransformerBlock):
             "fp8": None,
             "fp4": None,
             "cpu_offloading": False,
+            # TransformerModule.__call__ checks this even for mocked Blocks.
+            "cuda_graph_impl": "none",
         })()
 
     def _checkpointed_forward(
