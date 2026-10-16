@@ -18,7 +18,9 @@ jobs:
           python3 -m compileall -q             verl/models/mcore/tpr             verl/workers/engine/megatron/tpr             verl/experimental/tpr             tests/models/mcore/tpr/unit/test_production_architecture.py \
             tests/models/mcore/tpr/parallel/compare_old_new_tpr_tp2cp4_ppo.py
       - name: Check old/new replay shell syntax
-        run: bash -n tests/models/mcore/tpr/parallel/run_old_new_tpr_tp2cp4_ppo.sh
+        run: |
+          bash -n tests/models/mcore/tpr/parallel/run_old_new_tpr_tp2cp4_ppo.sh
+          bash -n tests/models/mcore/tpr/parallel/run_old_new_tpr_tp2cp2dp2_ppo.sh
       - name: Run stdlib-only structural tests
         run: |
           python3 - <<'PY'
