@@ -1090,65 +1090,31 @@ class RingCPAttentionBackend:
         )
 
 
-def _cached_blocks(kv_stack: KVStack, layer_number: int) -> tuple[RingLocalKVBlock, ...]:
-    blocks = []
-    for segment_id in kv_stack.segment_ids:
-        state = kv_stack.get(segment_id).kv
+def _prefix_blocks_by_layer(
+    kv_stack: KVStack,
+    anchors: ShardedPastKVAnchors | None,
+    expected_layer_numbers: tuple[int, ...],
+) -> dict[int, tuple[RingLocalKVBlock, ...]]:
+    """Use one Prefix block construction path for cached and anchored KV."""
+    if anchors is None:
+        sources = tuple(
+            (segment_id, kv_stack.get(segment_id).kv)
+            for segment_id in kv_stack.segment_ids
+        )
+    else:
+        sources = tuple((entry.segment_id, entry) for entry in anchors.entries)
+
+    for _, state in sources:
         if not isinstance(physical_sequence_shard(state.shard), RangeSequenceShard):
             raise TypeError("Ring CP requires RangeSequenceShard Prefix states")
-        blocks.append(
-            RingLocalKVBlock(
-                segment_id,
-                state.shard,
-                *state.key_values[layer_number],
-            )
+
+    return {
+        layer: tuple(
+            RingLocalKVBlock(segment_id, state.shard, *state.key_values[layer])
+            for segment_id, state in sources
         )
-    return tuple(blocks)
-
-
-def make_cached_ring_cp_backend(
-    kv_stack: KVStack,
-    *,
-    expected_layer_numbers: tuple[int, ...],
-    current_shard: SequenceShard,
-    cp_group: Any,
-) -> RingCPAttentionBackend:
-    return RingCPAttentionBackend(
-        global_prefix_length=kv_stack.prefix_length,
-        current_shard=current_shard,
-        prefix_blocks_by_layer={
-            layer: _cached_blocks(kv_stack, layer) for layer in expected_layer_numbers
-        },
-        cp_group=cp_group,
-    )
-
-
-def make_anchored_ring_cp_backend(
-    anchors: ShardedPastKVAnchors,
-    *,
-    expected_layer_numbers: tuple[int, ...],
-    current_shard: SequenceShard,
-    cp_group: Any,
-) -> RingCPAttentionBackend:
-    for entry in anchors.entries:
-        if not isinstance(physical_sequence_shard(entry.shard), RangeSequenceShard):
-            raise TypeError("Ring CP requires RangeSequenceShard Prefix anchors")
-    return RingCPAttentionBackend(
-        global_prefix_length=anchors.global_prefix_length,
-        current_shard=current_shard,
-        prefix_blocks_by_layer={
-            layer: tuple(
-                RingLocalKVBlock(
-                    entry.segment_id,
-                    entry.shard,
-                    *entry.key_values[layer],
-                )
-                for entry in anchors.entries
-            )
-            for layer in expected_layer_numbers
-        },
-        cp_group=cp_group,
-    )
+        for layer in expected_layer_numbers
+    }
 
 
 RING_CP_BACKEND = "ring"
@@ -1201,14 +1167,16 @@ class RingCPBackend:
     ) -> RingCPAttentionBackend:
         if not isinstance(physical_sequence_shard(current_shard), RangeSequenceShard):
             raise TypeError("Ring CP requires RangeSequenceShard")
-        if past_anchors is None:
-            return make_cached_ring_cp_backend(
-                kv_stack, expected_layer_numbers=expected_layer_numbers,
-                current_shard=current_shard, cp_group=self._cp_group,
-            )
-        return make_anchored_ring_cp_backend(
-            past_anchors, expected_layer_numbers=expected_layer_numbers,
-            current_shard=current_shard, cp_group=self._cp_group,
+        return RingCPAttentionBackend(
+            global_prefix_length=(
+                kv_stack.prefix_length if past_anchors is None
+                else past_anchors.global_prefix_length
+            ),
+            current_shard=current_shard,
+            prefix_blocks_by_layer=_prefix_blocks_by_layer(
+                kv_stack, past_anchors, expected_layer_numbers,
+            ),
+            cp_group=self._cp_group,
         )
 
 
