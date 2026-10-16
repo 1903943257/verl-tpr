@@ -205,24 +205,48 @@ def test_public_dense_symbols_resolve_to_canonical_engine() -> None:
 
 
 
-def test_model_public_api_excludes_legacy_aliases() -> None:
-    """Production model exports stay canonical while old explicit imports transition."""
-    syntax = ast.parse((MODEL / "__init__.py").read_text(encoding="utf-8"))
-    maps = {
-        target.id: ast.literal_eval(node.value)
+def test_model_public_api_has_no_legacy_exports() -> None:
+    """The public model package exposes only canonical production TPR types."""
+    source = (MODEL / "__init__.py").read_text(encoding="utf-8")
+    syntax = ast.parse(source)
+    exports = next(
+        ast.literal_eval(node.value)
         for node in syntax.body
         if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name) and target.id in ("_PRODUCTION_EXPORTS", "_LEGACY_EXPORTS")
-    }
-    public = maps["_PRODUCTION_EXPORTS"]
-    legacy = maps["_LEGACY_EXPORTS"]
-    assert not (public.keys() & legacy.keys())
-    assert all(not module.startswith("verl.experimental.tpr") for module in public.values())
-    assert all(module.startswith("verl.experimental.tpr") for module in legacy.values())
-    assert public["RingCPBackend"] == "verl.workers.engine.megatron.tpr.ring"
-    assert public["SegmentExecutor"] == "verl.workers.engine.megatron.tpr.executor"
-    assert "SegmentPlan" not in public and "SegmentSpec" not in public
-    assert legacy["SegmentPlan"] == "verl.experimental.tpr.legacy.plan"
-    assert legacy["SegmentSpec"] == "verl.experimental.tpr.legacy.plan"
-    assert "parallel" not in public
+        and any(
+            isinstance(target, ast.Name) and target.id == "_PRODUCTION_EXPORTS"
+            for target in node.targets
+        )
+    )
+    assert "_LEGACY_EXPORTS" not in source
+    assert "_MODULES" not in source
+    assert not any(module.startswith("verl.experimental.tpr") for module in exports.values())
+    assert exports["RingCPBackend"] == "verl.workers.engine.megatron.tpr.ring"
+    assert exports["SegmentExecutor"] == "verl.workers.engine.megatron.tpr.executor"
+    assert "SegmentPlan" not in exports and "SegmentSpec" not in exports
+
+
+def test_historical_tests_use_explicit_experimental_imports() -> None:
+    """Do not accidentally reintroduce top-level legacy aliases."""
+    package_root = "verl.models.mcore.tpr"
+    model_submodules = {"attention", "context", "rectangular_attention"}
+    source = (MODEL / "__init__.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    public = next(
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "_PRODUCTION_EXPORTS"
+            for target in node.targets
+        )
+    )
+    for root in (ROOT / "verl", ROOT / "tests/models/mcore/tpr"):
+        for file in root.rglob("*.py"):
+            tree = ast.parse(file.read_text(encoding="utf-8"), filename=str(file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module == package_root:
+                    for symbol in node.names:
+                        assert symbol.name in public or symbol.name in model_submodules, (
+                            f"{file} imports obsolete top-level TPR symbol {symbol.name}"
+                        )
