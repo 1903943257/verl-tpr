@@ -278,3 +278,99 @@ def test_query_coalescing_requires_original_contiguous_unpadded_view():
     assert not ring._can_coalesce_prefix_query(noncontiguous, config)
     config.segment_padded_lengths = (128, 72)
     assert not ring._can_coalesce_prefix_query(q, config)
+
+
+def test_prepared_ring_layout_matches_full_validation_without_rechecking_placement(monkeypatch):
+    """Preparation is once per Segment; every Layer still checks the live K/V."""
+    group = object()
+    current_shard = make_ring_sequence_shard(63, cp_rank=0, cp_size=2)
+    prefix_shard = make_ring_sequence_shard(127, cp_rank=0, cp_size=2)
+    q = torch.randn(current_shard.local_length, 1, 4, 8)
+    k = torch.randn(current_shard.local_length, 1, 2, 8)
+    v = torch.randn_like(k)
+    blocks = (
+        ring.RingLocalKVBlock(
+            7, prefix_shard,
+            torch.randn(prefix_shard.local_length, 1, 2, 8),
+            torch.randn(prefix_shard.local_length, 1, 2, 8),
+        ),
+    )
+    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    context = ring.RingCPAttentionBackend(
+        global_prefix_length=127, current_shard=current_shard,
+        prefix_blocks_by_layer={1: blocks, 2: blocks},
+        cp_group=group,
+    )
+    _, ordinary = ring._normalize_inputs(
+        q, k, v, prefix_blocks=blocks, current_shard=current_shard,
+        cp_group=group, softmax_scale=None,
+    )
+    prepared = context._ring_layout
+    assert (prepared.segment_lengths, prepared.segment_padded_lengths) == ((127, 63), (128, 64))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("static Ring placement was recomputed per layer")
+
+    monkeypatch.setattr(ring, "_group_world_size_and_rank", forbidden)
+    monkeypatch.setattr(ring, "_validate_ring_shard", forbidden)
+    monkeypatch.setattr(ring, "_process_group_global_ranks", forbidden)
+    _, optimized = ring._normalize_inputs(
+        q, k, v, prefix_blocks=blocks, current_shard=current_shard,
+        cp_group=group, softmax_scale=None, _layout=prepared,
+    )
+    assert optimized == ordinary
+    with pytest.raises(ValueError, match="dtype/device"):
+        ring._normalize_inputs(
+            q, k.double(), v, prefix_blocks=blocks, current_shard=current_shard,
+            cp_group=group, softmax_scale=None, _layout=prepared,
+        )
+    with pytest.raises(ValueError, match="Prefix segment placement"):
+        ring._normalize_inputs(
+            q, k, v,
+            prefix_blocks=(ring.RingLocalKVBlock(8, prefix_shard, blocks[0].key, blocks[0].value),),
+            current_shard=current_shard, cp_group=group,
+            softmax_scale=None, _layout=prepared,
+        )
+    with pytest.raises(ValueError, match="CP group"):
+        ring._normalize_inputs(
+            q, k, v, prefix_blocks=blocks, current_shard=current_shard,
+            cp_group=object(), softmax_scale=None, _layout=prepared,
+        )
+
+
+def test_unified_ring_prefix_builder_keeps_anchored_autograd_leaves(monkeypatch):
+    """Cached and anchored Prefix KV have identical placement, different graph ownership."""
+    group = object()
+    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    shard = make_ring_sequence_shard(64, cp_rank=0, cp_size=2)
+    current = make_ring_sequence_shard(32, cp_rank=0, cp_size=2)
+    kv = (
+        torch.randn(shard.local_length, 1, 2, 8),
+        torch.randn(shard.local_length, 1, 2, 8),
+    )
+    cached_state = SimpleNamespace(shard=shard, key_values={1: kv})
+    stack = SimpleNamespace(
+        segment_ids=(4,), prefix_length=64,
+        get=lambda segment_id: SimpleNamespace(kv=cached_state),
+    )
+    leaves = tuple(t.detach().clone().requires_grad_() for t in kv)
+    anchor = SimpleNamespace(segment_id=4, shard=shard, key_values={1: leaves})
+    past = SimpleNamespace(entries=(anchor,), global_prefix_length=64)
+    policy = ring.RingCPBackend(group, parallel_size=2, parallel_rank=0)
+    cached = policy.make_attention_backend(
+        stack, expected_layer_numbers=(1,), current_shard=current, past_anchors=None,
+    )
+    anchored = policy.make_attention_backend(
+        stack, expected_layer_numbers=(1,), current_shard=current, past_anchors=past,
+    )
+    original = cached._prefix_blocks_by_layer[1][0]
+    leaf = anchored._prefix_blocks_by_layer[1][0]
+    assert original.segment_id == leaf.segment_id == 4
+    assert original.shard == leaf.shard == shard
+    assert original.key is kv[0] and original.value is kv[1]
+    assert leaf.key is leaves[0] and leaf.value is leaves[1]
+    (leaf.key.sum() + leaf.value.sum()).backward()
+    assert all(t.grad is not None for t in leaves)
+    assert all(t.grad is None for t in kv)
