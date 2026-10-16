@@ -17,7 +17,13 @@ from types import SimpleNamespace
 import pytest
 
 import verl.experimental.tpr.legacy.cp.backend as backend_module
-from verl.experimental.tpr.legacy.cp.backend import ALLGATHER_CP_BACKEND, AllGatherCPBackend, HybridCPBackend, TPRCPBackend, UlyssesCPBackend
+from verl.experimental.tpr.legacy.cp.backend import (
+    ALLGATHER_CP_BACKEND,
+    AllGatherCPBackend,
+    HybridCPBackend,
+    TPRCPBackend,
+    UlyssesCPBackend,
+)
 from verl.experimental.tpr.hybrid import HybridCPTopology
 from verl.experimental.tpr.shard import PrefixShard, RangeSequenceShard
 from verl.models.mcore.tpr import RingCPBackend, SequenceShard
