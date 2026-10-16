@@ -269,6 +269,8 @@ def test_query_coalescing_slices_head_major_statistics_and_reassembles():
 def test_query_coalescing_requires_original_contiguous_unpadded_view():
     config = SimpleNamespace(
         coalesce_prefix_full=True, coalesce_prefix_query=True,
+        coalesce_prefix_padded=False,
+        current_shard=make_ring_sequence_shard(64, cp_rank=0, cp_size=2),
         segment_lengths=(128, 64), segment_padded_lengths=(128, 64),
     )
     q = torch.randn(16, 1, 4, 8)
@@ -279,6 +281,13 @@ def test_query_coalescing_requires_original_contiguous_unpadded_view():
     noncontiguous = q.transpose(0, 2).contiguous().transpose(0, 2)
     assert not ring._can_coalesce_prefix_query(noncontiguous, config)
     config.segment_padded_lengths = (128, 72)
+    assert not ring._can_coalesce_prefix_query(q, config)
+    config.coalesce_prefix_padded = True
+    assert ring._can_coalesce_prefix_query(q, config)
+    config.coalesce_prefix_padded = False
+    # A rank containing an entirely virtual Query chunk cannot restore full
+    # head-major merged-query statistics; use the original two-range path.
+    config.current_shard = make_ring_sequence_shard(1, cp_rank=0, cp_size=4)
     assert not ring._can_coalesce_prefix_query(q, config)
 
 
@@ -466,3 +475,74 @@ def test_ring_block_stats_report_effective_fa_counts(capsys):
     assert report["fa_current"] == 5
     assert report["fa_total"] == 9
     assert report["fa_prefix_calls_saved"] == 4
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize("prefix_length", [1, 7, 17, 127, 17479])
+def test_padded_merged_query_sources_trim_kv_without_copy(cp_size, prefix_length):
+    """Full Query source K/V are trimmed only after RingP2P transport."""
+    cp_rank = 0
+    config = ring._RingAttentionConfig(
+        cp_group=None, global_ranks=tuple(range(cp_size)),
+        cp_size=cp_size, cp_rank=cp_rank,
+        segment_lengths=(prefix_length, 63),
+        segment_padded_lengths=(
+            ring.round_up_sequence_length(prefix_length, 2 * cp_size),
+            ring.round_up_sequence_length(63, 2 * cp_size),
+        ),
+        current_shard=make_ring_sequence_shard(63, cp_rank=cp_rank, cp_size=cp_size),
+        query_heads=4, head_dim=8, softmax_scale=8 ** -0.5,
+        coalesce_prefix_full=True, coalesce_prefix_query=True,
+        coalesce_prefix_padded=True,
+    )
+    for source_rank in range(cp_size):
+        shard = make_ring_sequence_shard(
+            prefix_length, cp_rank=source_rank, cp_size=cp_size,
+        )
+        key = torch.randn(shard.local_length, 1, 2, 8)
+        value = torch.randn_like(key)
+        result = ring._source_merged_prefix_kv(key, value, config, 0, source_rank)
+        valid = shard.valid_local_length
+        if valid == 0:
+            assert result is None
+            continue
+        k, v = result
+        assert k.shape == v.shape == (valid, 2, 8)
+        assert k.untyped_storage().data_ptr() == key.untyped_storage().data_ptr()
+        assert v.untyped_storage().data_ptr() == value.untyped_storage().data_ptr()
+        torch.testing.assert_close(k, key[:valid, 0], rtol=0, atol=0)
+        torch.testing.assert_close(v, value[:valid, 0], rtol=0, atol=0)
+
+
+def test_padded_query_merge_allows_real_ragged_agent_lengths():
+    cp = 4
+    prefix, current = 17479, 863
+    shard = make_ring_sequence_shard(current, cp_rank=0, cp_size=cp)
+    cfg = ring._RingAttentionConfig(
+        cp_group=None, global_ranks=(0, 1, 2, 3), cp_size=cp, cp_rank=0,
+        segment_lengths=(prefix, current),
+        segment_padded_lengths=(17480, 864),
+        current_shard=shard, query_heads=16, head_dim=128,
+        softmax_scale=128 ** -0.5,
+        coalesce_prefix_full=True, coalesce_prefix_query=True,
+        coalesce_prefix_padded=True,
+    )
+    q = torch.randn(shard.local_length, 1, 16, 128)
+    assert ring._can_coalesce_prefix_query(q, cfg)
+    cfg.coalesce_prefix_padded = False
+    assert not ring._can_coalesce_prefix_query(q, cfg)
+
+
+def test_all_padded_query_rank_falls_back_from_query_merge():
+    cp = 4
+    for rank in range(cp):
+        shard = make_ring_sequence_shard(1, cp_rank=rank, cp_size=cp)
+        cfg = ring._RingAttentionConfig(
+            cp_group=None, global_ranks=(0, 1, 2, 3), cp_size=cp, cp_rank=rank,
+            segment_lengths=(17, 1), segment_padded_lengths=(24, 8),
+            current_shard=shard, query_heads=4, head_dim=8,
+            softmax_scale=8 ** -0.5, coalesce_prefix_full=True,
+            coalesce_prefix_query=True, coalesce_prefix_padded=True,
+        )
+        q = torch.zeros(shard.local_length, 1, 4, 8)
+        assert not ring._can_coalesce_prefix_query(q, cfg)
