@@ -68,6 +68,9 @@ def test_fixed_shape_40k_one_mode():
     if os.getenv("TPR_BENCH_MEM_AUDIT", "0") not in ("0", "1"):
         raise ValueError("TPR_BENCH_MEM_AUDIT must be 0 or 1")
     mem_audit = os.getenv("TPR_BENCH_MEM_AUDIT", "0") == "1"
+    ref_audit = os.getenv("TPR_RECOMPUTE_REF_AUDIT", "0") == "1"
+    if ref_audit and not mem_audit:
+        raise ValueError("TPR_RECOMPUTE_REF_AUDIT=1 requires TPR_BENCH_MEM_AUDIT=1")
     if not 0 <= warmups <= 10 or not 1 <= repeats <= 20:
         raise ValueError("Require 0..10 warmups and 1..20 measured repeats")
     # _qwen3_tp_checkpoint constructs native MCore recompute config before
@@ -281,14 +284,32 @@ def test_fixed_shape_40k_one_mode():
                     dtype=torch.float32, device=runtime.device,
                 )
                 dist.all_reduce(audit, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+                ref_counts = None
+                if ref_audit:
+                    from verl.workers.engine.megatron.tpr.recompute import (
+                        tpr_recompute_live_ref_counts,
+                    )
+                    refs = tpr_recompute_live_ref_counts()
+                    ref_max = torch.tensor(
+                        [refs["checkpoint_run_functions"], refs["attention_contexts"]],
+                        dtype=torch.float32, device=runtime.device,
+                    )
+                    dist.all_reduce(ref_max, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+                    ref_counts = {
+                        "checkpoint_run_functions": int(ref_max[0].item()),
+                        "attention_contexts": int(ref_max[1].item()),
+                    }
                 if dist.get_rank() == 0:
                     record["live_alloc_before_gc_gib_worst"] = float(audit[0].item())
                     record["live_alloc_after_gc_gib_worst"] = float(audit[1].item())
+                    if ref_counts is not None:
+                        record["live_recompute_refs"] = ref_counts
                     print(
                         f"TPR_FIXED_SHAPE_MEM_AUDIT mode={mode} "
                         f"recompute={int(recompute_enabled)} iter={iteration} "
                         f"live_before_gc_gib={float(audit[0]):.3f} "
                         f"live_after_gc_gib={float(audit[1]):.3f} "
+                        f"live_recompute_refs={ref_counts} "
                         f"local_collected_objects={collected}",
                         flush=True,
                     )
