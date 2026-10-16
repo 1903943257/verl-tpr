@@ -34,7 +34,11 @@ from torch import Tensor
 import verl.experimental.tpr.hybrid as hybrid
 import verl.workers.engine.megatron.tpr.ring as ring
 import verl.experimental.tpr.ulysses as ulysses
-from verl.experimental.tpr.hybrid import HybridCPTopology, HybridLocalKVBlock, make_hybrid_sequence_shard
+from verl.experimental.tpr.hybrid import (
+    HybridCPTopology,
+    HybridLocalKVBlock,
+    make_hybrid_sequence_shard,
+)
 from verl.utils.device import is_torch_npu_available
 
 _EXPECTED_WORLD_SIZE = 4
