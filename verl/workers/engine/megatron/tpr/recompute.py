@@ -12,6 +12,8 @@ Scope: dense FA, full/uniform/1, PP=1.  NPU/Ring equivalence is not yet gated.
 from __future__ import annotations
 
 import inspect
+import os
+import weakref
 from types import MethodType
 from typing import Any
 
@@ -21,6 +23,22 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 
 from verl.models.mcore.tpr.attention import TPRSelfAttention
 from verl.models.mcore.tpr.context import get_tpr_attention_context, use_tpr_attention_context
+
+
+# Development-only weak references: never keep checkpoint closures, KV tensors,
+# or per-segment attention contexts alive. Disabled in production by default.
+_RECOMPUTE_RUN_REFS: list[weakref.ReferenceType] = []
+_RECOMPUTE_OUTER_REFS: list[weakref.ReferenceType] = []
+
+
+def tpr_recompute_live_ref_counts() -> dict[str, int]:
+    """Count and compact weak refs to outstanding checkpoint closures/contexts."""
+    _RECOMPUTE_RUN_REFS[:] = [r for r in _RECOMPUTE_RUN_REFS if r() is not None]
+    _RECOMPUTE_OUTER_REFS[:] = [r for r in _RECOMPUTE_OUTER_REFS if r() is not None]
+    return {
+        "checkpoint_run_functions": len(_RECOMPUTE_RUN_REFS),
+        "attention_contexts": len(_RECOMPUTE_OUTER_REFS),
+    }
 
 
 def validate_tpr_recompute_config(config: Any) -> bool:
@@ -101,6 +119,9 @@ def _checkpointed_tpr_forward(self: TransformerBlock, *args: Any, **kwargs: Any)
             return layer_output, new_key, new_value
 
         if torch.is_grad_enabled():
+            if os.getenv("TPR_RECOMPUTE_REF_AUDIT", "0") == "1":
+                _RECOMPUTE_RUN_REFS.append(weakref.ref(run_layer))
+                _RECOMPUTE_OUTER_REFS.append(weakref.ref(outer))
             if not hidden.requires_grad:
                 raise RuntimeError(
                     "TPR full recompute needs a grad-carrying TransformerBlock input"
