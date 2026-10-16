@@ -15,13 +15,7 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr import (
-    PopSegment,
-    PushSegment,
-    SegmentLossTerm,
-    SegmentPlan,
-    SegmentSpec,
-)
+from verl.experimental.tpr.legacy.plan import PopSegment, PushSegment, SegmentLossTerm, SegmentPlan, SegmentSpec
 
 
 def _branching_plan() -> SegmentPlan:
