@@ -45,12 +45,8 @@ from ..equivalence.test_tpr_engine_reference_equivalence_npu import (
     _reference_data,
 )
 from ..equivalence.test_segment_push_pop_npu import _parameter_grads
-from verl.models.mcore.tpr import (
-    TPR_REQUEST_KEY,
-    TPRForwardBackwardRequest,
-    TPRSelfAttention,
-    replace_self_attention_with_tpr,
-)
+from verl.experimental.tpr.legacy.engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
+from verl.models.mcore.tpr import TPRSelfAttention, replace_self_attention_with_tpr
 from verl.models.mcore.config_converter import get_hf_rope_theta, hf_to_mcore_config_dense
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
