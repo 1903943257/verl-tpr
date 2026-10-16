@@ -127,6 +127,15 @@ def install_tpr_full_recompute(model: torch.nn.Module, config: Any) -> int:
     blocks = [m for m in model.modules() if isinstance(m, TransformerBlock)]
     if not blocks:
         raise RuntimeError("TPR full recompute found no Megatron TransformerBlock")
+    # Validate every block before changing any method. Hybrid/GDN models
+    # must fail at initialization, never halfway through a PPO optimizer step.
+    for block in blocks:
+        if not getattr(block, "layers", None):
+            raise NotImplementedError("TPR recompute requires a nonempty dense TransformerBlock")
+        if any(not isinstance(getattr(layer, "self_attention", None), TPRSelfAttention)
+               for layer in block.layers):
+            raise NotImplementedError("TPR recompute currently requires dense FA layers")
+
     patched = 0
     for block in blocks:
         if getattr(block, "_tpr_full_recompute_installed", False):
