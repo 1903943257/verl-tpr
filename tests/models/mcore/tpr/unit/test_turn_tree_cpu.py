@@ -20,7 +20,8 @@ def _records(forest):
     """Compare the actual schedule, tokens and refs, without type identity."""
     return [
         (
-            tree.tree.uid, tree.tree.tree_index, tree.tree.member_rows,
+            getattr(tree, "tree", tree).uid, getattr(tree, "tree", tree).tree_index,
+            getattr(tree, "tree", tree).member_rows,
             [(segment.segment_id, segment.parent_id, segment.position_start,
               segment.prefix_length, segment.token_ids.tolist())
              for segment in tree.segment_plan.segments.values()],
@@ -61,7 +62,7 @@ def test_turn_forest_matches_reference_for_branches_duplicates_and_masks(seed, w
     assert actual.logical_loss_tokens == sum(int(mask.sum()) for mask in masks)
     assert digest_forest_plan(actual) == digest_forest_plan(build_tree_execution_plans(keys, batch, **options))
     # The persisted topology is unique; metadata access does not materialize a second tree.
-    assert all(tree.tree is tree for tree in actual.trees)
+    assert all(not hasattr(tree, "tree") for tree in actual.trees)
     assert all(not hasattr(tree, "nodes") for tree in actual.trees)
 
 
