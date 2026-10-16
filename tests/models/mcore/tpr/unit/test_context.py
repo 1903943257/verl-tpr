@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import weakref
+
 import pytest
 import torch
 
@@ -34,6 +37,17 @@ def _gdn_state(*, requires_grad: bool = False):
         torch.randn(1, 12, 4, requires_grad=requires_grad),
         torch.randn(1, 4, 8, 6, requires_grad=requires_grad),
     )
+
+
+def test_context_supports_weak_references_for_checkpoint_replay():
+    # Reentrant Megatron checkpoint closures must only weak-reference their
+    # owning context, since it holds the checkpoint's K/V autograd outputs.
+    context = TPRAttentionContext(prefix_length=0, suffix_length=3)
+    reference = weakref.ref(context)
+    assert reference() is context
+    del context
+    gc.collect()
+    assert reference() is None
 
 
 def test_context_manager_sets_and_restores_context():
