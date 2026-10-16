@@ -256,3 +256,52 @@ Alternatively run both checkpointed cases in fresh processes with
 mode is `--diagnostic-only --require-recompute`; legacy threshold gates
 are reported but not enforced. All console logs go under
 `/workspace/tpr_log/recompute/`.
+
+## 2026-10-16: observed controlled Full/TPR × recompute 2×2 matrix
+
+**User-reported NPU results** for Qwen3-4B, TP2×CP4, captured rows (4, 6),
+4,616 logical PPO tokens. These are four independent eight-rank replay runs.
+`full` remains **unshared SegmentExecutor/Ring**, **not genuine native Megatron Full**.
+
+| Case | PPO loss | Global BF16 gradient norm | Critical fwd/bwd (s) | Worst allocated (GiB) | Worst reserved (GiB) | Trees / Segments |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Full OFF | -1.7548251152038574 | 7.976451873779297 | 6.635661877 | 43.084094 | 47.197266 | 2 / 2 |
+| Full ON | -1.7548251152038574 | 7.974936485290527 | 7.877788798 | 17.997396 | 22.335938 | 2 / 2 |
+| TPR OFF | -1.7545651197433472 | 8.456138610839844 | 7.447827103 | 27.231803 | 30.148438 | 1 / 3 |
+| TPR ON | -1.7545651197433472 | 8.454642295837402 | 8.577214051 | 14.538741 | 16.574219 | 1 / 3 |
+
+**Isolation within each execution mode:**
+- Full OFF vs ON: equal loss and exact reported response logprobs,
+  sampled parameter-gradient relative L2 **0.014425218**;
+  recompute saves **58.2273% allocated**, **52.6754% reserved**,
+  but runtime increases **18.7190%**.
+- TPR OFF vs ON: equal loss and exact reported response logprobs,
+  sampled parameter-gradient relative L2 **0.015527614**;
+  recompute saves **46.6112% allocated**, **45.0246% reserved**,
+  but runtime increases **15.1640%**.
+- With recompute ON in both, TPR vs unshared Full saves
+  **19.2175% allocated** and **25.7957% reserved**, but TPR
+  runs **8.8784% longer**.
+- With recompute OFF in both, TPR saves **36.7938% allocated**,
+  **36.1225% reserved**, but runs **12.2394% longer**.
+
+**Numerical parity warning (must not ignore):** Full vs shared TPR has
+loss gap **0.00025999546**, response logprob relative L2
+**0.0573565426** (5.74%), and sampled parameter-gradient relative
+L2 **0.547133764 ON** / **0.547227756 OFF** (~54.7%). The
+approximately unchanged Full-vs-TPR drift under recompute indicates
+that **recompute is not the dominant new source of the cross-mode
+difference**. In contrast, *within* Full and within TPR, OFF/ON
+logprobs match exactly. Avoid interpreting a small scalar PPO loss gap
+as a gradient-equivalence pass. Diagnose tree execution/segment
+boundary, logprob ownership/temperature/clipping, and CP Ring
+numerics under the *same logical PPO labels* before production gating.
+
+**Follow-ups:** run separately *genuine native Megatron/VERL Full*
+OFF/ON with matched capture, model, topology, recompute policy and
+measurement window; the current `run_verl_engine_full_replay.sh`
+still explicitly rejects native activation recompute. For the
+controlled four cases, optionally enable full BF16-gradient capture
+for each run and compare per-parameter gradients/cosines. No main
+change or claim of native Full recompute validation follows from
+this result.
