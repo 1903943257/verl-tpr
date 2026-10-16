@@ -14,15 +14,10 @@
 
 import torch
 
-from verl.models.mcore.tpr import (
-    AllGatherCPBackend,
-    KVPrefixState,
-    PaddedSequenceShard,
-    iter_valid_sequence_slices,
-    make_hybrid_sequence_shard,
-    make_ring_sequence_shard,
-    round_up_sequence_length,
-)
+from verl.experimental.tpr.legacy.cp.backend import AllGatherCPBackend
+from verl.models.mcore.tpr import KVPrefixState, iter_valid_sequence_slices, make_ring_sequence_shard, round_up_sequence_length
+from verl.experimental.tpr.shard import PaddedSequenceShard
+from verl.experimental.tpr.hybrid import make_hybrid_sequence_shard
 
 
 def test_round_up_sequence_length_uses_backend_alignment():
