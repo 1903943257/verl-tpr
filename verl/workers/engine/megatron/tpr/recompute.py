@@ -92,6 +92,15 @@ def _checkpointed_tpr_forward(self: TransformerBlock, *args: Any, **kwargs: Any)
         # checkpoint behavior, including the ordinary attention implementation.
         return original(*args, **kwargs)
 
+    # IMPORTANT: Megatron CheckpointFunction keeps run_function on its
+    # autograd context. Capturing outer *strongly* creates a cross-language
+    # cycle: checkpoint ctx -> run_layer -> outer -> returned KV -> grad_fn
+    # -> checkpoint ctx. NPU tensors retained through this cycle can survive
+    # Python gc and accumulate between actor updates / benchmark iterations.
+    # SegmentExecutor holds outer strongly until backward completes, so
+    # checkpoint replay can safely dereference it through a weak reference.
+    outer_ref = weakref.ref(outer)
+
     # Models with multiple TransformerBlocks are supported independently.
     # The target shape is full/uniform/1, so each layer owns exactly one
     # checkpoint and one (K,V) side-output pair.
@@ -100,7 +109,16 @@ def _checkpointed_tpr_forward(self: TransformerBlock, *args: Any, **kwargs: Any)
             raise NotImplementedError("TPR recompute currently requires dense FA layers")
 
         def run_layer(x: torch.Tensor, *, _layer=layer):
-            replay = outer.new_collector()
+            # Never capture 'outer' directly in this checkpoint closure.
+            # In the executor, _backward_segment keeps the context alive
+            # across the forward, replay, and completion of backward.
+            current_outer = outer_ref()
+            if current_outer is None:
+                raise RuntimeError(
+                    "TPR checkpoint replay outlived its attention context; "
+                    "keep the SegmentExecutor context alive through backward"
+                )
+            replay = current_outer.new_collector()
             with use_tpr_attention_context(replay):
                 layer_output, layer_context = _layer(
                     hidden_states=x,
