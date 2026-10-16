@@ -529,8 +529,8 @@ def test_padded_query_merge_allows_real_ragged_agent_lengths():
     )
     q = torch.randn(shard.local_length, 1, 16, 128)
     assert ring._can_coalesce_prefix_query(q, cfg)
-    cfg.coalesce_prefix_padded = False
-    assert not ring._can_coalesce_prefix_query(q, cfg)
+    from dataclasses import replace
+    assert not ring._can_coalesce_prefix_query(q, replace(cfg, coalesce_prefix_padded=False))
 
 
 def test_all_padded_query_rank_falls_back_from_query_merge():
