@@ -366,3 +366,68 @@ TPR_OFFLINE_MODE=tpr torchrun --nproc_per_node=8 \
 Source/protocol and model remain the same as the previously verified
 Step 6 OFF benchmark. **The two ON runs still require real NPU validation**.
 A failure is not an implicit PASS or automatic fallback to OFF.
+
+## 2026-10-16: eight-trajectory Step 6 TPR ON memory accumulation / OOM
+
+**User-supplied NPU failure log** from the first 40K 8-session test:
+- Native Full + `full/uniform/1` completed: median fwd/bwd
+  **32.829754 s** (n=3), worst peak allocated **13.746 GiB**.
+- TPR + explicit-KV checkpoint adapter: warmup iteration 0
+  **32.618061 s**, peak **24.860 GiB**; measured iteration 1
+  **30.508493 s**, peak **38.376 GiB**; measured iteration 2
+  **30.039366 s**, peak **51.893 GiB**; next iteration failed with
+  NPU OOM (NPU 6, 60.95 GiB total, 53.74 GiB allocated).
+  Peak grew ~**13.5 GiB per additional iteration**. TPR ON is
+  **not an accepted performance result** until multi-iteration memory
+  stabilizes.
+- Immediate allocation failure occurred at
+  `SegmentExecutor._compute_loss()` for a CP rank with **zero**
+  owned PPO objective tokens:
+  `logits.float().sum() * 0.0` requested **1.63 GiB**.
+  This wide BF16→FP32 logits cast is unnecessary to construct a
+  differentiable zero, and is a failure trigger, **not proven root
+  cause** of the steady allocation growth.
+
+**Mitigation and diagnostic, this branch only:**
+- Replace both zero-objective sites by
+  `logits[0, 0, 0].float() * 0.0`. This preserves a connected
+  scalar zero and Ring backward participation without the
+  full-vocabulary FP32 copy. A CPU contract test validates zero
+  gradient for the whole logits tensor.
+- Add `TPR_BENCH_MEM_AUDIT=1` to the fixed-shape benchmark:
+  after each fully timed forward/backward, synchronizes, prints
+  world-maximum **live allocated before/after `gc.collect()`**, and
+  keeps GC strictly **outside** the measured F/B duration.
+  This experiment intentionally changes cross-iteration memory lifetime.
+  If before-GC grows but after-GC drops toward the stable baseline,
+  inspect reference cycles / replay-local closures. If both grow,
+  inspect live graph/KV/CP backend references and NPU allocator state.
+  GC diagnostics are not a production memory management solution.
+
+```bash
+cd /workspace/verl-tpr-recompute
+mkdir -p /workspace/tpr_log/recompute
+export TPR_OFFLINE_CAPTURE_MANIFEST=/workspace/tpr_offline_run5_first8_40k_v1/capture_manifest.json
+export TPR_BENCH_SOURCE_STEP=6
+export TPR_BENCH_OUTPUT_DIR=/workspace/tpr_recompute_fixed40k_step6_gcprobe_v1
+export TPR_RUN_FIXED_SHAPE_40K_BENCH=1
+export TPR_BENCH_RECOMPUTE=1
+export TPR_BENCH_MEM_AUDIT=1
+export TPR_BENCH_WARMUPS=1
+export TPR_BENCH_REPEATS=3
+export TPR_BENCH_CAPTURE_LOGPROBS=1
+export TPR_TREE_POLICY=qwen_turn
+export TPR_EXEC_PROFILE=0
+export ASCEND_RT_VISIBLE_DEVICES=8,9,10,11,12,13,14,15
+unset TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS
+set -o pipefail
+TPR_OFFLINE_MODE=tpr torchrun --nproc_per_node=8 \
+  --master_addr=127.0.0.1 --master_port=29795 \
+  -m pytest -s -x \
+  tests/models/mcore/tpr/parallel/test_tpr_fixed_shape_40k_benchmark_npu.py \
+  2>&1 | tee /workspace/tpr_log/recompute/step6_tpr_recompute_gcprobe_v1.log
+```
+
+Never compare a GC-audited critical section's repeated-step timings
+with historical steady-state medians without noting the altered
+between-iteration GC policy. Do not yet add to `main`.
