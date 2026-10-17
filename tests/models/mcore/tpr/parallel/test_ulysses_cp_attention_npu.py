@@ -32,7 +32,9 @@ import torch.distributed as dist
 from torch import Tensor
 
 import verl.experimental.tpr.ulysses as ulysses
-from verl.models.mcore.tpr import AllGatherCPBackend, LocalKVBlock, SequenceShard
+from verl.experimental.tpr.legacy.cp.backend import AllGatherCPBackend
+from verl.experimental.tpr.allgather import LocalKVBlock
+from verl.models.mcore.tpr import SequenceShard
 from verl.utils.device import is_torch_npu_available
 
 

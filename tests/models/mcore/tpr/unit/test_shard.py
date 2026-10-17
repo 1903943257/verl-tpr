@@ -15,7 +15,8 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr import KVPrefixState, PrefixShard, RangeSequenceShard, SequenceShard
+from verl.models.mcore.tpr import KVPrefixState, SequenceShard
+from verl.experimental.tpr.shard import PrefixShard, RangeSequenceShard
 
 
 def test_contiguous_shard_maps_global_and_local_offsets():

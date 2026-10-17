@@ -84,3 +84,65 @@ def test_cached_view_is_compact_graph_free_and_released_with_its_gradients():
     assert state.released and not state._key_values and not state._gradients
     with pytest.raises(RuntimeError, match="released"):
         state.consume_gradients()
+
+
+def test_executor_consumes_anchor_gradients_without_a_second_full_copy():
+    state = KVPrefixState(0, 3, _kv(3))
+    anchors = state.make_anchors()
+    for key, value in anchors.key_values.values():
+        (key.square() + 2 * value.square()).sum().backward()
+    owned = {layer: tuple(t.grad for t in pair) for layer, pair in anchors.key_values.items()}
+    expected = {layer: tuple(t.clone() for t in pair) for layer, pair in owned.items()}
+    state.accumulate_anchor_gradients(anchors, consume=True)
+    for layer, pair in anchors.key_values.items():
+        for index, tensor in enumerate(pair):
+            assert tensor.grad is None
+            assert state.gradients[layer][index].data_ptr() == owned[layer][index].data_ptr()
+
+    # Clearing .grad makes another backward allocate independent contributions;
+    # its in-place accumulation must not replace or double the stored buffers.
+    for key, value in anchors.key_values.values():
+        (3 * key + 4 * value).sum().backward()
+    for layer, pair in anchors.key_values.items():
+        for index, tensor in enumerate(pair):
+            assert tensor.grad.data_ptr() != state.gradients[layer][index].data_ptr()
+    state.accumulate_anchor_gradients(anchors, consume=True)
+    for layer, pair in state.gradients.items():
+        for index, gradient in enumerate(pair):
+            torch.testing.assert_close(gradient, expected[layer][index] + (3 if index == 0 else 4))
+
+
+def test_public_anchor_accumulation_keeps_caller_gradient_buffers_independent():
+    state = KVPrefixState(0, 3, _kv(3))
+    anchors = state.make_anchors()
+    for key, value in anchors.key_values.values():
+        (key + value).sum().backward()
+    state.accumulate_anchor_gradients(anchors)
+    for layer, pair in anchors.key_values.items():
+        for index, tensor in enumerate(pair):
+            assert tensor.grad is not None
+            assert tensor.grad.data_ptr() != state.gradients[layer][index].data_ptr()
+            tensor.grad.zero_()
+            torch.testing.assert_close(state.gradients[layer][index], torch.ones_like(tensor))
+
+
+@pytest.mark.parametrize("alias_cached_kv", [False, True])
+def test_consumed_shared_gradients_get_independent_accumulation_storage(alias_cached_kv):
+    state = KVPrefixState(0, 3, _kv(3))
+    anchors = state.make_anchors()
+    shared = state.key_values[1][0] if alias_cached_kv else torch.ones_like(state.key_values[1][0])
+    initial = shared.clone()
+    for key, value in anchors.key_values.values():
+        key.grad = value.grad = shared
+    state.accumulate_anchor_gradients(anchors, consume=True)
+    pointers = [tensor.data_ptr() for pair in state.gradients.values() for tensor in pair]
+    assert len(set(pointers)) == len(pointers)
+    for layer, pair in state.gradients.items():
+        state.accumulate_layer_gradients(
+            layer, torch.full_like(pair[0], layer), torch.full_like(pair[1], layer + 1),
+        )
+    for layer, pair in state.gradients.items():
+        for index, gradient in enumerate(pair):
+            torch.testing.assert_close(gradient, initial + layer + index)
+    if alias_cached_kv:
+        torch.testing.assert_close(state.key_values[1][0], initial)

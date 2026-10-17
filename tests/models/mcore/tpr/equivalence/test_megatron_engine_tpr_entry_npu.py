@@ -27,7 +27,7 @@ from .test_fixed_topology_scheduler_npu import (
     _tokens,
 )
 from .test_segment_push_pop_npu import _install_single_rank_runtime, _make_model, _parameter_grads
-from verl.models.mcore.tpr import TPR_REQUEST_KEY, TPRForwardBackwardRequest
+from verl.experimental.tpr.legacy.engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
 

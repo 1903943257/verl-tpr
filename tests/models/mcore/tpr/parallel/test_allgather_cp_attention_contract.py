@@ -16,7 +16,8 @@ import pytest
 import torch
 
 import verl.experimental.tpr.allgather as cp_attention
-from verl.models.mcore.tpr import LocalKVBlock, PaddedSequenceShard, PrefixShard
+from verl.experimental.tpr.allgather import LocalKVBlock
+from verl.experimental.tpr.shard import PaddedSequenceShard, PrefixShard
 
 
 def _tensor(length, *, heads=2, head_dim=4):

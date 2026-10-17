@@ -37,7 +37,7 @@ import torch
 import torch.distributed as dist
 from tensordict import TensorDict
 
-from verl.models.mcore.tpr import TPR_REQUEST_KEY, TPRForwardBackwardRequest
+from verl.experimental.tpr.legacy.engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
 from verl.utils import tensordict_utils as tu
 
 from ._cp_gdn_test_utils import clone_parameter_gradients, named_tensor_comparison

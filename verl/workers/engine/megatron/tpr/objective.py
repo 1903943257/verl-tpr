@@ -49,6 +49,30 @@ def _metadata(batch: Any, key: str, default=None):
     return tu.get_non_tensor_data(batch, key=key, default=default)
 
 
+@torch.no_grad()
+def _logit_parts(logits: Tensor, targets: Tensor) -> tuple[Tensor, Tensor]:
+    """Diagnostic target logits and log-partition over the *global* TP vocab."""
+    values = logits.float()
+    if not torch.distributed.is_initialized():
+        return values.gather(1, targets[:, None]).squeeze(1), torch.logsumexp(values, dim=-1)
+    from megatron.core import parallel_state
+
+    group = parallel_state.get_tensor_model_parallel_group()
+    if group is None:
+        raise RuntimeError("TPR logit-parts probe requires the native Megatron TP group")
+    rank = torch.distributed.get_rank(group)
+    local_targets = targets - rank * values.shape[-1]
+    owned = (local_targets >= 0) & (local_targets < values.shape[-1])
+    target_logits = values.gather(1, local_targets.clamp(0, values.shape[-1] - 1)[:, None]).squeeze(1)
+    target_logits = target_logits.masked_fill(~owned, 0)
+    torch.distributed.all_reduce(target_logits, group=group)
+    maximum = values.amax(dim=-1)
+    torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX, group=group)
+    exp_sum = (values - maximum[:, None]).exp().sum(dim=-1)
+    torch.distributed.all_reduce(exp_sum, group=group)
+    return target_logits, maximum + exp_sum.log()
+
+
 class SegmentPPOObjectiveAdapter:
     """Bridge SegmentExecutor logits to an unmodified VERL PPO loss callable.
 
@@ -120,14 +144,11 @@ class SegmentPPOObjectiveAdapter:
         for ref in tree_plan.objective_refs:
             refs_by_segment[ref.segment_id].append(ref)
 
-        global_count = sum(len(refs) for refs in refs_by_segment.values())
         if shard_for_segment is not None:
             for segment_id, refs in refs_by_segment.items():
                 shard = shard_for_segment(tree_plan.segment_plan.get(segment_id))
                 refs_by_segment[segment_id] = [ref for ref in refs if shard.owns(ref.query_offset)]
         counts = {segment_id: len(refs) for segment_id, refs in refs_by_segment.items()}
-        if not global_count:
-            raise ValueError("tree has no supervised logical response tokens")
 
         def segment_loss_fn(segment: SegmentSpec, logits: Tensor):
             shard = None if shard_for_segment is None else shard_for_segment(segment)
@@ -180,7 +201,6 @@ class SegmentPPOObjectiveAdapter:
         # Reuse the exact physical (query,target,temperature) log-prob compute.
         # Crucially, repeated *logical* refs are not discarded from the loss.
         unique: dict[tuple[int, int, float], int] = {}
-        keys: list[tuple[int, int, float]] = []
         gather_ids: list[int] = []
         for ref, temperature in zip(refs, temperatures, strict=True):
             if ref.segment_id != segment.segment_id:
@@ -191,14 +211,11 @@ class SegmentPPOObjectiveAdapter:
             if offset is None:
                 raise ValueError("PPO ref is not owned by this CP rank")
             key = (offset, ref.target_token_id, temperature)
-            if key not in unique:
-                unique[key] = len(keys)
-                keys.append(key)
-            gather_ids.append(unique[key])
+            gather_ids.append(unique.setdefault(key, len(unique)))
 
-        positions = torch.tensor([key[0] for key in keys], device=logits.device, dtype=torch.long)
-        targets = torch.tensor([key[1] for key in keys], device=logits.device, dtype=torch.long)
-        temps = torch.tensor([key[2] for key in keys], device=logits.device, dtype=torch.float32)
+        positions = torch.tensor([key[0] for key in unique], device=logits.device, dtype=torch.long)
+        targets = torch.tensor([key[1] for key in unique], device=logits.device, dtype=torch.long)
+        temps = torch.tensor([key[2] for key in unique], device=logits.device, dtype=torch.float32)
         # PPO's native vocab-parallel logprob may save large BF16/FP32
         # [unique_queries, local_vocab] intermediates until backward.
         # With CP2 on 40K samples that can OOM even though every segment's
@@ -208,7 +225,7 @@ class SegmentPPOObjectiveAdapter:
         # All TP ranks owning this CP shard have identical refs/chunk order.
         use_chunked_lp = (
             self.log_prob_chunk_size is not None
-            and len(keys) > self.log_prob_chunk_size
+            and len(unique) > self.log_prob_chunk_size
             and not self.calculate_entropy
             and not self.capture_logit_parts
         )
@@ -230,25 +247,27 @@ class SegmentPPOObjectiveAdapter:
                     use_reentrant=False,
                     preserve_rng_state=False,
                 )
-                for start in range(0, len(keys), self.log_prob_chunk_size)
+                for start in range(0, len(unique), self.log_prob_chunk_size)
             ], dim=0)
         else:
             selected_logits = logits[0].index_select(0, positions)
             scaled_logits = selected_logits / temps.to(selected_logits.dtype)[:, None]
+            # Native FP32 vocab-parallel CE overwrites its input. Entropy also
+            # saves/mutates its logits in backward, so it needs independent
+            # storage even when computed before CE.
+            if self.calculate_entropy:
+                unique_entropy = self.entropy_fn(scaled_logits.clone())
+            if self.capture_logit_parts:
+                target_logits, lse = _logit_parts(scaled_logits, targets)
+                parts = list(zip(
+                    target_logits.cpu().tolist(), lse.cpu().tolist(), strict=True,
+                ))
             unique_log_probs = self.log_prob_fn(scaled_logits, targets)
-        if unique_log_probs.ndim != 1 or unique_log_probs.numel() != len(keys):
+        if unique_log_probs.ndim != 1 or unique_log_probs.numel() != len(unique):
             raise ValueError("log_prob_fn must return one scalar per unique query/target/temperature")
         gather = torch.tensor(gather_ids, device=logits.device, dtype=torch.long)
         log_probs = unique_log_probs.index_select(0, gather)
         if self.capture_logit_parts:
-            # Diagnostic only: decompose target logit and FP32 log-partition.
-            # Keep the training log-prob implementation unchanged.
-            target_logits = scaled_logits.gather(1, targets[:, None]).squeeze(1)
-            lse = torch.logsumexp(scaled_logits.float(), dim=-1)
-            parts = list(zip(
-                target_logits.detach().float().cpu().tolist(),
-                lse.detach().cpu().tolist(),
-            ))
             for ref, part_index in zip(refs, gather_ids, strict=True):
                 probe_key = (ref.sample_row, ref.response_offset)
                 if probe_key in self.debug_logit_parts:
@@ -263,8 +282,7 @@ class SegmentPPOObjectiveAdapter:
 
         entropy = None
         if self.calculate_entropy:
-            unique_entropy = self.entropy_fn(scaled_logits)
-            if unique_entropy.ndim != 1 or unique_entropy.numel() != len(keys):
+            if unique_entropy.ndim != 1 or unique_entropy.numel() != len(unique):
                 raise ValueError("entropy_fn must return one value per unique query")
             entropy = unique_entropy.index_select(0, gather)
 
@@ -338,14 +356,14 @@ class SegmentPPOObjectiveAdapter:
         model_output = {key: torch.cat(values, dim=0) for key, values in packed.items()}
         # Fail at the TPR/native-PPO boundary with the actual local shapes,
         # rather than inside no_padding_2_padding's opaque offsets assert.
-        packed_lengths = output_fields["attention_mask"].sum(dim=1, dtype=torch.int64)
-        expected_packed = int(packed_lengths.sum().item())
+        expected_packed = len(refs) + n
         for key, values in model_output.items():
             if values.shape[0] != expected_packed:
+                packed_lengths = [len(by_row[row]) + 1 for row in rows]
                 raise RuntimeError(
                     f"TPR compact PPO {key} pack mismatch: "
                     f"actual={values.shape[0]} expected={expected_packed} "
-                    f"row_lengths={packed_lengths.tolist()} refs={len(refs)} rows={rows} "
+                    f"row_lengths={packed_lengths} refs={len(refs)} rows={rows} "
                     f"shape={tuple(values.shape)}"
                 )
         loss, metrics = self.loss_function(

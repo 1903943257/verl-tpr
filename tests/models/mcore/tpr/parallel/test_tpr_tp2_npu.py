@@ -32,9 +32,7 @@ import torch.distributed as dist
 from tensordict import TensorDict
 
 from megatron.core import parallel_state
-from verl.models.mcore.tpr import (
-    TPRForwardBackwardRequest,
-)
+from verl.experimental.tpr.legacy.engine_adapter import TPRForwardBackwardRequest
 from verl.utils import tensordict_utils as tu
 
 from ._tpr_cp_test_utils import _equivalence_tpr_plan

@@ -15,7 +15,7 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr import (
+from verl.experimental.tpr.legacy.plan import (
     PopSegment,
     PushSegment,
     SegmentLossTerm,

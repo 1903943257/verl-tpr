@@ -87,3 +87,32 @@ def test_tp_plan_gather_catches_divergence_without_entering_forward(monkeypatch)
     monkeypatch.setattr(dist, "all_gather", simulated_all_gather)
     with pytest.raises(RuntimeError, match="schedule mismatch"):
         assert_tp_plan_agreement(digest_segment_plan(_plan()), tp_size=2)
+
+
+@pytest.mark.parametrize("tp_size,cp_size", [(1, 2), (2, 2)])
+@pytest.mark.parametrize("divergent", [False, True])
+def test_plan_preflight_covers_the_entire_tp_cp_group(monkeypatch, tp_size, cp_size, divergent):
+    import torch.distributed as dist
+    from megatron.core import parallel_state
+
+    group = object()
+    size = tp_size * cp_size
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: size)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(dist, "get_backend", lambda group: "gloo")
+    monkeypatch.setattr(parallel_state, "get_tensor_and_context_parallel_group", lambda: group, raising=False)
+
+    def gather(outputs, local, *, group):
+        assert len(outputs) == size
+        for item in outputs:
+            item.copy_(local)
+        if divergent:
+            outputs[-1][0] ^= 1
+
+    monkeypatch.setattr(dist, "all_gather", gather)
+    if divergent:
+        with pytest.raises(RuntimeError, match="TP×CP schedule mismatch"):
+            assert_tp_plan_agreement(digest_segment_plan(_plan()), tp_size=tp_size, cp_size=cp_size)
+    else:
+        assert_tp_plan_agreement(digest_segment_plan(_plan()), tp_size=tp_size, cp_size=cp_size)

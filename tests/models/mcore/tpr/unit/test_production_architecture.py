@@ -51,6 +51,7 @@ def test_turn_tree_is_only_production_builder() -> None:
     assert "class _TrieNode" not in source
     assert "def build_trajectory_trees(" not in source
     assert "class SegmentObjectiveRef" in source
+    assert "def tree(self)" not in source
 
 
 def test_ppo_executor_no_legacy_ce_gdn_paths() -> None:
@@ -90,6 +91,7 @@ def test_engine_owns_shard_tree_state() -> None:
     assert not eager_state_imports
     assert "class KVPrefixState:" in state
     assert "class KVStack:" in state
+    assert "sequence_length = global_length" not in state
     assert "class PrefixStateStack:" not in state
     assert "class ShardedPastKVAnchors" not in state
     assert "GDNPrefixState" not in state
@@ -154,7 +156,15 @@ def test_optional_cp_factories_are_experimental() -> None:
 
 def test_context_is_thin_and_has_no_eager_engine_imports() -> None:
     source = (MODEL / "context.py").read_text(encoding="utf-8")
-    assert len(source.splitlines()) <= 230
+    # Guard responsibilities rather than formatting/line count: the shared
+    # compact-storage helper is needed before each Push layer releases QKV.
+    definitions = {node.name for node in ast.parse(source).body
+                   if isinstance(node, (ast.ClassDef, ast.FunctionDef))}
+    assert definitions == {
+        "TPRAttentionBackend", "TPRAttentionContext", "_compact_kv_tensor",
+        "_validate_layer_number", "_validate_kv_pair", "_assert_layers",
+        "_validate_gdn_layer_state", "get_tpr_attention_context", "use_tpr_attention_context",
+    }
     assert "class TPRAttentionContext:" in source
     assert "def use_tpr_attention_context(" in source
     assert "def get_past_kv(" in source
@@ -185,14 +195,26 @@ def test_internal_relative_imports_resolve_after_relocation() -> None:
                     f"{file} has unresolved relative import: level={item.level} module={item.module}"
                 )
 
-def test_public_dense_symbols_resolve_to_canonical_engine() -> None:
-    """No exported production executor or Ring type may point to legacy copies."""
-    import ast
-
+def _model_public_exports() -> dict[str, str]:
     syntax = ast.parse((MODEL / "__init__.py").read_text(encoding="utf-8"))
-    exports = next(ast.literal_eval(node.value) for node in syntax.body if
-                   isinstance(node, ast.Assign) and
-                   any(isinstance(target, ast.Name) and target.id == "_PRODUCTION_EXPORTS" for target in node.targets))
+    return next(
+        ast.literal_eval(node.value)
+        for node in syntax.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "_PRODUCTION_EXPORTS"
+            for target in node.targets
+        )
+    )
+
+
+def test_model_public_api_has_only_canonical_exports() -> None:
+    """Expose the production engine directly, without transitional aliases."""
+    source = (MODEL / "__init__.py").read_text(encoding="utf-8")
+    exports = _model_public_exports()
+    assert "_LEGACY_EXPORTS" not in source and "_MODULES" not in source
+    assert not any(module.startswith("verl.experimental.tpr") for module in exports.values())
+    assert "SegmentPlan" not in exports and "SegmentSpec" not in exports
     engine_expected = {
         "RingCPBackend": "ring",
         "SegmentExecutor": "executor",
@@ -200,29 +222,22 @@ def test_public_dense_symbols_resolve_to_canonical_engine() -> None:
         "KVStack": "state",
         "SequenceShard": "ring",
     }
-    for name, module in engine_expected.items():
-        assert exports[name] == "verl.workers.engine.megatron.tpr." + module, name
+    for symbol, module in engine_expected.items():
+        assert exports[symbol] == f"verl.workers.engine.megatron.tpr.{module}", symbol
 
 
-
-def test_model_public_api_excludes_legacy_aliases() -> None:
-    """Production model exports stay canonical while old explicit imports transition."""
-    syntax = ast.parse((MODEL / "__init__.py").read_text(encoding="utf-8"))
-    maps = {
-        target.id: ast.literal_eval(node.value)
-        for node in syntax.body
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name) and target.id in ("_PRODUCTION_EXPORTS", "_LEGACY_EXPORTS")
-    }
-    public = maps["_PRODUCTION_EXPORTS"]
-    legacy = maps["_LEGACY_EXPORTS"]
-    assert not (public.keys() & legacy.keys())
-    assert all(not module.startswith("verl.experimental.tpr") for module in public.values())
-    assert all(module.startswith("verl.experimental.tpr") for module in legacy.values())
-    assert public["RingCPBackend"] == "verl.workers.engine.megatron.tpr.ring"
-    assert public["SegmentExecutor"] == "verl.workers.engine.megatron.tpr.executor"
-    assert "SegmentPlan" not in public and "SegmentSpec" not in public
-    assert legacy["SegmentPlan"] == "verl.experimental.tpr.legacy.plan"
-    assert legacy["SegmentSpec"] == "verl.experimental.tpr.legacy.plan"
-    assert "parallel" not in public
+def test_historical_tests_use_explicit_experimental_imports() -> None:
+    """Do not accidentally reintroduce top-level legacy aliases."""
+    package_root = "verl.models.mcore.tpr"
+    model_submodules = {"attention", "context", "rectangular_attention"}
+    public = _model_public_exports()
+    obsolete = []
+    for root in (ROOT / "verl", ROOT / "tests/models/mcore/tpr"):
+        for file in root.rglob("*.py"):
+            tree = ast.parse(file.read_text(encoding="utf-8"), filename=str(file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module == package_root:
+                    for symbol in node.names:
+                        if symbol.name not in public and symbol.name not in model_submodules:
+                            obsolete.append(f"{file}: {symbol.name}")
+    assert not obsolete, "Obsolete TPR model imports:\\n" + "\\n".join(sorted(obsolete))

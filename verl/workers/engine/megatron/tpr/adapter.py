@@ -57,10 +57,16 @@ def run_forest(
     total = None
     with nullcontext() if no_sync_context is None else no_sync_context():
         for tree in forest.trees:
+            # No objective anywhere below this root: neither replay nor dKV is
+            # needed. This is a global-tree decision, never a CP-local count.
+            if not tree.logical_loss_tokens:
+                continue
             loss = run_tree(tree)
             if not isinstance(loss, Tensor) or loss.numel() != 1:
                 raise TypeError("run_tree must return a scalar Tensor")
             total = loss.detach() if total is None else total + loss.detach()
+    if total is None:
+        raise ValueError("forest has no supervised logical response tokens")
     # A failed tree never reaches native gradient finalization.
     finalize_gradients()
     return total
@@ -84,7 +90,7 @@ class _PPOMetrics:
                     raise NotImplementedError(f"TPR PPO metric {name} requires unsupported {value.aggregation}")
             self.values.setdefault(name, []).append(value)
 
-    def scalar_lists(self):
+    def scalar_lists(self, cp_runtime=None):
         # V1 Trainer uses np.mean(list), so wrapped metrics must return ONE
         # additive scalar. Plain numeric diagnostics retain their list semantics.
         result = {}
@@ -93,7 +99,43 @@ class _PPOMetrics:
                 raise TypeError(f"TPR metric {name} mixes Metric and numeric values")
             values = [float(value.aggregate() if isinstance(value, Metric) else value) for value in values]
             result[name] = [sum(values)] if True in self.kinds[name] else values
-        return result
+        if cp_runtime is None or not cp_runtime.enabled:
+            return result
+
+        # Ranks with no owned refs may have no metric keys at all. Exchange the
+        # small, already-host-side scalar dictionaries once, not one collective
+        # per key (which would deadlock on an empty rank). SUMs and weighted
+        # MEANs are additive across CP; plain diagnostics keep list semantics.
+        import torch.distributed as dist
+
+        local = {name: (True in self.kinds[name], values) for name, values in result.items()}
+        peers = [None] * cp_runtime.size
+        dist.all_gather_object(peers, local, group=cp_runtime.group)
+        result, kinds = {}, {}
+        for peer in peers:
+            for name, (wrapped, values) in peer.items():
+                if name in kinds and kinds[name] != wrapped:
+                    raise TypeError(f"TPR metric {name} mixes Metric and numeric values across CP")
+                kinds[name] = wrapped
+                result.setdefault(name, []).extend(values)
+        return {name: [sum(values)] if kinds[name] else values for name, values in result.items()}
+
+
+def _assert_finite_tree_loss(loss: Tensor, *, tp_size: int, cp_size: int) -> None:
+    finite = torch.isfinite(loss.detach()).to(torch.int64)
+    if tp_size * cp_size > 1:
+        import torch.distributed as dist
+        from megatron.core import parallel_state
+
+        group = (parallel_state.get_tensor_and_context_parallel_group() if cp_size > 1
+                 else parallel_state.get_tensor_model_parallel_group())
+        if group is None:
+            raise RuntimeError("TPR cannot resolve the loss-check model-parallel group")
+        # All model-parallel peers reject before another tree or finalization;
+        # a rank-local exception here would strand finite peers in collectives.
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN, group=group)
+    if not bool(finite.item()):
+        raise FloatingPointError("non-finite TPR PPO tree loss; gradients will not be finalized")
 
 
 def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None:
@@ -309,8 +351,8 @@ def run_tpr_forward_backward_batch(
         raise ValueError("TPR PPO mini-batch has no supervised response tokens")
     record_stage("tree_build_cpu_ms", profile_origin)
     tp_check_start = time.perf_counter()
-    if tp_size > 1:
-        assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size)
+    if tp_size * sizes["CP"] > 1:
+        assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size, cp_size=sizes["CP"])
     record_stage("tp_plan_collective_ms", tp_check_start)
     cp_runtime = resolve_engine_cp_runtime(engine, config)
     _validate_tpr_cp_combination(tp_size, cp_runtime, config, ppo=True)
@@ -365,8 +407,7 @@ def run_tpr_forward_backward_batch(
         loss = executor.run(event_profiler=event_profiler, tree_index=tree_number)
         tree_number += 1
         metrics_start = time.perf_counter() if detailed_profile else None
-        if not bool(torch.isfinite(loss).item()):
-            raise FloatingPointError("non-finite TPR PPO tree loss; gradients will not be finalized")
+        _assert_finite_tree_loss(loss, tp_size=tp_size, cp_size=cp_runtime.size)
         for segment_id, segment_metrics in executor.segment_loss_metrics:
             token_weight = counts[segment_id] / forest.logical_loss_tokens
             metrics.add(segment_metrics, token_weight)
@@ -415,7 +456,7 @@ def run_tpr_forward_backward_batch(
         "tpr/unique_tree_tokens": unique_tree_tokens,
         "tpr/topology_token_reuse_ratio": logical_input_tokens / unique_tree_tokens,
     }
-    metric_lists = metrics.scalar_lists()
+    metric_lists = metrics.scalar_lists(cp_runtime)
     metric_lists.update({name: [float(value)] for name, value in diagnostics.items()})
 
     # VERL postprocess expects list-valued micro-batch metrics and a list of

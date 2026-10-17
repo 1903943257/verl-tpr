@@ -15,11 +15,8 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr import (
-    HybridCPTopology,
-    make_hybrid_sequence_shard,
-    make_ring_sequence_shard,
-)
+from verl.experimental.tpr.hybrid import HybridCPTopology, make_hybrid_sequence_shard
+from verl.models.mcore.tpr import make_ring_sequence_shard
 
 
 def test_hybrid_shards_reconstruct_each_ring_rank_before_ulysses_head_split():

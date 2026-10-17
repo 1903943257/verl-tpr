@@ -14,8 +14,10 @@
 
 """Per-forward bridge between the Engine executor and Megatron attention layers.
 
-Only ephemeral references live here. The Engine state.py owns long-lived KV,
-detached Prefix caches and delayed gradients. This module never clones/detaches.
+The Engine state.py owns long-lived KV and delayed gradients. Push forwards
+can compact graph-free KV as each layer completes, avoiding QKV storage pinned
+by value views until the end of the entire model forward. Pop forwards retain
+the original tensors and their autograd graphs.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
+import torch
 from torch import Tensor
 
 if TYPE_CHECKING:
@@ -34,6 +37,17 @@ if TYPE_CHECKING:
 
 KVPair = tuple[Tensor, Tensor]
 RotaryPosEmb = Tensor | tuple[Tensor, Tensor]
+
+
+def _compact_kv_tensor(tensor: Tensor) -> Tensor:
+    """Release oversized/view storage without copying an already compact tensor."""
+
+    if (
+        tensor.is_contiguous() and tensor.storage_offset() == 0
+        and tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
+    ):
+        return tensor
+    return tensor.clone(memory_format=torch.contiguous_format)
 
 
 class TPRAttentionBackend(Protocol):
@@ -104,6 +118,7 @@ class TPRAttentionContext:
     # Legacy GDN extension uses the same forward scope; Dense PPO never fills it.
     initial_gdn_states: Mapping[int, GDNLayerState] = field(default_factory=dict)
     capture_gdn_final_state: bool = True
+    compact_new_kv: bool = False
     _new_key_values: dict[int, KVPair] = field(default_factory=dict, init=False, repr=False)
     _new_gdn_states: dict[int, GDNLayerState] = field(default_factory=dict, init=False, repr=False)
 
@@ -116,6 +131,8 @@ class TPRAttentionContext:
                 raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
         if not isinstance(self.capture_gdn_final_state, bool):
             raise TypeError("capture_gdn_final_state must be a bool")
+        if not isinstance(self.compact_new_kv, bool):
+            raise TypeError("compact_new_kv must be a bool")
         if self.prefix_length == 0:
             if self.past_key_values:
                 raise ValueError("past_key_values must be empty when prefix_length is 0")
@@ -173,6 +190,10 @@ class TPRAttentionContext:
         if layer_number in self._new_key_values:
             raise RuntimeError(f"new KV for layer {layer_number} was already recorded")
         _validate_kv_pair(layer_number, key, value, expected_sequence_length=self.local_suffix_length, kind="new")
+        if self.compact_new_kv:
+            if torch.is_grad_enabled():
+                raise RuntimeError("compact_new_kv requires a no-grad Push forward")
+            key, value = (_compact_kv_tensor(tensor.detach()) for tensor in (key, value))
         self._new_key_values[layer_number] = (key, value)
 
     def assert_new_kv_layers(self, expected_layer_numbers: Iterable[int]) -> None:

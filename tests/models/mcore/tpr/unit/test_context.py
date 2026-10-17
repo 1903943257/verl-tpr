@@ -15,8 +15,8 @@
 import pytest
 import torch
 
+from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
 from verl.models.mcore.tpr import (
-    GDNLayerState,
     TPRAttentionContext,
     get_tpr_attention_context,
     use_tpr_attention_context,
@@ -95,6 +95,52 @@ def test_new_kv_collector_preserves_tensor_identity_and_checks_layers():
     assert context.new_key_values[1][1] is new_value
     assert context.new_key_values[1][0].requires_grad
     context.assert_new_kv_layers([1])
+
+
+def test_push_collector_compacts_fused_qkv_views_at_each_layer():
+    context = TPRAttentionContext(0, 3, compact_new_kv=True)
+    with torch.no_grad():
+        for layer in (1, 2):
+            fused_qkv = torch.randn(3, 1, 8, 8)
+            key, value = fused_qkv[:, :, 4:6], fused_qkv[:, :, 6:8]
+            context.set_new_kv(layer, key, value)
+            for cached, source in zip(context.new_key_values[layer], (key, value), strict=True):
+                torch.testing.assert_close(cached, source)
+                assert cached.is_contiguous() and cached.storage_offset() == 0
+                assert cached.untyped_storage().nbytes() == cached.numel() * cached.element_size()
+                assert cached.untyped_storage().data_ptr() != fused_qkv.untyped_storage().data_ptr()
+                assert cached.grad_fn is None and not cached.requires_grad
+
+
+def test_push_collector_does_not_copy_already_compact_storage():
+    context = TPRAttentionContext(0, 3, compact_new_kv=True)
+    key, value = _kv(3, requires_grad=True)
+    with torch.no_grad():
+        context.set_new_kv(1, key, value)
+    for cached, source in zip(context.new_key_values[1], (key, value), strict=True):
+        assert cached.data_ptr() == source.data_ptr()
+        assert cached.grad_fn is None and not cached.requires_grad
+
+
+def test_push_compaction_cannot_silently_detach_a_pop_graph():
+    context = TPRAttentionContext(0, 3, compact_new_kv=True)
+    with pytest.raises(RuntimeError, match="no-grad Push"):
+        context.set_new_kv(1, *_kv(3, requires_grad=True))
+    assert not context.new_key_values
+
+
+def test_legacy_no_grad_context_preserves_tensor_identity_without_opt_in():
+    context = TPRAttentionContext(0, 3)
+    key, value = _kv(3)
+    with torch.no_grad():
+        context.set_new_kv(1, key, value)
+    assert context.new_key_values[1][0] is key
+    assert context.new_key_values[1][1] is value
+
+
+def test_compaction_mode_must_be_a_boolean():
+    with pytest.raises(TypeError, match="compact_new_kv must be a bool"):
+        TPRAttentionContext(0, 3, compact_new_kv="push")
 
 
 def test_duplicate_new_kv_is_rejected():

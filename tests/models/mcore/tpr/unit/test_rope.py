@@ -16,12 +16,10 @@ import pytest
 import torch
 
 from verl.workers.engine.megatron.tpr.executor import disable_bound_context_parallel_sharding
-from verl.models.mcore.tpr import (
-    AllGatherCPBackend,
-    RangeSequenceShard,
-    build_sharded_rotary_pos_emb,
-    build_suffix_rotary_pos_emb,
-)
+from verl.experimental.tpr.legacy.cp.backend import AllGatherCPBackend
+from verl.experimental.tpr.shard import RangeSequenceShard
+from verl.models.mcore.tpr import build_sharded_rotary_pos_emb, build_suffix_rotary_pos_emb
+from verl.workers.engine.megatron.tpr.ring import SequenceShard, make_ring_sequence_shard
 
 
 class _RecordingRotaryEmbedding:
@@ -124,6 +122,36 @@ def test_sharded_rope_follows_noncontiguous_local_token_order():
         (2, 22),
     ]
     assert all(call["cp_group"].size() == 1 for call in rotary_embedding.calls)
+
+
+@pytest.mark.parametrize("cp_size", [1, 2, 4])
+@pytest.mark.parametrize("disable_cp_sharding", [False, True])
+def test_sharded_rope_vectors_and_call_contract_cover_every_padding_case(cp_size, disable_cp_sharding):
+    observed = set()
+    for length in range(1, 34):
+        for rank in range(cp_size):
+            shard = (SequenceShard.full(length) if cp_size == 1 else
+                     make_ring_sequence_shard(length, cp_size=cp_size, cp_rank=rank))
+            rotary = _RecordingRotaryEmbedding()
+            position_start = 17 + length
+            actual = build_sharded_rotary_pos_emb(
+                rotary, position_start=position_start, shard=shard,
+                disable_context_parallel_sharding=disable_cp_sharding,
+            )
+            expected_positions = shard.physical_global_indices().clamp_max(length - 1) + position_start
+            torch.testing.assert_close(actual[:, 0, 0, 0], expected_positions.float(), rtol=0, atol=0)
+            expected_calls = []
+            for start, end in shard.physical_global_ranges:
+                valid = max(0, min(end, length) - start)
+                observed.add("normal" if valid == end - start else "partial" if valid else "all_padding")
+                expected_calls.append((valid, position_start + start) if valid else (1, position_start + length - 1))
+            assert [(call["max_seq_len"], call["offset"]) for call in rotary.calls] == expected_calls
+            assert all(call["packed_seq"] is False for call in rotary.calls)
+            if disable_cp_sharding:
+                assert all(call["cp_group"].size() == 1 for call in rotary.calls)
+            else:
+                assert all(call["cp_group"] is None for call in rotary.calls)
+    assert observed == ({"normal"} if cp_size == 1 else {"normal", "partial", "all_padding"})
 
 
 def test_sharded_rope_repeats_the_last_logical_position_for_padding():
