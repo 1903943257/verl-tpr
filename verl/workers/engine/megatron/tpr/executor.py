@@ -143,20 +143,12 @@ def build_sharded_rotary_pos_emb(
         valid_end = min(physical_end, shard.global_length)
         valid_length = max(0, valid_end - physical_start)
         physical_length = physical_end - physical_start
-        if valid_length:
-            chunk = build_suffix_rotary_pos_emb(
-                rotary_embedding,
-                prefix_length=position_start + physical_start,
-                suffix_length=valid_length,
-                disable_context_parallel_sharding=disable_context_parallel_sharding,
-            )
-        else:
-            chunk = build_suffix_rotary_pos_emb(
-                rotary_embedding,
-                prefix_length=position_start + shard.global_length - 1,
-                suffix_length=1,
-                disable_context_parallel_sharding=disable_context_parallel_sharding,
-            )
+        chunk = build_suffix_rotary_pos_emb(
+            rotary_embedding,
+            prefix_length=position_start + min(physical_start, shard.global_length - 1),
+            suffix_length=max(valid_length, 1),
+            disable_context_parallel_sharding=disable_context_parallel_sharding,
+        )
         if valid_length < physical_length:
             padding = chunk[-1:].expand(physical_length - valid_length, *chunk.shape[1:])
             chunk = torch.cat((chunk if valid_length else chunk[:0], padding), dim=0)
@@ -318,13 +310,8 @@ class SegmentExecutor:
             )
             del logits
             self._assert_collected_layers(context)
-            # Detach here (as before); KVPrefixState alone decides whether a
-            # view needs copying into compact, independently owned storage.
-            graph_free_kv = {
-                layer: (key.detach(), value.detach())
-                for layer, (key, value) in context.new_key_values.items()
-            }
-            self.kv_stack.push(segment, graph_free_kv, shard=self._segment_shard(segment))
+            # The Push context already detaches and compacts each layer's KV.
+            self.kv_stack.push(segment, context.new_key_values, shard=self._segment_shard(segment))
 
     def pop(self, segment_id: SegmentId) -> Tensor:
         """Recompute current KV and relay gradients from descendant Segments."""

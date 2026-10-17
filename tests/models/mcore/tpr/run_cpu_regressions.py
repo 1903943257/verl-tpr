@@ -39,6 +39,8 @@ UNIT = (
     "segment_executor", "fixed_topology_scheduler", "segment_external_objective",
     "tp_validation", "rope", "gdn_prefix_state", "tpr_batch_runner",
     "control_plane_gloo_cpu",
+    "replay_bootstrap_cpu",
+    "profile_tpr_dp2_step6_cpu", "npu_profile_capture_cpu",
 )
 PARALLEL = (
     "ring_cp_attention_contract", "cp_padding_contract", "cp_backend_contract",

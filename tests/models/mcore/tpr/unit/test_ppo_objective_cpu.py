@@ -100,6 +100,55 @@ def test_compact_ppo_fields_loss_and_gradients_match_reference(temperature, extr
     assert actual[4] == expected[4] == {"native_callback": True}
 
 
+@pytest.mark.parametrize("chunk_size", [None, 2])
+def test_physical_dedup_keeps_first_seen_order_and_every_logical_occurrence(chunk_size):
+    initial = torch.arange(21, dtype=torch.float64).reshape(1, 3, 7) / 9
+    segment = SegmentSpec(0, None, torch.tensor([3, 4, 5]), 0, 0)
+    refs = (
+        SegmentObjectiveRef(0, 2, 3, 2, 1), SegmentObjectiveRef(0, 0, 1, 0, 0),
+        SegmentObjectiveRef(0, 0, 1, 1, 0), SegmentObjectiveRef(0, 0, 1, 2, 0),
+        SegmentObjectiveRef(0, 2, 4, 0, 1), SegmentObjectiveRef(0, 2, 3, 1, 1),
+    )
+    positions = torch.tensor([2, 0, 0, 2, 2])
+    targets = torch.tensor([3, 1, 1, 4, 3])
+    temperatures = torch.tensor([1, 1, 2, 1, 2], dtype=initial.dtype)
+    scaled = initial[0].index_select(0, positions) / temperatures[:, None]
+    unique_log_probs = _log_probs(scaled, targets)
+    expected_packed = torch.stack([
+        unique_log_probs[1], unique_log_probs[3], unique_log_probs.new_zeros(()),
+        unique_log_probs[2], unique_log_probs[4], unique_log_probs.new_zeros(()),
+        unique_log_probs[1], unique_log_probs[0], unique_log_probs.new_zeros(()),
+    ])
+    results = []
+    for cls in (ReferenceObjective, SegmentPPOObjectiveAdapter):
+        batch = TensorDict({
+            "old_log_probs": torch.full((3, 2), -1.2),
+            "advantages": torch.tensor([[1., -2.], [0.5, -0.8], [1.3, -0.2]]),
+            "response_mask": torch.ones(3, 2, dtype=torch.bool),
+        }, batch_size=[3])
+        tu.assign_non_tensor_data(batch, "temperature", [1., 2., 1.])
+        tu.assign_non_tensor(batch, batch_num_tokens=13, dp_size=2)
+        traced, captured = [], []
+
+        def recorded_log_probs(logits, labels):
+            traced.append((logits.detach().clone(), labels.clone()))
+            return _log_probs(logits, labels)
+
+        logits = initial.clone().requires_grad_()
+        adapter = cls(batch, _loss_callback(captured), log_prob_fn=recorded_log_probs,
+                      log_prob_chunk_size=chunk_size)
+        loss, _ = adapter.compute_loss(segment, logits, refs)
+        assert len(traced) == (1 if chunk_size is None else 3)
+        torch.testing.assert_close(torch.cat([call[0] for call in traced]), scaled, rtol=0, atol=0)
+        torch.testing.assert_close(torch.cat([call[1] for call in traced]), targets, rtol=0, atol=0)
+        torch.testing.assert_close(captured[0][0]["log_probs"], expected_packed, rtol=0, atol=0)
+        assert captured[0][1]["response_mask"].sum().item() == len(refs)
+        loss.backward()
+        results.append((loss.detach(), logits.grad))
+    torch.testing.assert_close(results[0][0], results[1][0], rtol=0, atol=0)
+    torch.testing.assert_close(results[0][1], results[1][1], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("temperature", [0, -1, float("nan"), float("inf"), [1, 0]])
 def test_invalid_temperature_rejected(temperature):
     adapter = SegmentPPOObjectiveAdapter(_batch(temperature, False), _loss_callback([]))

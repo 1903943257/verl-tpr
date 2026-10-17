@@ -204,6 +204,7 @@ verl is fast with:
 
    sglang_multiturn/sandbox_fusion.rst
    tpr_audit_fixes_20261016.md
+   tpr/performance_plan_20261017.md
 
 Contribution
 -------------

@@ -1,10 +1,16 @@
 # TPR 本地审计修复（2026-10-16）
 
-Last updated: 10/16/2026.
+Last updated: 10/17/2026.
 
 基线：PR #7 `0de0542d84b9f2a655ec62530c32c63311ea91a2`。
 本地开发分支：`fix/tpr-audit-20261016`；提交目标为现有 PR #7。
-不直接更新远端 main，PR 保持 Draft，等待人工审阅与服务器验收。
+不直接更新远端 main，合入仍需人工审阅。
+
+2026-10-17：用户报告 main `ce6387c5` 对 PR7 `2dc82406` 的真实 Actor PPO
+阶段性验收通过：TP2×CP4 全参数梯度、TP2×CP2×DP2 Step 6 / 30K 抽样梯度
+在 2% BF16 工程容差内；具体数值、未覆盖范围和下一轮采集见
+[性能分析与采集计划](tpr/performance_plan_20261017.md)。这不是后续清理的 NPU 验收，
+也不是完整连续训练或性能验收；此处未在本机重放服务器结果。
 
 ## 已修改
 
@@ -52,7 +58,8 @@ git diff --check
 
 当前 Windows 验证环境：PyTorch `2.10.0+cpu`、TensorDict `0.14.3`。
 新增 Gloo 双进程测试在该 Windows torch 构建中因无法创建 Gloo device 跳过；
-Linux CI 不会对此错误跳过。HCCL 的 object collective 仍需服务器验证。
+Linux CI 不会对此错误跳过。后续服务器验收已覆盖上述两种拓扑的实际执行；
+CP metrics 的独立数值参考仍未验收。
 CI 使用项目允许的 TensorDict `0.10.0`；本地该版本的独立安装因网络下载停滞取消，
 未将其列为已通过的验证。现有 AReaL 环境未修改。
 
@@ -70,8 +77,8 @@ CI 使用项目允许的 TensorDict `0.10.0`；本地该版本的独立安装因
 和 chunk/coalesce 配置；对照 PR #7 基线与本分支的逐 token log-prob、全参数梯度、
 优化器更新和多步训练，并分别记录暖身后时间及峰值显存。
 现有 `compare_old_new_tpr_tp2cp4_ppo.py --require-full-grads` 可用于完整梯度检查；
-DP2 脚本的 sampled gradient witness 不能替代它。现有旧版 wrapper 的导入路径固定为
-历史 pre-refactor 布局，比较两个新布局 checkout 时应分别运行各自的 offline runner，
-不要直接把 PR #7 当作该 wrapper 的历史 `OLD_ROOT`。
+DP2 脚本的 sampled gradient witness 不能替代它。本轮已将 wrapper 限定到两个
+Engine 布局 checkout（main `ce6387c5` / PR7 `2dc82406`），删除历史布局导入兼容；
+wrapper 显式使用可覆盖的 2% 容差，独立比较脚本的默认阈值没有放宽。
 
 AI assistance: OpenAI Codex；合入/提交前仍需人工逐行审阅及服务器门禁。

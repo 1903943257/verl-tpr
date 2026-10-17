@@ -165,8 +165,8 @@ def test_cp_loss_scaling_and_empty_rank_connected_zero(cp_size, owned):
     torch.testing.assert_close(logits.grad, expected)
 
 
-def test_push_caches_compact_detached_kv_in_state():
-    """Push relies on KVPrefixState for storage ownership, not executor clones."""
+def test_push_caches_compact_detached_kv_in_state(monkeypatch):
+    """Push transfers the context's detached compact tensors without rewrapping."""
     model = _PrefixModel()
     forest = build_tree_execution_plans(
         tuple(f"sample_tpr_{row}" for row in range(5)),
@@ -184,9 +184,19 @@ def test_push_caches_compact_detached_kv_in_state():
             for segment_id in tree.segment_plan.segments
         },
     )
+    forward, recorded = executor._forward, {}
+
+    def capture_push(*args, **kwargs):
+        context, logits = forward(*args, **kwargs)
+        assert context.compact_new_kv and kwargs["no_grad"]
+        recorded.update(context.new_key_values)
+        return context, logits
+
+    monkeypatch.setattr(executor, "_forward", capture_push)
     executor.push(tree.segment_plan.root_id)
-    for key, value in executor.kv_stack.top().kv.key_values.values():
-        for tensor in (key, value):
+    for layer, pair in executor.kv_stack.top().kv.key_values.items():
+        for tensor, original in zip(pair, recorded[layer], strict=True):
+            assert tensor is original
             assert tensor.grad_fn is None and not tensor.requires_grad
             assert tensor.is_contiguous()
             assert tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
