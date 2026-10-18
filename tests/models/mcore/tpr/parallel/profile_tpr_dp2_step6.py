@@ -89,7 +89,8 @@ def configure_environment(reference, environ):
             or len(set(map(int, visible.split(",")))) != 8):
         raise ValueError("ASCEND_RT_VISIBLE_DEVICES must contain exactly 8 unique nonnegative integer IDs")
     controls = {
-        "TPR_EXPERIMENTAL_OFFLINE_DP2": "1", "TPR_OFFLINE_MODE": "tpr",
+        "TPR_EXPERIMENTAL_OFFLINE_DP2": "1", "TPR_RUN_TP2CP2DP2_ONE_STEP": "1",
+        "TPR_OFFLINE_MODE": "tpr",
         "TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS": "0", "TPR_TREE_POLICY": "qwen_turn",
         "TPR_TURN_MIN_SEGMENT_TOKENS": "128", "TPR_RING_COALESCE_PREFIX_FULL": "0",
         "TPR_RING_COALESCE_PREFIX_QUERY": "0", "TPR_PPO_LOGPROB_CHUNK_TOKENS": "512",
@@ -204,6 +205,26 @@ def runtime_without_cli(factory):
         sys.argv[:] = original_argv
 
 
+def load_target_modules(repo):
+    """Import every runtime dependency with MindSpeed CLI isolation already active.
+
+    The caller must use runtime_without_cli around this function. In particular
+    MindSpeed can parse and cache sys.argv during module import, *before* _runtime
+    is called. Passing this driver's --profile flag to that parser changes the
+    patch registration path and can duplicate the NVTX range_push patch.
+    """
+    replay = importlib.import_module("tests.models.mcore.tpr.parallel.test_tpr_tp2cp2dp2_one_step_npu")
+    checkpoint = importlib.import_module("tests.models.mcore.tpr.parallel._qwen3_tp_checkpoint")
+    actor = importlib.import_module("tests.models.mcore.tpr.parallel.test_real_actor_tp2cp4_offline_ppo_npu")
+    adapter = importlib.import_module("verl.workers.engine.megatron.tpr.adapter")
+    verify_module_paths(repo, [replay, checkpoint, actor, adapter])
+    torch = importlib.import_module("torch")
+    dist = importlib.import_module("torch.distributed")
+    parallel_state = importlib.import_module("megatron.core.parallel_state")
+    ppo_loss = importlib.import_module("verl.workers.utils.losses").ppo_loss
+    return replay, checkpoint, actor, adapter, torch, dist, parallel_state, ppo_loss
+
+
 def main(argv=None):
     args = parse_args(argv)  # --help/invalid CLI must not import NPU or target packages.
     reference = load_reference(args.reference_json)
@@ -216,15 +237,11 @@ def main(argv=None):
     rank_dir.mkdir(parents=True, exist_ok=False)
     sys.path.insert(0, str(args.repo))
     os.chdir(args.repo)
-    replay = importlib.import_module("tests.models.mcore.tpr.parallel.test_tpr_tp2cp2dp2_one_step_npu")
-    checkpoint = importlib.import_module("tests.models.mcore.tpr.parallel._qwen3_tp_checkpoint")
-    actor = importlib.import_module("tests.models.mcore.tpr.parallel.test_real_actor_tp2cp4_offline_ppo_npu")
-    adapter = importlib.import_module("verl.workers.engine.megatron.tpr.adapter")
-    verify_module_paths(args.repo, [replay, checkpoint, actor, adapter])
-    import torch
-    import torch.distributed as dist
-    from megatron.core import parallel_state
-    from verl.workers.utils.losses import ppo_loss
+    # MindSpeed may initialize/capture its args on import, not just at _runtime.
+    # Keep all target imports outside the driver's --profile/--repo CLI.
+    (replay, checkpoint, actor, adapter, torch, dist, parallel_state, ppo_loss) = (
+        runtime_without_cli(lambda: load_target_modules(args.repo))
+    )
 
     runtime = None
     try:
