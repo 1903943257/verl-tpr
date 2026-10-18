@@ -421,18 +421,6 @@ class SegmentPPOObjectiveAdapter:
         compact = TensorDict(output_fields, batch_size=[n], device=dev)
         tu.assign_non_tensor(compact, **self._normalization)
         model_output = {key: torch.cat(values, dim=0) for key, values in packed.items()}
-        # Fail at the TPR/native-PPO boundary with the actual local shapes,
-        # rather than inside no_padding_2_padding's opaque offsets assert.
-        expected_packed = len(refs) + n
-        for key, values in model_output.items():
-            if values.shape[0] != expected_packed:
-                packed_lengths = [len(by_row[row]) + 1 for row in rows]
-                raise RuntimeError(
-                    f"TPR compact PPO {key} pack mismatch: "
-                    f"actual={values.shape[0]} expected={expected_packed} "
-                    f"row_lengths={packed_lengths} refs={len(refs)} rows={rows} "
-                    f"shape={tuple(values.shape)}"
-                )
         loss, metrics = self.loss_function(
             model_output=model_output,
             data=compact,
