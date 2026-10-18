@@ -24,7 +24,7 @@ from types import MappingProxyType
 import torch
 from torch import Tensor
 
-from verl.models.mcore.tpr.context import KVPair, _validate_layer_number
+from verl.models.mcore.tpr.context import KVPair, _validate_kv_pair, _validate_layer_number
 from verl.models.mcore.tpr.context import _compact_kv_tensor as _compact_graph_free_tensor
 
 from .ring import SequenceShard
@@ -42,16 +42,7 @@ def _normalize_local_kv(key_values: Mapping[int, KVPair], *, local_length: int) 
         if not isinstance(pair, tuple) or len(pair) != 2:
             raise TypeError(f"layer {layer} KV must be a (key, value) tuple")
         key, value = pair
-        if not isinstance(key, Tensor) or not isinstance(value, Tensor):
-            raise TypeError(f"layer {layer} K/V must be torch tensors")
-        if key.ndim != 4 or key.shape != value.shape:
-            raise ValueError(f"layer {layer} K/V shapes must match [sequence, batch, heads, head_dim]")
-        if key.shape[0] != local_length:
-            raise ValueError(f"layer {layer} KV local sequence length must be {local_length}, got {key.shape[0]}")
-        if key.shape[1] != 1:
-            raise ValueError(f"layer {layer} KV batch size must be 1, got {key.shape[1]}")
-        if (key.device, key.dtype) != (value.device, value.dtype):
-            raise ValueError(f"layer {layer} K/V device and dtype must match")
+        _validate_kv_pair(layer, key, value, expected_sequence_length=local_length, kind="cached")
         if any(t.requires_grad or t.grad_fn is not None for t in pair):
             raise ValueError(f"layer {layer} cached K/V must be detached and graph-free")
         if placement is not None and placement != (key.device, key.dtype):
