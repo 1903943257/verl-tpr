@@ -892,5 +892,8 @@ def aggregate_cp_loss(
     global_normalized_loss = normalized_loss.detach().clone()
     if runtime.enabled:
         dist.all_reduce(global_loss_sum, op=dist.ReduceOp.SUM, group=runtime.group)
-        dist.all_reduce(global_normalized_loss, op=dist.ReduceOp.SUM, group=runtime.group)
+        if normalized_loss is loss_sum:
+            global_normalized_loss.copy_(global_loss_sum)
+        else:
+            dist.all_reduce(global_normalized_loss, op=dist.ReduceOp.SUM, group=runtime.group)
     return global_loss_sum, global_normalized_loss
