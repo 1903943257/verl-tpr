@@ -284,6 +284,10 @@ def test_recorded_full_vs_tpr_one_step():
     destination = Path(os.getenv(
         "TPR_OFFLINE_OUTPUT_DIR", "/workspace/tpr_offline_qwen4b_tp2cp4"
     ))
+    # Reject stale topology flags before initializing HCCL or loading 4B.
+    tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
+    if tree_policy != "qwen_turn":
+        raise ValueError(f"offline Actor replay requires qwen_turn, got {tree_policy!r}")
     runtime = _runtime()
     try:
         from verl.workers.utils.losses import ppo_loss
@@ -298,10 +302,6 @@ def test_recorded_full_vs_tpr_one_step():
         )
         from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans
         # Production TPR supports only complete Qwen/ChatML Turn sharing.
-        # An old "exact" default here could fail after model initialization.
-        tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
-        if tree_policy != "qwen_turn":
-            raise ValueError(f"offline Actor replay requires qwen_turn, got {tree_policy!r}")
         forest = build_tree_execution_plans(
             _trajectory_keys_from_minibatch(batch), batch,
             tree_policy=tree_policy,
