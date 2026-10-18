@@ -89,7 +89,8 @@ class ProfileCLIContracts(unittest.TestCase):
                     driver.load_reference(self.reference_path)
 
     def test_controls_reject_conflicts_without_overwriting(self):
-        for key, value in (("TPR_RING_COALESCE_PREFIX_FULL", "1"),
+        for key, value in (("TPR_RUN_TP2CP2DP2_ONE_STEP", "0"),
+                           ("TPR_RING_COALESCE_PREFIX_FULL", "1"),
                            ("TPR_OFFLINE_GRAD_SYNC_DTYPE", "fp32"),
                            ("TPR_EXEC_PROFILE", "1"), ("TPR_FIXED_TILE_TOKENS", "512"),
                            ("TPR_MEM_TRACE", "1"), ("TPR_BENCH_CAPTURE_LOGPROBS", "1")):
@@ -101,6 +102,7 @@ class ProfileCLIContracts(unittest.TestCase):
         environment = {}
         actual = driver.configure_environment(self.reference, environment)
         self.assertEqual(actual["TPR_EXEC_PROFILE"], "0")
+        self.assertEqual(actual["TPR_RUN_TP2CP2DP2_ONE_STEP"], "1")
         self.assertEqual(actual["TPR_BENCH_CAPTURE_LOGPROBS"], "0")
         self.assertEqual(actual["TPR_PPO_LOGPROB_CHUNK_TOKENS"], "512")
         self.assertEqual(environment, actual)
@@ -135,6 +137,37 @@ class ProfileCLIContracts(unittest.TestCase):
                 raise RuntimeError("bootstrap failed")
             with self.assertRaisesRegex(RuntimeError, "bootstrap failed"):
                 driver.runtime_without_cli(factory)
+            self.assertEqual(driver.sys.argv, original)
+
+    def test_target_imports_are_cli_isolated_before_mindspeed_runtime(self):
+        # Import itself can initialize/cache MindSpeed patches. Suppress the
+        # driver's --profile flag before ANY target import, not only _runtime.
+        imported = []
+        fake_module = SimpleNamespace(ppo_loss=object())
+        def fake_import(name):
+            self.assertEqual(driver.sys.argv, ["profile_tpr_dp2_step6.py"])
+            imported.append(name)
+            return fake_module
+
+        original = ["profile_tpr_dp2_step6.py", "--profile", "--repo", "candidate"]
+        with patch.object(driver.sys, "argv", original[:]), patch.object(
+                driver.importlib, "import_module", side_effect=fake_import), patch.object(
+                driver, "verify_module_paths") as verify:
+            modules = driver.runtime_without_cli(lambda: driver.load_target_modules(self.root))
+            self.assertEqual(driver.sys.argv, original)
+        self.assertEqual(len(modules), 8)
+        self.assertIn("tests.models.mcore.tpr.parallel.test_tpr_tp2cp2dp2_one_step_npu", imported)
+        self.assertIn("verl.workers.engine.megatron.tpr.adapter", imported)
+        self.assertIn("megatron.core.parallel_state", imported)
+        self.assertIn("verl.workers.utils.losses", imported)
+        verify.assert_called_once()
+
+    def test_failed_target_import_restores_driver_cli(self):
+        original = ["profile_tpr_dp2_step6.py", "--profile", "--repo", "candidate"]
+        with patch.object(driver.sys, "argv", original[:]), patch.object(
+                driver.importlib, "import_module", side_effect=RuntimeError("bad import")):
+            with self.assertRaisesRegex(RuntimeError, "bad import"):
+                driver.runtime_without_cli(lambda: driver.load_target_modules(self.root))
             self.assertEqual(driver.sys.argv, original)
 
     def test_existing_rank_output_fails_before_heavy_imports(self):
