@@ -388,7 +388,7 @@ class SegmentExecutor:
             if entry.segment.segment_id != segment_id:
                 raise RuntimeError(f"cannot pop segment {segment_id}: stack top is {entry.segment.segment_id}")
 
-            relayed_gradients = dict(entry.gradients)
+            relayed_gradients = dict(entry.kv.gradients)
             if relayed_gradients and tuple(relayed_gradients) != self.expected_layer_numbers:
                 raise RuntimeError(
                     f"segment {segment_id} relayed KV gradient layers must be {self.expected_layer_numbers}, "
