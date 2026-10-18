@@ -69,8 +69,7 @@ old, new = (json.loads(path.read_text()) for path in (old_path, new_path))
 invariants = (
     "source_step", "mode", "topology", "effective_sequence_cap",
     "source_capture", "checkpoint", "input_sha256", "global_ppo_tokens",
-    "placement_policy", "dp_partitions", "dp_tree_token_costs",
-    "global_tree_tokens", "duplicated_tree_tokens",
+    "placement_policy",
     "warmups", "repeats", "gradient_sync_reduce_dtype",
     "ppo_logprob_chunk_tokens", "recompute", "updated_weights",
 )
@@ -83,11 +82,34 @@ if old["warmups"] != 0 or old["repeats"] != 1 or old["updated_weights"] is not F
     raise AssertionError("Expected exactly one fixed-weight PPO F/B step per revision")
 a, b = old["runs"][-1], new["runs"][-1]
 loss_gap = abs(float(a["loss"]) - float(b["loss"]))
-rank_losses_a = [float(r["local_loss_dp_scaled"]) for r in a["ranks"]]
-rank_losses_b = [float(r["local_loss_dp_scaled"]) for r in b["ranks"]]
-if len(rank_losses_a) != len(rank_losses_b) or len(rank_losses_a) != 8:
-    raise AssertionError("Expected eight rank-local PPO loss records")
-rank_loss_gap = max(abs(x - y) for x, y in zip(rank_losses_a, rank_losses_b))
+# Turn-aware planning may legitimately change DP assignment. Rank-local
+# contributions must therefore agree WITHIN each run, not across revisions.
+# The total global PPO objective and post-finalize gradients remain comparable.
+def validate_run(name, data, run):
+    partitions = data["dp_partitions"]
+    if (len(partitions) != 2 or any(not p for p in partitions)
+            or sorted(row for p in partitions for row in p) != list(range(8))):
+        raise AssertionError(f"{name}: DP placement must cover all eight rows exactly once")
+    ranks = run["ranks"]
+    if len(ranks) != 8 or sorted(int(r["rank"]) for r in ranks) != list(range(8)):
+        raise AssertionError(f"{name}: expected eight distinct rank-local reports")
+    for rank in ranks:
+        if rank["rows"] != partitions[int(rank["dp_rank"])]:
+            raise AssertionError(f"{name}: rank-local rows disagree with DP placement")
+    report = run["loss_report"]
+    if not math.isfinite(float(run["loss"])):
+        raise AssertionError(f"{name}: nonfinite global loss")
+    gaps = {
+        "tp_local_max_gap": float(report["tp_local_max_gap"]),
+        "cp_replica_max_gap": float(report["cp_replica_max_gap"]),
+        "global_reporting_max_gap": float(report["global_reporting_max_gap"]),
+    }
+    if any(not math.isfinite(v) or v > 0.001 for v in gaps.values()):
+        raise AssertionError(f"{name}: internal TP/CP/global loss report disagrees: {gaps}")
+    return gaps
+
+old_internal = validate_run("old", old, a)
+new_internal = validate_run("new", new, b)
 ga, gb = old.get("gradient_witness"), new.get("gradient_witness")
 if not ga or not gb:
     raise AssertionError("Missing old/new gradient witness; do not accept loss-only PPO parity")
@@ -107,12 +129,13 @@ replica_abs = max(
 )
 limits = {
     "loss_abs": float(os.getenv("TPR_ACCEPT_LOSS_ABS", "0.001")),
-    "rank_loss_abs": float(os.getenv("TPR_ACCEPT_RANK_LOSS_ABS", "0.001")),
+    "internal_loss_abs": float(os.getenv("TPR_ACCEPT_RANK_LOSS_ABS", "0.001")),
     "sampled_grad_rel_l2": float(os.getenv("TPR_ACCEPT_GRAD_REL_L2", "0.02")),
     "replica_sample_max_abs": float(os.getenv("TPR_ACCEPT_REPLICA_ABS", "0.00003")),
 }
 measured = {
-    "loss_abs": loss_gap, "rank_loss_abs": rank_loss_gap,
+    "loss_abs": loss_gap,
+    "internal_loss_abs": max(*old_internal.values(), *new_internal.values()),
     "sampled_grad_rel_l2": grad_rel_l2,
     "replica_sample_max_abs": replica_abs,
 }
@@ -120,9 +143,18 @@ checks = {k: math.isfinite(v) and v <= limits[k] for k, v in measured.items()}
 report = {
     "old_capture": str(old_path), "new_capture": str(new_path),
     "input_sha256": old["input_sha256"], "source_step": old["source_step"],
+    "placement_old": {
+        "partitions": old["dp_partitions"], "cost_model": old.get("placement_cost_model"),
+        "tree_costs": old["dp_tree_token_costs"], "duplicated_tokens": old["duplicated_tree_tokens"],
+    },
+    "placement_new": {
+        "partitions": new["dp_partitions"], "cost_model": new.get("placement_cost_model"),
+        "tree_costs": new["dp_tree_token_costs"], "duplicated_tokens": new["duplicated_tree_tokens"],
+    },
+    "old_internal_loss_gaps": old_internal, "new_internal_loss_gaps": new_internal,
     "measured": measured, "limits": limits, "checks": checks,
     "passed": all(checks.values()),
-    "scope": "Fixed-weight one-step PPO, same capture, sampled gradient witness; does not certify full gradients, optimizer updates, or tokenwise logprobs",
+    "scope": "Fixed-weight one-step PPO, same capture, globally comparable loss and sampled gradients across potentially different legal DP placements; does not certify full gradients, optimizer updates, or tokenwise logprobs",
 }
 output_path.write_text(json.dumps(report, indent=2, allow_nan=False))
 print("TPR_OLD_NEW_TP2CP2DP2_REPORT " + json.dumps(report, allow_nan=False), flush=True)
