@@ -590,7 +590,7 @@ PPO loss differences do not establish training-gradient equivalence.
 
 ## TP2 CP2 DP2 recompute compatibility experiment (8 Ascend NPUs)
 
-Status: code committed, server NPU validation pending. Reuses the existing
+Status: 30K OFF/ON 8-NPU HCCL correctness PASS with isolated FP32 grad sync; 40K ON-only PASS (OFF OOM). Reuses the existing
 Qwen3-4B real-Actor PPO one-step TP2 RingCP2 DP2 replay and original
 session-first8 Step6 captures and DTA/DFS minimax placement. No changes to
 production TP/CP/DP, Ring kernels or optimizer paths.
@@ -680,3 +680,57 @@ To reproduce BF16 native-gradient discrepancies separately, explicitly set
 TPR_OFFLINE_GRAD_SYNC_DTYPE=bf16; failure of the exact replica witness is
 a real numerical consistency problem, not a passing test. Do not use
 diagnostic-only policy to claim recompute correctness.
+
+
+### Verified DP2 recompute results (2026-10-18; user-supplied NPU logs)
+
+These are measured, completed Ascend 910B experimental *offline replay*
+runs; they supersede the preceding pending-status wording. Both cases use
+Qwen3-4B-128K, TP2×RingCP2×DP2, 8 NPUs, original Actor PPO Step 6,
+turn tree and DFS/DTA DP placement. The gradient-finalization reduction is
+the explicit **FP32 per-parameter staging** mode; it is *not* the native
+BF16 gradient synchronization behavior.
+
+**40K ON-only capacity/update replay:**
+
+- Output: /workspace/tpr_experiments/recompute_dp2_step6_on_fp32_v1/
+- 1 warmup + 3 measured forward/backward runs: measured critical seconds
+  28.529518, 28.582731, 28.668194; median **28.582731 s**.
+- Peak allocated memory after warmup: **20.419 GiB**, stable.
+- Global PPO loss ~0.100033596–0.100033602; DP0 local
+  0.0762786567, DP1 local 0.123788543, TP/CP reporting gaps 0,
+  global reporting gap <=1.49e-8.
+- DFS/DTA placement DP rows [[2,3,0,6,5],[1,4,7]], costs
+  [108806,87248], duplicated tree tokens 17576.
+- Job completed with the strict gradient-replica gate and optional
+  single-step offline optimizer verification enabled by the runner.
+  **No successful 40K OFF baseline exists**; do not claim OFF/ON parity
+  or a 40K memory reduction percentage.
+
+**30K (~30,720-token) same-capture OFF/ON correctness pair:**
+
+- Report: /workspace/tpr_experiments/recompute_dp2_step6_30k_fp32_pair_v1/comparison.json
+- Global PPO loss absolute gap: **3.7252903e-9**.
+- *All BF16 parameter-gradient shards* OFF vs ON relative L2:
+  **0.00922255517 (0.9223%)**; this is not a grad-norm gap or a
+  sparse witness estimate. Strict CP×DP sampled replica gate passed.
+- Single-step CPU FP32-master AdamW completed; sampled updated-weight
+  max absolute gap **3.05175781e-5**. This does **not** certify exact
+  full-parameter post-optimizer parity.
+- OFF median forward/backward (+ grad finalization) **12.362386 s**;
+  ON median **16.534103 s**, i.e. ON time +33.74%.
+- OFF peak allocated **40.653 GiB**; ON **16.403 GiB**,
+  reduction **24.250 GiB / 59.65%**.
+- Comparator emitted status **PASS** after validating both input hashes,
+  global losses, full gradient files, sampled weight updates, and
+  other replay settings; this is an 8-NPU *experimental* compatibility gate,
+  not a production GRPO throughput benchmark.
+
+**Qualification:** The F/B performance timer excludes the separate
+optimizer update. The pair verifies one offline optimizer step after
+repeated frozen-weight F/B, not multiple consecutive production VERL
+optimizer steps. Native 910B BF16 post-finalization replica differences
+were observed separately; the FP32-controlled PASS must not be represented
+as a BF16 production gradient-sync fix. Recompute+DP2 is validated for
+the above topology/captures/precision, not automatically every DP/CP/TP
+configuration or the full 40K OFF/ON comparison.
