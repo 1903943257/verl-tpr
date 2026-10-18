@@ -7,6 +7,12 @@ cd "$(dirname "$0")/../../../../.."
 
 SOURCE="${TPR_CP1_SOURCE:-/workspace/tpr_actor_capture_4b_n8_run1/actor_update_rank0_batch0.pt}"
 ROOT="${TPR_CP1_ROOT:-/workspace/tpr_experiments/cp1_full_tpr_2k}"
+CAP="${TPR_CP1_CAP:-2048}"
+PROMPT_WINDOW="${TPR_CP1_PROMPT_WINDOW:-$((CAP / 2))}"
+if ((CAP < 128 || CAP > 4096 || PROMPT_WINDOW < 1 || PROMPT_WINDOW >= CAP)); then
+  echo "Invalid short capture cap/prompt_window: $CAP/$PROMPT_WINDOW" >&2
+  exit 2
+fi
 export TPR_QWEN_4B_PATH="${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}"
 : "${ASCEND_RT_VISIBLE_DEVICES:=8}"
 export ASCEND_RT_VISIBLE_DEVICES
@@ -32,15 +38,27 @@ export PYTHONUNBUFFERED=1
 unset TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
 
 mkdir -p "$ROOT"
-export TPR_CP1_CAPTURE="$ROOT/actor_pair_cap2048.pt"
+export TPR_CP1_CAPTURE="$ROOT/actor_pair_cap${CAP}_p${PROMPT_WINDOW}.pt"
 if [[ ! -e "$TPR_CP1_CAPTURE" ]]; then
   python -m tests.models.mcore.tpr.parallel.prepare_tpr_cp1_short_capture \
-    "$SOURCE" "$TPR_CP1_CAPTURE" --rows 4,6 --cap 2048 --prompt-window 1024
+    "$SOURCE" "$TPR_CP1_CAPTURE" --rows 4,6 --cap "$CAP" --prompt-window "$PROMPT_WINDOW"
 fi
 [[ -f "$TPR_CP1_CAPTURE" ]] || { echo "Missing derived capture" >&2; exit 2; }
 [[ -f "${TPR_CP1_CAPTURE%.pt}.audit.json" ]] || {
   echo "Missing short capture audit; refusing stale input" >&2; exit 2;
 }
+python - "$SOURCE" "$TPR_CP1_CAPTURE" "$CAP" "$PROMPT_WINDOW" <<'PY'
+import json, sys
+from pathlib import Path
+source, capture = Path(sys.argv[1]).resolve(), Path(sys.argv[2]).resolve()
+cap, prompt = int(sys.argv[3]), int(sys.argv[4])
+audit = json.loads(capture.with_suffix(".audit.json").read_text())
+assert audit["source"] == str(source), "Derived capture belongs to a different source"
+assert audit["cap"] == cap and audit["prompt_window"] == prompt, "Old crop settings"
+assert audit["original_rows"] == [4, 6], "Wrong sibling source rows"
+assert all(x <= cap for x in audit["retained_lengths"])
+assert all(n > 0 for n in audit["supervised_tokens_per_row"])
+PY
 
 # Each arm loads exactly the same initial Qwen3-4B weights from checkpoint.
 # A separate torchrun exits after backward; no optimizer step is performed.
