@@ -2,10 +2,10 @@
 # Verify the refactored TPR against an independent pre-refactor checkout.
 # This is a REAL Qwen3-4B PPO F/B + gradient-finalize gate, not a Full-vs-TPR
 # speedup test. It intentionally does not change the production Ring runtime.
-# Usage: bash this_script.sh OLD_ROOT NEW_ROOT 40K_MANIFEST OUTPUT_ROOT [STEP=6]
+# Usage: bash this_script.sh OLD_ROOT NEW_ROOT CAPTURE_MANIFEST OUTPUT_ROOT [STEP=6]
 set -euo pipefail
 if (( $# < 4 || $# > 5 )); then
-  echo "Usage: $0 OLD_ROOT NEW_ROOT 40K_MANIFEST OUTPUT_ROOT [STEP=6]" >&2
+  echo "Usage: $0 OLD_ROOT NEW_ROOT CAPTURE_MANIFEST OUTPUT_ROOT [STEP=6]" >&2
   exit 2
 fi
 OLD="$(realpath "$1")"
@@ -20,20 +20,20 @@ STEP="${5:-6}"
   echo "Missing new test runner: $NEW" >&2; exit 2;
 }
 [[ "$OLD" != "$NEW" ]] || { echo "Old and new checkouts must differ" >&2; exit 2; }
-[[ -f "$MANIFEST" ]] || { echo "Missing 40K manifest: $MANIFEST" >&2; exit 2; }
+[[ -f "$MANIFEST" ]] || { echo "Missing capture manifest: $MANIFEST" >&2; exit 2; }
 [[ ! -e "$OUT" ]] || { echo "Output exists: $OUT" >&2; exit 2; }
 mkdir -p "$OUT"
 OUT="$(realpath "$OUT")"
-# Docker rsync checkouts may not include host .git metadata. The operator
-# pins and verifies both worktrees on the host before copying them to Docker.
+# Git is exclusively a host-side operation. Docker records the SHAs
+# explicitly verified on the host; it never invokes Git.
 for version in old new; do
-  if [[ "$version" == old ]]; then root="$OLD"; else root="$NEW"; fi
-  if git -C "$root" rev-parse HEAD > "$OUT/$version.sha" 2>/dev/null; then
-    echo "TPR_DP2_REVISION version=$version sha=$(cat "$OUT/$version.sha")"
-  else
-    echo "git_metadata_not_mounted" > "$OUT/$version.sha"
-    echo "TPR_DP2_REVISION version=$version sha=unavailable_verify_on_host"
+  if [[ "$version" == old ]]; then sha="${TPR_OLD_GIT_SHA:-}"; else sha="${TPR_NEW_GIT_SHA:-}"; fi
+  if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "Set TPR_${version^^}_GIT_SHA to the full host-verified commit SHA" >&2
+    exit 2
   fi
+  printf '%s\\n' "$sha" > "$OUT/$version.sha"
+  echo "TPR_DP2_REVISION version=$version sha=$sha source=host_verified"
 done
 
 # Hold all experimental knobs equal. No Fixed Tile and no Ring redesign here.
