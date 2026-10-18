@@ -273,6 +273,8 @@ def _placement(capture, runtime, expected_tokens):
     sequences = [list(map(int, ids.tolist())) for ids in global_batch["input_ids"].unbind(0)]
     placement = plan_tpr_dta_dp(
         sequences, global_keys, dp_size=2, enforce_equal_rows=False,
+        prompt_lengths=[int(ids.numel()) for ids in global_batch["prompts"].unbind(0)],
+        turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
     )
     if (sorted(sum((list(p) for p in placement.partitions), [])) != list(range(8))
             or not all(placement.partitions)):
@@ -529,6 +531,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 "source_capture": str(capture), "checkpoint": str(checkpoint),
                 "input_sha256": sha, "global_ppo_tokens": global_tokens,
                 "placement_policy": plan.policy,
+                "placement_cost_model": plan.cost_model,
                 "dp_partitions": [list(x) for x in plan.partitions],
                 "dp_tree_token_costs": list(plan.tree_tokens_by_rank),
                 "global_tree_tokens": plan.global_tree_tokens,

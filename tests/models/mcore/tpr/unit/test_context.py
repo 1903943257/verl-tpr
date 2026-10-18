@@ -15,7 +15,6 @@
 import pytest
 import torch
 
-from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
 from verl.models.mcore.tpr import (
     TPRAttentionContext,
     get_tpr_attention_context,
@@ -27,13 +26,6 @@ def _kv(sequence_length: int, *, requires_grad: bool = False):
     key = torch.randn(sequence_length, 1, 2, 8, requires_grad=requires_grad)
     value = torch.randn(sequence_length, 1, 2, 8, requires_grad=requires_grad)
     return key, value
-
-
-def _gdn_state(*, requires_grad: bool = False):
-    return GDNLayerState(
-        torch.randn(1, 12, 4, requires_grad=requires_grad),
-        torch.randn(1, 4, 8, 6, requires_grad=requires_grad),
-    )
 
 
 def test_context_manager_sets_and_restores_context():
@@ -152,43 +144,11 @@ def test_duplicate_new_kv_is_rejected():
         context.set_new_kv(1, new_key, new_value)
 
 
-def test_gdn_state_is_restored_and_collected_without_detaching():
-    initial_state = _gdn_state(requires_grad=True)
-    context = TPRAttentionContext(
-        prefix_length=6,
-        suffix_length=3,
-        initial_gdn_states={1: initial_state},
-    )
-    new_state = _gdn_state(requires_grad=True)
-
-    assert context.get_initial_gdn_state(1) is initial_state
-    assert context.get_initial_gdn_state(1).conv_state.requires_grad
-    context.set_new_gdn_state(1, new_state)
-    assert context.new_gdn_states[1] is new_state
-    context.assert_new_gdn_layers([1])
-
-
-def test_gdn_state_context_enforces_root_missing_and_duplicate_contracts():
-    with pytest.raises(ValueError, match="initial_gdn_states"):
-        TPRAttentionContext(
-            prefix_length=0,
-            suffix_length=3,
-            initial_gdn_states={1: _gdn_state()},
-        )
-
-    root_context = TPRAttentionContext(prefix_length=0, suffix_length=3)
-    assert root_context.get_initial_gdn_state(1) is None
-
-    suffix_context = TPRAttentionContext(
-        prefix_length=6,
-        suffix_length=3,
-        initial_gdn_states={1: _gdn_state()},
-    )
-    with pytest.raises(KeyError, match="layer 2"):
-        suffix_context.get_initial_gdn_state(2)
-    suffix_context.set_new_gdn_state(1, _gdn_state())
-    with pytest.raises(RuntimeError, match="already recorded"):
-        suffix_context.set_new_gdn_state(1, _gdn_state())
+def test_dense_context_has_no_experimental_recurrent_state_api():
+    context = TPRAttentionContext(0, 3)
+    assert not any("gdn" in name.lower() for name in dir(context))
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        TPRAttentionContext(0, 3, initial_gdn_states={})
 
 
 @pytest.mark.parametrize(

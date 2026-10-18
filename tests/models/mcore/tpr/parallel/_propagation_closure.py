@@ -48,7 +48,8 @@ class ClosureCapture:
 
 
 def propagation_closure(model, capture, reference, runtime, monkeypatch, metrics, *, cp):
-    from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
+    from verl.experimental.tpr.gdn.context import GDNTPRAttentionContext as TPRAttentionContext
+    from verl.experimental.tpr.gdn.context import use_tpr_attention_context
     from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
     from verl.models.mcore.tpr import attention
     from verl.experimental.tpr import ring_attention as ring

@@ -26,7 +26,8 @@ def _forward(model, x, initial=None, prefix_length=0):
     if model.cp_size == 2:
         return model(x, initial)
     # CP1 reference retains the Stage 3.2 implementation, not the CP adapter.
-    from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
+    from verl.experimental.tpr.gdn.context import GDNTPRAttentionContext as TPRAttentionContext
+    from verl.experimental.tpr.gdn.context import use_tpr_attention_context
 
     context = TPRAttentionContext(prefix_length=prefix_length,
                                   suffix_length=x.shape[0], initial_gdn_states=initial or {})

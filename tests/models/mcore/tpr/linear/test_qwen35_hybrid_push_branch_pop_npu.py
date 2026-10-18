@@ -216,7 +216,10 @@ def _native_reference(model, plan, device, *, tpr_context=False, probe=None):
         positions = torch.arange(tokens.numel(), device=device).unsqueeze(0)
         context_manager = nullcontext()
         if tpr_context:
-            from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
+            from verl.experimental.tpr.gdn.context import (
+                GDNTPRAttentionContext as TPRAttentionContext,
+                use_tpr_attention_context,
+            )
             from verl.workers.engine.megatron.tpr.executor import build_suffix_rotary_pos_emb
 
             context = TPRAttentionContext(

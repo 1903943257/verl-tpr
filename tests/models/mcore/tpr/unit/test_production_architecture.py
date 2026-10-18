@@ -6,7 +6,13 @@ protect separation of the Ring-only PPO runtime from optional experiments.
 from __future__ import annotations
 
 import ast
+import copy
+from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
+from typing import TypeVar
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[5]
@@ -32,13 +38,72 @@ def test_no_experimental_backend_in_production_imports() -> None:
         "verl.models.mcore.tpr.parallel.hybrid_attention",
         "verl.models.mcore.tpr.parallel.ulysses_attention",
     )
-    for name in PRODUCTION:
-        tree = ast.parse(_source(name))
+    files = [ENGINE / f"{name}.py" for name in PRODUCTION] + list(MODEL.glob("*.py"))
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
-                assert not any(node.module.startswith(v) for v in forbidden), (name, node.module)
+                assert not any(node.module.startswith(v) for v in forbidden), (path, node.module)
             elif isinstance(node, ast.Import):
-                assert not any(alias.name.startswith(v) for alias in node.names for v in forbidden), name
+                assert not any(alias.name.startswith(v) for alias in node.names for v in forbidden), path
+
+
+def test_production_has_no_recurrent_state_implementation_or_dispatch() -> None:
+    for base in (ENGINE, MODEL):
+        for path in base.glob("*.py"):
+            assert "gdn" not in path.read_text(encoding="utf-8").lower(), path
+
+
+def test_ppo_dense_guard_checks_every_decoder_slot() -> None:
+    tree = ast.parse(_source("adapter"))
+    definition = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "_assert_dense_model")
+
+    class Attention:
+        pass
+
+    namespace = {"Any": object, "TPRSelfAttention": Attention}
+    exec(compile(ast.Module(body=[definition], type_ignores=[]), "<adapter dense guard>", "exec"), namespace)
+    guard = namespace["_assert_dense_model"]
+    dense = SimpleNamespace(self_attention=Attention())
+    unsupported = SimpleNamespace(self_attention=object())
+    guard(SimpleNamespace(decoder=SimpleNamespace(layers=[dense, dense])))
+    for layers in ([], [unsupported], [dense, unsupported], [dense, SimpleNamespace()]):
+        with pytest.raises(TypeError, match="every decoder layer"):
+            guard(SimpleNamespace(decoder=SimpleNamespace(layers=layers)))
+    with pytest.raises(TypeError, match="every decoder layer"):
+        guard(SimpleNamespace(incidental_attention=Attention()))
+
+
+def test_module_spec_rejects_mixed_attention_without_model_mutation() -> None:
+    definition = next(node for node in ast.parse(_source("adapter")).body
+                      if isinstance(node, ast.FunctionDef) and node.name == "replace_self_attention_with_tpr")
+
+    @dataclass
+    class Spec:
+        module: object
+        submodules: object = None
+
+    class Dense:
+        pass
+
+    class Patched(Dense):
+        pass
+
+    namespace = {
+        "_SpecT": TypeVar("_SpecT"), "copy": copy, "ModuleSpec": Spec, "replace": replace,
+        "SelfAttention": Dense, "TPRSelfAttention": Patched,
+        "get_module": lambda spec: spec.module, "_get_layer_specs": lambda spec: spec.layer_specs,
+    }
+    exec(compile(ast.Module(body=[definition], type_ignores=[]), "<adapter module spec>", "exec"), namespace)
+    convert = namespace["replace_self_attention_with_tpr"]
+    dense = Spec(object, SimpleNamespace(self_attention=Spec(Dense)))
+    original = SimpleNamespace(layer_specs=[dense])
+    assert convert(original).layer_specs[0].submodules.self_attention.module is Patched
+    mixed = SimpleNamespace(layer_specs=[dense, Spec(object, SimpleNamespace(self_attention=Spec(object)))])
+    with pytest.raises(TypeError, match="requires Megatron SelfAttention"):
+        convert(mixed)
+    assert dense.submodules.self_attention.module is Dense
 
 
 def test_turn_tree_is_only_production_builder() -> None:
@@ -163,7 +228,7 @@ def test_context_is_thin_and_has_no_eager_engine_imports() -> None:
     assert definitions == {
         "TPRAttentionBackend", "TPRAttentionContext", "_compact_kv_tensor",
         "_validate_layer_number", "_validate_kv_pair", "_assert_layers",
-        "_validate_gdn_layer_state", "get_tpr_attention_context", "use_tpr_attention_context",
+        "get_tpr_attention_context", "use_tpr_attention_context",
     }
     assert "class TPRAttentionContext:" in source
     assert "def use_tpr_attention_context(" in source

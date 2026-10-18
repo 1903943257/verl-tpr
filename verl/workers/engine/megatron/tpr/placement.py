@@ -17,6 +17,7 @@ a compatible variable-cardinality dispatch + mini-batch contract exists.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 from typing import Literal, Sequence
 
 Policy = Literal["verl_uid", "dta_dfs", "tpr_dta"]
@@ -32,6 +33,7 @@ class DPPlacementPlan:
     duplicated_tree_tokens: int
     equal_rows_per_rank: bool
     policy: Policy
+    cost_model: str = "exact_tokens"
 
     @property
     def max_tree_tokens(self) -> int:
@@ -51,7 +53,7 @@ def _sequences(token_sequences: Sequence[Sequence[int]]) -> tuple[tuple[int, ...
     return tuple(result)
 
 
-def _lcp(left: tuple[int, ...], right: tuple[int, ...]) -> int:
+def _lcp(left: Sequence, right: Sequence) -> int:
     length = 0
     for a, b in zip(left, right):
         if a != b:
@@ -75,7 +77,7 @@ def _uid_scoped_tree_cost(
     sequences: Sequence[tuple[int, ...]],
     uids: Sequence[str],
 ) -> int:
-    """Token cost of the *existing TPR* forest, which never shares across UID."""
+    """UID-scoped exact-token reference, NOT the Turn execution cost."""
     if len(sequences) != len(uids):
         raise ValueError("number of UIDs must match number of trajectories")
     groups: dict[str, list[tuple[int, ...]]] = {}
@@ -88,6 +90,8 @@ def _check_partitions(partitions: Sequence[Sequence[int]], n: int, dp_size: int)
     if len(partitions) != dp_size:
         raise ValueError(f"expected {dp_size} DP partitions, got {len(partitions)}")
     flat = [index for part in partitions for index in part]
+    if any(type(index) is not int for index in flat):
+        raise ValueError("DP partitions must contain integer row indices")
     if any(not part for part in partitions):
         raise ValueError("each DP replica must receive at least one trajectory")
     if sorted(flat) != list(range(n)):
@@ -101,6 +105,9 @@ def _result(
     dp_size: int,
     enforce_equal_rows: bool,
     uid_list: Sequence[str] | None = None,
+    *,
+    tree_cost: Callable[[Sequence[int]], int] | None = None,
+    cost_model: str = "exact_tokens",
 ) -> DPPlacementPlan:
     _check_partitions(partitions, len(sequences), dp_size)
     equal = len({len(part) for part in partitions}) == 1
@@ -111,6 +118,8 @@ def _result(
             "counts. Keep this plan offline; do not pass it to batch.reorder()."
         )
     def cost_of(indices: Sequence[int]) -> int:
+        if tree_cost is not None:
+            return tree_cost(indices)
         subset = [sequences[i] for i in indices]
         return (
             _tree_token_cost(subset)
@@ -130,6 +139,7 @@ def _result(
         duplicated_tree_tokens=duplication,
         equal_rows_per_rank=equal,
         policy=policy,
+        cost_model=cost_model,
     )
 
 
@@ -166,14 +176,21 @@ def plan_dta_dfs(
             else (lambda i: (uid_list[i], sequences[i], i))
         ),
     )
+    overlap = [0] + [
+        _lcp(sequences[a], sequences[b])
+        if uid_list is None or uid_list[a] == uid_list[b] else 0
+        for a, b in zip(order, order[1:])
+    ]
+    partitions = _dfs_partitions(order, sequences, overlap, dp_size, enforce_equal_rows)
+    return _result(sequences, partitions, "dta_dfs" if uid_list is None else "tpr_dta",
+                   dp_size, enforce_equal_rows, uid_list=uid_list,
+                   cost_model="exact_tokens" if uid_list is None else "uid_exact_tokens")
+
+
+def _dfs_partitions(order, sequences, overlap, dp_size, enforce_equal_rows):
+    """Minimax over lexical DFS intervals; overlap is in real token units."""
     lengths = [len(sequences[i]) for i in order]
-    increment = [0] * len(order)
-    for i in range(1, len(order)):
-        same_uid = uid_list is None or uid_list[order[i - 1]] == uid_list[order[i]]
-        increment[i] = (
-            lengths[i] - _lcp(sequences[order[i - 1]], sequences[order[i]])
-            if same_uid else lengths[i]
-        )
+    increment = [0] + [lengths[i] - overlap[i] for i in range(1, len(order))]
     cumulative = [0]
     for value in increment:
         cumulative.append(cumulative[-1] + value)
@@ -199,10 +216,7 @@ def plan_dta_dfs(
         return groups
 
     low = max(lengths)
-    high = (
-        _tree_token_cost(sequences)
-        if uid_list is None else _uid_scoped_tree_cost(sequences, uid_list)
-    )
+    high = cost(0, len(order))
     while low < high:
         mid = (low + high) // 2
         if len(divide(mid)) <= dp_size:
@@ -238,15 +252,7 @@ def plan_dta_dfs(
             raise AssertionError("could not construct non-empty DP partitions")
         start, end = groups[i]
         groups[i:i + 1] = [(start, end - 1), (end - 1, end)]
-    partitions = [[order[i] for i in range(start, end)] for start, end in groups]
-    return _result(
-        sequences,
-        partitions,
-        "dta_dfs" if uid_list is None else "tpr_dta",
-        dp_size,
-        enforce_equal_rows,
-        uid_list=uid_list,
-    )
+    return [[order[i] for i in range(start, end)] for start, end in groups]
 
 
 
@@ -257,32 +263,55 @@ def plan_tpr_dta_dp(
     dp_size: int,
     *,
     enforce_equal_rows: bool = True,
+    prompt_lengths: Sequence[int] | None = None,
+    turn_min_segment_tokens: int = 128,
 ) -> DPPlacementPlan:
-    """DTA-inspired **DP-only** placement with the existing TPR UID semantics.
+    """DP-only minimax using the SAME Turn units as the executable forest.
 
-    Inputs are the *global*, unpadded actor trajectories and exactly the same
-    per-row keys consumed by build_tree_execution_plans.  Cost is calculated
-    from each DP replica's UID-scoped exact-token forest, matching the existing
-    build_trajectory_trees logic.  DP planner only returns row indices:
-    it does not build alternative execution graphs or carry any DTA KV state.
-
-    Returns original global row indices for dispatch.  Each DP replica then
-    invokes the unchanged TPR build_tree_execution_plans/runner on its local
-    batch.  The outer VERL Trainer integration is not enabled yet.
+    Prompt endpoints and the Turn minimum affect sharing and must match the
+    training batch. Planning never changes the captured training data.
+    Costs count physical topology tokens, before any zero-objective pruning.
+    The flat exact-token DTA reference remains separately available above.
     """
-    from .tree import _parse_key
+    from .tree import _parse_key, _turn_units
 
+    if type(dp_size) is not int or dp_size <= 0:
+        raise ValueError("dp_size must be a positive integer")
+    sequences = _sequences(token_sequences)
+    if len(sequences) < dp_size:
+        raise ValueError("number of trajectories must be >= dp_size")
     if len(trajectory_keys) != len(token_sequences):
         raise ValueError("trajectory_keys and token_sequences must have equal lengths")
     if len(set(trajectory_keys)) != len(trajectory_keys):
         raise ValueError("trajectory_keys must be unique")
     uids = tuple(_parse_key(key)[0] for key in trajectory_keys)
-    return plan_dta_dfs(
-        token_sequences,
-        dp_size,
-        enforce_equal_rows=enforce_equal_rows,
-        uid_list=uids,
-    )
+    if type(turn_min_segment_tokens) is not int or turn_min_segment_tokens < 1:
+        raise ValueError("turn_min_segment_tokens must be a positive integer")
+    prompts = [0] * len(sequences) if prompt_lengths is None else list(prompt_lengths)
+    if len(prompts) != len(sequences) or any(
+        type(length) is not int or not 0 <= length <= len(sequence)
+        for length, sequence in zip(prompts, sequences)
+    ):
+        raise ValueError("prompt_lengths must contain one valid token length per row")
+    units = [tuple(unit for unit, _ in _turn_units(list(tokens), prompt, turn_min_segment_tokens))
+             for tokens, prompt in zip(sequences, prompts, strict=True)]
+
+    def shared(a, b):
+        if uids[a] != uids[b]:
+            return 0
+        return sum(len(unit) for unit in units[a][:_lcp(units[a], units[b])])
+
+    def cost(indices):
+        ordered = sorted(indices, key=lambda i: (uids[i], units[i], i))
+        return (len(sequences[ordered[0]]) + sum(
+            len(sequences[b]) - shared(a, b) for a, b in zip(ordered, ordered[1:])
+        )) if ordered else 0
+
+    order = sorted(range(len(sequences)), key=lambda i: (uids[i], units[i], i))
+    overlap = [0] + [shared(a, b) for a, b in zip(order, order[1:])]
+    partitions = _dfs_partitions(order, sequences, overlap, dp_size, enforce_equal_rows)
+    return _result(sequences, partitions, "tpr_dta", dp_size, enforce_equal_rows,
+                   tree_cost=cost, cost_model="qwen_turn")
 
 
 def plan_verl_uid(
@@ -324,4 +353,5 @@ def plan_verl_uid(
             uid_list=list(uid_list),
             k_partitions=dp_size,
         )
-    return _result(sequences, partitions, "verl_uid", dp_size, True, uid_list=uid_list)
+    return _result(sequences, partitions, "verl_uid", dp_size, True,
+                   uid_list=uid_list, cost_model="uid_exact_tokens")

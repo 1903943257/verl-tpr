@@ -325,3 +325,9 @@ class KVStack:
     def assert_empty(self) -> None:
         if self._entries:
             raise RuntimeError(f"KV stack is not empty: {self.segment_ids}")
+
+    def clear(self) -> None:
+        """Release all path KV/dKV after an unrecoverable execution failure."""
+        for entry in self._entries.values():
+            entry.kv.release()
+        self._entries.clear()

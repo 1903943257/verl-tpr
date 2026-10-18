@@ -25,7 +25,8 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from mindspeed.core.ssm.gated_delta_net import GatedDeltaNet
 
-from verl.models.mcore.tpr.context import TPRAttentionContext, get_tpr_attention_context
+from .context import GDNTPRAttentionContext as TPRAttentionContext
+from .context import get_tpr_attention_context
 from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
 
 

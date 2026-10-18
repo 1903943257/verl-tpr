@@ -37,7 +37,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.megatron_utils import unwrap_model
 from verl.utils.metric import AggregationType, Metric
 
-from .executor import SegmentExecutor, SegmentEventProfiler
+from .executor import SegmentEventProfiler, SegmentExecutor, prepare_replay_model, validate_replay_plan
 from .ring import aggregate_cp_loss, resolve_engine_cp_runtime
 from .tree import ForestExecutionPlan, TreeExecutionPlan, assert_tp_plan_agreement, digest_forest_plan
 
@@ -250,6 +250,15 @@ def _trajectory_keys_from_minibatch(data: Any) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _assert_dense_model(model: Any) -> None:
+    # Inspect the actual decoder slots, not just the presence of one supported
+    # module somewhere in a potentially mixed model. Native VERL is unchanged.
+    layers = getattr(getattr(model, "decoder", None), "layers", ())
+    if not layers or any(not isinstance(getattr(layer, "self_attention", None), TPRSelfAttention)
+                         for layer in layers):
+        raise TypeError("TPR PPO requires every decoder layer to use TPRSelfAttention")
+
+
 def run_tpr_forward_backward_batch(
     engine: MegatronEngine,
     data: Any,
@@ -313,12 +322,8 @@ def run_tpr_forward_backward_batch(
             "TPR PPO phase-4 does not support: "
             + ", ".join(k for k, enabled in unsupported.items() if enabled)
         )
-    if any(getattr(module, "tpr_state_kind", None) == "gdn" for module in model.modules()):
-        raise NotImplementedError("GDN is an experimental TPR extension, not supported by production Dense PPO")
-    attentions = [module for module in model.modules() if isinstance(module, TPRSelfAttention)]
-    if not attentions:
-        raise TypeError("TPR PPO requires TPRSelfAttention installed during model initialization")
-    layer_numbers = tuple(sorted(attention.layer_number for attention in attentions))
+    _assert_dense_model(model)
+    prepared_model = prepare_replay_model(model)
 
     token_count = tu.get_non_tensor_data(data, key="batch_num_tokens", default=None)
     dp_size = tu.get_non_tensor_data(data, key="dp_size", default=None)
@@ -356,6 +361,14 @@ def run_tpr_forward_backward_batch(
     record_stage("tp_plan_collective_ms", tp_check_start)
     cp_runtime = resolve_engine_cp_runtime(engine, config)
     _validate_tpr_cp_combination(tp_size, cp_runtime, config, ppo=True)
+    # Reject unsupported physical shapes for the whole forest before any
+    # forward/backward can leave the mini-batch with partial gradients.
+    for tree_plan in forest.trees:
+        if tree_plan.logical_loss_tokens:
+            validate_replay_plan(
+                tree_plan.segment_plan, prepared_model, cp_size=cp_runtime.size,
+                active_segment_ids=tree_plan.active_segment_ids,
+            )
     # DP2+CP2 has twice the per-rank local sequence of the CP4 baseline.
     # Default this *isolated* experiment to recomputable PPO logprob chunks;
     # ordinary TPR and all other topologies remain unchanged.
@@ -396,7 +409,9 @@ def run_tpr_forward_backward_batch(
         executor = SegmentExecutor(
             model,
             tree_plan.segment_plan,
-            expected_layer_numbers=layer_numbers,
+            expected_layer_numbers=prepared_model.layer_numbers,
+            prepared_model=prepared_model,
+            active_segment_ids=tree_plan.active_segment_ids,
             loss_scale_func=getattr(config, "grad_scale_func", None),
             segment_loss_fn=callback,
             segment_loss_term_counts=counts,
@@ -435,6 +450,9 @@ def run_tpr_forward_backward_batch(
         segment.length for tree in forest.trees
         for segment in tree.segment_plan.segments.values()
     )
+    active_tree_tokens = sum(
+        tree.segment_plan.get(segment_id).length for tree in forest.trees for segment_id in tree.active_segment_ids
+    )
     # All segments share the original global batch denominator. Pass the
     # same additive objective to both legacy reduction slots.
     _, global_normalized_loss = aggregate_cp_loss(
@@ -455,6 +473,10 @@ def run_tpr_forward_backward_batch(
         "tpr/logical_input_tokens": logical_input_tokens,
         "tpr/unique_tree_tokens": unique_tree_tokens,
         "tpr/topology_token_reuse_ratio": logical_input_tokens / unique_tree_tokens,
+        # The historical keys above describe the unpruned topology. These are
+        # the globally supervised closure, not Push+Pop forward token totals.
+        "tpr/active_tree_tokens": active_tree_tokens,
+        "tpr/active_physical_segments": sum(len(tree.active_segment_ids) for tree in forest.trees),
     }
     metric_lists = metrics.scalar_lists(cp_runtime)
     metric_lists.update({name: [float(value)] for name, value in diagnostics.items()})
@@ -508,14 +530,11 @@ def replace_self_attention_with_tpr(transformer_layer_spec: _SpecT) -> _SpecT:
         attention_module = get_module(attention_spec)
         if attention_module is TPRSelfAttention:
             continue
-        if (getattr(attention_module, "tpr_state_kind", None) == "gdn"
-                or getattr(attention_module, "__name__", None) == "GatedDeltaNet"):
-            raise NotImplementedError("Production TPR ModuleSpec supports Dense SelfAttention only")
         if attention_module is not SelfAttention:
             module_name = getattr(attention_module, "__name__", repr(attention_module))
             raise TypeError(
                 f"layer_specs[{index}] uses unsupported attention module {module_name}; "
-                "TPR requires Megatron SelfAttention or patched MindSpeed GatedDeltaNet"
+                "TPR requires Megatron SelfAttention"
             )
 
         layer_submodules.self_attention = replace(attention_spec, module=TPRSelfAttention)

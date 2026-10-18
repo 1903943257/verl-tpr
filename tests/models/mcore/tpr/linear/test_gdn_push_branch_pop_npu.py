@@ -111,7 +111,8 @@ def _random_tensor(runtime, shape, *, seed, requires_grad=False) -> Tensor:
 
 
 def _run_segment(model, hidden_states, *, prefix_length, initial_states=None):
-    from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
+    from verl.experimental.tpr.gdn.context import GDNTPRAttentionContext as TPRAttentionContext
+    from verl.experimental.tpr.gdn.context import use_tpr_attention_context
 
     context = TPRAttentionContext(
         prefix_length=prefix_length,

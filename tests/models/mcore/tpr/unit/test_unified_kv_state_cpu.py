@@ -86,6 +86,24 @@ def test_cached_view_is_compact_graph_free_and_released_with_its_gradients():
         state.consume_gradients()
 
 
+def test_failed_path_clear_releases_every_level_and_invalidates_old_anchors():
+    stack = KVStack()
+    states = [stack.push(_segment(0, None, 3, 0), _kv(3)).kv,
+              stack.push(_segment(1, 0, 2, 3), _kv(2)).kv]
+    anchors = stack.build_past_anchors()
+    for entry in anchors.entries:
+        for key, value in entry.key_values.values():
+            (key + value).sum().backward()
+    stack.accumulate_anchor_gradients(anchors, consume=True)
+    assert all(state._key_values and state._gradients for state in states)
+    stack.clear()
+    stack.clear()  # Exception cleanup may be entered more than once.
+    stack.assert_empty()
+    assert all(state.released and not state._key_values and not state._gradients for state in states)
+    with pytest.raises(RuntimeError, match="stale"):
+        stack.accumulate_anchor_gradients(anchors)
+
+
 def test_executor_consumes_anchor_gradients_without_a_second_full_copy():
     state = KVPrefixState(0, 3, _kv(3))
     anchors = state.make_anchors()

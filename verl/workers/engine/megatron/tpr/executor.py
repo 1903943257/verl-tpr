@@ -20,6 +20,7 @@ import os
 import time
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import torch
@@ -169,6 +170,66 @@ def _validate_length(name: str, value: int, *, allow_zero: bool) -> None:
         raise ValueError(f"{name} must be a {qualifier} integer, got {value!r}")
 
 
+@dataclass(frozen=True, slots=True)
+class PreparedReplayModel:
+    """Batch-scoped static model facts and live stochastic-setting references.
+
+    The model structure must not be replaced during a batch. Settings on the
+    registered configs and Dropout modules are rechecked before execution.
+    """
+
+    model: nn.Module
+    device: torch.device
+    layer_numbers: tuple[int, ...]
+    configs: tuple[Any, ...]
+    dropouts: tuple[nn.Module, ...]
+
+    def validate(self) -> None:
+        _validate_replay_settings(self.configs, self.dropouts)
+
+
+def prepare_replay_model(
+    model: nn.Module, *, expected_layer_numbers: tuple[int, ...] | None = None,
+) -> PreparedReplayModel:
+    """Inspect the model once per PPO batch, rather than twice for every tree."""
+    if not isinstance(model, nn.Module):
+        raise TypeError(f"model must be torch.nn.Module, got {type(model).__name__}")
+    if not hasattr(model, "rotary_pos_emb") or not callable(model.rotary_pos_emb):
+        raise TypeError("model must expose a callable rotary_pos_emb")
+    layers = tuple(_infer_layer_numbers(model) if expected_layer_numbers is None else expected_layer_numbers)
+    if not layers or any(not isinstance(layer, int) or isinstance(layer, bool) or layer <= 0 for layer in layers):
+        raise ValueError(f"expected_layer_numbers must contain positive integers, got {layers}")
+    if len(set(layers)) != len(layers):
+        raise ValueError(f"expected_layer_numbers contains duplicates: {layers}")
+    configs, dropouts = _replay_settings(model)
+    prepared = PreparedReplayModel(model, _model_device(model), tuple(sorted(layers)),
+                                   configs, dropouts)
+    prepared.validate()
+    return prepared
+
+
+def validate_replay_plan(
+    plan: SegmentPlan, prepared_model: PreparedReplayModel, *, cp_size: int = 1,
+    active_segment_ids: frozenset[SegmentId] | None = None,
+) -> None:
+    """Fail before model execution when native TP+SP cannot split a segment.
+
+    Unlike Ring CP's virtual padding, this path must not change native GEMM
+    shapes by silently padding an odd local sequence.
+    """
+    config = getattr(prepared_model.model, "config", None)
+    tp_size = getattr(config, "tensor_model_parallel_size", 1)
+    if cp_size == 1 and tp_size > 1 and getattr(config, "sequence_parallel", False):
+        for segment in plan.segments.values():
+            if active_segment_ids is not None and segment.segment_id not in active_segment_ids:
+                continue
+            if segment.length % tp_size:
+                raise ValueError(
+                    f"segment {segment.segment_id} length={segment.length} must be divisible by "
+                    f"TP={tp_size} for sequence_parallel=True with CP=1; native GEMM shapes are not padded"
+                )
+
+
 class SegmentExecutor:
     """Execute graph-free Push and gradient-carrying Pop for a SegmentPlan.
 
@@ -188,26 +249,19 @@ class SegmentExecutor:
         cp_backend: RingCPBackend | str | None = None,
         segment_loss_fn: Callable[[SegmentSpec, Tensor], tuple[Tensor, dict[str, Any]]] | None = None,
         segment_loss_term_counts: Mapping[SegmentId, int] | None = None,
+        active_segment_ids: frozenset[SegmentId] | None = None,
+        prepared_model: PreparedReplayModel | None = None,
     ) -> None:
-        if not isinstance(model, nn.Module):
-            raise TypeError(f"model must be torch.nn.Module, got {type(model).__name__}")
         if not isinstance(plan, SegmentPlan):
             raise TypeError(f"plan must be SegmentPlan, got {type(plan).__name__}")
-        if not hasattr(model, "rotary_pos_emb") or not callable(model.rotary_pos_emb):
-            raise TypeError("model must expose a callable rotary_pos_emb")
-        _assert_deterministic_replay(model)
-        if expected_layer_numbers is None:
-            expected_layer_numbers = _infer_layer_numbers(model)
-        expected_layer_numbers = tuple(expected_layer_numbers)
-        if not expected_layer_numbers:
-            raise ValueError("expected_layer_numbers must not be empty")
-        if any(
-            not isinstance(layer, int) or isinstance(layer, bool) or layer <= 0
-            for layer in expected_layer_numbers
-        ):
-            raise ValueError(f"expected_layer_numbers must contain positive integers, got {expected_layer_numbers}")
-        if len(set(expected_layer_numbers)) != len(expected_layer_numbers):
-            raise ValueError(f"expected_layer_numbers contains duplicates: {expected_layer_numbers}")
+        self._external_preparation = prepared_model is not None
+        if prepared_model is None:
+            prepared_model = prepare_replay_model(model, expected_layer_numbers=expected_layer_numbers)
+        elif prepared_model.model is not model:
+            raise ValueError("prepared_model belongs to a different model")
+        elif expected_layer_numbers is not None and tuple(sorted(expected_layer_numbers)) != prepared_model.layer_numbers:
+            raise ValueError("expected_layer_numbers differ from prepared_model")
+        self.prepared_model = prepared_model
 
         if not callable(segment_loss_fn):
             raise TypeError("Production TPR requires a callable segment_loss_fn")
@@ -217,13 +271,21 @@ class SegmentExecutor:
             for segment_id, count in counts.items()
         ):
             raise ValueError("invalid PPO segment objective counts")
+        if active_segment_ids is not None:
+            active_segment_ids = frozenset(active_segment_ids)
+            if (not active_segment_ids.issubset(plan.segments) or any(
+                plan.get(segment_id).parent_id not in active_segment_ids
+                for segment_id in active_segment_ids if segment_id != plan.root_id
+            ) or any(count and segment_id not in active_segment_ids for segment_id, count in counts.items())):
+                raise ValueError("active_segment_ids must contain objective owners and all their ancestors")
+        self.active_segment_ids = active_segment_ids
         self.segment_loss_fn = segment_loss_fn
         self.segment_loss_term_counts = counts
         self.segment_loss_metrics: list[tuple[SegmentId, dict[str, Any]]] = []
 
         self.model = model
         self.plan = plan
-        self.expected_layer_numbers = tuple(sorted(expected_layer_numbers))
+        self.expected_layer_numbers = prepared_model.layer_numbers
         self.kv_stack = KVStack() if kv_stack is None else kv_stack
         self.loss_scale_func = loss_scale_func
         self.cp_group = cp_group
@@ -253,8 +315,11 @@ class SegmentExecutor:
                     raise ValueError(
                         f"segment {segment.segment_id} {exc}"
                     ) from exc
+        validate_replay_plan(plan, prepared_model, cp_size=self.cp_size,
+                             active_segment_ids=active_segment_ids)
         self._failed = False
         self._ran = False
+        self._operation_depth = 0
 
     @property
     def failed(self) -> bool:
@@ -266,18 +331,20 @@ class SegmentExecutor:
 
     def run(self, *, event_profiler=None, tree_index: int = 0) -> Tensor:
         """Execute each branch, then replay its ancestors in postorder."""
+        self._ensure_healthy()
         if self._ran:
             raise RuntimeError("SegmentExecutor.run is single-use")
-        _assert_deterministic_replay(self.model)
-        self._ran = True
         losses = []
         with self._operation():
+            self._ran = True
             self.kv_stack.assert_empty()
+            if self.active_segment_ids == frozenset():
+                return torch.zeros((), device=self.prepared_model.device)
             pending = [(self.plan.root_id, False, 0)]
             while pending:
                 segment_id, exiting, depth = pending.pop()
                 segment = self.plan.get(segment_id)
-                children = self.plan.children_of(segment_id)
+                children = self._children_of(segment_id)
                 kind = "pop" if exiting else "push" if children else "visit_leaf"
                 profile = None if event_profiler is None else event_profiler.begin(
                     segment, kind=kind, tree_index=tree_index, depth=depth,
@@ -343,7 +410,7 @@ class SegmentExecutor:
 
         with self._operation():
             segment = self.plan.get(segment_id)
-            if self.plan.children_of(segment_id):
+            if self._children_of(segment_id):
                 raise ValueError(f"segment {segment_id} is not a leaf")
 
             expected_parent = self.kv_stack.top().segment.segment_id if len(self.kv_stack) else None
@@ -403,7 +470,7 @@ class SegmentExecutor:
         no_grad: bool,
         sharded_past_anchors: PastKVAnchors | None = None,
     ) -> tuple[TPRAttentionContext, Tensor]:
-        device = _model_device(self.model)
+        device = self.prepared_model.device
         shard = self._segment_shard(segment)
         local_token_ids = shard.select(segment.token_ids)
         if os.getenv("TPR_MEM_TRACE", "0") == "1":
@@ -486,14 +553,33 @@ class SegmentExecutor:
         if self._failed:
             raise RuntimeError("SegmentExecutor is failed and cannot continue")
 
+    def _children_of(self, segment_id: SegmentId) -> tuple[SegmentSpec, ...]:
+        children = self.plan.children_of(segment_id)
+        if self.active_segment_ids is None:
+            return children
+        return tuple(child for child in children if child.segment_id in self.active_segment_ids)
+
     @contextmanager
     def _operation(self):
         self._ensure_healthy()
+        outermost = self._operation_depth == 0
+        self._operation_depth += 1
         try:
+            if outermost:
+                if self._external_preparation:
+                    self.prepared_model.validate()
+                else:
+                    # Standalone users may change modules between construction
+                    # and execution; the adapter's batch-scoped token is stricter.
+                    _assert_deterministic_replay(self.model)
             yield
-        except Exception:
+        except BaseException:
             self._failed = True
+            if outermost:
+                self.kv_stack.clear()
             raise
+        finally:
+            self._operation_depth -= 1
 
     def _assert_collected_layers(self, context: TPRAttentionContext) -> None:
         context.assert_new_kv_layers(self.expected_layer_numbers)
@@ -515,13 +601,28 @@ def _connected_zero(logits: Tensor) -> Tensor:
 
 def _assert_deterministic_replay(model: nn.Module) -> None:
     """Push and Pop must see the same KV; RNG replay is not implemented."""
+    _validate_replay_settings(*_replay_settings(model))
+
+
+def _replay_settings(model: nn.Module) -> tuple[tuple[Any, ...], tuple[nn.Module, ...]]:
+    configs, dropouts = {}, []
     for module in model.modules():
         config = getattr(module, "config", None)
+        if config is not None:
+            configs[id(config)] = config
+        if isinstance(module, nn.modules.dropout._DropoutNd):
+            dropouts.append(module)
+    return tuple(configs.values()), tuple(dropouts)
+
+
+def _validate_replay_settings(configs, dropouts) -> None:
+    for config in configs:
         for name in ("hidden_dropout", "embedding_dropout", "attention_dropout"):
             value = getattr(config, name, 0.0)
             if value is not None and float(value) != 0.0:
                 raise ValueError(f"TPR replay requires {name}=0; stochastic Push/Pop is unsupported")
-        if isinstance(module, nn.modules.dropout._DropoutNd) and module.training and module.p != 0:
+    for module in dropouts:
+        if module.training and module.p != 0:
             raise ValueError("TPR replay requires training Dropout p=0; stochastic Push/Pop is unsupported")
 
 
@@ -533,8 +634,8 @@ def _infer_layer_numbers(model: nn.Module) -> tuple[int, ...]:
     result = []
     for layer in layers:
         attention = getattr(layer, "self_attention", None)
-        if getattr(attention, "tpr_state_kind", None) == "gdn":
-            raise NotImplementedError("GDN TPR is experimental, not part of Dense PPO")
+        if getattr(attention, "tpr_state_kind", "kv") != "kv":
+            raise NotImplementedError("Production TPR only supports Dense KV attention")
         layer_number = getattr(attention, "layer_number", None)
         if layer_number is None:
             raise ValueError("cannot infer layer_number from model.decoder.layers")

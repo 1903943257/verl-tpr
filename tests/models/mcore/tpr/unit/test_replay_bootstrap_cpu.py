@@ -63,3 +63,9 @@ def test_actor_replay_and_comparison_use_only_the_canonical_turn_path():
     assert "verl.workers.engine.megatron.tpr.adapter" in script
     assert '${TPR_ACCEPT_GRAD_REL_L2:-0.02}' in script
     assert 'TPR_OFFLINE_SAVE_FULL_GRADS:-1' in script and 'compare_args+=(--require-full-grads)' in script
+
+
+def test_length_probe_imports_existing_native_ring_reference():
+    script = (PARALLEL / "run_full_native_ring_step1_length_probe.sh").read_text(encoding="utf-8")
+    assert "verl.models.mcore.tpr.parallel.ring_attention" not in script
+    assert "from verl.workers.engine.megatron.tpr.ring import ordinary_ring_cp_attention" in script

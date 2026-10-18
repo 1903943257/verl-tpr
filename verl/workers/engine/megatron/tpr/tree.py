@@ -130,6 +130,17 @@ class TreeExecutionPlan:
     member_rows: tuple[int, ...]
     segment_plan: SegmentPlan
     objective_refs: tuple[SegmentObjectiveRef, ...]
+    active_segment_ids: frozenset[SegmentId] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Global query owners and their ancestors, never CP-local counts.
+        active = set()
+        for ref in self.objective_refs:
+            segment_id = ref.segment_id
+            while segment_id is not None and segment_id not in active:
+                active.add(segment_id)
+                segment_id = self.segment_plan.get(segment_id).parent_id
+        object.__setattr__(self, "active_segment_ids", frozenset(active))
 
     @property
     def key(self) -> str:
@@ -142,7 +153,6 @@ class TreeExecutionPlan:
     @property
     def logical_loss_tokens(self) -> int:
         return len(self.objective_refs)
-
 
 @dataclass(frozen=True, slots=True)
 class ForestExecutionPlan:
@@ -205,14 +215,18 @@ def _turn_units(tokens: list[int], prompt_length: int, minimum: int):
 
 def _compress(node: _TurnNode, parent_id: int | None, start: int, inputs: list[Tensor],
               segments: list[SegmentSpec], paths: dict[int, tuple[int, ...]], path: tuple[int, ...]) -> None:
-    while not node.terminal_rows and len(node.children) == 1:
-        node = next(iter(node.children.values()))
-    segment_id = len(segments)
-    segments.append(SegmentSpec(segment_id, parent_id, inputs[node.source_row][start:node.end], start, start))
-    path = (*path, segment_id)
-    paths.update((row, path) for row in node.terminal_rows)
-    for child in node.children.values():
-        _compress(child, segment_id, node.end, inputs, segments, paths, path)
+    # Explicit DFS preserves insertion order without a Python recursion limit
+    # on long conversations with terminal rows at many successive Turn nodes.
+    pending = [(node, parent_id, start, path)]
+    while pending:
+        node, parent_id, start, path = pending.pop()
+        while not node.terminal_rows and len(node.children) == 1:
+            node = next(iter(node.children.values()))
+        segment_id = len(segments)
+        segments.append(SegmentSpec(segment_id, parent_id, inputs[node.source_row][start:node.end], start, start))
+        path = (*path, segment_id)
+        paths.update((row, path) for row in node.terminal_rows)
+        pending.extend((child, segment_id, node.end, path) for child in reversed(node.children.values()))
 
 
 def build_tree_execution_plans(
