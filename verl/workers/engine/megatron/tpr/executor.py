@@ -376,7 +376,7 @@ class SegmentExecutor:
                 no_grad=True,
             )
             del logits
-            self._assert_collected_layers(context)
+            context.assert_new_kv_layers(self.expected_layer_numbers)
             # The Push context already detaches and compacts each layer's KV.
             self.kv_stack.push(segment, context.new_key_values, shard=self._segment_shard(segment))
 
@@ -439,9 +439,9 @@ class SegmentExecutor:
             past_key_values={} if self.cp_enabled else anchors.key_values,
             sharded_past_anchors=anchors if self.cp_enabled else None,
         )
-        self._assert_collected_layers(context)
+        context.assert_new_kv_layers(self.expected_layer_numbers)
         normalized_loss = self._compute_loss(segment, logits)
-        count = self._owned_loss_count(segment)
+        count = self.segment_loss_term_counts.get(segment.segment_id, 0)
         roots, gradients = [], []
         # Empty CP objectives must still traverse Attention's collectives.
         # Frozen current KV, however, has no graph to relay through.
@@ -517,16 +517,13 @@ class SegmentExecutor:
 
     def _compute_loss(self, segment: SegmentSpec, logits: Tensor) -> Tensor:
         """Delegate all policy math to VERL's original PPO callback."""
-        if not self._owned_loss_count(segment):
+        if not self.segment_loss_term_counts.get(segment.segment_id, 0):
             return _connected_zero(logits)
         loss, metrics = self.segment_loss_fn(segment, logits)
         if not isinstance(loss, Tensor) or loss.numel() != 1 or not loss.requires_grad:
             raise TypeError("PPO objective must return a differentiable scalar Tensor")
         self.segment_loss_metrics.append((segment.segment_id, metrics))
         return loss
-
-    def _owned_loss_count(self, segment: SegmentSpec) -> int:
-        return self.segment_loss_term_counts.get(segment.segment_id, 0)
 
     def _prepare_backward_loss(
         self,
@@ -580,9 +577,6 @@ class SegmentExecutor:
             raise
         finally:
             self._operation_depth -= 1
-
-    def _assert_collected_layers(self, context: TPRAttentionContext) -> None:
-        context.assert_new_kv_layers(self.expected_layer_numbers)
 
 
 
