@@ -102,7 +102,11 @@ done
 
 OFF="$OUT/off/step${STEP}_tpr_tp2cp2dp2.json"
 ON="$OUT/on/step${STEP}_tpr_tp2cp2dp2_recompute_on.json"
-if [[ -f "$OFF" && -f "$ON" && ${#FAILED[@]} -eq 0 ]]; then
+if [[ "${TPR_DP2_VALIDATION_MODES:-both}" != "both" ]]; then
+  # An intentional 40K ON-only capacity/optimizer run is not an OFF/ON
+  # correctness comparison. Do not mislabel it as a failed pair.
+  echo "TPR_DP2_RECOMPUTE_SINGLE_MODE_COMPLETE mode=${MODES[0]} comparison=not_requested"
+elif [[ -f "$OFF" && -f "$ON" && ${#FAILED[@]} -eq 0 ]]; then
   python tests/models/mcore/tpr/parallel/compare_tpr_dp2_recompute.py \
     "$OFF" "$ON" "$OUT/comparison.json" \
     2>&1 | tee "$OUT/logs/comparison.log"
