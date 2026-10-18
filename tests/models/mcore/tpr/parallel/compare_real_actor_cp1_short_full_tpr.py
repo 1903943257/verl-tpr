@@ -1,4 +1,4 @@
-"""Compare three CP1 Actor PPO arms in canonical TP1 parameter coordinates.
+"""Compare four CP1 Actor PPO arms in canonical TP1 parameter coordinates.
 
 Full means whole-sequence GPT with NO TPR context, using the same CP1
 square-CANN oracle core as the TPR-capable model. The derivative capture
@@ -12,7 +12,7 @@ import math
 from pathlib import Path
 
 
-MODES = ("full", "one_node", "shared")
+MODES = ("full", "one_node", "split_no_share", "shared")
 
 
 def _metrics(a: list[float], b: list[float]) -> dict:
@@ -66,6 +66,11 @@ def compare(directory: Path) -> dict:
         raise AssertionError("Full did not use two independent whole trajectories")
     if (results["one_node"]["forest_trees"], results["one_node"]["forest_segments"]) != (2, 2):
         raise AssertionError("One-node path is not exactly two independent roots")
+    split = results["split_no_share"]
+    if (split["forest_trees"], split["forest_segments"]) != (2, 4):
+        raise AssertionError("Split-no-share must be two Root/Leaf chains")
+    if split["unique_tree_tokens"] != full["logical_input_tokens"] or split["reuse_ratio"] != 1:
+        raise AssertionError("Split-no-share accidentally reused physical Root tokens")
     shared = results["shared"]
     if (shared["forest_trees"], shared["forest_segments"]) != (1, 3):
         raise AssertionError("Shared path is not Root + two sibling Leafs")
@@ -83,6 +88,8 @@ def compare(directory: Path) -> dict:
     outcomes = {}
     for name, reference, candidate in (
         ("full_vs_one_node", "full", "one_node"),
+        ("one_node_vs_split_no_share", "one_node", "split_no_share"),
+        ("split_no_share_vs_shared", "split_no_share", "shared"),
         ("one_node_vs_shared", "one_node", "shared"),
         ("full_vs_shared", "full", "shared"),
     ):
@@ -130,6 +137,7 @@ def compare(directory: Path) -> dict:
         "ppo_tokens": full["ppo_tokens"],
         "full_logical_tokens": full["logical_input_tokens"],
         "shared_unique_tree_tokens": shared["unique_tree_tokens"],
+        "split_no_share_unique_tree_tokens": split["unique_tree_tokens"],
         "shared_prefix_reuse_ratio": shared["reuse_ratio"],
         "comparisons": outcomes,
         "caveat": (
@@ -146,11 +154,12 @@ def main() -> None:
     parser.add_argument("directory", type=Path)
     args = parser.parse_args()
     result = compare(args.directory)
-    output = args.directory / "comparison.json"
+    # Keep the original three-arm comparison.json immutable.
+    output = args.directory / "comparison_split_no_share.json"
     if output.exists():
         raise FileExistsError(output)
     output.write_text(json.dumps(result, indent=2))
-    print("TPR_CP1_SHORT_COMPARISON", json.dumps({
+    print("TPR_CP1_SHORT_SPLIT_COMPARISON", json.dumps({
         "ppo_tokens": result["ppo_tokens"],
         "reuse": result["shared_prefix_reuse_ratio"],
         "comparisons": {
