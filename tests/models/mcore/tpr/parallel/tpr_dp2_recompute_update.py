@@ -67,7 +67,7 @@ def _single_cpu_master_adamw_step(model, runtime, *, norm: float, lr: float,
     owner = runtime.cp_rank == 0 and runtime.dp_rank == 0
     owner_rank = torch.tensor(
         [dist.get_rank() if owner else 2**30],
-        dtype=torch.int64, device=runtime.device,
+        dtype=torch.float32, device=runtime.device,
     )
     dist.all_reduce(owner_rank, op=dist.ReduceOp.MIN, group=runtime.dp_cp_group)
     src = int(owner_rank.item())
