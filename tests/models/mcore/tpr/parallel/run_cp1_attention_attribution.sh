@@ -53,6 +53,18 @@ if ! python -m pytest -q \
   exit 1
 fi
 
+# A prior successful 4B replay may have failed ONLY during analysis.
+# Reuse its immutable snapshot files; do not enter NPU replays again.
+if [[ -f "$TPR_CP1_ROOT/full/trace.pt" &&
+      -f "$TPR_CP1_ROOT/split_no_share/trace.pt" &&
+      -f "$TPR_CP1_ROOT/shared/trace.pt" &&
+      -f "$TPR_CP1_ROOT/comparison_split_no_share.json" ]]; then
+  echo "TPR_CP1_AUDIT_RECOVERY: all PPO traces are cached; regenerating conclusion only."
+  python -m tests.models.mcore.tpr.parallel.analyze_cp1_attention_attribution \
+    "$TPR_CP1_ROOT"
+  exit 0
+fi
+
 echo "CP1 4B attention attribution: isolated NPU8, 2K, authentic Actor PPO."
 echo "Detailed NPU logs: $TPR_CP1_ROOT/full_run.log"
 # Reuses existing loss/witness procedures; tracing is an opt-in test hook.
