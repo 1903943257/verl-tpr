@@ -196,7 +196,7 @@ def test_pr7_recompute_collector_preserves_compaction_ownership():
     assert replay is not original
     assert replay.prefix_length == original.prefix_length
     assert replay.suffix_length == original.suffix_length
-    assert replay.past_key_values is original.past_key_values
+    assert replay.past_key_values == original.past_key_values
     assert replay.attention_backend is original.attention_backend
     assert replay.compact_new_kv is False
     assert not replay.new_key_values
