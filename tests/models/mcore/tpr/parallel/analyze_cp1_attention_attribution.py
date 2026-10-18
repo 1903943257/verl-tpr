@@ -89,8 +89,16 @@ def analyze(root: Path) -> dict:
             or s["root_length"] != shared["root_length"]
             or not 0 < s["root_length"] < min(f["row_lengths"])):
         raise AssertionError("Three probes do not describe identical token/Root bounds")
-    if f["root_length"] != s["root_length"]:
-        raise AssertionError("Full prompt endpoint does not match actual shared Root split")
+    # Full is a nonsharing model run: its "root_length" is only the
+    # prompt endpoint used to select sparse absolute-token trace coordinates.
+    # The qwen_turn compression may legitimately include complete shared
+    # response turns beyond that prompt. The REAL Root boundary comes from
+    # the split_no_share/shared execution plan. Compare records by their
+    # *absolute token indices* in _intersection, never by sampling anchors.
+    full_prompt_endpoint = f["root_length"]
+    actual_root_length = s["root_length"]
+    if not 0 < full_prompt_endpoint < min(f["row_lengths"]):
+        raise AssertionError("Full trace has an invalid prompt sampling endpoint")
 
     root_diff = _stage(f, s, baseline_phase="full", phase="push")
     leaf_diff = _stage(f, s, baseline_phase="full", phase="leaf")
@@ -155,7 +163,9 @@ def analyze(root: Path) -> dict:
         "real_supervised_ppo_tokens": comparison["ppo_tokens"],
         "topology": "TP1_CP1_DP1",
         "source_capture": "controlled_2k_real_actor_ppo_capture",
-        "root_length": s["root_length"],
+        "root_length": actual_root_length,
+        "full_trace_sampling_prompt_endpoint": full_prompt_endpoint,
+        "full_sampling_endpoint_differs_from_root": full_prompt_endpoint != actual_root_length,
         "row_lengths": s["row_lengths"],
         "selected_layers": list(SELECTED_LAYERS),
         "fixed_tile_enabled": False,
