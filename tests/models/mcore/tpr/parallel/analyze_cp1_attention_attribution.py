@@ -101,6 +101,7 @@ def analyze(root: Path) -> dict:
     split_shared_root = _stage(s, shared, baseline_phase="push", phase="push")
     square = s["same_qkv_attention"]
     gemm = s["same_input_gemm_replay"]
+    linear_replays = gemm.get("individual_original_linear_replays", {})
     relay_split = s.get("kv_relay_roundoff", {})
     relay_shared = shared.get("kv_relay_roundoff", {})
 
@@ -159,6 +160,7 @@ def analyze(root: Path) -> dict:
         "first_root_stage_difference": first,
         "first_leaf_stage_difference": first_leaf,
         "same_input_qkv_physical_m_replay": gemm,
+        "same_input_original_projection_m_replays": linear_replays,
         "qkv_m_shape_effect_confirmed": known_mismatch,
         "same_qkv_square_vs_rectangular": square,
         "same_qkv_attention_numerically_different": square_mismatch > 0,
@@ -208,6 +210,24 @@ def analyze(root: Path) -> dict:
         report["conclusions"].append(
             "PARTIAL: QKV M-dependent result observed, but actual recorded "
             "Full/Split QKV could not be reproduced exactly. Attribution incomplete."
+        )
+    for module_name, module_result in linear_replays.items():
+        m = module_result["same_full_input_m_replay"]
+        compatible = module_result["input_equal"]
+        report["conclusions"].append(
+            f"FIRST-LAYER {module_name.upper()} BF16 SHAPE REPLAY: "
+            f"same-Full-input M-only max_abs={m['max_abs']:.8g}, "
+            f"changed={m['changed']}/{m['count']}, "
+            f"natural Root input identical={compatible}. "
+            + (
+                "It is a candidate direct contributor to natural Root drift."
+                if compatible and m["changed"] and
+                module_result["full_replay_vs_actual"]["exact"] and
+                module_result["root_replay_vs_actual"] is not None and
+                module_result["root_replay_vs_actual"]["exact"]
+                else "Do not identify this shape-only replay with the natural Root "
+                     "output without matching inputs AND exact replay."
+            )
         )
     if first:
         report["conclusions"].append(
