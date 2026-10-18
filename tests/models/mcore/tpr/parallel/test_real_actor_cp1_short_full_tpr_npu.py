@@ -41,7 +41,7 @@ pytestmark = pytest.mark.skipif(
     reason="Set TPR_RUN_CP1_SHORT_ACTOR=1 for opt-in one-NPU Actor PPO parity",
 )
 
-MODES = ("full", "one_node", "shared")
+MODES = ("full", "one_node", "split_no_share", "shared")
 
 
 @torch.no_grad()
@@ -62,6 +62,69 @@ def _initial_weight_fingerprint(model) -> str:
     return digest.hexdigest()
 
 
+def _make_unshared_split(shared_forest, batch):
+    """Clone the exact shared Root/Leaf boundary for each logical sibling.
+
+    No KV is shared between rows. Objectives keep identical target tokens,
+    global predicting-query positions, logical row IDs and PPO denominator.
+    The ONLY physical difference from shared is that the Root is recomputed
+    for each row rather than reused across two siblings.
+    """
+    from verl.workers.engine.megatron.tpr.tree import (
+        ForestExecutionPlan, SegmentObjectiveRef, SegmentPlan, SegmentSpec,
+        TreeExecutionPlan,
+    )
+
+    if len(shared_forest.trees) != 1:
+        raise AssertionError("Need exactly one original shared tree")
+    original = shared_forest.trees[0]
+    plan = original.segment_plan
+    root = plan.get(plan.root_id)
+    children = plan.children_of(plan.root_id)
+    if len(children) != 2 or any(plan.children_of(child.segment_id) for child in children):
+        raise AssertionError("Expected one Root and exactly two sibling Leaves")
+    boundary = root.length
+    rows = tuple(original.member_rows)
+    if set(rows) != {0, 1}:
+        raise AssertionError(f"Expected two local sibling rows (0,1), got {rows}")
+    independent = []
+    for row in sorted(rows):
+        tokens = batch["input_ids"][row].detach().cpu().long()
+        if not 0 < boundary < tokens.numel():
+            raise AssertionError("Invalid shared Root boundary for split-no-share")
+        if not torch.equal(tokens[:boundary], root.token_ids):
+            raise AssertionError("Shared root is not an exact token prefix of both rows")
+        local_plan = SegmentPlan(
+            (
+                SegmentSpec(0, None, tokens[:boundary], 0, 0),
+                SegmentSpec(1, 0, tokens[boundary:], boundary, boundary),
+            ),
+            root_id=0,
+        )
+        refs = []
+        for ref in original.objective_refs:
+            if ref.sample_row != row:
+                continue
+            parent = plan.get(ref.segment_id)
+            global_query = parent.position_start + ref.query_offset
+            target_global = global_query + 1
+            if target_global >= tokens.numel() or int(tokens[target_global]) != ref.target_token_id:
+                raise AssertionError(f"Split ref target mismatch row={row}, query={global_query}")
+            new_id = 0 if global_query < boundary else 1
+            refs.append(SegmentObjectiveRef(
+                new_id, global_query if new_id == 0 else global_query - boundary,
+                ref.target_token_id, ref.sample_row, ref.response_offset,
+            ))
+        if not refs:
+            raise AssertionError(f"Split tree row {row} has no supervised targets")
+        independent.append(TreeExecutionPlan(
+            uid=f"{original.uid}_split_no_share_{row}",
+            tree_index=row, member_rows=(row,),
+            segment_plan=local_plan, objective_refs=tuple(refs),
+        ))
+    return ForestExecutionPlan(tuple(independent), shared_forest.logical_loss_tokens)
+
+
 def _short_forest(batch, *, mode: str):
     from verl.workers.engine.megatron.tpr.adapter import _trajectory_keys_from_minibatch
 
@@ -76,7 +139,7 @@ def _short_forest(batch, *, mode: str):
         segment.length for tree in result.trees
         for segment in tree.segment_plan.segments.values()
     )
-    if mode == "shared":
+    if mode in ("shared", "split_no_share"):
         if len(result.trees) != 1 or result.segment_count != 3:
             raise AssertionError(
                 f"Expected one Root + two sibling Leafs, got "
@@ -87,6 +150,14 @@ def _short_forest(batch, *, mode: str):
             raise AssertionError("Short capture did not produce two Root siblings")
         if not physical < logical:
             raise AssertionError("Shared mode has no real Prefix reuse")
+        if mode == "split_no_share":
+            result = _make_unshared_split(result, batch)
+            physical = sum(
+                seg.length for tree in result.trees
+                for seg in tree.segment_plan.segments.values()
+            )
+            if len(result.trees) != 2 or result.segment_count != 4 or physical != logical:
+                raise AssertionError("Unshared split must be two independent Root/Leaf chains")
     else:
         if len(result.trees) != 2 or result.segment_count != 2 or physical != logical:
             raise AssertionError("Full/one-node control must have exactly two unshared roots")
@@ -134,6 +205,50 @@ def _run_controlled_full(model, batch, *, loss_fn, forest):
     }
 
 
+
+def _run_split_no_share(model, engine, batch, *, loss_fn, forest):
+    """Run two isolated Root/Leaf chains through the SAME production Executor."""
+    from verl.models.mcore.tpr.attention import TPRSelfAttention
+    from verl.workers.engine.megatron.tpr.adapter import run_forest
+    from verl.workers.engine.megatron.tpr.executor import SegmentExecutor
+    from verl.workers.engine.megatron.tpr.objective import SegmentPPOObjectiveAdapter
+
+    chunk_size = int(os.getenv("TPR_PPO_LOGPROB_CHUNK_TOKENS", "0"))
+    if chunk_size < 0:
+        raise ValueError("Negative PPO chunk size")
+    objective = SegmentPPOObjectiveAdapter(
+        batch, loss_fn, log_prob_chunk_size=chunk_size or None,
+    )
+    layers = tuple(sorted(
+        module.layer_number for module in model.modules()
+        if isinstance(module, TPRSelfAttention)
+    ))
+    if len(layers) != 36:
+        raise AssertionError("Need all 36 TPR-capable Qwen3-4B layers")
+    model_config = model.config
+    if model_config.recompute_granularity is not None:
+        raise AssertionError("Parity must disable recompute")
+
+    def run_one_tree(tree):
+        callback, counts = objective.bind_tree(tree)
+        return SegmentExecutor(
+            model, tree.segment_plan,
+            expected_layer_numbers=layers,
+            loss_scale_func=getattr(model_config, "grad_scale_func", None),
+            segment_loss_fn=callback, segment_loss_term_counts=counts,
+        ).run()
+
+    total_loss = run_forest(
+        forest, run_one_tree,
+        lambda: model_config.finalize_model_grads_func(
+            engine.module, None, force_all_reduce=True,
+        ),
+    )
+    return {
+        "loss": float(total_loss.item()),
+        "logprobs": dict(objective.debug_new_log_probs),
+    }
+
 def test_real_actor_cp1_short_full_vs_tpr():
     mode = os.getenv("TPR_CP1_MODE", "")
     if mode not in MODES:
@@ -159,7 +274,7 @@ def test_real_actor_cp1_short_full_vs_tpr():
 
         # Original rows are now two local records (0,1) inside the derived
         # capture. Force synthetic nonsharing keys in Full and one-node arms.
-        batch_mode = "tpr" if mode == "shared" else "full"
+        batch_mode = "tpr" if mode in ("shared", "split_no_share") else "full"
         batch, original_keys, ppo_tokens, input_sha = _load_real_pair(
             capture, (0, 1), batch_mode,
         )
@@ -188,6 +303,10 @@ def test_real_actor_cp1_short_full_vs_tpr():
         if mode == "full":
             result = _run_controlled_full(
                 model, batch, loss_fn=loss_fn, forest=forest,
+            )
+        elif mode == "split_no_share":
+            result = _run_split_no_share(
+                model, engine, batch, loss_fn=loss_fn, forest=forest,
             )
         else:
             from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
@@ -223,7 +342,8 @@ def test_real_actor_cp1_short_full_vs_tpr():
             "reference": (
                 "whole_GPT_no_TPR_context_CP1_square_CANN"
                 if mode == "full" else "TPR_1root_per_row_CP1"
-                if mode == "one_node" else "TPR_shared_root_two_leaves_CP1"
+                if mode == "one_node" else "TPR_independent_root_leaf_chains_CP1"
+                if mode == "split_no_share" else "TPR_shared_root_two_leaves_CP1"
             ),
             "source_capture": str(capture),
             "original_keys": list(original_keys),
