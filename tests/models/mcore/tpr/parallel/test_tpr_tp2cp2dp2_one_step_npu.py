@@ -515,6 +515,16 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 model, runtime, mode="tpr_tp2cp2dp2",
                 require_exact_replicas=(replica_policy == "strict"),
             )
+        from .tpr_dp2_recompute_update import optional_dp2_verification
+        save_full_grads = os.getenv("TPR_DP2_SAVE_FULL_GRADS", "0")
+        optimizer_step = os.getenv("TPR_DP2_OPTIMIZER_STEP", "0")
+        if save_full_grads not in ("0", "1") or optimizer_step not in ("0", "1"):
+            raise ValueError("TPR_DP2_SAVE_FULL_GRADS/OPTIMIZER_STEP must be 0 or 1")
+        verify = optional_dp2_verification(
+            model, runtime, output, step,
+            save_full_grads=save_full_grads == "1",
+            optimizer_step=optimizer_step == "1",
+        )
         if dist.get_rank() == 0:
             output.mkdir(parents=True, exist_ok=True)
             suffix = "_recompute_on" if recompute_enabled else ""
@@ -544,7 +554,9 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 "recompute_method": model.config.recompute_method,
                 "recompute_num_layers": model.config.recompute_num_layers,
                 "recompute_installed_tpr_blocks": installed_blocks,
-                "updated_weights": False,
+                "updated_weights": optimizer_step == "1",
+                "full_gradient_paths": verify["full_gradient_paths"],
+                "optimizer_step": verify["optimizer_step"],
                 "median_fwd_bwd_s": statistics.median(times),
                 "gradient_witness": gradient_witness,
                 "gradient_replica_policy": replica_policy,
