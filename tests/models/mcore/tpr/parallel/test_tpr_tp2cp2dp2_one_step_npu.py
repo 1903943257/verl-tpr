@@ -26,6 +26,11 @@ from verl.workers.engine.megatron.tpr.placement import plan_tpr_dta_dp
 from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
 from verl.utils import tensordict_utils as tu
 
+# Avoid module-level NPU skip during checkpoint helper import, before
+# _runtime() is entered for this opt-in distributed test.
+if os.getenv("TPR_RUN_TP2CP2DP2_ONE_STEP") == "1":
+    import torch_npu  # noqa: F401
+
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 from .test_real_actor_tp2cp4_offline_ppo_npu import (
     _PPO,
