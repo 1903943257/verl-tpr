@@ -393,14 +393,14 @@ def run_tpr_forward_backward_batch(
     metrics = _PPOMetrics()
     event_profiler = SegmentEventProfiler() if detailed_profile else None
     tree_number = 0
+    shard_for_segment = (
+        None if cp_runtime.backend is None
+        else lambda segment: cp_runtime.backend.make_sequence_shard(segment.length)
+    )
 
     def run_one_tree(tree_plan):
         nonlocal tree_number
         setup_start = time.perf_counter() if detailed_profile else None
-        shard_for_segment = (
-            None if cp_runtime.backend is None
-            else lambda segment: cp_runtime.backend.make_sequence_shard(segment.length)
-        )
         callback, counts = objective.bind_tree(tree_plan, shard_for_segment=shard_for_segment)
         executor = SegmentExecutor(
             model,
