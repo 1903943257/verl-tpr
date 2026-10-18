@@ -1,175 +1,88 @@
-# TPR 阶段性验收、清理与 NPU 采集
+# TPR 主线：正确性、精简与可验证的性能优化
 
-Last updated: 10/17/2026.
+更新：2026-10-18。适用仓库：`1903943257/verl-tpr` PR7。
+原则：优先复用 VERL / Megatron / MindSpeed；不改变 Full 基线的 GEMM 形状，不开启 Fixed Tile；
+每个优化独立提交、回归、测量，不把 Profiler 本身当作项目目标。
 
-## 冻结基线与范围
+## 已验证的边界与尚未验收的部分
 
-用户报告的验收基线：main `ce6387c5af2213de00562c6752fbfd63aa96df7c`
-对 PR7 `2dc82406a7abf1e0a78694b7810522bbe4f1d3a6`，Qwen3-4B BF16，8 Ascend NPU，
-真实 Actor PPO capture，梯度工程容差 2%。本机没有访问这些服务器结果或执行 NPU 重放。
+2026-10-16/17 冻结验收：main `ce6387c5af2213de00562c6752fbfd63aa96df7c`
+对 PR7 旧头 `2dc82406a7abf1e0a78694b7810522bbe4f1d3a6`，
+Qwen3-4B BF16、真实 Agent PPO Capture、8×Ascend NPU。
 
-| 验收 | 用户报告结果 |
-| --- | --- |
-| TP2×CP4 | loss gap = 0；logprob max_abs = 0 |
-| TP2×CP4 全参数梯度 | rel L2 = 0.01027872；cosine = 0.99994723 |
-| TP2×CP4 抽样梯度 / gradient norm | rel L2 = 0.01581897；norm 相对差 = 0.000298 |
-| TP2×CP4 更新 | SGD 后抽样参数一致 |
-| TP2×CP2×DP2，Step 6 / 30K | loss / rank loss gap = 0；抽样梯度 rel L2 = 0.01450909 |
-| DP2 副本 / 比较器 | gradient max_abs = 0；PASS |
-| Linux CPU CI | 471 项通过 |
+- TP2×CP4 两条 sibling：loss / logprob 完全一致；
+  full-gradient relative L2 = 0.01027872，cosine = 0.99994723；2% 工程门禁下阶段接受，
+  **原始 1% 梯度门禁未通过**。
+- TP2×CP2×DP2 的 Step6 / 30K：loss gap = 0；
+  sampled-gradient relative L2 = 0.01450909，副本抽样完全一致。
+- 以上均为**固定权重单步 F/B + gradient finalize**；
+  不是 AdamW 连续训练，也不代表新 PR7 头已经完成 NPU 回归。
+- 仍缺：DP2 全参数梯度、CP 独立数值参考、多步更新后漂移、
+  完整训练吞吐、重计算下的显存和梯度正确性。
 
-现有结果（服务器路径）：
+## 已清理的过度设计
 
-```text
-/workspace/tpr_log/pr7_dp2_30k_retry2/old/step6_tpr_tp2cp2dp2.json
-/workspace/tpr_log/pr7_dp2_30k_retry2/new/step6_tpr_tp2cp2dp2.json
-/workspace/tpr_log/pr7_dp2_30k_retry2/comparison.json
-```
+不再维护独立 `profile_tpr_dp2_step6.py`、`_npu_profile_capture.py` 及其大量 mock 测试。
+一次 8-rank Level1 + stack/shapes/memory 原生 Profile 曾生成约 **118 GB**，
+且解析耗时超过一小时，无法作为轻量性能诊断工具。
 
-**未验收**：DP2 全参数梯度、CP metrics 的独立数值参考、完整连续 AdamW、端到端吞吐。
-此轮没有真实算子 Profile，不宣称任何加速比或实际峰值显存收益。
-累计改动仍须对冻结基线比较，不能把 2% 当作每个补丁分别可消耗的漂移预算。
+**唯一默认入口是既有 PPO replay**：
 
-## 此轮清理
+- `tests/models/mcore/tpr/parallel/run_tpr_tp2cp2dp2_one_step.sh`
+- `TPR_EXEC_PROFILE=0`：可比的无诊断总耗时、loss 与峰值 allocated。
+- `TPR_EXEC_PROFILE=1`：复用现有 `SegmentEventProfiler`；
+  仅记录每个 rank 的 Push/Leaf/Pop NPU Event、执行前后 allocated/reserved、
+  局部峰值、Tree Build / Executor Setup 等 Host 耗时。
+  输出每 rank 一个小型 `stepN_rankR_segments.json`，**不调用 torch_npu.profiler**。
+  此模式有埋点开销，**不作为 speedup 计算依据**。
+- 事件显存不能简单相加；局部 peak 不等于长期 KV 真实保留量；
+  CPU Host 时间不等于 NPU Kernel 时间，通信重叠也不能从 compute-stream Event 推断。
+- 全局峰值在 Event 局部 reset 后需用 `SegmentEventProfiler` 保存的最大值恢复；
+  不得误报更低显存。
 
-生产代码只合并等价 RoPE 参数分支、删除 Push 已压紧 KV 的重复 detach 容器、
-以有序字典代替 objective 的重复去重列表，并把错误消息长度列表延后到错误分支。
-保留调用次序、Tensor 所有权、目标排列、CP padding、梯度接力和原生 GEMM 形状。
-生产净减少 17 行；测试与独立采集工具单独计量，不以删除回归覆盖换行数。
-
-测试入口默认 `qwen_turn`，去掉无效 Exact 分支及历史 pre-refactor 导入路径。
-MindSpeed 参数清洗、RoPE CP-group sentinel、完整梯度门禁等正确性相关处理保留。
-生产 Ring / Attention 后端 / Fixed Tile 状态均未改；采集标记仅安装在独立测试进程。
-
-## 四个方向：先验证瓶颈，再单独改动
-
-### Root Ring
-
-`verl/workers/engine/megatron/tpr/ring.py` 中已经有 `ordinary_ring_cp_attention`，但当前生产 Root
-仍使用分块自定义路径。无 padding、CP 大小 C、祖先段数 A 时，静态调度 FA 调用数为：
-
-| 路径 | 每层每次 forward 或 backward 的 FA 次数 |
-| --- | --- |
-| 当前 Root | 2C + 1（CP2: 5；CP4: 9） |
-| 默认有祖先段 | 4CA + 2C + 1 |
-| prefix full coalesce | 2CA + 2C + 1 |
-| 额外满足 query coalesce 条件 | CA + 2C + 1 |
-| 原生 MindSpeed Root 候选 | C（CP2: 2；CP4: 4） |
-
-这是源码调度推导，不是实测时间（原生路径参考本机 MindSpeed `376e9cc`，服务器版本仍需记录）；
-padding 会改变调度。内部段通常还包括 Push forward、
-Pop 重算 forward 和 Pop backward，不能只看一次 Root forward。
-候选快路径须核对空 prefix、CP group/rank 顺序、RoPE 后 Q/K、GQA、dtype/scale、
-输出布局及梯度归属；先无 padding，再覆盖尾部虚拟 padding 和全 padding rank。
-不能通过改 QKV/MLP 的 GEMM 形状来获得“快路径”。此次不启用该候选。
-
-### Ring 通信与调度
-
-两种 Root 路径的理论 KV / dKV 通信跳数并不会随 FA 次数减少：每 KV 段、每 rank，
-forward 为 C−1 个 KV hop，backward 为 C−1 个 KV 加 C−1 个 dKV hop，合计 3(C−1)。
-每个 packed 消息含 K/V；祖先段数会扩大消息数。
-当前自定义 backward 的 dKV 发送后很快 wait，原生实现有跨下一块 FA 延后等待的机会；
-需要 HCCL Trace 证明实际暴露等待和重叠，不能用当前计算 stream Event 当成网络耗时。
-另记录 online merge 的 FP32 cast / exp / cat、padding mask 分配和各段 buffer 创建。
-暂不调整 coalesce 默认值、消息顺序、通信组或流。
-
-### Push LM Head
-
-Push 当前调用完整模型并丢弃 logits。原生 Megatron 的部分版本支持
-`output_processor` / `output_processor_context`，在 LM Head 前返回 decoder 输出；
-仓内已有接口探测逻辑，但必须核查服务器实际安装版本，不能仅凭本机源码推定可用。
-未来只对 Push 探测并使用原生接口；旧版本保留完整 forward，不 monkeypatch 模型算法。
-保留最终 norm、SP 布局和原有 decoder GEMM；不要为了丢弃的 hidden states 额外 gather。
-先从 Profile 确认 Push 的 LM Head GEMM、通信和 logits 生命周期占比。
-
-### KV 压实
-
-设 BF16、batch=1、当前 rank 物理段长 S、本地 Q heads=q、KV heads=k、head dim=d。
-紧凑 KV 为 `4*S*k*d` 字节；融合 QKV 为 `2*S*(q+2*k)*d` 字节。
-若 V view 钉住融合 QKV、RoPE 后 K 独立存储，则压实理论可释放
-`2*S*(q+k)*d` 字节/已完成层；有 output gate 时还需计入 gate backing storage。
-必须实际读取唯一 storage 元数据，不能把逻辑 Tensor 大小相加当作占用。
-
-仅作尺度示例：q=16、k=4、d=128、S=7680、36 层时，紧凑 KV 为 15 MiB/层，
-上述别名假设下旧占用为 52.5 MiB/层，累计差约 1.32 GiB；
-这不代表真实 Turn 段长、全局峰值或 allocator reserved 的实测下降。
-原 QKV / V 的局部变量仍可能存活到 attention 返回，紧接压实函数后的采样不等于已释放；
-同时观察下一层入口、Push 返回、Pop 重算和 backward。
-原生 Root 还可能保存远端 KV，不能默认比自定义 Root 更省显存。
-
-## 独立采集入口
-
-工具：`tests/models/mcore/tpr/parallel/profile_tpr_dp2_step6.py`，默认不启用 Profiler。
-从同一份新工具代码启动，但 `--repo` 分别指向两个干净目标 checkout，
-复用各自原有 runtime / placement / engine / PPO 实现。
-`--reference-json` 使用对应已验收 JSON，校验 Step 6、30720 cap、原始 8 行、
-输入 SHA、原 PPO token 分母和 DP partition；不重新裁剪、合成或重采样。
-
-Git 仍在宿主机操作。预先在宿主机确认目标 SHA 与生产目录干净；容器内 Git 不可用时，
-工具把 `--revision` 标记为 **host_declared_not_verified**，并保存实际加载文件的 SHA256，
-不能把这个标签当作容器内 Git 验证成功。新工具自身也保存文件哈希。
-
-示例（`tooling`、`main_repo`、`pr7_repo` 替换为容器实际可见路径；不要复制 Markdown 链接作 URL）：
+Docker 示例（Git 只在宿主机操作；先核对原始 manifest 的实际路径）：
 
 ```bash
-tooling=/workspace/verl-tpr-tooling
-main_repo=/workspace/verl-main-baseline
-pr7_repo=/workspace/verl-pr7-baseline
-out=/workspace/tpr_experiments/profiles/pr7_dp2_step6
-refs=/workspace/tpr_log/pr7_dp2_30k_retry2
-
-torchrun --standalone --nproc_per_node=8 \
-  "$tooling/tests/models/mcore/tpr/parallel/profile_tpr_dp2_step6.py" \
-  --repo "$main_repo" --label main \
-  --revision ce6387c5af2213de00562c6752fbfd63aa96df7c \
-  --reference-json "$refs/old/step6_tpr_tp2cp2dp2.json" \
-  --output-root "$out/main/trace" --profile --warmups 3 --repeats 1
-
-torchrun --standalone --nproc_per_node=8 \
-  "$tooling/tests/models/mcore/tpr/parallel/profile_tpr_dp2_step6.py" \
-  --repo "$pr7_repo" --label pr7 \
-  --revision 2dc82406a7abf1e0a78694b7810522bbe4f1d3a6 \
-  --reference-json "$refs/new/step6_tpr_tp2cp2dp2.json" \
-  --output-root "$out/pr7/trace" --profile --warmups 3 --repeats 1
+cd /workspace/verl-tpr-review
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+TPR_EXEC_PROFILE=1 TPR_BENCH_CAPTURE_LOGPROBS=0 \
+TPR_BENCH_WARMUPS=1 TPR_BENCH_REPEATS=3 TPR_BENCH_MASTER_PORT=29798 \
+bash tests/models/mcore/tpr/parallel/run_tpr_tp2cp2dp2_one_step.sh \
+  /workspace/tpr_dp2_30k_bf16_deterministic_pair_v1/capture_manifest.json \
+  /workspace/tpr_experiments/performance/step6_light_v1 6
 ```
 
-每 rank 独立目录，已有输出拒绝覆盖。Level1、CPU+NPU、`profile_memory=True`、
-`record_shapes=True`、`with_stack=True`、`data_simplification=False`；不排除 HCCL。
-保留原始 native 输出、Text Trace/CSV、阶段时间/事件、KV storage 元数据、配置、版本、
-声明 SHA 和实际文件哈希。具体能力与导出状态写入清单；不能把未导出项报告为已采集。
-观察器只在测试进程临时安装 scope / module hooks，退出时恢复，不改变结果和 Tensor 返回。
-树编号与 segment 的 parent / prefix / length 一同记录；CPU scope 包括树构造、计划摘要和预检、
-objective 绑定、forest 执行、梯度 finalize 及 CP loss 聚合。
-阶段 Event 是当前 compute stream 的时间；通信线上的真实重叠以原始 HCCL Trace 为准。
+正式 Full/TPR 性能比较必须 `TPR_EXEC_PROFILE=0` 且关闭额外日志采集，
+相同权重、样本、采样字段、并行参数、设备、重算策略和预热条件；
+报告 max-rank median / p90 与峰值显存，不能用单 rank Host 时间代表全局吞吐。
+上述轻量命令仍**不包含 optimizer step**。
 
-性能测量另起无 Profiler 进程：同样命令**去掉 `--profile`**、改到新输出目录
-`main/timing` 或 `pr7/timing`，使用 `--warmups 3 --repeats 10`。
-此模式不安装观察 hooks；记录同步 forward+backward 的 max-rank wall time、median / p90。
-建议交错 main / PR7 独立进程重复，记录温度/频率/负载；Profiler 内耗时仅归因，不作收益数字。
-工具不更新权重，不构成 AdamW 连续训练或 DP2 全参数梯度的新验收。
-默认可见卡为 `8,9,10,11,12,13,14,15`；如容器使用其它映射，可显式设置
-`ASCEND_RT_VISIBLE_DEVICES` 为 8 个唯一非负整数 ID，两边必须使用相同映射。
-原生 shapes/memory/stack 采集本身也可能改变 Tensor 生命周期；
-Profiler 峰值不可与无 Profiler 峰值混作压实收益，显存收益须另在同等无 Profiler 条件下确认。
+## 优先级与完成条件
 
-核查：FA / GEMM / RoPE / LM Head 时间线及形状；HCCL bytes / hop / wait / overlap；
-Push/Pop/leaf/反向事件；KV 唯一 storage、基线和峰值 allocated/reserved；CPU enqueue 时间。
-旧 `profiling/test_tpr_qwen3_ring_cp_profile_npu.py` 使用 legacy scheduler/executor，
-不是当前生产 Actor 路径的替代证明。
+| 优先级 | 方向 | 下一项具体工作 | 完成门禁 |
+| --- | --- | --- | --- |
+| P0 | 精度与语义 | PR7 当前头重跑 TP2×CP4 sibling full gradients 与 TP2×CP2×DP2 Step6；修正不必要的对象、分支和状态，不改数学行为 | loss/logprob、完整梯度、DP replica 与前版冻结结果对齐；2% 是累计而非逐补丁预算 |
+| P0 | 真正的 optimizer step | 相同离线 Capture、相同初始权重下，Native Full 与 TPR 各运行至少两步 AdamW（含 optimizer state、clip、weight update） | 每步 loss、grad norm、权重更新及 held-out Full 验证有独立记录 |
+| P0 | Recompute | 完成 Full Uniform(1) 对 TPR Push/Leaf/Pop 与 KV 生命周期的验证，先 TP2×CP4，再 DP2；兼顾 30K/40K OOM | 开关前后 objective/梯度门禁 + 峰值显存、总步耗时；不能只证明 F/B 能运行 |
+| P1 | 代码精简 | 模块级核对执行入口、Tree/Objective/KV、CP/Ring 与 Megatron 原生能力，逐项删冗余；保留 Padding/Turn Tree，确保旧测试覆盖不被误删 | 每批小 diff + CPU/8NPU 回归，未使用能力不混入生产热路径 |
+| P1 | DP 生产化 | 当前 DP2 仍是实验门禁；确认真实 GRPO minibatch、DP Placement、world loss 分母、gradient finalize 和副本一致性 | 真正 VERL Actor 在线/离线 DP2 入口运行，完整参数梯度及更新通过 |
+| P1 | 性能归因 | 用轻量 per-segment 时间/显存确定 Root Ring、Push/Pop、PPO chunk/gradient finalize 谁占主要成本 | 真实数据上 Main/PR7 无埋点对比，明确性能排名与回归风险 |
+| P1 | Root Ring | 先核对能否直接复用 MindSpeed 的原生 Root，保留内部段正确的矩形因果与 Ring；不重新实现新通信后端 | CP2/CP4、GQA、多段 Prefix、Padding、前反向一致，再测收益 |
+| P1 | Push / KV | 避免 Push 中被丢弃的 LM Head logits；验证 compact KV 的 storage 别名、Pop 释放时机 | loss/梯度不变，实测峰值和分段耗时下降；不靠理论显存估算宣称收益 |
+| P1 | 完整 E2E | 使用统一捕获轨迹作离线精度对照；另做原生 Rollout→GRPO→Actor 多步真实训练 | 逐步 reward、loss、weight、显存、吞吐，无异常 OOM/重复计数 |
+| P2 | TP/SP 与跨模型 | 原生 TP2×SP 在 CP1 的收益评估；扩展不同 Chat Template 的 Turn Tree，Qwen3-1.7B/4B 之外再测 Llama；Linear/GDN 与 CP 组合单独立项 | 明确各自支持边界、独立验收，不拖慢 Dense Qwen PPO 主线 |
 
-## 本机验证（不是新的 NPU 验收）
+## 四个待验证的性能方向
 
-```bash
-python -B tests/models/mcore/tpr/run_cpu_regressions.py
-git diff --check
-```
+1. **Root Ring**：自定义 Root 的多块 FA 调度可能有冗余；先以代码和轻量分段耗时确认，再评估原生 MindSpeed Root。
+2. **Ring HCCL**：通信次数、阻塞和重叠只在 Root 优化仍不足时进一步研究，不默认启用昂贵原生 Trace。
+3. **Push LM Head**：共享前缀无需输出 logits，优先试已有 Megatron 输出处理接口，避免 monkeypatch。
+4. **KV 压实**：核对 QKV backing storage、每层 KV 的唯一 storage bytes、Pop 后释放和 allocator 全局峰值，不把逻辑大小当物理节省。
 
-Windows / PyTorch 2.10 CPU / TensorDict 0.14.3：**516 passed, 1 skipped**；
-跳过项为本机 torch 构建无法创建 Gloo device，Linux CI 不据此跳过。
-独立 Ring/Offload unittest 共 33 项（1 skipped），291 个 Python 文件语法、
-15 项架构合同和两份 old/new shell 语法检查通过。
-新观察器的 15 项 mock 测试及独立 driver 的 17 项 CPU 合同已纳入上述 runner；
-mock API 不能验证真实 torch_npu 导出或 HCCL 时序。
+## 维护与验收约束
 
-上述真实 NPU 导出、清理后 main/PR7 重放及收益测量仍待服务器运行；提交状态以 PR head 为准。
-AI assistance: OpenAI Codex；提交/合入前需人工逐行审阅。
+- 代码与 Git 操作只在宿主机；Docker 工作树统一 `/workspace/verl-tpr-review`。
+- `torchrun --master_addr=127.0.0.1 --master_port=<port>`，禁止 `--standalone`。
+- 路径中的 Full/TPR 已验收 JSON、真实 Captures、模型权重均不可被新工具清理脚本自动删除。
+- CPU 回归：`python -B tests/models/mcore/tpr/run_cpu_regressions.py`。
+- 生产代码 PR / 优化结论必须配套真正 NPU 测试；CI CPU PASS 不等于 NPU 正确。
