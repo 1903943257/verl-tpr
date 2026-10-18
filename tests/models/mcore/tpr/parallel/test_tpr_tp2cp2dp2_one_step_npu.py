@@ -1,10 +1,10 @@
 """One recorded PPO step: Qwen3-4B TPR TP2 x RingCP2 x DP2 on 8 NPUs.
 
-Compare against the EXISTING TP2 x CP4 x DP1 Native Full fixed-shape JSON.
-Same 8 original Sessions and HF checkpoint; no rollout and no AdamW.
-One *source* step is replayed for warmup/repeated F/B timing, without updates.
-The DP placement is the DFS minimax planner imported from PR #5; this is
-an isolated research experiment, NOT a production VERL DP2 enablement.
+Reuses the DFS minimax DP planner and original eight-session PPO capture.
+TPR_DP2_RECOMPUTE=1 enables the KV-aware full/uniform/1 adapter; default OFF
+preserves the historical benchmark. Optional full BF16 gradient snapshots and
+one CPU FP32-master AdamW step happen AFTER frozen-weight F/B timing.
+This is an isolated research experiment, NOT production VERL DP2 enablement.
 """
 from __future__ import annotations
 
