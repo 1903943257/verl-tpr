@@ -212,9 +212,7 @@ def _trajectory_keys_from_minibatch(data: Any) -> tuple[str, ...]:
     count = len(data["input_ids"])
     explicit = tu.get_non_tensor_data(data, key="tpr_trajectory_keys", default=None)
     if explicit is not None:
-        if hasattr(explicit, "tolist"):
-            explicit = explicit.tolist()
-        keys = tuple(explicit)
+        keys = tuple(explicit.tolist() if hasattr(explicit, "tolist") else explicit)
         if len(keys) != count or not all(isinstance(key, str) for key in keys):
             raise ValueError("tpr_trajectory_keys must contain one string per mini-batch row")
         return keys
@@ -225,12 +223,8 @@ def _trajectory_keys_from_minibatch(data: Any) -> tuple[str, ...]:
             "TPR PPO requires tpr_trajectory_keys or a per-row uid in the actor "
             "mini-batch. Preserve the TQ identity across VERL preprocessing."
         )
-    if hasattr(uid, "tolist"):
-        values = uid.tolist()
-    elif hasattr(uid, "unbind"):
-        values = list(uid.unbind())
-    else:
-        values = list(uid)
+    values = (uid.tolist() if hasattr(uid, "tolist") else
+              list(uid.unbind()) if hasattr(uid, "unbind") else list(uid))
     if len(values) != count:
         raise ValueError(f"uid row count {len(values)} != input_ids rows {count}")
     result = []
