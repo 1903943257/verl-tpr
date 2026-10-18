@@ -64,7 +64,7 @@ class CP1AttentionTrace:
         self.tokens = [t.detach().cpu().long() for t in batch["input_ids"].unbind()]
         self.root_len = (
             forest.trees[0].segment_plan.get(0).length if mode != "full"
-            else None
+            else int(batch["prompts"][0].numel())
         )
         if len(self.tokens) != 2:
             raise AssertionError("Expected exactly two authentic sibling trajectories")
@@ -83,6 +83,8 @@ class CP1AttentionTrace:
         self.same_qkv_attention = {}
         self.original_rectangular = None
         self.replay = {}
+        self.relay_accumulation = {}
+        self.original_accumulate = None
         self.call_counts = {"root_push": 0, "root_pop": 0, "leaf": 0, "full": 0}
 
     def _model_pre(self, _module, _args, kwargs):
@@ -133,7 +135,7 @@ class CP1AttentionTrace:
         self.call_counts["full"] += int(phase == "full")
 
     def _indices(self, width: int, start: int, *, row: int) -> list[int]:
-        boundary = self.root_len if self.root_len is not None else 1024
+        boundary = self.root_len
         full_len = self.tokens[row].numel()
         choices = (
             list(range(0, 16))
@@ -250,6 +252,40 @@ class CP1AttentionTrace:
                 ))
         self.original_rectangular = attention_source.rectangular_causal_attention
         if self.mode != "full":
+            from verl.workers.engine.megatron.tpr.state import KVPrefixState
+            self.original_accumulate = KVPrefixState.accumulate_layer_gradients
+
+            def audited_accumulate(prefix_state, layer_number, key_grad, value_grad):
+                if layer_number not in (1, 2, 8, 36):
+                    return self.original_accumulate(prefix_state, layer_number, key_grad, value_grad)
+                row = 0 if self.mode == "shared" else self.row_cursor
+                key = f"root_r{row}|L{layer_number}"
+                previous = self.relay_accumulation.get(key)
+                inputs = (key_grad.detach().float().cpu(), value_grad.detach().float().cpu())
+                if previous is None:
+                    reference = tuple(x.clone() for x in inputs)
+                    count = 1
+                else:
+                    reference = tuple(
+                        a + b for a, b in zip(previous["_fp32"], inputs, strict=True)
+                    )
+                    count = previous["count"] + 1
+                self.original_accumulate(prefix_state, layer_number, key_grad, value_grad)
+                stored = prefix_state.gradients[layer_number]
+                err = {
+                    name: _difference(ref.float(), actual.detach().float().cpu())
+                    for name, ref, actual in zip(
+                        ("dK", "dV"), reference, stored, strict=True,
+                    )
+                }
+                self.relay_accumulation[key] = {
+                    "_fp32": reference,
+                    "count": count,
+                    "bf16_vs_fp32_accumulate": err,
+                }
+
+            KVPrefixState.accumulate_layer_gradients = audited_accumulate
+        if self.mode != "full":
             attention_source.rectangular_causal_attention = self._patched_rectangular
         return self
 
@@ -259,6 +295,9 @@ class CP1AttentionTrace:
         self.handles.clear()
         if self.original_rectangular is not None:
             attention_source.rectangular_causal_attention = self.original_rectangular
+        if self.original_accumulate is not None:
+            from verl.workers.engine.megatron.tpr.state import KVPrefixState
+            KVPrefixState.accumulate_layer_gradients = self.original_accumulate
         self.root_queries.clear()
 
     @torch.no_grad()
@@ -330,6 +369,13 @@ class CP1AttentionTrace:
             "records": self.records,
             "same_qkv_attention": self.same_qkv_attention,
             "same_input_gemm_replay": self.replay,
+            "kv_relay_roundoff": {
+                k: {
+                    "count": v["count"],
+                    "bf16_vs_fp32_accumulate": v["bf16_vs_fp32_accumulate"],
+                }
+                for k, v in self.relay_accumulation.items()
+            },
             "full_first_qkv_x": self.full_first_qkv_x,
             "root_first_qkv_x": self.root_first_qkv_x,
             "selected_layers": SELECTED_LAYERS,
