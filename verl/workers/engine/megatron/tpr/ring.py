@@ -1478,6 +1478,17 @@ class RingCPAttentionBackend:
         except KeyError as exc:
             raise KeyError(f"Ring CP context has no layer {layer_number}") from exc
         if self._use_native_root:
+            if (
+                layer_number == self._first_layer
+                and self._ring_layout.cp_rank == 0
+                and os.getenv("TPR_RING_BLOCK_STATS", "0") == "1"
+            ):
+                print("TPR_FAST_ROOT_RING " + json.dumps({
+                    "backend": "mindspeed_native",
+                    "root_length": self._current_shard.global_length,
+                    "padded_length": self._current_shard.padded_length,
+                    "grad_enabled": torch.is_grad_enabled(),
+                }, sort_keys=True), flush=True)
             return ordinary_ring_cp_attention(
                 query, new_key, new_value,
                 current_shard=self._current_shard,
