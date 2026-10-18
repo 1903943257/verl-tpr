@@ -71,7 +71,6 @@ class PastKVAnchors:
     """
 
     entries: tuple[KVPrefixAnchors, ...]
-    stack_signature: tuple[SegmentId, ...]
 
     @property
     def prefix_length(self) -> int:
@@ -228,10 +227,6 @@ class KVStackEntry:
     segment: SegmentSpec
     kv: KVPrefixState
 
-    @property
-    def gradients(self) -> Mapping[int, KVPair]:
-        return self.kv.gradients
-
 
 class KVStack:
     """Own only the active root-to-parent path and its delayed dKV."""
@@ -295,18 +290,16 @@ class KVStack:
         return _concatenate_kv(tuple((entry.kv.shard, entry.kv.key_values) for entry in self._entries.values()))
 
     def build_past_anchors(self) -> PastKVAnchors:
-        return PastKVAnchors(tuple(entry.kv.make_anchors() for entry in self._entries.values()), self.segment_ids)
+        return PastKVAnchors(tuple(entry.kv.make_anchors() for entry in self._entries.values()))
 
     def accumulate_anchor_gradients(self, anchors: PastKVAnchors, *, consume: bool = False) -> None:
-        if anchors.stack_signature != self.segment_ids:
-            raise RuntimeError("stale Prefix anchor stack signature")
         if tuple(entry.segment_id for entry in anchors.entries) != self.segment_ids:
-            raise RuntimeError("Prefix anchor entries do not match stack signature")
+            raise RuntimeError("stale Prefix anchor stack signature")
         for entry in anchors.entries:
             self.get(entry.segment_id).kv.accumulate_anchor_gradients(entry, consume=consume)
 
     def get_new_kv_gradients(self, segment_id: SegmentId) -> Mapping[int, KVPair]:
-        return self.get(segment_id).gradients
+        return self.get(segment_id).kv.gradients
 
     def assert_empty(self) -> None:
         if self._entries:
