@@ -287,12 +287,14 @@ parity does not establish complete PPO/optimizer acceptance.
 Run `bash tests/models/mcore/tpr/parallel/run_real_actor_cp1_short_full_tpr.sh`
 from the synced Docker worktree with physical NPU 8 available. The script
 uses fixed `127.0.0.1:29797`, a 2048-token cap per trajectory, and the
-existing real Actor PPO capture rows (4,6). It produces three independent
+existing real Actor PPO capture rows (4,6). It produces four independent
 checkpoint-loaded TP1/CP1/DP1 runs:
 
 - `full`: whole-sequence GPT forward/backward **without** TPR context,
   using the controlled square-CANN CP1 core; **not** native VERL Engine.
 - `one_node`: two independent TPR one-Root-leaf plans; no shared KV.
+- `split_no_share`: two independent Root/Leaf chains with exactly the same
+  boundary and PPO query/target refs as `shared`, but no inter-row KV reuse.
 - `shared`: one `qwen_turn` tree, Root Push / two siblings / Root Pop.
 
 The derivation keeps an identical trailing prompt window and selects an
@@ -306,12 +308,14 @@ audit records original row IDs, offset, lengths and fingerprints. Scripts
 reject missing branches or missing PPO supervision rather than claiming
 reuse without an actual shared Root.
 
-The comparator saves `comparison.json` with Full vs one-node, one-node vs
-shared and Full vs shared token logprob/Loss metrics, canonical sampled
+The original three-arm `comparison.json` remains untouched. The updated
+comparator writes `comparison_split_no_share.json` and adds one-node vs
+split-no-share (segmentation effect) and split-no-share vs shared (actual
+KV reuse effect). All comparisons include token logprob/Loss, canonical sampled
 parameter gradients, complete Norm-only gradients and global grad norms.
 Neither the 64-sample canonical witness nor the Norm-only vector is a
 complete all-parameter gradient L2. No optimizer step is executed. Full,
-one-node and shared use the same Qwen3-4B BF16 weights, VERL vanilla PPO
+one-node, split-no-share and shared use the same Qwen3-4B BF16 weights, VERL vanilla PPO
 objective and optional chunked logprob computation; dropout=0 and model
 recompute disabled. Root Native Ring is forced OFF: CP1 cannot validate
 Native Ring correctness by itself.
