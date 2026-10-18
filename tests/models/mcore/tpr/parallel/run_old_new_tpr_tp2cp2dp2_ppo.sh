@@ -32,7 +32,7 @@ for version in old new; do
     echo "Set TPR_${version^^}_GIT_SHA to the full host-verified commit SHA" >&2
     exit 2
   fi
-  printf '%s\\n' "$sha" > "$OUT/$version.sha"
+  printf '%s\n' "$sha" > "$OUT/$version.sha"
   echo "TPR_DP2_REVISION version=$version sha=$sha source=host_verified"
 done
 
