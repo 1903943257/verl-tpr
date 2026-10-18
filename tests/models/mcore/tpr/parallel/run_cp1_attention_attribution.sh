@@ -15,6 +15,10 @@ export TPR_TREE_POLICY=qwen_turn
 export TPR_RING_COALESCE_PREFIX_FULL=0
 export TPR_RING_COALESCE_PREFIX_QUERY=0
 export TPR_RING_COALESCE_PREFIX_PADDED=0
+# Never import or enable the historical test-only Fixed Tile interventions.
+unset TPR_QWEN17_PPO_TILE_GEMM TPR_QWEN17_GPT_TILE_GEMM \
+  TPR_QWEN17_GPT_FP32_GEMM TPR_QWEN17_GPT_GROUPED_GEMM_GROUPS \
+  TPR_QWEN17_SPLIT_FP32_DW_BACKWARD || true
 export TPR_CP1_SOURCE="${TPR_CP1_SOURCE:-/workspace/tpr_actor_capture_4b_n8_run1/actor_update_rank0_batch0.pt}"
 export TPR_QWEN_4B_PATH="${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}"
 : "${ASCEND_RT_VISIBLE_DEVICES:=8}"
