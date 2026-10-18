@@ -27,7 +27,9 @@ from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_ba
 from verl.utils import tensordict_utils as tu
 
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
-from .test_real_actor_tp2cp4_offline_ppo_npu import _PPO, _load_real_pair
+from .test_real_actor_tp2cp4_offline_ppo_npu import (
+    _PPO, _load_real_pair, _sanitize_mindspeed_repatch_args,
+)
 
 pytestmark = pytest.mark.skipif(
     os.getenv("TPR_RUN_TP2CP2DP2_ONE_STEP") != "1",
@@ -65,7 +67,9 @@ def _runtime():
             pipeline_model_parallel_size=1,
             expert_model_parallel_size=1,
         )
-    assert get_full_args().context_parallel_algo == "megatron_cp_algo"
+    args = get_full_args()
+    _sanitize_mindspeed_repatch_args(args)
+    assert args.context_parallel_algo == "megatron_cp_algo"
     tp = parallel_state.get_tensor_model_parallel_group()
     cp = parallel_state.get_context_parallel_group()
     dp = parallel_state.get_data_parallel_group()
