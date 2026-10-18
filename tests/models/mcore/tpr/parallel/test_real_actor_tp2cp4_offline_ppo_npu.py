@@ -297,17 +297,19 @@ def test_recorded_full_vs_tpr_one_step():
             run_tpr_forward_backward_batch, _trajectory_keys_from_minibatch,
         )
         from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans
+        # Production TPR supports only complete Qwen/ChatML Turn sharing.
+        # An old "exact" default here could fail after model initialization.
+        tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
+        if tree_policy != "qwen_turn":
+            raise ValueError(f"offline Actor replay requires qwen_turn, got {tree_policy!r}")
         forest = build_tree_execution_plans(
             _trajectory_keys_from_minibatch(batch), batch,
-            tree_policy=os.getenv("TPR_TREE_POLICY", "exact"),
+            tree_policy=tree_policy,
             turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
         )
         if mode == "full" and (len(forest.trees) != len(rows)
                                or forest.segment_count != len(rows)):
             raise AssertionError("Full control accidentally reused a prefix")
-        if mode == "tpr" and os.getenv("TPR_TREE_POLICY", "exact") == "exact":
-            if len(forest.trees) != 1 or forest.segment_count <= len(rows):
-                raise AssertionError("Exact TPR mode did not create expected shared tree")
         # Turn mode can yield multiple trees without shared complete turns.
         ring_impl = _install_offline_full_ring_backend(mode)
         if hf.num_hidden_layers != 36:
