@@ -248,7 +248,8 @@ def test_temperature_metadata_rejects_out_of_range_logical_sample(row):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("extras", [False, True])
 @pytest.mark.parametrize("chunk_size", [None, 1])
-def test_selected_low_precision_logits_match_native_fp32_output_contract(dtype, extras, chunk_size):
+def test_selected_low_precision_logits_match_native_fp32_output_contract(dtype, extras, chunk_size, monkeypatch):
+    monkeypatch.setenv("TPR_SELECTED_LOGITS_FP32", "1")
     torch.manual_seed(517)
     # Only three unique physical (query,target,temp) combinations are needed,
     # rather than casting all five physical vocab rows as Float16Module does.
@@ -289,6 +290,21 @@ def test_selected_low_precision_logits_match_native_fp32_output_contract(dtype, 
     # one cast back, including when one query exceeds the soft chunk-size limit.
     torch.testing.assert_close(actual[1], expected[1].to(dtype), rtol=0, atol=0)
     assert not actual[1][:, 2:].count_nonzero()
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_selected_low_precision_logits_default_to_bf16_contract(dtype, monkeypatch):
+    from verl.workers.engine.megatron.tpr.objective import _selected_scaled_logits
+
+    monkeypatch.delenv("TPR_SELECTED_LOGITS_FP32", raising=False)
+    source = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]], dtype=dtype, requires_grad=True)
+    positions = torch.tensor([0, 1], dtype=torch.long)
+    temperatures = torch.ones(2, dtype=torch.float32)
+    selected = _selected_scaled_logits(source, positions, temperatures, None)
+    assert selected.dtype == dtype
+    torch.testing.assert_close(selected, source[0], rtol=0, atol=0)
+    selected.sum().backward()
+    torch.testing.assert_close(source.grad, torch.ones_like(source), rtol=0, atol=0)
 
 
 def test_batch_rows_and_host_masks_are_cached_across_segments(monkeypatch):
@@ -375,7 +391,9 @@ def _native_ppo_loss():
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("extras", [False, True])
 @pytest.mark.parametrize("chunk_size", [None, 1])
-def test_low_precision_contract_uses_real_native_ppo_entropy_kl_and_is(dtype, extras, chunk_size):
+def test_low_precision_contract_uses_real_native_ppo_entropy_kl_and_is(dtype, extras, chunk_size, monkeypatch):
+    monkeypatch.setenv("TPR_SELECTED_LOGITS_FP32", "1")
+
     class ActorConfig:
         loss_agg_mode = "token-mean"
         policy_loss = {"loss_mode": "vanilla"}
