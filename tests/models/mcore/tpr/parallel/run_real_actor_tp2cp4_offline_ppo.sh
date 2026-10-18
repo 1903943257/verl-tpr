@@ -29,7 +29,7 @@ for mode in "${modes[@]}"; do
     export TPR_OFFLINE_MODE="$mode"
     echo "TPR_OFFLINE_START mode=$mode rows=$TPR_OFFLINE_ROWS device=$ASCEND_RT_VISIBLE_DEVICES"
     # An OOM in Full must not prevent the independent TPR memory experiment.
-    if torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29784 \
+    if torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29797 \
        -m pytest -vv -s -x \
        tests/models/mcore/tpr/parallel/test_real_actor_tp2cp4_offline_ppo_npu.py \
        2>&1 | tee "$TPR_OFFLINE_OUTPUT_DIR/${mode}.log"; then
