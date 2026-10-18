@@ -7,3 +7,6 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Version-update PRs are paused to keep TPR branch maintenance focused.
+    # Dependabot security updates remain independently configurable.
+    open-pull-requests-limit: 0
