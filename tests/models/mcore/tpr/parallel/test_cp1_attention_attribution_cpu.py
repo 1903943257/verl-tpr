@@ -65,6 +65,9 @@ def test_autoconclusion_identifies_real_qkv_m_effect(tmp_path):
                 "loss_abs_gap": 0.0,
                 "canonical_sampled_grad": {"relative_l2": 0.0, "cosine": 1.0},
                 "complete_norm_grad": {"relative_l2": 0.0},
+                "global_grad_norm_reference": 8.0,
+                "global_grad_norm_candidate": 8.0,
+                "global_grad_norm_relative_gap": 0.0,
             }
             for k in ("full_vs_one_node", "one_node_vs_split_no_share",
                       "split_no_share_vs_shared", "full_vs_shared")
