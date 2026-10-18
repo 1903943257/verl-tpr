@@ -280,3 +280,48 @@ Next gate: same authentic Actor capture with `TPR_ROOT_NATIVE_RING=0` vs `1`,
 keeping Prefix Merge settings fixed. Compare Root Push/Pop time, end-to-end
 loss/logprob, full parameter gradients, actual FA calls, and memory. Kernel
 parity does not establish complete PPO/optimizer acceptance.
+
+
+### Controlled single-card Qwen3-4B PPO Full vs TPR (2026-10-18)
+
+Run `bash tests/models/mcore/tpr/parallel/run_real_actor_cp1_short_full_tpr.sh`
+from the synced Docker worktree with physical NPU 8 available. The script
+uses fixed `127.0.0.1:29797`, a 2048-token cap per trajectory, and the
+existing real Actor PPO capture rows (4,6). It produces three independent
+checkpoint-loaded TP1/CP1/DP1 runs:
+
+- `full`: whole-sequence GPT forward/backward **without** TPR context,
+  using the controlled square-CANN CP1 core; **not** native VERL Engine.
+- `one_node`: two independent TPR one-Root-leaf plans; no shared KV.
+- `shared`: one `qwen_turn` tree, Root Push / two siblings / Root Pop.
+
+The derivation keeps an identical trailing prompt window and selects an
+original supervised response window around the first sibling divergence.
+It never synthesizes PPO labels or alters values of the retained
+`old_log_probs`, `advantages`, response/loss masks or temperatures.
+**Left-truncating the prompt and shifting the response window changes
+conditioning**: this is a deterministic controlled numerical comparison,
+not equivalent to the original online PPO objective. The output capture
+audit records original row IDs, offset, lengths and fingerprints. Scripts
+reject missing branches or missing PPO supervision rather than claiming
+reuse without an actual shared Root.
+
+The comparator saves `comparison.json` with Full vs one-node, one-node vs
+shared and Full vs shared token logprob/Loss metrics, canonical sampled
+parameter gradients, complete Norm-only gradients and global grad norms.
+Neither the 64-sample canonical witness nor the Norm-only vector is a
+complete all-parameter gradient L2. No optimizer step is executed. Full,
+one-node and shared use the same Qwen3-4B BF16 weights, VERL vanilla PPO
+objective and optional chunked logprob computation; dropout=0 and model
+recompute disabled. Root Native Ring is forced OFF: CP1 cannot validate
+Native Ring correctness by itself.
+
+CPU capture contract:
+
+```bash
+python -m pytest -q tests/models/mcore/tpr/parallel/test_cp1_short_capture_cpu.py
+```
+
+After CP1 is well characterized, use the established TP2CP1 and TP2CP4
+replay matrices to isolate tensor/context parallelism and then return to
+Fast Root Native Push-only drift on the original 4B Actor sibling capture.
