@@ -34,6 +34,19 @@ def _range_validity(item: _RingRangeSlice, *, device: torch.device) -> Tensor:
     return torch.arange(item.physical_length, device=device) < item.valid_length
 
 
+def _check_attention_mask(attention_mask: Tensor | None, query: Tensor, key: Tensor) -> Tensor | None:
+    if attention_mask is None:
+        return None
+    if attention_mask.dtype != torch.bool:
+        raise ValueError("Ring physical attention mask must use torch.bool")
+    if tuple(attention_mask.shape) != (query.shape[0], key.shape[0]):
+        raise ValueError(
+            "Ring physical attention mask shape must match Q/KV, got "
+            f"{tuple(attention_mask.shape)} for Q={query.shape[0]}, KV={key.shape[0]}"
+        )
+    return attention_mask.contiguous()
+
+
 def _physical_block_attention_mask(
     query_item: _RingRangeSlice,
     kv_item: _RingRangeSlice,
@@ -111,15 +124,7 @@ def _block_attention_forward(
     except ImportError as exc:  # pragma: no cover - requires the server NPU runtime
         raise RuntimeError("torch_npu is required for Ring CP attention") from exc
     causal_fast_path = block_kind is RingBlockKind.CAUSAL and attention_mask is None
-    if attention_mask is not None:
-        if attention_mask.dtype != torch.bool:
-            raise ValueError("Ring physical attention mask must use torch.bool")
-        if tuple(attention_mask.shape) != (query.shape[0], key.shape[0]):
-            raise ValueError(
-                "Ring physical attention mask shape must match Q/KV, got "
-                f"{tuple(attention_mask.shape)} for Q={query.shape[0]}, KV={key.shape[0]}"
-            )
-        attention_mask = attention_mask.contiguous()
+    attention_mask = _check_attention_mask(attention_mask, query, key)
     result = torch_npu.npu_fusion_attention(
         query,
         key,
@@ -261,15 +266,7 @@ def _block_attention_backward(
     except ImportError as exc:  # pragma: no cover - requires the server NPU runtime
         raise RuntimeError("torch_npu is required for Ring CP attention backward") from exc
     causal_fast_path = block_kind is RingBlockKind.CAUSAL and attention_mask is None
-    if attention_mask is not None:
-        if attention_mask.dtype != torch.bool:
-            raise ValueError("Ring physical attention mask must use torch.bool")
-        if tuple(attention_mask.shape) != (query.shape[0], key.shape[0]):
-            raise ValueError(
-                "Ring physical attention mask shape must match Q/KV, got "
-                f"{tuple(attention_mask.shape)} for Q={query.shape[0]}, KV={key.shape[0]}"
-            )
-        attention_mask = attention_mask.contiguous()
+    attention_mask = _check_attention_mask(attention_mask, query, key)
     result = torch_npu.npu_fusion_attention_grad(
         query,
         key,
