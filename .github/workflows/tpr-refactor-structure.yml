@@ -2,13 +2,35 @@ name: TPR refactor structural checks
 on:
   push:
     branches:
-      - refactor/tpr-ppo-engine-ring-turn-20261015
+      - main
+      - 'refactor/tpr-*'
+      - 'fix/tpr-*'
+  pull_request:
+    paths:
+      - 'verl/models/mcore/tpr/**'
+      - 'verl/workers/engine/megatron/tpr/**'
+      - 'verl/experimental/tpr/**'
+      - 'tests/models/mcore/tpr/**'
+      - '.github/workflows/tpr-refactor-structure.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  isolated-cpu-regressions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - name: Install isolated CPU test dependencies (not the training runtime)
+        run: |
+          uv venv --python 3.12 .venv-tpr-cpu
+          uv pip install --python .venv-tpr-cpu/bin/python 'torch==2.10.0' --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --python .venv-tpr-cpu/bin/python 'tensordict==0.10.0' pytest numpy packaging
+      - name: Run real TPR code with CPU-only Megatron interface stubs
+        run: .venv-tpr-cpu/bin/python -B tests/models/mcore/tpr/run_cpu_regressions.py
   syntax-and-architecture:
     runs-on: ubuntu-latest
     steps:
@@ -36,10 +58,15 @@ jobs:
       - name: Run stdlib-only structural tests
         run: |
           python3 - <<'PY'
-          import runpy
+          import importlib.util
+          import sys
           from pathlib import Path
           test_file = Path("tests/models/mcore/tpr/unit/test_production_architecture.py")
-          tests = runpy.run_path(str(test_file))
+          spec = importlib.util.spec_from_file_location("tpr_structure_contract", test_file)
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          tests = vars(module)
           total = 0
           for name, fn in sorted(tests.items()):
               if name.startswith("test_") and callable(fn):

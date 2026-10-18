@@ -128,7 +128,8 @@ def _trace_layer(layer, monkeypatch):
 
 
 def _forward(layer, hidden):
-    from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
+    from verl.experimental.tpr.gdn.context import GDNTPRAttentionContext as TPRAttentionContext
+    from verl.experimental.tpr.gdn.context import use_tpr_attention_context
 
     # Layer 1 is GDN: no RoPE/FA, external state, or packed metadata is needed.
     context = TPRAttentionContext(prefix_length=0, suffix_length=hidden.shape[0])

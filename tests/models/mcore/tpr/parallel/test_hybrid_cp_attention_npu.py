@@ -34,7 +34,7 @@ from torch import Tensor
 import verl.experimental.tpr.hybrid as hybrid
 import verl.workers.engine.megatron.tpr.ring as ring
 import verl.experimental.tpr.ulysses as ulysses
-from verl.models.mcore.tpr import (
+from verl.experimental.tpr.hybrid import (
     HybridCPTopology,
     HybridLocalKVBlock,
     make_hybrid_sequence_shard,

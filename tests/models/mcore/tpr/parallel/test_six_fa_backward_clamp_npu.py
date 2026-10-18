@@ -93,7 +93,7 @@ def six_fa_backward_clamp(
     are replaced by CP1 local-shard values while preserving the CP2 graph.
     """
     from verl.models.mcore.tpr import attention
-    from verl.models.mcore.tpr.context import TPRAttentionContext
+    from verl.experimental.tpr.gdn.context import GDNTPRAttentionContext as TPRAttentionContext
     from verl.experimental.tpr import ring_attention as ring
 
     active = []

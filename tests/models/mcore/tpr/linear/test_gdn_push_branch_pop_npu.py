@@ -111,7 +111,8 @@ def _random_tensor(runtime, shape, *, seed, requires_grad=False) -> Tensor:
 
 
 def _run_segment(model, hidden_states, *, prefix_length, initial_states=None):
-    from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
+    from verl.experimental.tpr.gdn.context import GDNTPRAttentionContext as TPRAttentionContext
+    from verl.experimental.tpr.gdn.context import use_tpr_attention_context
 
     context = TPRAttentionContext(
         prefix_length=prefix_length,
@@ -393,7 +394,7 @@ def _diagnose_operator_boundaries(model, prefix, suffix, prefix_target, suffix_t
 
 
 def test_single_gdn_push_branch_pop_matches_materialized_paths(runtime):
-    from verl.models.mcore.tpr import GDNLayerState, GDNPrefixState
+    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState, GDNPrefixState
 
     torch.manual_seed(32001)
     reference_model = _make_gdn(runtime)

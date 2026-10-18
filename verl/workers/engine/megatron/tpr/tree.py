@@ -130,15 +130,21 @@ class TreeExecutionPlan:
     member_rows: tuple[int, ...]
     segment_plan: SegmentPlan
     objective_refs: tuple[SegmentObjectiveRef, ...]
+    active_segment_ids: frozenset[SegmentId] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Global query owners and their ancestors, never CP-local counts.
+        active = set()
+        for ref in self.objective_refs:
+            segment_id = ref.segment_id
+            while segment_id is not None and segment_id not in active:
+                active.add(segment_id)
+                segment_id = self.segment_plan.get(segment_id).parent_id
+        object.__setattr__(self, "active_segment_ids", frozenset(active))
 
     @property
     def key(self) -> str:
         return f"{self.uid}:{self.tree_index}"
-
-    @property
-    def tree(self) -> TreeExecutionPlan:
-        """Metadata alias for callers formerly reading a separate topology."""
-        return self
 
     def refs_for_segment(self, segment_id: int) -> tuple[SegmentObjectiveRef, ...]:
         self.segment_plan.get(segment_id)
@@ -147,7 +153,6 @@ class TreeExecutionPlan:
     @property
     def logical_loss_tokens(self) -> int:
         return len(self.objective_refs)
-
 
 @dataclass(frozen=True, slots=True)
 class ForestExecutionPlan:
@@ -210,14 +215,18 @@ def _turn_units(tokens: list[int], prompt_length: int, minimum: int):
 
 def _compress(node: _TurnNode, parent_id: int | None, start: int, inputs: list[Tensor],
               segments: list[SegmentSpec], paths: dict[int, tuple[int, ...]], path: tuple[int, ...]) -> None:
-    while not node.terminal_rows and len(node.children) == 1:
-        node = next(iter(node.children.values()))
-    segment_id = len(segments)
-    segments.append(SegmentSpec(segment_id, parent_id, inputs[node.source_row][start:node.end], start, start))
-    path = (*path, segment_id)
-    paths.update((row, path) for row in node.terminal_rows)
-    for child in node.children.values():
-        _compress(child, segment_id, node.end, inputs, segments, paths, path)
+    # Explicit DFS preserves insertion order without a Python recursion limit
+    # on long conversations with terminal rows at many successive Turn nodes.
+    pending = [(node, parent_id, start, path)]
+    while pending:
+        node, parent_id, start, path = pending.pop()
+        while not node.terminal_rows and len(node.children) == 1:
+            node = next(iter(node.children.values()))
+        segment_id = len(segments)
+        segments.append(SegmentSpec(segment_id, parent_id, inputs[node.source_row][start:node.end], start, start))
+        path = (*path, segment_id)
+        paths.update((row, path) for row in node.terminal_rows)
+        pending.extend((child, segment_id, node.end, path) for child in reversed(node.children.values()))
 
 
 def build_tree_execution_plans(
@@ -343,17 +352,18 @@ def digest_forest_plan(forest: ForestExecutionPlan) -> str:
     return hasher.hexdigest()
 
 
-def assert_tp_plan_agreement(digest: str, *, tp_size: int) -> None:
-    """Collectively reject divergent execution plans on the native TP group.
+def assert_tp_plan_agreement(digest: str, *, tp_size: int, cp_size: int = 1) -> None:
+    """Reject divergent plans on the native TP group (TP×CP when CP is enabled).
 
     Called ONCE per TPR minibatch, *before* model forward or TP collectives.
     Uses only a 32-byte SHA256 signature per rank, not model tensors / KV.
     Every peer receives the same success or mismatch result.
     """
-    if tp_size == 1:
+    if tp_size < 1 or cp_size < 1:
+        raise ValueError("tp_size and cp_size must be positive")
+    size = tp_size * cp_size
+    if size == 1:
         return
-    if tp_size < 1:
-        raise ValueError("tp_size must be positive")
     if len(digest) != 64:
         raise ValueError("SHA256 digest must be a 64-character hex string")
 
@@ -362,22 +372,28 @@ def assert_tp_plan_agreement(digest: str, *, tp_size: int) -> None:
     from megatron.core import parallel_state
 
     if not dist.is_available() or not dist.is_initialized():
-        raise RuntimeError("TPR TP2 requires an initialized distributed process group")
-    group = parallel_state.get_tensor_model_parallel_group()
+        raise RuntimeError("TPR TP/CP requires an initialized distributed process group")
+    axis = "TP×CP" if cp_size > 1 else "TP"
+    group = (parallel_state.get_tensor_and_context_parallel_group() if cp_size > 1
+             else parallel_state.get_tensor_model_parallel_group())
     if group is None:
-        raise RuntimeError("TPR TP2 cannot resolve native Megatron TP group")
-    if dist.get_world_size(group=group) != tp_size:
-        raise RuntimeError("TPR TP group size differs from Engine TP config")
+        raise RuntimeError(f"TPR cannot resolve native Megatron {axis} group")
+    if dist.get_world_size(group=group) != size:
+        raise RuntimeError(f"TPR {axis} group size differs from Engine config")
     # HCCL AllGather supports int64, so store SHA256 as eight int64 words
     # (each word is a non-negative 32-bit unsigned value).
     words = [int(digest[i:i + 8], 16) for i in range(0, 64, 8)]
-    device = torch.device("npu", torch.npu.current_device()) if dist.get_backend(group) == "hccl" else torch.device("cpu")
+    device = torch.device("cpu")
+    if dist.get_backend(group) != "gloo":
+        from verl.utils.device import get_device_id, get_device_name
+
+        device = torch.device(get_device_name(), get_device_id())
     local = torch.tensor(words, dtype=torch.int64, device=device)
-    signatures = [torch.empty_like(local) for _ in range(tp_size)]
+    signatures = [torch.empty_like(local) for _ in range(size)]
     dist.all_gather(signatures, local, group=group)
     if any(not torch.equal(value, local) for value in signatures):
         rank = dist.get_rank(group=group)
         raise RuntimeError(
-            f"TPR TP schedule mismatch on tp_rank={rank}: forest, SegmentPlan, "
+            f"TPR {axis} schedule mismatch on rank={rank}: forest, SegmentPlan, "
             "topology or PPO refs differ across model-parallel peers"
         )

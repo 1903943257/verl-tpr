@@ -3,8 +3,12 @@
 """CPU placement-contract tests; these do not enable distributed training."""
 
 from itertools import combinations
+import random
+import sys
+import types
 
 import pytest
+import torch
 
 from verl.workers.engine.megatron.tpr.placement import (
     _tree_token_cost,
@@ -108,8 +112,19 @@ def test_native_uid_dp1_preserves_every_row_without_importing_verl_balancer():
     assert plan.policy == "verl_uid"
 
 
-def test_native_uid_delegates_to_verl_balancer(monkeypatch):
-    from verl.utils import seqlen_balancing
+@pytest.fixture
+def balancer(monkeypatch):
+    # These are delegation tests, not tests of the upstream partitioner. Keep
+    # its unrelated DataProto/Ray dependencies out of the isolated CPU suite.
+    module = types.ModuleType("verl.utils.seqlen_balancing")
+    module.get_group_balanced_partitions = None
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    from verl import utils
+    monkeypatch.setattr(utils, "seqlen_balancing", module, raising=False)
+    return module
+
+
+def test_native_uid_delegates_to_verl_balancer(monkeypatch, balancer):
 
     captured = {}
 
@@ -117,7 +132,7 @@ def test_native_uid_delegates_to_verl_balancer(monkeypatch):
         captured.update(seqlen_list=seqlen_list, uid_list=uid_list, k=k_partitions)
         return [[0, 1], [2, 3]]
 
-    monkeypatch.setattr(seqlen_balancing, "get_group_balanced_partitions", fake_partition)
+    monkeypatch.setattr(balancer, "get_group_balanced_partitions", fake_partition)
     plan = plan_verl_uid([[1, 2], [1, 3], [9, 8], [9, 7]], ["a", "a", "b", "b"], 2)
     assert plan.partitions == ((0, 1), (2, 3))
     assert captured == {
@@ -127,11 +142,9 @@ def test_native_uid_delegates_to_verl_balancer(monkeypatch):
     }
 
 
-def test_native_uid_rejects_unequal_rows_from_upstream(monkeypatch):
-    from verl.utils import seqlen_balancing
-
+def test_native_uid_rejects_unequal_rows_from_upstream(monkeypatch, balancer):
     monkeypatch.setattr(
-        seqlen_balancing, "get_group_balanced_partitions",
+        balancer, "get_group_balanced_partitions",
         lambda **kw: [[0], [1, 2, 3]],
     )
     with pytest.raises(ValueError, match="unequal per-DP row counts"):
@@ -139,16 +152,17 @@ def test_native_uid_rejects_unequal_rows_from_upstream(monkeypatch):
 
 
 
-def test_tpr_dp_uid_scoped_cost_matches_existing_tpr_semantics():
+def test_tpr_dp_uid_scoped_cost_matches_turn_semantics():
     # Token-identical trajectories from different UIDs are NOT coalesced by
-    # our existing build_trajectory_trees. DTA's global trie would say 5,
-    # but the actual TPR forest has two independent 4-token paths.
+    # the Turn builder. There is also no COMPLETE shared turn between the two
+    # distinct uidA rows: the actual forest has three 4-token paths.
     sequences = [[1, 2, 3, 4], [1, 2, 3, 5], [1, 2, 3, 4]]
     keys = ["uidA_rollout_0", "uidA_rollout_1", "uidB_rollout_0"]
     plan = plan_tpr_dta_dp(sequences, keys, dp_size=1)
     assert plan.policy == "tpr_dta"
-    assert plan.global_tree_tokens == 9
-    assert plan.tree_tokens_by_rank == (9,)
+    assert plan.global_tree_tokens == 12
+    assert plan.tree_tokens_by_rank == (12,)
+    assert plan.cost_model == "qwen_turn"
     assert _tree_token_cost(sequences) == 5
 
 
@@ -170,3 +184,62 @@ def test_tpr_dp_key_contract():
         plan_tpr_dta_dp([[1], [1]], ["a_b_0", "a_b_0"], 1)
     with pytest.raises(ValueError, match="trajectory key"):
         plan_tpr_dta_dp([[1]], ["invalid"], 1)
+
+
+def _execution_cost(sequences, keys, prompts=None, minimum=128):
+    from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans
+    boundaries = [1] * len(sequences) if prompts is None else [max(1, n) for n in prompts]
+    batch = {"input_ids": [torch.tensor(s) for s in sequences],
+             "response_mask": [torch.ones(len(s) - n, dtype=torch.bool)
+                               for s, n in zip(sequences, boundaries, strict=True)]}
+    if prompts is not None:
+        batch["prompts"] = [torch.tensor(s[:n]) for s, n in zip(sequences, prompts, strict=True)]
+    forest = build_tree_execution_plans(keys, batch, turn_min_segment_tokens=minimum)
+    return sum(segment.length for tree in forest.trees for segment in tree.segment_plan.segments.values())
+
+
+def test_partial_turn_is_not_invented_shared_work():
+    seqs = [[11] * 100 + [21, 151645], [11] * 100 + [22, 151645]]
+    keys = ["uid_tpr_0", "uid_tpr_1"]
+    for dp in (1, 2):
+        plan = plan_tpr_dta_dp(seqs, keys, dp)
+        assert plan.global_tree_tokens == _execution_cost(seqs, keys) == 204
+        assert plan.duplicated_tree_tokens == 0
+
+
+@pytest.mark.parametrize("seed", range(24))
+def test_turn_cost_matches_real_forest_with_prompts_uids_and_duplicates(seed):
+    rng = random.Random(seed)
+    seqs = [[1, 2, 151645, 3, 151645, 4 + i % 2, 151645] for i in range(6)]
+    prompts = [rng.choice((2, 3, 5)) for _ in seqs]
+    keys = [f"uid{i % 2}_tpr_{i}" for i in range(len(seqs))]
+    minimum = rng.choice((1, 3, 128))
+    plan = plan_tpr_dta_dp(seqs, keys, 2, enforce_equal_rows=False,
+                           prompt_lengths=prompts, turn_min_segment_tokens=minimum)
+    assert plan.global_tree_tokens == _execution_cost(seqs, keys, prompts, minimum)
+    costs = tuple(_execution_cost([seqs[i] for i in part], [keys[i] for i in part],
+                                  [prompts[i] for i in part], minimum) for part in plan.partitions)
+    assert plan.tree_tokens_by_rank == costs
+    assert plan.duplicated_tree_tokens == sum(costs) - plan.global_tree_tokens
+
+
+def test_turn_minimax_matches_exhaustive_real_forest_intervals():
+    from verl.workers.engine.megatron.tpr.tree import _turn_units
+    seqs = [[1, 151645, 2, 151645], [1, 151645, 3, 151645],
+            [1, 151645, 3, 4, 151645], [5, 151645], [5, 151645, 6, 151645], [7, 151645]]
+    keys = [f"uid_tpr_{i}" for i in range(len(seqs))]
+    order = sorted(range(len(seqs)), key=lambda i: tuple(u for u, _ in _turn_units(seqs[i], 0, 1)))
+    expected = min(max(_execution_cost([seqs[i] for i in order[a:b]],
+                                      [keys[i] for i in order[a:b]], minimum=1)
+                       for a, b in zip((0, *cuts), (*cuts, len(order))))
+                   for cuts in combinations(range(1, len(order)), 2))
+    actual = plan_tpr_dta_dp(seqs, keys, 3, enforce_equal_rows=False, turn_min_segment_tokens=1)
+    assert actual.max_tree_tokens == expected
+
+
+@pytest.mark.parametrize("prompts,minimum", [([0], 1), ([-1, 0], 1), ([0, 4], 1), ([0, 0], 0),
+                                            ([0, 0], True)])
+def test_turn_cost_rejects_wrong_boundary_configuration(prompts, minimum):
+    with pytest.raises(ValueError):
+        plan_tpr_dta_dp([[1, 2], [1, 3]], ["u_tpr_0", "u_tpr_1"], 1,
+                        prompt_lengths=prompts, turn_min_segment_tokens=minimum)

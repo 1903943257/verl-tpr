@@ -18,7 +18,7 @@ import pytest
 
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
-from verl.experimental.tpr.gdn.module_spec import _get_layer_specs
+from verl.workers.engine.megatron.tpr.adapter import _get_layer_specs
 from verl.models.mcore.tpr import (
     TPRSelfAttention,
     make_tpr_module_spec_provider,
@@ -177,6 +177,16 @@ def test_hybrid_spec_dispatch_preserves_pattern_and_is_idempotent(monkeypatch):
 def test_rejects_unsupported_attention_module():
     with pytest.raises(TypeError, match="unsupported attention module"):
         replace_self_attention_with_tpr(_layer_spec(_UnsupportedAttention))
+
+
+def test_production_rejects_every_non_dense_spec_without_optional_imports():
+    class OtherAttention:
+        pass
+
+    mixed = SimpleNamespace(layer_specs=[_layer_spec(), _layer_spec(OtherAttention)])
+    with pytest.raises(TypeError, match="requires Megatron SelfAttention"):
+        replace_self_attention_with_tpr(mixed)
+    assert _attention_spec(mixed.layer_specs[0]).module is SelfAttention
 
 
 @pytest.mark.parametrize(

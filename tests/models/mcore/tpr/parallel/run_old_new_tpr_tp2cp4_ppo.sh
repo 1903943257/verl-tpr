@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Replay true Actor PPO through old and new TP2CP4 TPR separately.
+# Compare two canonical Engine-layout checkouts (e.g. ce6387c5 vs PR7).
+# Historical pre-refactor model-directory adapters are not supported here.
 # bash tests/models/mcore/tpr/parallel/run_old_new_tpr_tp2cp4_ppo.sh \
 #   /workspace/verl-tpr-old /workspace/verl-tpr-review \
 #   /workspace/tpr_actor_capture_4b_n8_run1/actor_update_rank0_batch0.pt \
@@ -50,19 +51,16 @@ for version in old new; do
     (
         cd "$source_dir"
         export PYTHONPATH="$source_dir:${PYTHONPATH:-}"
-        if [[ "$version" == old ]]; then
-            python -c 'import inspect; from verl.models.mcore.tpr.megatron_adapter import run_tpr_forward_backward_batch as f; print("ACTUAL_TPR_ADAPTER", inspect.getfile(f), flush=True)'
-        else
-            python -c 'import inspect; from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch as f; print("ACTUAL_TPR_ADAPTER", inspect.getfile(f), flush=True)'
-        fi
+        python -c 'import inspect; from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch as f; print("ACTUAL_TPR_ADAPTER", inspect.getfile(f), flush=True)'
         bash tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_offline_ppo.sh
     ) 2>&1 | tee "$OUT/$version.log"
 done
+# Phase acceptance uses an explicit 2% BF16 gradient engineering tolerance.
+# Do not weaken the comparator's standalone defaults or disable full gradients.
+compare_args=("$OUT/old" "$OUT/new" --grad-rel-max "${TPR_ACCEPT_GRAD_REL_L2:-0.02}")
 if [[ "$TPR_OFFLINE_SAVE_FULL_GRADS" == "1" ]]; then
-    python "$NEW/tests/models/mcore/tpr/parallel/compare_old_new_tpr_tp2cp4_ppo.py" \
-        "$OUT/old" "$OUT/new" --require-full-grads | tee "$OUT/comparison.log"
-else
-    python "$NEW/tests/models/mcore/tpr/parallel/compare_old_new_tpr_tp2cp4_ppo.py" \
-        "$OUT/old" "$OUT/new" | tee "$OUT/comparison.log"
+    compare_args+=(--require-full-grads)
 fi
+python "$NEW/tests/models/mcore/tpr/parallel/compare_old_new_tpr_tp2cp4_ppo.py" \
+    "${compare_args[@]}" | tee "$OUT/comparison.log"
 echo "TPR_OLD_NEW_REPLAY_DONE result=$OUT/comparison.log"

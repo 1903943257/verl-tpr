@@ -27,7 +27,9 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
-from verl.models.mcore.tpr.context import KVPair, TPRAttentionContext, use_tpr_attention_context
+from verl.models.mcore.tpr.context import KVPair
+from verl.experimental.tpr.gdn.context import GDNTPRAttentionContext as TPRAttentionContext
+from verl.experimental.tpr.gdn.context import use_tpr_attention_context
 from verl.experimental.tpr.offload import validate_activation_offload, with_activation_offload
 from verl.workers.engine.megatron.tpr.state import KVStack
 from verl.experimental.tpr.legacy.cp.backend import TPRCPBackend, resolve_tpr_cp_backend

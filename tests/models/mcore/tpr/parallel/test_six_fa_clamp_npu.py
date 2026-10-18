@@ -26,7 +26,7 @@ FA_LAYERS = (4, 8, 12, 16, 20, 24)
 @contextmanager
 def clamp_segment(model, sid, runtime, monkeypatch, *, cp, reference, store, layers, counts):
     from verl.models.mcore.tpr import attention
-    from verl.models.mcore.tpr.context import TPRAttentionContext
+    from verl.experimental.tpr.gdn.context import GDNTPRAttentionContext as TPRAttentionContext
     from verl.experimental.tpr import ring_attention as ring
     shard = ring.make_ring_sequence_shard(128, cp_rank=runtime.cp_group.rank(), cp_size=2)
     indices = shard.global_indices(device="cpu")

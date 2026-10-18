@@ -26,8 +26,17 @@ from verl.workers.engine.megatron.tpr.placement import plan_tpr_dta_dp
 from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
 from verl.utils import tensordict_utils as tu
 
+# Avoid module-level NPU skip during checkpoint helper import, before
+# _runtime() is entered for this opt-in distributed test.
+if os.getenv("TPR_RUN_TP2CP2DP2_ONE_STEP") == "1":
+    import torch_npu  # noqa: F401
+
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
-from .test_real_actor_tp2cp4_offline_ppo_npu import _PPO, _load_real_pair
+from .test_real_actor_tp2cp4_offline_ppo_npu import (
+    _PPO,
+    _load_real_pair,
+    _sanitize_mindspeed_repatch_args,
+)
 
 pytestmark = pytest.mark.skipif(
     os.getenv("TPR_RUN_TP2CP2DP2_ONE_STEP") != "1",
@@ -65,7 +74,9 @@ def _runtime():
             pipeline_model_parallel_size=1,
             expert_model_parallel_size=1,
         )
-    assert get_full_args().context_parallel_algo == "megatron_cp_algo"
+    args = get_full_args()
+    _sanitize_mindspeed_repatch_args(args)
+    assert args.context_parallel_algo == "megatron_cp_algo"
     tp = parallel_state.get_tensor_model_parallel_group()
     cp = parallel_state.get_context_parallel_group()
     dp = parallel_state.get_data_parallel_group()
@@ -267,6 +278,8 @@ def _placement(capture, runtime, expected_tokens):
     sequences = [list(map(int, ids.tolist())) for ids in global_batch["input_ids"].unbind(0)]
     placement = plan_tpr_dta_dp(
         sequences, global_keys, dp_size=2, enforce_equal_rows=False,
+        prompt_lengths=[int(ids.numel()) for ids in global_batch["prompts"].unbind(0)],
+        turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
     )
     if (sorted(sum((list(p) for p in placement.partitions), [])) != list(range(8))
             or not all(placement.partitions)):
@@ -353,6 +366,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 flush=True,
             )
         runs = []
+        local_profiles = [] if profile else None
         for iteration in range(warmups + repeats):
             model.zero_grad(set_to_none=True)
             dist.barrier()
@@ -364,6 +378,20 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             )
             torch.npu.synchronize()
             own_seconds = time.perf_counter() - start
+            # Lightweight native SegmentEventProfiler: NPU Events and allocator
+            # counters only. Materialize AFTER the existing synchronization;
+            # never enable torch_npu.profiler or emit an operator timeline.
+            segment_profile = None
+            if profile:
+                segment_profile = {
+                    "iteration": iteration,
+                    "warmup": iteration < warmups,
+                    "stage_host_ms": dict(engine._tpr_stage_profile),
+                    "segments": engine._tpr_segment_event_profiler.materialize(),
+                    "segment_peak_allocated_bytes": int(engine._tpr_segment_peak_allocated_bytes),
+                    "segment_peak_reserved_bytes": int(engine._tpr_segment_peak_reserved_bytes),
+                }
+                local_profiles.append(segment_profile)
 
             # Ascend 910B HCCL Reduce does NOT support float64. These
             # world MAX reductions must use FP32 or their outputs may stay
@@ -374,9 +402,13 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             dist.all_reduce(
                 critical, op=dist.ReduceOp.MAX, group=dist.group.WORLD,
             )
+            # SegmentEventProfiler resets local peak counters at event
+            # boundaries. Preserve the overall peak across those resets.
+            local_peak = int(torch.npu.max_memory_allocated())
+            if segment_profile is not None:
+                local_peak = max(local_peak, segment_profile["segment_peak_allocated_bytes"])
             peak = torch.tensor(
-                float(torch.npu.max_memory_allocated()),
-                dtype=torch.float32, device=runtime.device,
+                float(local_peak), dtype=torch.float32, device=runtime.device,
             )
             dist.all_reduce(
                 peak, op=dist.ReduceOp.MAX, group=dist.group.WORLD,
@@ -432,7 +464,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                     "stage_ms": {},
                 })
             if profile and dist.get_rank() == 0:
-                gathered[0]["stage_ms"] = dict(engine._tpr_stage_profile)
+                gathered[0]["stage_ms"] = dict(segment_profile["stage_host_ms"])
             from .tpr_dp2_loss_consistency import analyze_dp2_loss_report
             loss_report = analyze_dp2_loss_report(gathered)
             if dist.get_rank() == 0:
@@ -466,6 +498,19 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 )
             dist.barrier()
 
+        if profile:
+            # One small JSON per rank: no HCCL object collectives, no trace
+            # parsing, no profiler threads, and no synchronization beyond the
+            # existing training/replay barriers.
+            output.mkdir(parents=True, exist_ok=True)
+            report = output / f"step{step}_rank{dist.get_rank()}_segments.json"
+            report.write_text(json.dumps({
+                "source_step": step, "rank": dist.get_rank(),
+                "topology": {"tp": 2, "cp": 2, "dp": 2},
+                "profile_kind": "npu_events_and_allocator_counters",
+                "runs": local_profiles,
+            }, indent=2), encoding="utf-8")
+
         gradient_witness = None
         replica_policy = os.getenv("TPR_BENCH_GRAD_REPLICA_POLICY", "strict")
         if replica_policy not in ("strict", "diagnostic"):
@@ -491,6 +536,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 "source_capture": str(capture), "checkpoint": str(checkpoint),
                 "input_sha256": sha, "global_ppo_tokens": global_tokens,
                 "placement_policy": plan.policy,
+                "placement_cost_model": plan.cost_model,
                 "dp_partitions": [list(x) for x in plan.partitions],
                 "dp_tree_token_costs": list(plan.tree_tokens_by_rank),
                 "global_tree_tokens": plan.global_tree_tokens,
