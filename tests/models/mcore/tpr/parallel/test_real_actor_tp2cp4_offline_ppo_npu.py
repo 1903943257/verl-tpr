@@ -24,6 +24,13 @@ import torch.distributed as dist
 from megatron.core import parallel_state
 
 from verl.utils import tensordict_utils as tu
+
+# The checkpoint helper imports legacy NPU-gated test utilities at module
+# collection time. For an explicitly requested eight-NPU replay, register
+# torch.npu before their module-level availability check runs.
+if os.getenv("TPR_RUN_REAL_ACTOR_TP2CP4") == "1":
+    import torch_npu  # noqa: F401
+
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 
 pytestmark = pytest.mark.skipif(
