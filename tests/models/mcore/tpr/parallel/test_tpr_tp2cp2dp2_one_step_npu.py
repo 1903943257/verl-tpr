@@ -359,6 +359,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 flush=True,
             )
         runs = []
+        local_profiles = [] if profile else None
         for iteration in range(warmups + repeats):
             model.zero_grad(set_to_none=True)
             dist.barrier()
@@ -370,6 +371,20 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             )
             torch.npu.synchronize()
             own_seconds = time.perf_counter() - start
+            # Lightweight native SegmentEventProfiler: NPU Events and allocator
+            # counters only. Materialize AFTER the existing synchronization;
+            # never enable torch_npu.profiler or emit an operator timeline.
+            segment_profile = None
+            if profile:
+                segment_profile = {
+                    "iteration": iteration,
+                    "warmup": iteration < warmups,
+                    "stage_host_ms": dict(engine._tpr_stage_profile),
+                    "segments": engine._tpr_segment_event_profiler.materialize(),
+                    "segment_peak_allocated_bytes": int(engine._tpr_segment_peak_allocated_bytes),
+                    "segment_peak_reserved_bytes": int(engine._tpr_segment_peak_reserved_bytes),
+                }
+                local_profiles.append(segment_profile)
 
             # Ascend 910B HCCL Reduce does NOT support float64. These
             # world MAX reductions must use FP32 or their outputs may stay
@@ -380,9 +395,13 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             dist.all_reduce(
                 critical, op=dist.ReduceOp.MAX, group=dist.group.WORLD,
             )
+            # SegmentEventProfiler resets local peak counters at event
+            # boundaries. Preserve the overall peak across those resets.
+            local_peak = int(torch.npu.max_memory_allocated())
+            if segment_profile is not None:
+                local_peak = max(local_peak, segment_profile["segment_peak_allocated_bytes"])
             peak = torch.tensor(
-                float(torch.npu.max_memory_allocated()),
-                dtype=torch.float32, device=runtime.device,
+                float(local_peak), dtype=torch.float32, device=runtime.device,
             )
             dist.all_reduce(
                 peak, op=dist.ReduceOp.MAX, group=dist.group.WORLD,
@@ -438,7 +457,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                     "stage_ms": {},
                 })
             if profile and dist.get_rank() == 0:
-                gathered[0]["stage_ms"] = dict(engine._tpr_stage_profile)
+                gathered[0]["stage_ms"] = dict(segment_profile["stage_host_ms"])
             from .tpr_dp2_loss_consistency import analyze_dp2_loss_report
             loss_report = analyze_dp2_loss_report(gathered)
             if dist.get_rank() == 0:
@@ -471,6 +490,19 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                     flush=True,
                 )
             dist.barrier()
+
+        if profile:
+            # One small JSON per rank: no HCCL object collectives, no trace
+            # parsing, no profiler threads, and no synchronization beyond the
+            # existing training/replay barriers.
+            output.mkdir(parents=True, exist_ok=True)
+            report = output / f"step{step}_rank{dist.get_rank()}_segments.json"
+            report.write_text(json.dumps({
+                "source_step": step, "rank": dist.get_rank(),
+                "topology": {"tp": 2, "cp": 2, "dp": 2},
+                "profile_kind": "npu_events_and_allocator_counters",
+                "runs": local_profiles,
+            }, indent=2), encoding="utf-8")
 
         gradient_witness = None
         replica_policy = os.getenv("TPR_BENCH_GRAD_REPLICA_POLICY", "strict")
