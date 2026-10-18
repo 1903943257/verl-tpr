@@ -100,7 +100,12 @@ def _run_controlled_full(model, batch, *, loss_fn, forest):
 
     if get_tpr_attention_context() is not None:
         raise AssertionError("Full must execute with NO TPRAttentionContext")
-    objective = SegmentPPOObjectiveAdapter(batch, loss_fn)
+    chunk_size = int(os.getenv("TPR_PPO_LOGPROB_CHUNK_TOKENS", "0"))
+    if chunk_size < 0:
+        raise ValueError("TPR_PPO_LOGPROB_CHUNK_TOKENS must be nonnegative")
+    objective = SegmentPPOObjectiveAdapter(
+        batch, loss_fn, log_prob_chunk_size=chunk_size or None,
+    )
     losses = []
     for tree in forest.trees:
         plan = tree.segment_plan
