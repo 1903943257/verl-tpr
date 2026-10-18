@@ -1,16 +1,5 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 
 
 """CANN fused attention primitives and FP32 online softmax for Ring CP."""
@@ -32,19 +21,6 @@ _MAX_TOKENS = 2**31 - 1
 
 def _range_validity(item: _RingRangeSlice, *, device: torch.device) -> Tensor:
     return torch.arange(item.physical_length, device=device) < item.valid_length
-
-
-def _check_attention_mask(attention_mask: Tensor | None, query: Tensor, key: Tensor) -> Tensor | None:
-    if attention_mask is None:
-        return None
-    if attention_mask.dtype != torch.bool:
-        raise ValueError("Ring physical attention mask must use torch.bool")
-    if tuple(attention_mask.shape) != (query.shape[0], key.shape[0]):
-        raise ValueError(
-            "Ring physical attention mask shape must match Q/KV, got "
-            f"{tuple(attention_mask.shape)} for Q={query.shape[0]}, KV={key.shape[0]}"
-        )
-    return attention_mask.contiguous()
 
 
 def _physical_block_attention_mask(
@@ -124,7 +100,15 @@ def _block_attention_forward(
     except ImportError as exc:  # pragma: no cover - requires the server NPU runtime
         raise RuntimeError("torch_npu is required for Ring CP attention") from exc
     causal_fast_path = block_kind is RingBlockKind.CAUSAL and attention_mask is None
-    attention_mask = _check_attention_mask(attention_mask, query, key)
+    if attention_mask is not None:
+        if attention_mask.dtype != torch.bool:
+            raise ValueError("Ring physical attention mask must use torch.bool")
+        if tuple(attention_mask.shape) != (query.shape[0], key.shape[0]):
+            raise ValueError(
+                "Ring physical attention mask shape must match Q/KV, got "
+                f"{tuple(attention_mask.shape)} for Q={query.shape[0]}, KV={key.shape[0]}"
+            )
+        attention_mask = attention_mask.contiguous()
     result = torch_npu.npu_fusion_attention(
         query,
         key,
@@ -266,7 +250,15 @@ def _block_attention_backward(
     except ImportError as exc:  # pragma: no cover - requires the server NPU runtime
         raise RuntimeError("torch_npu is required for Ring CP attention backward") from exc
     causal_fast_path = block_kind is RingBlockKind.CAUSAL and attention_mask is None
-    attention_mask = _check_attention_mask(attention_mask, query, key)
+    if attention_mask is not None:
+        if attention_mask.dtype != torch.bool:
+            raise ValueError("Ring physical attention mask must use torch.bool")
+        if tuple(attention_mask.shape) != (query.shape[0], key.shape[0]):
+            raise ValueError(
+                "Ring physical attention mask shape must match Q/KV, got "
+                f"{tuple(attention_mask.shape)} for Q={query.shape[0]}, KV={key.shape[0]}"
+            )
+        attention_mask = attention_mask.contiguous()
     result = torch_npu.npu_fusion_attention_grad(
         query,
         key,
