@@ -546,3 +546,65 @@ def test_all_padded_query_rank_falls_back_from_query_merge():
         )
         q = torch.zeros(shard.local_length, 1, 4, 8)
         assert not ring._can_coalesce_prefix_query(q, cfg)
+
+
+@pytest.mark.parametrize("four_dimensional", [False, True])
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_single_sequence_statistics_preserve_head_major_values(four_dimensional, noncontiguous):
+    length, heads, lanes = 7, 3, 8
+    head_major = torch.arange(heads * length * lanes).reshape(heads, length, lanes).float()
+    shape = (1, heads, length, lanes) if four_dimensional else (length, heads, lanes)
+    statistics = head_major.reshape(shape)
+    if noncontiguous:
+        statistics = torch.stack((statistics, -statistics), dim=-1)[..., 0]
+    flattened = ring._flatten_tnd_softmax(statistics, (length,))
+    torch.testing.assert_close(flattened, head_major.transpose(0, 1), rtol=0, atol=0)
+    if not noncontiguous:
+        assert flattened.untyped_storage().data_ptr() == statistics.untyped_storage().data_ptr()
+    restored = ring._unflatten_tnd_softmax(flattened, (length,))
+    assert restored.is_contiguous()
+    torch.testing.assert_close(restored, head_major.reshape(length, heads, lanes), rtol=0, atol=0)
+    for invalid_lengths in ((length - 1,), (3, 4)):
+        with pytest.raises(ValueError, match="one matching query length"):
+            ring._flatten_tnd_softmax(statistics, invalid_lengths)
+
+
+@pytest.mark.parametrize("visibility", ["full", "causal", "padded"])
+def test_forward_backward_use_identical_cann_visibility(monkeypatch, visibility):
+    calls = []
+    query = torch.zeros(4, 2, 8)
+    key = value = torch.zeros(4, 1, 8)
+    statistics = torch.ones(4, 2, 8)
+
+    def fused(*args, **kwargs):
+        calls.append(kwargs)
+        return query, statistics, statistics
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(
+        npu_fusion_attention=fused, npu_fusion_attention_grad=fused,
+    ))
+    kind = RingBlockKind.FULL if visibility == "full" else RingBlockKind.CAUSAL
+    mask = None
+    if visibility == "padded":
+        mask = torch.zeros(4, 8, dtype=torch.bool)[:, ::2]
+        mask[:, -1] = True
+    common = dict(query_heads=2, softmax_scale=0.25, block_kind=kind, attention_mask=mask)
+    ring._block_attention_forward(query, key, value, **common)
+    ring._block_attention_backward(query, key, value, query,
+        attention_output=query, softmax_max=statistics, softmax_sum=statistics, **common)
+    forward, backward = calls
+    assert forward.pop("scale") == backward.pop("scale_value") == 0.25
+    assert forward.pop("inner_precise") == 0
+    for name in ("attention_in", "softmax_max", "softmax_sum"):
+        backward.pop(name)
+    assert forward.keys() == backward.keys()
+    for name in forward:
+        if isinstance(forward[name], torch.Tensor):
+            torch.testing.assert_close(forward[name], backward[name], rtol=0, atol=0)
+        else:
+            assert forward[name] == backward[name]
+    assert forward["sparse_mode"] == (3 if visibility == "causal" else 0)
+    assert forward["next_tockens"] == (0 if visibility == "causal" else 2**31 - 1)
+    if mask is not None:
+        assert forward["atten_mask"].is_contiguous()
+        torch.testing.assert_close(forward["atten_mask"], mask)

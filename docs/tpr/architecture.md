@@ -213,3 +213,23 @@ python -m pytest -q tests/models/mcore/tpr/unit/test_production_architecture.py
 
 NPU integration tests require a configured Ascend 910 / MindSpeed / Megatron
 stack and authentic actor captures. Record every skipped gate explicitly.
+
+### Ring maintenance branch (2026-10-18)
+
+Continue Ring implementation, QKV experiments and their acceptance tests on
+`refactor/tpr-ring-layout-validation-main-20261016`. The canonical source is
+`verl/workers/engine/megatron/tpr/ring.py`.
+
+The gradient/contract fixes from `75b53c15` are adapted to this Engine-owned
+implementation: FP32 dQ accumulation, shared CANN visibility parameters,
+single-sequence TND statistics conversion and shared K/Q slice metadata for
+V/dO. The prepared per-Segment layout, padded joint Query+KV merging, valid
+KV gradient scatter, virtual Query masking, native whole-Ring reference and
+effective FA counters are retained. FULL/QUERY/PADDED merging remains opt-in
+with all three flags defaulting to zero.
+
+The historical experimental AllGather/Ulysses references remain available on
+this branch. The old Ring-only branch's removal of those test parameters does
+not apply to these independent references. Deep-Prefix CPU and NPU regression
+tests supplement the existing padded CP2/CP4 gates; CPU validation does not
+establish CANN/HCCL numerical or throughput acceptance.

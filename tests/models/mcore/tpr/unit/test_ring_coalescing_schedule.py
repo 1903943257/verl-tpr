@@ -78,15 +78,20 @@ class Tensor:
         assert self.shape == other.shape
         return self
 
+    def to(self, *args, **kwargs):
+        return self
+
 
 def shard(length, *, cp_rank, cp_size, padded_length=None):
     padded_length = padded_length or length
     chunk = padded_length // (2 * cp_size)
     ranges = ((cp_rank * chunk, (cp_rank + 1) * chunk),
               ((2 * cp_size - cp_rank - 1) * chunk, (2 * cp_size - cp_rank) * chunk))
+    valid_ranges = tuple((start, min(end, length)) for start, end in ranges if start < length)
     return SimpleNamespace(global_length=length, padded_length=padded_length,
                            local_length=2 * chunk, physical_global_ranges=ranges,
-                           global_ranges=ranges)
+                           ranges=ranges, global_ranges=valid_ranges,
+                           valid_local_length=sum(end - start for start, end in valid_ranges))
 
 
 def load_dispatch():
@@ -94,13 +99,13 @@ def load_dispatch():
     wanted = {"RingBlockKind", "_RingRangeSlice", "_iter_range_slices", "_prefix_full_slices",
               "classify_ring_block", "_physical_block_attention_mask", "_RingTPRAttention",
               "_can_coalesce_prefix_query", "_slice_tnd_result", "_trace_merged_query",
-              "_source_schedule"}
+              "_can_coalesce_prefix_kv", "_source_merged_prefix_kv", "_source_schedule"}
     nodes = [node for node in ast.parse(source.read_text(encoding="utf-8")).body
              if isinstance(node, (ast.ClassDef, ast.FunctionDef)) and node.name in wanted]
     preamble = ast.parse("from __future__ import annotations").body
     ns = dict(dataclass=dataclass, Enum=Enum,
               torch=SimpleNamespace(autograd=SimpleNamespace(Function=object),
-                                    zeros_like=lambda t: Tensor(t.shape)),
+                                    zeros_like=lambda t, **kw: Tensor(t.shape), float32="fp32"),
               _RingAttentionConfig=SimpleNamespace, make_ring_sequence_shard=shard)
     exec(compile(ast.Module(body=preamble + nodes, type_ignores=[]), str(source), "exec"), ns)
     return ns
@@ -142,7 +147,8 @@ class DispatchTests(unittest.TestCase):
                                  segment_padded_lengths=(16384,) * (2 if prefix else 1),
                                  cp_size=cp, cp_rank=rank, current_shard=current,
                                  query_heads=16, head_dim=128, softmax_scale=1,
-                                 coalesce_prefix_full=enabled, coalesce_prefix_query=query_enabled)
+                                 coalesce_prefix_full=enabled, coalesce_prefix_query=query_enabled,
+                                 coalesce_prefix_padded=False, trace_layer=None)
         q = Tensor((current.local_length, 1, 16, 128))
         query_storage.append(q.storage)
         kv = [Tensor((current.local_length, 1, 8, 128)) for _ in range(2 * len(config.segment_lengths))]
@@ -199,6 +205,8 @@ class DispatchTests(unittest.TestCase):
     def test_query_eligibility_fallback(self):
         ns = load_dispatch()
         config = SimpleNamespace(coalesce_prefix_full=True, coalesce_prefix_query=True,
+                                 coalesce_prefix_padded=False,
+                                 current_shard=shard(64, cp_rank=0, cp_size=2),
                                  segment_lengths=(128, 64), segment_padded_lengths=(128, 64))
         q = Tensor((16, 1, 4, 8))
         self.assertTrue(ns["_can_coalesce_prefix_query"](q, config))
@@ -213,10 +221,16 @@ class DispatchTests(unittest.TestCase):
         tensor = Tensor((4096, 8, 128))
         full = shard(16384, cp_rank=0, cp_size=4)
         items = ns["_prefix_full_slices"](tensor, full, enabled=True)
-        self.assertIs(items[0].tensor, tensor)
+        self.assertIs(items[0].tensor.storage, tensor.storage)
         self.assertEqual(items[0].local_slice, slice(0, 4096))
         padded = shard(16383, cp_rank=0, cp_size=4, padded_length=16384)
+        # The padded opt-in now trims virtual tail tokens in one zero-copy view.
         items = ns["_prefix_full_slices"](tensor, padded, enabled=True)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].valid_length, 4095)
+        self.assertIs(items[0].tensor.storage, tensor.storage)
+        # Without the opt-in, preserve the original two physical chunks.
+        items = ns["_prefix_full_slices"](tensor, padded, enabled=False)
         self.assertEqual(len(items), 2)
         self.assertEqual(items[-1].valid_length, 2047)
 
