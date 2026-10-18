@@ -237,6 +237,13 @@ establish CANN/HCCL numerical or throughput acceptance.
 
 ### Experimental Fast Root Ring (2026-10-18)
 
+Set `TPR_ROOT_NATIVE_RING_PHASE` to `both` (default), `push`, or `pop`
+when `TPR_ROOT_NATIVE_RING=1`. Push-only switches graph-free Root KV
+creation; Pop-only switches the recomputed Root forward/backward. These
+are diagnostic ablations, not independent production configurations.
+Record the phase in the output directory name, and keep the same captured
+Actor batch, qwen_turn topology, Prefix Merge settings and model weights.
+
 Use `TPR_ROOT_NATIVE_RING=1` to opt in; default is `0`. Only the actual tree
 Root (`segment_id == plan.root_id`, no parent) switches to MindSpeed's native
 `ringattn_context_parallel()` via the existing `ordinary_ring_cp_attention()`.
