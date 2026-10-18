@@ -586,3 +586,51 @@ TPR_OFFLINE_MODE=tpr torchrun --nproc_per_node=8 \
 After stabilization in no-audit mode, verify Full/TPR logprob
 alignment and full parameter-gradient parity separately; small scalar
 PPO loss differences do not establish training-gradient equivalence.
+
+
+## TP2 CP2 DP2 recompute compatibility experiment (8 Ascend NPUs)
+
+Status: code committed, server NPU validation pending. Reuses the existing
+Qwen3-4B real-Actor PPO one-step TP2 RingCP2 DP2 replay and original
+session-first8 Step6 captures and DTA/DFS minimax placement. No changes to
+production TP/CP/DP, Ring kernels or optimizer paths.
+
+Two independent eight-rank jobs load the same HF weights, replay the same
+original PPO fields, and run TPR Recompute OFF and ON (full/uniform/1).
+Every TransformerBlock is checked for successful KV-aware installation.
+The test repeats frozen-weight F/B with CP×DP gradient finalization. After
+timing, all BF16 gradients from TP0/TP1 CP0/DP0 are saved, then a single
+CPU FP32-master AdamW update uses the worldwide global gradnorm and clipping.
+Each TP-local CP×DP group receives updated BF16 parameters via broadcast.
+A separate CPU comparator reads every saved parameter gradient and checks
+whole-gradient relative L2 and max-abs, global PPO loss, exact gradient
+replica witness, and post-update sampled weights. OFF and ON use distinct
+fresh processes and output subdirectories; no partial result is called PASS.
+
+Host:
+    cd /mnt/pipeline-data/j00972288/project/uniagent_linear/verl-tpr-recompute
+    git pull --ff-only
+
+Docker:
+    cd /workspace/verl-tpr-recompute
+    mkdir -p /workspace/tpr_log/recompute
+    python -m pytest -q -x tests/models/mcore/tpr/unit/test_tpr_dp2_recompute_compare_cpu.py 2>&1 | tee /workspace/tpr_log/recompute/dp2_compare_cpu.log
+    bash tests/models/mcore/tpr/parallel/run_tpr_dp2_recompute_validation.sh /workspace/tpr_offline_run5_first8_40k_v1/capture_manifest.json /workspace/tpr_experiments/recompute_dp2_step6_pair_v1 6
+
+The runner uses torchrun --master_addr=127.0.0.1 --master_port=29797,
+never --standalone. It stores logs under its dedicated output/logs, and
+all gradient snapshots inside off/ and on/. Preserve at least two complete
+copies of model BF16 gradients on disk. Offline optimizer is separate from
+timed F/B, and is NOT the production VERL Optimizer or online GRPO loop.
+
+40K CP2/DP2 previously OOMed on some configurations. If the OFF baseline
+fails on 40K, the same-input ON/OFF parity comparison is inconclusive.
+Use the same separately derived 30K manifest for BOTH jobs if necessary
+and label the cap correctly; do not mix 30K with 40K.
+
+The report thresholds default to global PPO loss absolute gap <=1e-3,
+full-gradient rel-L2 <=5%, and sampled updated-weight max-abs <=0.02.
+The per-mode sampled gradient replica gate is strict/exact. Complete
+post-update full-parameter parity and production optimizer throughput
+are NOT established by sampled weight checks. CI/CPU tests do not
+substitute for real 8-NPU HCCL execution.
