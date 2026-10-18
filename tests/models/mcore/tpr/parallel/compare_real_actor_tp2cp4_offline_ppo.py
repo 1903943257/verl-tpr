@@ -115,7 +115,7 @@ def _complete_gradient_metrics(full, tpr):
     }
 
 
-def compare(root):
+def compare(root, *, diagnostic_only=False, require_recompute=False, require_full_grads=False):
     snapshots = {}
     for mode in ("full", "tpr"):
         files = [root / f"{mode}_rank{i}.pt" for i in range(8)]
@@ -124,6 +124,18 @@ def compare(root):
             raise FileNotFoundError(f"Missing {mode} ranks: {missing}")
         snapshots[mode] = [torch.load(path, map_location="cpu", weights_only=False) for path in files]
     full, tpr = snapshots["full"], snapshots["tpr"]
+    if require_recompute:
+        for rank, (a, b) in enumerate(zip(full, tpr, strict=True)):
+            for mode, item in (("full", a), ("tpr", b)):
+                if (item.get("recompute_enabled") is not True
+                        or item.get("recompute_granularity") != "full"
+                        or item.get("recompute_method") != "uniform"
+                        or item.get("recompute_num_layers") != 1
+                        or item.get("recompute_installed_blocks", 0) < 1):
+                    raise AssertionError(
+                        f"rank {rank} {mode}: expected installed full/uniform/1 "
+                        "checkpoint adapter, got invalid saved metadata"
+                    )
     invariant = (
         "source_capture", "source_rows", "source_keys", "data_sha256",
         "checkpoint", "objective", "optimizer", "logical_ppo_tokens",
@@ -166,6 +178,10 @@ def compare(root):
     loss_gap = abs(losses[0][0]-losses[0][1])
     grad_rel = _l2_pair(full, tpr)
     complete_grad = _complete_gradient_metrics(full, tpr)
+    if require_full_grads and complete_grad is None:
+        raise AssertionError(
+            "Complete gradients missing: run both modes with TPR_OFFLINE_SAVE_FULL_GRADS=1"
+        )
     grad_norms = None
     if all("global_bf16_grad_norm" in x for x in full + tpr):
         f_norm = full[0]["global_bf16_grad_norm"]
@@ -221,12 +237,26 @@ def compare(root):
     print(f"TPR_OFFLINE_PERF full={fp} tpr={tp}", flush=True)
     print(f"TPR_OFFLINE_GRAD_NORM {grad_norms}", flush=True)
     print(f"TPR_OFFLINE_COMPLETE_GRAD {complete_grad}", flush=True)
-    if not all(gates.values()):
+    if not all(gates.values()) and not diagnostic_only:
         raise AssertionError("Recorded PPO Full/TPR one-step provisional gate failed")
+    if diagnostic_only:
+        print(
+            "TPR_OFFLINE_DIAGNOSTIC_ONLY: provisional Full-vs-TPR gates "
+            "are reported, not enforced. Distinct execution layouts have "
+            "not been asserted numerically equivalent.",
+            flush=True,
+        )
     return gates
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("output_dir", type=Path)
+    parser.add_argument("--diagnostic-only", action="store_true")
+    parser.add_argument("--require-recompute", action="store_true")
+    parser.add_argument("--require-full-grads", action="store_true")
     args = parser.parse_args()
-    compare(args.output_dir)
+    compare(
+        args.output_dir, diagnostic_only=args.diagnostic_only,
+        require_recompute=args.require_recompute,
+        require_full_grads=args.require_full_grads,
+    )

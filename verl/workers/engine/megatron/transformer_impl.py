@@ -499,6 +499,18 @@ class MegatronEngine(BaseEngine):
             peft_config=self.model_config.get("lora", None),
         )
         self.tf_config = updated_tf_config
+        if (
+            self.engine_config.tpr_enabled
+            and getattr(updated_tf_config, "recompute_granularity", None) is not None
+        ):
+            from verl.utils.megatron_utils import unwrap_model
+            from verl.workers.engine.megatron.tpr.recompute import install_tpr_full_recompute
+
+            # Instance-local: keep native TransformerBlock unchanged for
+            # non-TPR models and avoid global Megatron/MindSpeed patching.
+            if len(module) != 1:
+                raise NotImplementedError("TPR full recompute requires PP/VPP=1")
+            install_tpr_full_recompute(unwrap_model(module[0]), updated_tf_config)
         print(f"module: {len(module)}")
 
         if self.engine_config.use_dist_checkpointing:

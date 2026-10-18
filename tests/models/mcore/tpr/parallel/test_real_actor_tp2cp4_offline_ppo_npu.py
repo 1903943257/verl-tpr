@@ -282,6 +282,13 @@ def test_recorded_full_vs_tpr_one_step():
     mode = os.environ.get("TPR_OFFLINE_MODE")
     if mode not in ("full", "tpr"):
         raise AssertionError("Set TPR_OFFLINE_MODE=full or tpr")
+    recompute_setting = os.getenv("TPR_OFFLINE_RECOMPUTE", "0")
+    if recompute_setting not in ("0", "1"):
+        raise ValueError("TPR_OFFLINE_RECOMPUTE must be 0 or 1")
+    recompute_enabled = recompute_setting == "1"
+    # ON supports both unshared Full (same TPR Ring/Executor without
+    # cross-trajectory sharing) and shared TPR. It does not turn this
+    # controlled Full comparator into a native Megatron Full run.
     rows_value = os.getenv("TPR_OFFLINE_ROWS", "4,6")
     if rows_value == "all":
         raw = torch.load(os.environ["TPR_REAL_ACTOR_MINIBATCH"],
@@ -317,17 +324,55 @@ def test_recorded_full_vs_tpr_one_step():
             tree_policy=os.getenv("TPR_TREE_POLICY", "qwen_turn"),
             turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
         )
-        if mode == "full" and (len(forest.trees) != len(rows)
-                               or forest.segment_count != len(rows)):
-            raise AssertionError("Full control accidentally reused a prefix")
-        # Turn mode can yield multiple trees without shared complete turns.
+        if mode == "full" and (
+            len(forest.trees) != len(rows)
+            or any(len(tree.member_rows) != 1 for tree in forest.trees)
+        ):
+            # Qwen turn-only builds multiple Segments even for an unshared
+            # trajectory.  Isolation is about row ownership, not Segments.
+            raise AssertionError("Full control accidentally reused tokens across rows")
+        # Turn-only TPR may yield multiple trees if complete turns are not shared.
         ring_impl = _install_offline_full_ring_backend(mode)
         if hf.num_hidden_layers != 36:
             raise AssertionError("Not the real Qwen3-4B")
         model.config.no_sync_func = None
         model.config.grad_scale_func = None
         model.config.calculate_per_token_loss = False
-        model.config.recompute_granularity = None
+        # Match the OFF baseline's model, checkpoint, tree and PPO exactly;
+        # only the per-layer activation checkpoint behavior may differ.
+        if recompute_enabled:
+            from megatron.core.transformer.transformer_block import TransformerBlock
+            from verl.workers.engine.megatron.tpr.recompute import (
+                assert_tpr_full_recompute_installed,
+                install_tpr_full_recompute,
+            )
+
+            model.config.recompute_granularity = "full"
+            model.config.recompute_method = "uniform"
+            model.config.recompute_num_layers = 1
+            blocks = [module for module in model.modules() if isinstance(module, TransformerBlock)]
+            if not blocks or any(block.config is not model.config for block in blocks):
+                raise AssertionError("Real Qwen TransformerBlock config is not the model config")
+            installed_blocks = install_tpr_full_recompute(model, model.config)
+            if installed_blocks != len(blocks):
+                raise AssertionError(
+                    f"Recompute installed on {installed_blocks} of {len(blocks)} TransformerBlocks"
+                )
+            assert_tpr_full_recompute_installed(model, model.config)
+        else:
+            model.config.recompute_granularity = None
+            model.config.recompute_method = None
+            model.config.recompute_num_layers = None
+            installed_blocks = 0
+        if os.environ.get("RANK", "0") == "0":
+            print(
+                f"TPR_RECOMPUTE_CONFIG mode={mode} enabled={recompute_enabled} "
+                f"granularity={model.config.recompute_granularity} "
+                f"method={model.config.recompute_method} "
+                f"num_layers={model.config.recompute_num_layers} "
+                f"installed_blocks={installed_blocks}",
+                flush=True,
+            )
         finalize_sec = [0.0]
 
         def finalize(chunks, num_tokens, *, force_all_reduce=False, **kwargs):
@@ -397,6 +442,11 @@ def test_recorded_full_vs_tpr_one_step():
         after = _witness(model, grads=False)
         payload = {
             "mode": mode, "rank": dist.get_rank(),
+            "recompute_enabled": recompute_enabled,
+            "recompute_granularity": model.config.recompute_granularity,
+            "recompute_method": model.config.recompute_method,
+            "recompute_num_layers": model.config.recompute_num_layers,
+            "recompute_installed_blocks": installed_blocks,
             "tp_rank": runtime.tp_rank, "cp_rank": runtime.cp_rank,
             "world": 8, "tp": 2, "cp": 4, "dp": 1,
             "model": "Qwen3-4B", "checkpoint": str(checkpoint),
@@ -434,7 +484,8 @@ def test_recorded_full_vs_tpr_one_step():
             raise FileExistsError(output_path)
         torch.save(payload, output_path)
         print(
-            f"TPR_OFFLINE_REPLAY mode={mode} rank={dist.get_rank()} "
+            f"TPR_OFFLINE_REPLAY mode={mode} recompute={int(recompute_enabled)} "
+            f"installed_blocks={installed_blocks} rank={dist.get_rank()} "
             f"rows={rows} loss={payload['loss']:.9g} "
             f"global_grad_norm={grad_norm:.9g} "
             f"fwd_bwd_sec={fwd_bwd_sec:.3f} "
