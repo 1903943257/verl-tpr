@@ -75,3 +75,49 @@ def test_derived_capture_keeps_original_ppo_labels_and_sibling_root(tmp_path: Pa
             )
     with pytest.raises(FileExistsError):
         derive_short_capture(source, target, rows=(0, 1), cap=512, prompt_window=256)
+
+
+def test_split_no_share_preserves_each_siblings_exact_query_and_target():
+    from verl.workers.engine.megatron.tpr.tree import (
+        ForestExecutionPlan, SegmentObjectiveRef, SegmentPlan, SegmentSpec,
+        TreeExecutionPlan,
+    )
+    from .test_real_actor_cp1_short_full_tpr_npu import _make_unshared_split
+
+    row0 = torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.long)
+    row1 = torch.tensor([1, 2, 3, 4, 9, 10], dtype=torch.long)
+    root = SegmentSpec(0, None, row0[:4], 0, 0)
+    leaf0 = SegmentSpec(1, 0, row0[4:], 4, 4)
+    leaf1 = SegmentSpec(2, 0, row1[4:], 4, 4)
+    source_plan = SegmentPlan((root, leaf0, leaf1), root_id=0)
+    source_refs = (
+        SegmentObjectiveRef(0, 3, 5, 0, 0),
+        SegmentObjectiveRef(1, 0, 6, 0, 1),
+        SegmentObjectiveRef(0, 3, 9, 1, 0),
+        SegmentObjectiveRef(2, 0, 10, 1, 1),
+    )
+    shared = ForestExecutionPlan((
+        TreeExecutionPlan(
+            uid="original-session", tree_index=0,
+            member_rows=(0, 1), segment_plan=source_plan,
+            objective_refs=source_refs,
+        ),
+    ), logical_loss_tokens=len(source_refs))
+    split = _make_unshared_split(shared, {"input_ids": [row0, row1]})
+    assert len(split.trees) == 2
+    assert split.segment_count == 4
+    assert split.logical_loss_tokens == 4
+    for row, tree in enumerate(split.trees):
+        assert tree.member_rows == (row,)
+        assert len(tree.segment_plan.segments) == 2
+        assert torch.equal(tree.segment_plan.get(0).token_ids, row0[:4])
+        assert torch.equal(tree.segment_plan.get(1).token_ids, (row0, row1)[row][4:])
+        refs = sorted(tree.objective_refs, key=lambda x: x.response_offset)
+        assert [(r.segment_id, r.query_offset, r.target_token_id) for r in refs] == [
+            (0, 3, 5 if row == 0 else 9),
+            (1, 0, 6 if row == 0 else 10),
+        ]
+    assert sum(
+        seg.length for tree in split.trees
+        for seg in tree.segment_plan.segments.values()
+    ) == row0.numel() + row1.numel()
