@@ -22,11 +22,11 @@ Run from the verl repository root with two visible NPUs::
         tests/models/mcore/tpr/parallel/test_tpr_qwen3_cp_equivalence_npu.py
 
 The full-trajectory reference executes each complete trajectory separately
-through AllGather CP and remains an end-to-end BF16 numerical baseline.  The
-Qwen3-1.7B non-divisible AllGather, Ulysses, and Ring cases, plus the divisible
-Ring control, additionally run P -> S1 and P -> S2 as independent segmented
-trees.  The backend-matched segmented reference is the semantic oracle for Prefix KV reuse.  Set
-``TPR_QWEN_CP_TOPOLOGY=divisible`` for the shape-control case.
+through production Ring CP. Qwen3-1.7B additionally runs P -> S1 and P -> S2
+with separate Prefix states to check reuse against the same attention shapes.
+These comparisons exercise segmentation and Prefix gradient relay; they share
+the Ring implementation and do not independently establish kernel correctness.
+Set ``TPR_QWEN_CP_TOPOLOGY=divisible`` for the divisible-length control.
 """
 
 from __future__ import annotations
@@ -49,6 +49,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from verl.models.mcore.config_converter import get_hf_rope_theta, hf_to_mcore_config_dense
 from verl.models.mcore.tpr import (
     PhysicalExecutionKind,
+    RING_CP_BACKEND,
     SegmentExecutor,
     SegmentPlan,
     TPRSelfAttention,
@@ -96,31 +97,9 @@ _LOSS_ATOL = 2e-2
 _LOSS_RTOL = 2e-2
 _LOGPROB_DIAGNOSTIC_ATOL = 5e-2
 _LOGPROB_DIAGNOSTIC_RTOL = 5e-3
-_LOGPROB_RELATIVE_L2_TOL_BY_MODEL_AND_BACKEND = {
-    "qwen3_0_6b": {
-        "allgather": 5e-3,
-        "ulysses": 5e-3,
-        "ring": 7e-3,
-    },
-    "qwen3_1_7b": {
-        "allgather": 7e-3,
-        "ulysses": 7e-3,
-        "ring": 7e-3,
-    },
-}
+_LOGPROB_RELATIVE_L2_TOL = 7e-3
 _LOGPROB_COSINE_MIN = 0.9999
-_CP_GLOBAL_GRAD_RELATIVE_L2_TOL_BY_MODEL_AND_BACKEND = {
-    "qwen3_0_6b": {
-        "allgather": 2e-2,
-        "ulysses": 2e-2,
-        "ring": 2.5e-2,
-    },
-    "qwen3_1_7b": {
-        "allgather": 2.5e-2,
-        "ulysses": 2.5e-2,
-        "ring": 2.5e-2,
-    },
-}
+_CP_GLOBAL_GRAD_RELATIVE_L2_TOL = 2.5e-2
 _CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL = 7e-2
 
 
@@ -150,7 +129,7 @@ class _LoadedQwenCPCase:
     logical_indices: dict[tuple[int, int], int]
     logical_count: int
     full_trajectory_reference: _QwenCPReference
-    segmented_references: dict[str, _QwenCPReference]
+    segmented_reference: _QwenCPReference | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,23 +297,11 @@ def _tokens(start: int, length: int, vocab_size: int) -> torch.Tensor:
     return torch.arange(start, start + length, dtype=torch.long) % vocab_size
 
 
-def _segmented_reference_backends(model_case: _QwenModelCase) -> tuple[str, ...]:
-    if model_case.name != "qwen3_1_7b":
-        return ()
-    if _TOPOLOGY_NAME == "non_divisible":
-        return ("allgather", "ulysses", "ring")
-    # Ring changes both the attention decomposition and reduction order even
-    # without padding.  Its divisible control therefore needs the same
-    # backend-matched oracle; Full-Trajectory remains the numerical baseline.
-    return ("ring",)
-
-
 def _compare_logprobs(
     actual,
     expected,
     *,
     case,
-    backend,
     comparison,
     rank,
 ) -> _LogprobComparison:
@@ -354,7 +321,7 @@ def _compare_logprobs(
     if rank == 0:
         print(
             "Qwen logprob comparison: "
-            f"comparison={comparison}, model={case.spec.name}, backend={backend}, "
+            f"comparison={comparison}, model={case.spec.name}, backend={RING_CP_BACKEND}, "
             f"topology={_TOPOLOGY_NAME}, relative_l2={relative_l2.item():.6e}, "
             f"cosine={cosine.item():.9f}, max_abs={max_abs_difference:.6e}, "
             f"pointwise_outliers={pointwise_outliers}/{case.logical_count}"
@@ -475,8 +442,8 @@ def real_qwen_cp_case(request, cp_runtime):
     full_trajectory_reference = _move_reference_to_cpu(full_reference_result)
     del full_reference_result
 
-    segmented_references = {}
-    for segmented_backend in _segmented_reference_backends(model_case):
+    segmented_reference = None
+    if model_case.name == "qwen3_1_7b":
         segmented_result = _run_independent_segmented_cp_reference(
             reference_model,
             prefix,
@@ -485,14 +452,12 @@ def real_qwen_cp_case(request, cp_runtime):
             runtime,
             logical_indices,
             logical_count,
-            cp_backend=segmented_backend,
+            cp_backend=RING_CP_BACKEND,
             expected_layer_numbers=tuple(
                 range(1, hf_config.num_hidden_layers + 1)
             ),
         )
-        segmented_references[segmented_backend] = _move_reference_to_cpu(
-            segmented_result
-        )
+        segmented_reference = _move_reference_to_cpu(segmented_result)
         del segmented_result
     _clear_model_gradients(reference_model)
     del reference_model
@@ -509,7 +474,7 @@ def real_qwen_cp_case(request, cp_runtime):
         logical_indices=logical_indices,
         logical_count=logical_count,
         full_trajectory_reference=full_trajectory_reference,
-        segmented_references=segmented_references,
+        segmented_reference=segmented_reference,
     )
     try:
         yield loaded
@@ -519,11 +484,9 @@ def real_qwen_cp_case(request, cp_runtime):
         torch.npu.empty_cache()
 
 
-@pytest.mark.parametrize("backend", ("allgather", "ulysses", "ring"))
 def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
     real_qwen_cp_case,
     cp_runtime,
-    backend,
     monkeypatch,
 ):
     case = real_qwen_cp_case
@@ -544,7 +507,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
     original_pop = SegmentExecutor.pop
     actual_execution_trace = []
     actual_prefix_gradients = {}
-    use_segmented_oracle = backend in case.segmented_references
+    use_segmented_oracle = case.segmented_reference is not None
 
     def capture_loss(executor, segment, logits):
         if executor.model is case.model:
@@ -628,7 +591,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         case.model,
         case.plan,
         runtime,
-        expected_backend=backend,
+        expected_backend=RING_CP_BACKEND,
     )
     dist.all_reduce(actual_logprobs, op=dist.ReduceOp.SUM, group=runtime.cp_group)
     dist.all_reduce(owner_counts, op=dist.ReduceOp.SUM, group=runtime.cp_group)
@@ -656,7 +619,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
     )
 
     if use_segmented_oracle:
-        reference = case.segmented_references[backend]
+        reference = case.segmented_reference
         assert reference.execution_trace == (
             (PhysicalExecutionKind.PUSH, 0),
             (PhysicalExecutionKind.VISIT_LEAF, 1),
@@ -680,7 +643,6 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
             reference.target_logprobs,
             full_reference.target_logprobs,
             case=case,
-            backend=backend,
             comparison="full_vs_segmented (A_vs_B)",
             rank=runtime.rank,
         )
@@ -712,7 +674,6 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         actual_logprobs,
         reference.target_logprobs,
         case=case,
-        backend=backend,
         comparison=semantic_comparison,
         rank=runtime.rank,
     )
@@ -725,12 +686,10 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
             msg="shape-matched independent segmented logprobs differ from TPR",
         )
     model_name = case.spec.name
-    relative_l2_tolerance = _LOGPROB_RELATIVE_L2_TOL_BY_MODEL_AND_BACKEND[model_name][
-        backend
-    ]
+    relative_l2_tolerance = _LOGPROB_RELATIVE_L2_TOL
     assert logprob_comparison.relative_l2 <= relative_l2_tolerance, (
         f"Qwen logprob relative L2 {logprob_comparison.relative_l2:.6e} exceeds "
-        f"{relative_l2_tolerance:.6e} for model={model_name}, backend={backend}"
+        f"{relative_l2_tolerance:.6e} for model={model_name}, backend={RING_CP_BACKEND}"
     )
     assert logprob_comparison.cosine >= _LOGPROB_COSINE_MIN, (
         f"Qwen logprob cosine {logprob_comparison.cosine:.9f} is below "
@@ -759,9 +718,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         _assert_real_qwen_gradients_close(
             _flatten_prefix_gradients(actual_prefix_gradients),
             _flatten_prefix_gradients(reference.prefix_gradients),
-            global_relative_l2_tol=(
-                _CP_GLOBAL_GRAD_RELATIVE_L2_TOL_BY_MODEL_AND_BACKEND[model_name][backend]
-            ),
+            global_relative_l2_tol=_CP_GLOBAL_GRAD_RELATIVE_L2_TOL,
             per_parameter_relative_l2_tol=_CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL,
         )
     # The segmented reference recomputes and backpropagates Prefix once per
@@ -773,9 +730,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
     _assert_real_qwen_gradients_close(
         actual_gradients,
         reference.parameter_gradients,
-        global_relative_l2_tol=(
-            _CP_GLOBAL_GRAD_RELATIVE_L2_TOL_BY_MODEL_AND_BACKEND[model_name][backend]
-        ),
+        global_relative_l2_tol=_CP_GLOBAL_GRAD_RELATIVE_L2_TOL,
         per_parameter_relative_l2_tol=_CP_PER_PARAMETER_GRAD_RELATIVE_L2_TOL,
         enforce_per_parameter_relative_l2=not use_segmented_oracle,
     )
@@ -790,7 +745,6 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
             actual_logprobs,
             full_reference.target_logprobs,
             case=case,
-            backend=backend,
             comparison="full_vs_tpr (A_vs_C)",
             rank=runtime.rank,
         )
@@ -804,7 +758,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         full_logprob_comparison = logprob_comparison
         full_gradient_comparison = None
     assert output["metrics"]["tpr_cp_size"] == 2
-    assert output["metrics"]["tpr_cp_backend"] == backend
+    assert output["metrics"]["tpr_cp_backend"] == RING_CP_BACKEND
     assert output["metrics"]["tpr_peak_path_tokens"] == (
         _PREFIX_LENGTH + _FIRST_SUFFIX_LENGTH
     )
@@ -814,7 +768,7 @@ def test_real_qwen3_engine_tpr_cp_matches_independent_cp(
         print(
             f"\n{case.spec.name} real-checkpoint TPR CP correctness passed\n"
             f"  checkpoint: {case.spec.path}\n"
-            f"  backend: {backend}\n"
+            f"  backend: {RING_CP_BACKEND}\n"
             f"  topology: {_TOPOLOGY_NAME}, P={_PREFIX_LENGTH}, "
             f"S1={_FIRST_SUFFIX_LENGTH}, "
             f"S2={_SECOND_SUFFIX_LENGTH}\n"

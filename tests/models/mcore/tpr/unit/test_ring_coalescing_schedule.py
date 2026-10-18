@@ -56,6 +56,9 @@ class Tensor:
     def contiguous(self):
         return self if self.is_contiguous() else Tensor(self.shape)
 
+    def to(self, dtype):
+        return self
+
     def reshape(self, *shape):
         return Tensor(shape, self.storage)
 
@@ -100,7 +103,7 @@ def load_dispatch():
     preamble = ast.parse("from __future__ import annotations").body
     ns = dict(dataclass=dataclass, Enum=Enum,
               torch=SimpleNamespace(autograd=SimpleNamespace(Function=object),
-                                    zeros_like=lambda t: Tensor(t.shape)),
+                                    float32="fp32", zeros_like=lambda t, **kw: Tensor(t.shape)),
               _RingAttentionConfig=SimpleNamespace, make_ring_sequence_shard=shard)
     exec(compile(ast.Module(body=preamble + nodes, type_ignores=[]), str(source), "exec"), ns)
     return ns

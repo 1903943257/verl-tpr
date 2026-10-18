@@ -451,3 +451,56 @@ def test_prefix_query_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths,
                                         for length in (*prefix_lengths, current_length))
     saved = _EXPECTED_WORLD_SIZE * len(prefix_lengths) if eligible else 0
     assert before[2] - after[2] == before[3] - after[3] == saved
+
+
+@pytest.mark.parametrize("ancestors", [18, 26, 48])
+@pytest.mark.parametrize("merge_mode", ["off", "kv", "query"])
+def test_long_prefix_query_gradient_matches_dense(cp_runtime, monkeypatch, ancestors, merge_mode):
+    """Catch repeated BF16 dQ rounding with real CANN kernels and Ring transport."""
+    device, cp_group = cp_runtime
+    cp_size, rank = dist.get_world_size(cp_group), dist.get_rank(cp_group)
+    heads, head_dim = 2, 64
+    length, scale = 2 * cp_size, head_dim**-0.5
+    shard = make_ring_sequence_shard(length, cp_rank=rank, cp_size=cp_size)
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", "0" if merge_mode == "off" else "1")
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", "1" if merge_mode == "query" else "0")
+
+    global_query = torch.zeros(length, 1, heads, head_dim, device=device, dtype=_DTYPE)
+    prefix_key, prefix_value = torch.zeros_like(global_query), torch.zeros_like(global_query)
+    signs = torch.tensor([-1.0] * cp_size + [1.0] * cp_size, device=device, dtype=_DTYPE)
+    prefix_key[:, 0, :, 0] = signs[:, None] * 8
+    prefix_value[:, 0, :, 0] = signs[:, None] * torch.tensor([1.0, 2.0], device=device, dtype=_DTYPE)
+    prefix_blocks = tuple(
+        RingLocalKVBlock(index, shard, _local_leaf(prefix_key, shard), _local_leaf(prefix_value, shard))
+        for index in range(ancestors)
+    )
+    local_query = _local_leaf(global_query, shard)
+    actual = ring.ring_cp_attention(
+        local_query,
+        _local_leaf(global_query, shard),
+        _local_leaf(global_query, shard),
+        prefix_blocks=prefix_blocks,
+        current_shard=shard,
+        cp_group=cp_group,
+        softmax_scale=scale,
+    )
+    global_gradient = torch.zeros(length, 1, heads * head_dim, device=device, dtype=_DTYPE)
+    global_gradient[0, 0, ::head_dim] = 1
+    actual.backward(shard.select(global_gradient))
+
+    # Keep the independent dense autograd oracle on CPU in FP32, so neither
+    # CANN backward nor BF16 leaf-gradient casting supplies the expected dQ.
+    reference_query = global_query.detach().cpu().float().requires_grad_(True)
+    expected = _reference(
+        reference_query,
+        [prefix_key.detach().cpu().float()] * ancestors,
+        [prefix_value.detach().cpu().float()] * ancestors,
+        torch.zeros_like(reference_query),
+        torch.zeros_like(reference_query),
+        scale,
+    )
+    expected.backward(global_gradient.detach().cpu().float())
+    assert local_query.grad.dtype == _DTYPE
+    _assert_close(local_query.grad, shard.select(reference_query.grad).to(device), gradient=True)
+    # Q=0 makes dK zero; nonzero Prefix dK is intentionally not a contract here.
+    dist.barrier(group=cp_group)

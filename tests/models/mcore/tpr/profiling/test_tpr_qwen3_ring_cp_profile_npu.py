@@ -1554,9 +1554,10 @@ def test_qwen3_reference_cp_vs_tpr_ring_cp_profile(profile_runtime):
     assert model.share_embeddings_and_output_weights == hf_config.tie_word_embeddings
     parameters = target.assert_model_scale(model)
     if runtime.rank == 0:
+        prefix_full, prefix_query = ring_attention.ring_merge_settings()
         print(f"Qwen3-{size}: checkpoint={model_path}, CP={runtime.cp_size}")
-        print(f"Prefix FULL coalescing: {os.getenv('TPR_RING_COALESCE_PREFIX_FULL', '0') == '1'}")
-        print(f"Prefix Q coalescing requested: {os.getenv('TPR_RING_COALESCE_PREFIX_QUERY', '0') == '1'}")
+        print(f"Prefix FULL coalescing requested: {prefix_full}")
+        print(f"Prefix Q coalescing requested: {prefix_query}")
         print(f"Activation offload: {_ENABLE_OFFLOAD}; swap_modules={_SWAP_MODULES}")
         print(f"Loss chunk size: {_LOSS_CHUNK_SIZE}")
         print(f"Profile cases: {[case.case_id for case in _PROFILE_CASES]}")
