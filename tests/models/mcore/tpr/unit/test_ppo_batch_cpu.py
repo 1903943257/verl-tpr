@@ -212,3 +212,31 @@ def test_layer_spec_normalization_preserves_single_and_block_forms():
         get_layer_specs(SimpleNamespace(layer_specs=[]))
     with pytest.raises(TypeError, match="containing layer_specs"):
         get_layer_specs(object())
+
+
+@pytest.mark.parametrize("same_scalar", [True, False])
+def test_cp_loss_reduction_reuses_identical_scalar_collective(monkeypatch, same_scalar):
+    """Keep both result buffers independent, but do not reduce one loss twice."""
+    source = Path(__file__).resolve().parents[5] / "verl/workers/engine/megatron/tpr/ring.py"
+    node = next(n for n in ast.parse(source.read_text(encoding="utf-8")).body
+                if isinstance(n, ast.FunctionDef) and n.name == "aggregate_cp_loss")
+    namespace = {"dist": torch.distributed, "Tensor": torch.Tensor}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
+    calls = []
+    group = object()
+
+    def all_reduce(tensor, *, op, group: object):
+        calls.append(tensor)
+        tensor.add_(7.0)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    lhs = torch.tensor(2.0)
+    rhs = lhs if same_scalar else torch.tensor(5.0)
+    total, normalized = namespace["aggregate_cp_loss"](
+        lhs, rhs, SimpleNamespace(enabled=True, group=group)
+    )
+    assert len(calls) == (1 if same_scalar else 2)
+    assert total.item() == 9.0
+    assert normalized.item() == (9.0 if same_scalar else 12.0)
+    assert total is not normalized
+    assert lhs.item() == 2.0 and rhs.item() == (2.0 if same_scalar else 5.0)
