@@ -599,3 +599,74 @@ def test_long_prefix_query_gradient_matches_dense(cp_runtime, monkeypatch, ances
     _assert_close(local_query.grad, shard.select(reference_query.grad).to(device), gradient=True)
     # Q=0 makes dK zero; nonzero Prefix dK is intentionally not a contract here.
     dist.barrier(group=cp_group)
+
+
+@pytest.mark.parametrize("length", [128, 127])
+def test_native_root_ring_matches_tpr_root_with_relayed_kv_gradients(cp_runtime, length):
+    """Exercise native Root Push/Pop attention and descendant dKV relay on CP2/4.
+
+    No Prefix is present in Root attention, but backward must still accept
+    gradients originating from later Segments through the newly created K/V.
+    """
+    device, cp_group = cp_runtime
+    rank = dist.get_rank(cp_group)
+    shard = make_ring_sequence_shard(length, cp_rank=rank, cp_size=_EXPECTED_WORLD_SIZE)
+    q_heads, kv_heads, head_dim = 4, 2, 64
+    scale = head_dim**-0.5
+    query = _randn((length, 1, q_heads, head_dim), seed=710, device=device)
+    key = _randn((length, 1, kv_heads, head_dim), seed=711, device=device)
+    value = _randn((length, 1, kv_heads, head_dim), seed=712, device=device)
+    gradient = shard.select(_randn((length, 1, q_heads * head_dim), seed=713, device=device))
+    relay_key = shard.select(_randn((length, 1, kv_heads, head_dim), seed=714, device=device))
+    relay_value = shard.select(_randn((length, 1, kv_heads, head_dim), seed=715, device=device))
+    padding = _padding_mask(shard, device=device)
+    if torch.any(padding).item():
+        gradient[padding] = 1  # Virtual Query upstream gradient must be ignored.
+
+    policy = ring.RingCPBackend(
+        cp_group, parallel_size=_EXPECTED_WORLD_SIZE, parallel_rank=rank,
+    )
+    stack = type("_EmptyRootStack", (), {"prefix_length": 0, "segment_ids": ()})()
+    native_backend = policy.make_attention_backend(
+        stack, expected_layer_numbers=(1,), current_shard=shard,
+        past_anchors=None, use_native_root=True,
+    )
+    original_backend = policy.make_attention_backend(
+        stack, expected_layer_numbers=(1,), current_shard=shard,
+        past_anchors=None, use_native_root=False,
+    )
+
+    # Root Push: graph-free, but still produces a normal output for real Q.
+    with torch.no_grad():
+        pushed = native_backend.attention(
+            1, shard.select(query), shard.select(key), shard.select(value),
+            softmax_scale=scale,
+        )
+    assert not pushed.requires_grad
+    _assert_padding_zero(pushed, shard)
+
+    def run(backend):
+        q = _local_leaf(query, shard)
+        k = _local_leaf(key, shard)
+        v = _local_leaf(value, shard)
+        output = backend.attention(1, q, k, v, softmax_scale=scale)
+        _assert_padding_zero(output, shard)
+        # Root Pop: new K/V are graph roots for relayed descendant gradients.
+        torch.autograd.backward(
+            (output, k, v),
+            (gradient, relay_key, relay_value),
+        )
+        return output.detach(), (q.grad, k.grad, v.grad)
+
+    reference_output, reference_grads = run(original_backend)
+    native_output, native_grads = run(native_backend)
+    _assert_close(native_output, reference_output)
+    _assert_close(native_output, pushed)
+    for actual, expected in zip(native_grads, reference_grads, strict=True):
+        _assert_close(actual, expected, gradient=True)
+    _assert_padding_zero(native_grads[0], shard)
+    if torch.any(padding).item():
+        # Relayed gradients refer to logical K/V, never virtual padding.
+        _assert_padding_zero(native_grads[1], shard)
+        _assert_padding_zero(native_grads[2], shard)
+    dist.barrier(group=cp_group)
