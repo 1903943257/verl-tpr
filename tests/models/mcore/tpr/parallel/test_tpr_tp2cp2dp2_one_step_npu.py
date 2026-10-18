@@ -311,7 +311,11 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
     if os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") != "1":
         raise ValueError("Offline DP2 adapter gate was not explicitly enabled")
     if os.getenv("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "0") != "0":
-        raise ValueError("Full baseline and this TPR run must both disable recompute")
+        raise ValueError("Use the explicit KV-aware TPR checkpoint adapter, not native recompute")
+    setting = os.getenv("TPR_DP2_RECOMPUTE", "0")
+    if setting not in ("0", "1"):
+        raise ValueError("TPR_DP2_RECOMPUTE must be 0 or 1")
+    recompute_enabled = setting == "1"
     if os.getenv("TPR_TREE_POLICY") != "qwen_turn":
         raise ValueError("Use the same qwen_turn policy as the TP2CP4 Full comparison")
     if os.getenv("TPR_OFFLINE_MODE") != "tpr":
@@ -346,6 +350,38 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
         from .grad_sync_precision import offline_grad_sync_dtype
         grad_sync_dtype = offline_grad_sync_dtype()
         engine = _engine_with_dp_finalize(model, runtime)
+        installed_blocks = 0
+        if recompute_enabled:
+            from megatron.core.transformer.transformer_block import TransformerBlock
+            from verl.workers.engine.megatron.tpr.recompute import (
+                install_tpr_full_recompute, assert_tpr_full_recompute_installed,
+            )
+            model.config.recompute_granularity = "full"
+            model.config.recompute_method = "uniform"
+            model.config.recompute_num_layers = 1
+            blocks = [m for m in model.modules() if isinstance(m, TransformerBlock)]
+            if not blocks or any(m.config is not model.config for m in blocks):
+                raise AssertionError("TransformerBlocks must share the model checkpoint config")
+            installed_blocks = install_tpr_full_recompute(model, model.config)
+            if installed_blocks != len(blocks):
+                raise AssertionError("Incomplete TPR checkpoint adapter installation")
+            assert_tpr_full_recompute_installed(model, model.config)
+        else:
+            model.config.recompute_granularity = None
+            model.config.recompute_method = None
+            model.config.recompute_num_layers = None
+        expected = ("full", "uniform", 1) if recompute_enabled else (None, None, None)
+        actual = (model.config.recompute_granularity, model.config.recompute_method,
+                  model.config.recompute_num_layers)
+        if actual != expected:
+            raise AssertionError(f"Incorrect checkpoint configuration: {actual}")
+        if dist.get_rank() == 0:
+            print(
+                f"TPR_DP2_RECOMPUTE enabled={int(recompute_enabled)} "
+                f"granularity={actual[0]} method={actual[1]} "
+                f"num_layers={actual[2]} installed_tpr_blocks={installed_blocks}",
+                flush=True,
+            )
         if dist.get_rank() == 0:
             print(
                 f"TPR_DP2_GRAD_REDUCE_MODE dtype={grad_sync_dtype} "
@@ -451,6 +487,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                     "peak_allocated_gib": float(peak.item()) / 2**30,
                     "loss": loss_report["global_reporting_loss"],
                     "loss_report": loss_report,
+                    "recompute": recompute_enabled,
                     "ranks": gathered,
                 }
                 runs.append(item)
@@ -480,7 +517,8 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             )
         if dist.get_rank() == 0:
             output.mkdir(parents=True, exist_ok=True)
-            target = output / f"step{step}_tpr_tp2cp2dp2.json"
+            suffix = "_recompute_on" if recompute_enabled else ""
+            target = output / f"step{step}_tpr_tp2cp2dp2{suffix}.json"
             if target.exists():
                 raise FileExistsError(target)
             times = [r["critical_fwd_bwd_s"] for r in runs if not r["warmup"]]
@@ -501,7 +539,12 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 "ppo_logprob_chunk_tokens": lp_chunk_tokens,
                 "gradient_sync_reduce_dtype": grad_sync_dtype,
                 "hccl_stats_reduce_dtype": "float32",
-                "recompute": False, "updated_weights": False,
+                "recompute": recompute_enabled,
+                "recompute_granularity": model.config.recompute_granularity,
+                "recompute_method": model.config.recompute_method,
+                "recompute_num_layers": model.config.recompute_num_layers,
+                "recompute_installed_tpr_blocks": installed_blocks,
+                "updated_weights": False,
                 "median_fwd_bwd_s": statistics.median(times),
                 "gradient_witness": gradient_witness,
                 "gradient_replica_policy": replica_policy,
@@ -513,7 +556,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             }
             target.write_text(json.dumps(data, indent=2))
             print(
-                f"TPR_TP2CP2DP2_SUMMARY step={step} "
+                f"TPR_TP2CP2DP2_SUMMARY step={step} recompute={int(recompute_enabled)} "
                 f"median_fwd_bwd_s={data['median_fwd_bwd_s']:.6f} "
                 f"dp_rows={data['dp_partitions']} duplicated_tree_tokens="
                 f"{plan.duplicated_tree_tokens} output={target}",
