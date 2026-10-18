@@ -35,6 +35,20 @@ if [[ -e "$TPR_CP1_ROOT/ATTENTION_ATTRIBUTION_FINAL.json" ]]; then
 fi
 mkdir -p "$TPR_CP1_ROOT"
 
+# Catch syntax, stage-coordinate and diagnostic attribution errors before
+# spending NPU time on four separate 4B checkpoint loads.
+python -m py_compile \
+  tests/models/mcore/tpr/parallel/cp1_attention_attribution.py \
+  tests/models/mcore/tpr/parallel/analyze_cp1_attention_attribution.py \
+  tests/models/mcore/tpr/parallel/test_real_actor_cp1_short_full_tpr_npu.py
+if ! python -m pytest -q \
+  tests/models/mcore/tpr/parallel/test_cp1_attention_attribution_cpu.py \
+  > "$TPR_CP1_ROOT/cpu_preflight.log" 2>&1; then
+  echo "FAILED CPU attribution preflight:" >&2
+  tail -n 100 "$TPR_CP1_ROOT/cpu_preflight.log" >&2
+  exit 1
+fi
+
 echo "CP1 4B attention attribution: isolated NPU8, 2K, authentic Actor PPO."
 echo "Detailed NPU logs: $TPR_CP1_ROOT/full_run.log"
 # Reuses existing loss/witness procedures; tracing is an opt-in test hook.
