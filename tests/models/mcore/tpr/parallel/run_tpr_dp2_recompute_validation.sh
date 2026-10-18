@@ -36,7 +36,17 @@ export TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS=0
 export TPR_BENCH_WARMUPS="${TPR_BENCH_WARMUPS:-1}"
 export TPR_BENCH_REPEATS="${TPR_BENCH_REPEATS:-3}"
 export TPR_BENCH_CAPTURE_LOGPROBS=1
-export TPR_OFFLINE_GRAD_SYNC_DTYPE="${TPR_OFFLINE_GRAD_SYNC_DTYPE:-bf16}"
+# Controlled correctness gate: 910B HCCL BF16 SUM/4 has shown
+# non-bitwise-identical post-finalize replicas even without recompute.
+# Use FP32 per-parameter staging to isolate KV-aware recompute correctness.
+# Explicit TPR_OFFLINE_GRAD_SYNC_DTYPE=bf16 remains available for diagnosis,
+# but BF16 strict replica failures must NOT be reported as recompute failures.
+export TPR_OFFLINE_GRAD_SYNC_DTYPE="${TPR_OFFLINE_GRAD_SYNC_DTYPE:-fp32}"
+if [[ "$TPR_OFFLINE_GRAD_SYNC_DTYPE" != "bf16" && "$TPR_OFFLINE_GRAD_SYNC_DTYPE" != "fp32" ]]; then
+  echo "TPR_OFFLINE_GRAD_SYNC_DTYPE must be fp32 or bf16" >&2
+  exit 2
+fi
+echo "TPR_DP2_RECOMPUTE_GRAD_SYNC precision=$TPR_OFFLINE_GRAD_SYNC_DTYPE strict_replicas=1 (offline only)"
 export TPR_PPO_LOGPROB_CHUNK_TOKENS="${TPR_PPO_LOGPROB_CHUNK_TOKENS:-512}"
 export TPR_BENCH_GRAD_WITNESS=1
 export TPR_BENCH_GRAD_REPLICA_POLICY=strict
