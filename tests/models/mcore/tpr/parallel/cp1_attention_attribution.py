@@ -79,6 +79,8 @@ class CP1AttentionTrace:
         self.records = {}
         self.full_first_qkv_x = None
         self.root_first_qkv_x = None
+        self.first_layer_linear_inputs_full = {}
+        self.first_layer_linear_inputs_root = {}
         self.root_queries = {}
         self.same_qkv_attention = {}
         self.original_rectangular = None
@@ -163,11 +165,18 @@ class CP1AttentionTrace:
             raise AssertionError(f"Duplicate forward/backward trace {key}")
         self.records[key] = {"positions": coords, "values": subset}
 
-        if not backward and stage == "qkv_in" and layer == 1:
-            if phase == "full" and row == 0:
-                self.full_first_qkv_x = t.detach().cpu().contiguous()
-            if phase == "push" and row == 0:
-                self.root_first_qkv_x = t.detach().cpu().contiguous()
+        if not backward and layer == 1 and stage in (
+            "qkv_in", "proj_in", "fc1_in", "fc2_in"
+        ) and row == 0:
+            if phase == "full":
+                self.first_layer_linear_inputs_full[stage] = t.detach().cpu().contiguous()
+            elif phase == "push":
+                self.first_layer_linear_inputs_root[stage] = t.detach().cpu().contiguous()
+            if stage == "qkv_in":
+                if phase == "full":
+                    self.full_first_qkv_x = self.first_layer_linear_inputs_full[stage]
+                elif phase == "push":
+                    self.root_first_qkv_x = self.first_layer_linear_inputs_root[stage]
 
         if (not backward and torch.is_grad_enabled() and t.requires_grad
                 and stage in ("qkv_out", "proj_out", "fc2_out")
@@ -302,50 +311,86 @@ class CP1AttentionTrace:
 
     @torch.no_grad()
     def replay_root_qkv_m(self, original_full_trace: Path):
-        """Same input + unchanged module/weights, physical M only differs."""
+        """Same inputs and unchanged native modules, only physical M differs.
+
+        Replays first-layer QKV, Attention projection, FC1 and FC2. For each,
+        root input equality is reported separately: a shape-only local
+        intervention is not proof of the actual segmented output's cause when
+        upstream activations are already different.
+        """
         if self.mode != "split_no_share":
             return
         full = torch.load(original_full_trace, map_location="cpu", weights_only=False)
-        x_full = full.get("full_first_qkv_x")
-        x_root = self.root_first_qkv_x
-        if x_full is None or x_root is None or x_root.shape[0] >= x_full.shape[0]:
-            raise AssertionError("Missing authentic first-layer Full/Root QKV operands")
-        if not torch.equal(x_full[:x_root.shape[0]], x_root):
-            self.replay = {
-                "input_equal": False,
-                "input_error": _difference(x_full[:x_root.shape[0]], x_root),
-                "physical_m_full": int(x_full.shape[0]),
-                "physical_m_root": int(x_root.shape[0]),
-                "conclusion": "First-layer input mismatch: do NOT attribute QKV error to M yet",
-            }
-            return
-        module = self.model.decoder.layers[0].self_attention.linear_qkv
-        device = next(module.parameters()).device
-        # Do not use FP32 or a new kernel: invoke the original Megatron module.
-        x = x_full.to(device=device)
-        y_full = _tensor(module(x)).detach()
-        y_root = _tensor(module(x_root.to(device=device))).detach()
-        prefix = y_full[:len(x_root)]
-        self.replay = {
-            "input_equal": True,
-            "physical_m_full": int(x_full.shape[0]),
-            "physical_m_root": int(x_root.shape[0]),
-            "qkv_same_input_m_replay": _difference(prefix, y_root),
+        original_inputs = full.get("first_layer_linear_inputs_full", {})
+        root_inputs = self.first_layer_linear_inputs_root
+        if set(original_inputs) != {"qkv_in", "proj_in", "fc1_in", "fc2_in"}:
+            raise AssertionError("Missing all four authentic first-layer Full GEMM operands")
+        if set(root_inputs) != set(original_inputs):
+            raise AssertionError("Missing Root projection/MLP operands")
+        layer = self.model.decoder.layers[0]
+        modules = {
+            "qkv": layer.self_attention.linear_qkv,
+            "proj": layer.self_attention.linear_proj,
+            "fc1": layer.mlp.linear_fc1,
+            "fc2": layer.mlp.linear_fc2,
         }
-        # Cross-check the actual recorded first-layer QKV outputs at the
-        # selected absolute token coordinates: replay must match each arm.
-        for arm, records, result in (
-            ("full", full["records"], y_full),
-            ("split_root", self.records, y_root),
-        ):
-            key = "r0|full|L1|qkv_out" if arm == "full" else "r0|push|L1|qkv_out"
-            stage = records[key]
-            index = torch.tensor(stage["positions"], device=device)
-            expected = stage["values"].to(device)
-            self.replay[f"{arm}_qkv_replay_vs_actual"] = _difference(
-                expected, result.index_select(0, index),
+        observed = {}
+        for label, module in modules.items():
+            stage = f"{label}_in"
+            full_input = original_inputs[stage]
+            root_input = root_inputs[stage]
+            if not 0 < root_input.shape[0] < full_input.shape[0]:
+                raise AssertionError(f"Invalid physical M for {label}")
+            same_real_input = torch.equal(
+                full_input[:root_input.shape[0]], root_input,
             )
-        del x, y_full, y_root
+            result = {
+                "input_equal": same_real_input,
+                "physical_m_full": int(full_input.shape[0]),
+                "physical_m_root": int(root_input.shape[0]),
+                "actual_prefix_input_mismatch": _difference(
+                    full_input[:root_input.shape[0]], root_input,
+                ),
+            }
+            device = next(module.parameters()).device
+            x_full = full_input.to(device=device)
+            # Original Megatron modules and BF16 math. No forced M, FP32
+            # Linear, or "equalizing" the native Full baseline.
+            output_full = _tensor(module(x_full)).detach()
+            output_cutoff = _tensor(module(
+                full_input[:root_input.shape[0]].to(device=device)
+            )).detach()
+            result["same_full_input_m_replay"] = _difference(
+                output_full[:root_input.shape[0]], output_cutoff,
+            )
+            full_record = full["records"][f"r0|full|L1|{label}_out"]
+            idx = torch.tensor(full_record["positions"], device=device)
+            result["full_replay_vs_actual"] = _difference(
+                full_record["values"].to(device),
+                output_full.index_select(0, idx),
+            )
+            root_record = self.records[f"r0|push|L1|{label}_out"]
+            root_indices = torch.tensor(root_record["positions"], device=device)
+            if same_real_input:
+                # Only when the natural Root input is identical can the
+                # shape-only cutoff replay be identified with actual Root.
+                result["root_replay_vs_actual"] = _difference(
+                    root_record["values"].to(device),
+                    output_cutoff.index_select(0, root_indices),
+                )
+            else:
+                result["root_replay_vs_actual"] = None
+            observed[label] = result
+            del x_full, output_full, output_cutoff
+        self.replay = {
+            "input_equal": observed["qkv"]["input_equal"],
+            "physical_m_full": observed["qkv"]["physical_m_full"],
+            "physical_m_root": observed["qkv"]["physical_m_root"],
+            "qkv_same_input_m_replay": observed["qkv"]["same_full_input_m_replay"],
+            "full_qkv_replay_vs_actual": observed["qkv"]["full_replay_vs_actual"],
+            "split_root_qkv_replay_vs_actual": observed["qkv"]["root_replay_vs_actual"],
+            "individual_original_linear_replays": observed,
+        }
 
     def save(self, destination: Path):
         if destination.exists():
@@ -378,6 +423,8 @@ class CP1AttentionTrace:
             },
             "full_first_qkv_x": self.full_first_qkv_x,
             "root_first_qkv_x": self.root_first_qkv_x,
+            "first_layer_linear_inputs_full": self.first_layer_linear_inputs_full,
+            "first_layer_linear_inputs_root": self.first_layer_linear_inputs_root,
             "selected_layers": SELECTED_LAYERS,
             "stage_names": STAGES,
             "no_fixed_tile": True,
