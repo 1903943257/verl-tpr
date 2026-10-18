@@ -328,10 +328,25 @@ def test_batch_row_preparation_rejects_mismatched_response_fields():
 
 def _native_ppo_loss():
     """Load the real loss bodies without unrelated distributed/config imports."""
-    import verl.utils.torch_functional as verl_F
     from verl.utils.metric import AggregationType, Metric
 
     root = Path(__file__).resolve().parents[5]
+    # Native PPO uses only these two masks from torch_functional. Execute
+    # their actual source definitions rather than importing the entire helper,
+    # whose unrelated tokenizer integration needs transformers in CPU CI.
+    functional_path = root / "verl/utils/torch_functional.py"
+    functional_tree = ast.parse(functional_path.read_text(encoding="utf-8"))
+    functional_tree.body = [
+        node for node in functional_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in {"masked_sum", "masked_mean"}
+    ]
+    assert len(functional_tree.body) == 2
+    functional_ns = {"torch": torch}
+    exec(compile(functional_tree, str(functional_path), "exec"), functional_ns)
+    verl_F = types.SimpleNamespace(
+        masked_sum=functional_ns["masked_sum"],
+        masked_mean=functional_ns["masked_mean"],
+    )
     namespace = dict(torch=torch, tu=tu, no_padding_2_padding=no_padding_2_padding,
                      verl_F=verl_F, Metric=Metric, AggregationType=AggregationType,
                      AlgoConfig=type("AlgoConfig", (), {}))
