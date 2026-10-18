@@ -15,7 +15,7 @@ from typing import TypeVar
 ROOT = Path(__file__).resolve().parents[5]
 ENGINE = ROOT / "verl/workers/engine/megatron/tpr"
 MODEL = ROOT / "verl/models/mcore/tpr"
-PRODUCTION = ("adapter", "tree", "objective", "executor", "state", "ring", "placement")
+PRODUCTION = ("adapter", "tree", "objective", "executor", "state", "ring", "ring_layout", "ring_ops", "placement")
 
 
 def _source(name: str) -> str:
@@ -152,7 +152,7 @@ def test_engine_owns_shard_tree_state() -> None:
     ring = _source("ring")
     state = _source("state")
     tree = _source("tree")
-    ring_classes = {node.name for node in ast.parse(ring).body if isinstance(node, ast.ClassDef)}
+    ring_classes = {node.name for node in ast.parse(_source("ring_layout")).body if isinstance(node, ast.ClassDef)}
     assert "SequenceShard" in ring_classes
     assert not {"PaddedSequenceShard", "RangeSequenceShard", "PrefixShard"} & ring_classes
     eager_state_imports = [node for node in ast.parse(ring).body
@@ -206,14 +206,14 @@ def test_lazy_exports_resolve_to_real_modules() -> None:
 
 
 def test_ring_retains_qkvmerge_and_padding_contract() -> None:
-    source = _source("ring")
-    assert "def _can_coalesce_prefix_query(" in source
-    assert "def _prefix_full_slices(" in source
-    assert "def _physical_block_attention_mask(" in source
-    assert "padded_length" in source
-    assert "physical_global_ranges" in source
-    assert "def iter_valid_sequence_slices(" in source
-    assert "class RingCPBackend:" in source
+    ring, layout, ops = (_source(name) for name in ("ring", "ring_layout", "ring_ops"))
+    assert "def _can_coalesce_prefix_query(" in ring
+    assert "def _prefix_full_slices(" in ring
+    assert "def _physical_block_attention_mask(" in ops
+    assert "padded_length" in layout
+    assert "physical_global_ranges" in layout
+    assert "def iter_valid_sequence_slices(" in layout
+    assert "class RingCPBackend:" in ring
 
 
 def test_optional_cp_factories_are_experimental() -> None:
