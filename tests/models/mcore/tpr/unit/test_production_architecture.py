@@ -12,9 +12,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TypeVar
 
-import pytest
-
-
 ROOT = Path(__file__).resolve().parents[5]
 ENGINE = ROOT / "verl/workers/engine/megatron/tpr"
 MODEL = ROOT / "verl/models/mcore/tpr"
@@ -54,6 +51,16 @@ def test_production_has_no_recurrent_state_implementation_or_dispatch() -> None:
             assert "gdn" not in path.read_text(encoding="utf-8").lower(), path
 
 
+def _expect_type_error(func, argument, message: str) -> None:
+    """The structural CI runs this file with stdlib Python only."""
+    try:
+        func(argument)
+    except TypeError as exc:
+        assert message in str(exc), str(exc)
+    else:
+        raise AssertionError(f"expected TypeError containing {message!r}")
+
+
 def test_ppo_dense_guard_checks_every_decoder_slot() -> None:
     tree = ast.parse(_source("adapter"))
     definition = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
@@ -69,10 +76,8 @@ def test_ppo_dense_guard_checks_every_decoder_slot() -> None:
     unsupported = SimpleNamespace(self_attention=object())
     guard(SimpleNamespace(decoder=SimpleNamespace(layers=[dense, dense])))
     for layers in ([], [unsupported], [dense, unsupported], [dense, SimpleNamespace()]):
-        with pytest.raises(TypeError, match="every decoder layer"):
-            guard(SimpleNamespace(decoder=SimpleNamespace(layers=layers)))
-    with pytest.raises(TypeError, match="every decoder layer"):
-        guard(SimpleNamespace(incidental_attention=Attention()))
+        _expect_type_error(guard, SimpleNamespace(decoder=SimpleNamespace(layers=layers)), "every decoder layer")
+    _expect_type_error(guard, SimpleNamespace(incidental_attention=Attention()), "every decoder layer")
 
 
 def test_module_spec_rejects_mixed_attention_without_model_mutation() -> None:
@@ -101,8 +106,7 @@ def test_module_spec_rejects_mixed_attention_without_model_mutation() -> None:
     original = SimpleNamespace(layer_specs=[dense])
     assert convert(original).layer_specs[0].submodules.self_attention.module is Patched
     mixed = SimpleNamespace(layer_specs=[dense, Spec(object, SimpleNamespace(self_attention=Spec(object)))])
-    with pytest.raises(TypeError, match="requires Megatron SelfAttention"):
-        convert(mixed)
+    _expect_type_error(convert, mixed, "requires Megatron SelfAttention")
     assert dense.submodules.self_attention.module is Dense
 
 
