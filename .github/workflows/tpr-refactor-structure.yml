@@ -58,10 +58,15 @@ jobs:
       - name: Run stdlib-only structural tests
         run: |
           python3 - <<'PY'
-          import runpy
+          import importlib.util
+          import sys
           from pathlib import Path
           test_file = Path("tests/models/mcore/tpr/unit/test_production_architecture.py")
-          tests = runpy.run_path(str(test_file))
+          spec = importlib.util.spec_from_file_location("tpr_structure_contract", test_file)
+          module = importlib.util.module_from_spec(spec)
+          sys.modules[spec.name] = module
+          spec.loader.exec_module(module)
+          tests = vars(module)
           total = 0
           for name, fn in sorted(tests.items()):
               if name.startswith("test_") and callable(fn):
