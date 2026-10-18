@@ -475,8 +475,11 @@ class _DestructiveEntropy(torch.autograd.Function):
 @pytest.mark.parametrize("calculate_entropy", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_native_inplace_logprob_and_entropy_preserve_loss_gradients_and_probes(
-    capture_parts, calculate_entropy, dtype,
+    capture_parts, calculate_entropy, dtype, monkeypatch,
 ):
+    # This specifically tests native FP32 in-place CE/entropy behavior,
+    # separately from the accepted BF16 production default.
+    monkeypatch.setenv("TPR_SELECTED_LOGITS_FP32", "1")
     initial = torch.tensor([[[2.0, -1.0, 4.0, 0.5], [-0.7, 1.1, 0.2, 3.5]]], dtype=dtype)
     segment = SegmentSpec(0, None, torch.tensor([3, 4]), 0, 0)
     refs = (SegmentObjectiveRef(0, 0, 2, 1, 0), SegmentObjectiveRef(0, 1, 0, 0, 1),
