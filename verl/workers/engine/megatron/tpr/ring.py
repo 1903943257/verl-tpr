@@ -42,14 +42,12 @@ from .ring_layout import (
 )
 from .ring_ops import (
     _range_validity, _physical_block_attention_mask, _block_attention_forward,
-    _merge_attention, _finalize_attention_result, _flatten_tnd_softmax,
-    _unflatten_tnd_softmax, _block_attention_backward,
+    _merge_attention, _finalize_attention_result, _block_attention_backward,
 )
 
 if TYPE_CHECKING:
     from .state import KVStack, PastKVAnchors
 
-SequenceRange = tuple[int, int]
 
 
 def _load_mindspeed_ring_primitives():
