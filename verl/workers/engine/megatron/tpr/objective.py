@@ -10,6 +10,7 @@ vanilla PPO with token-mean aggregation, not sequence-level objectives.
 from __future__ import annotations
 
 from collections import defaultdict
+import os
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -55,10 +56,11 @@ def _metadata(batch: Any, key: str, default=None):
 def _selected_scaled_logits(logits: Tensor, positions: Tensor, temperatures: Tensor,
                             query_indices: Tensor | None) -> Tensor:
     selected = logits[0].index_select(0, positions)
-    # Float16Module converts Native Actor output to FP32 before temperature
-    # scaling/entropy. TPR unwraps that module; restore its numerical contract
-    # here, after selection, without casting the full physical logits tensor.
-    if selected.dtype in (torch.float16, torch.bfloat16):
+    # Keep the accepted BF16 selected-logit arithmetic by default. Real
+    # Qwen3-4B PPO replay showed that unconditional FP32 promotion changed
+    # logprobs and full gradients; opt in only for precision diagnostics.
+    if (selected.dtype in (torch.float16, torch.bfloat16)
+            and os.getenv("TPR_SELECTED_LOGITS_FP32", "0") == "1"):
         selected = selected.float()
     if query_indices is not None:
         selected = selected.index_select(0, query_indices)
