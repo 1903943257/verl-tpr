@@ -233,3 +233,43 @@ this branch. The old Ring-only branch's removal of those test parameters does
 not apply to these independent references. Deep-Prefix CPU and NPU regression
 tests supplement the existing padded CP2/CP4 gates; CPU validation does not
 establish CANN/HCCL numerical or throughput acceptance.
+
+
+### Experimental Fast Root Ring (2026-10-18)
+
+Use `TPR_ROOT_NATIVE_RING=1` to opt in; default is `0`. Only the actual tree
+Root (`segment_id == plan.root_id`, no parent) switches to MindSpeed's native
+`ringattn_context_parallel()` via the existing `ordinary_ring_cp_attention()`.
+An empty Prefix alone is NOT a Root signal. Internal and Leaf Segments retain
+the existing TPR Prefix/Current Ring schedule.
+
+Root Push keeps its graph-free cached K/V; Root Pop recomputes graph-connected
+K/V and accepts relayed descendant dK/dV without changing tree ownership.
+Native Root Ring uses only trailing physical padding. Virtual Query output
+rows are zeroed before returning so even a nonzero padded upstream dO has
+zero Root graph gradient. Native causal visibility excludes virtual Keys
+from all real Queries. No new Ring transport or backward implementation.
+
+CPU routing and padding contract:
+
+```bash
+python -m pytest -q tests/models/mcore/tpr/parallel/test_ring_cp_attention_contract.py -k native_root
+```
+
+NPU Root Push/Pop numerical checks (run sequentially):
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=8,9 torchrun --master_addr=127.0.0.1 --master_port=29797 \
+  --nproc_per_node=2 -m pytest -xvs \
+  tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py \
+  -k native_root_ring_matches_tpr_root_with_relayed_kv_gradients
+ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 torchrun --master_addr=127.0.0.1 --master_port=29797 \
+  --nproc_per_node=4 -m pytest -xvs \
+  tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py \
+  -k native_root_ring_matches_tpr_root_with_relayed_kv_gradients
+```
+
+Next gate: same authentic Actor capture with `TPR_ROOT_NATIVE_RING=0` vs `1`,
+keeping Prefix Merge settings fixed. Compare Root Push/Pop time, end-to-end
+loss/logprob, full parameter gradients, actual FA calls, and memory. Kernel
+parity does not establish complete PPO/optimizer acceptance.
