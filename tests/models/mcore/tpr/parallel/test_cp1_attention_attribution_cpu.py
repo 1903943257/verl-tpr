@@ -30,7 +30,8 @@ def test_same_shape_metrics_and_aligned_absolute_positions():
         _difference(torch.zeros(2), torch.zeros(3))
 
 
-def test_autoconclusion_identifies_real_qkv_m_effect(tmp_path):
+@pytest.mark.parametrize("full_sampling_endpoint", [3, 4, 6])
+def test_autoconclusion_identifies_real_qkv_m_effect(tmp_path, full_sampling_endpoint):
     modes = {}
     for mode, kind in (("full", "full"), ("split_no_share", "push"),
                        ("shared", "push")):
@@ -45,7 +46,8 @@ def test_autoconclusion_identifies_real_qkv_m_effect(tmp_path):
             records["r0|push|L1|qkv_out"] = _sample(4.0)
         modes[mode] = {
             "mode": mode, "no_fixed_tile": True, "row_lengths": [8, 8],
-            "root_length": 4, "records": records,
+            "root_length": full_sampling_endpoint if mode == "full" else 4,
+            "records": records,
             "same_qkv_attention": {},
             "same_input_gemm_replay": {
                 "input_equal": True,
@@ -77,4 +79,7 @@ def test_autoconclusion_identifies_real_qkv_m_effect(tmp_path):
     assert result["qkv_m_shape_effect_confirmed"] is True
     assert result["first_root_stage_difference"]["stage"] == "qkv_out"
     assert result["fixed_tile_enabled"] is False
+    assert result["root_length"] == 4
+    assert result["full_trace_sampling_prompt_endpoint"] == full_sampling_endpoint
+    assert result["full_sampling_endpoint_differs_from_root"] == (full_sampling_endpoint != 4)
     assert any("CONFIRMED" in line for line in result["conclusions"])
