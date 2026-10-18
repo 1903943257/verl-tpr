@@ -24,18 +24,13 @@ from types import MappingProxyType
 import torch
 from torch import Tensor
 
-from verl.models.mcore.tpr.context import KVPair
+from verl.models.mcore.tpr.context import KVPair, _validate_layer_number
 from verl.models.mcore.tpr.context import _compact_kv_tensor as _compact_graph_free_tensor
 
 from .ring import SequenceShard
 from .tree import SegmentId, SegmentSpec, _validate_segment_id
 
 _generations = count()
-
-
-def _validate_layer_number(layer_number: int) -> None:
-    if not isinstance(layer_number, int) or isinstance(layer_number, bool) or layer_number <= 0:
-        raise ValueError(f"layer_number must be a positive integer, got {layer_number!r}")
 
 
 def _normalize_local_kv(key_values: Mapping[int, KVPair], *, local_length: int) -> dict[int, KVPair]:

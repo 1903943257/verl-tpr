@@ -18,18 +18,7 @@ import torch
 from torch import Tensor
 
 from .ring import SequenceShard
-from .tree import SegmentObjectiveRef, SegmentSpec, TreeExecutionPlan
-
-
-def _rows(batch: Any, key: str) -> list[Tensor]:
-    try:
-        value = batch[key]
-    except (KeyError, TypeError) as exc:
-        raise ValueError(f"missing PPO field {key!r}") from exc
-    values = list(value) if isinstance(value, (tuple, list)) else list(value.unbind())
-    if not all(isinstance(row, Tensor) and row.ndim == 1 for row in values):
-        raise ValueError(f"PPO field {key!r} must have 1-D rows")
-    return values
+from .tree import SegmentObjectiveRef, SegmentSpec, TreeExecutionPlan, _rows
 
 
 def _native_log_probs(logits: Tensor, labels: Tensor) -> Tensor:
