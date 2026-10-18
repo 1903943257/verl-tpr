@@ -54,7 +54,13 @@ def _stage(full, contender, *, baseline_phase: str, phase: str):
 
 
 def _first_difference(results):
-    ordered = (*STAGES, "post_rope_k", "raw_v")
+    # Follow the real decoder dataflow, not alphabetic/snapshot order.
+    # RoPE K/raw V precede attention; attn_out is after linear_proj.
+    ordered = (
+        "attn_in", "qkv_in", "qkv_out", "post_rope_k", "raw_v",
+        "proj_in", "proj_out", "attn_out",
+        "fc1_in", "fc1_out", "fc2_in", "fc2_out",
+    )
     for layer in SELECTED_LAYERS:
         for stage in ordered:
             match = results.get(f"r0|L{layer}|{stage}")
@@ -311,6 +317,9 @@ def main() -> None:
         "========== TPRSelfAttention 单卡数值归因：自动最终结论 ==========",
         f"模型={report['model']} | Root={report['root_length']} "
         f"| 序列={report['row_lengths']} | 固定GEMM分块=关闭",
+        f"Full 采样锚点 Prompt={report['full_trace_sampling_prompt_endpoint']}; "
+        f"实际共享 Root={report['root_length']}; "
+        f"边界不同={report['full_sampling_endpoint_differs_from_root']}",
         f"第一层 QKV 同输入改变 GEMM M 是否确认数值差异："
         f"{report['qkv_m_shape_effect_confirmed']}",
         f"相同 Q/K/V 时 Square/Rectangular Attention 差异元素数："
