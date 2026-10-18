@@ -634,3 +634,49 @@ The per-mode sampled gradient replica gate is strict/exact. Complete
 post-update full-parameter parity and production optimizer throughput
 are NOT established by sampled weight checks. CI/CPU tests do not
 substitute for real 8-NPU HCCL execution.
+
+
+### DP2 40K OFF OOM and BF16 replica non-exactness (follow-up)
+
+The 40K Step6 TP2/CP2/DP2 Recompute ON actually completed one warmup and
+three measured F/B passes, with ~28.46s median F/B and stable ~20.419 GiB
+peak allocated. The strict BF16 CP×DP gradient replica witness then failed:
+maximum sample gap 3.05175781e-5 (one BF16 rounding quantum near the
+affected small gradient) and spread/representative sample norm ~0.003818.
+This is an after-finalize *non-bitwise identical* weight-gradient issue;
+it is not an activation checkpoint crash or evidence of a new memory leak.
+OFF at 40K separately OOMed, so the 40K paired parity gate is incomplete.
+The exact OFF OOM allocation site still requires its original traceback.
+
+The isolated offline helper grad_sync_precision.py already documents BF16
+HCCL SUM/4 causing divergent weight-gradient copies on Ascend 910B. The
+dedicated recompute DP2 validation shell now defaults to explicit FP32
+per-parameter all_reduce staging, while keeping the strict exact replica
+witness enabled. This tests KV-aware recompute correctness in a controlled
+precision setting; it does NOT claim native BF16 grad synchronization
+is repaired or that production uses FP32.
+
+For the **40K ON-only capacity + single AdamW gate** (fresh output):
+
+    TPR_DP2_VALIDATION_MODES=on \
+      bash tests/models/mcore/tpr/parallel/run_tpr_dp2_recompute_validation.sh \
+      /workspace/tpr_offline_run5_first8_40k_v1/capture_manifest.json \
+      /workspace/tpr_experiments/recompute_dp2_step6_on_fp32_v1 6
+
+For the **matched 30K OFF/ON complete gradient + AdamW comparison**,
+derive the new capture using the existing explicit truncation utility,
+preserving all original supervised token labels that remain:
+
+    python tests/models/mcore/tpr/parallel/prepare_tpr_30k_one_step.py \
+      /workspace/tpr_offline_run5_first8_40k_v1/capture_manifest.json \
+      /workspace/tpr_experiments/recompute_dp2_step6_30k_capture_v1 \
+      --step 6 --cap 30720
+
+    bash tests/models/mcore/tpr/parallel/run_tpr_dp2_recompute_validation.sh \
+      /workspace/tpr_experiments/recompute_dp2_step6_30k_capture_v1/capture_manifest.json \
+      /workspace/tpr_experiments/recompute_dp2_step6_30k_fp32_pair_v1 6
+
+To reproduce BF16 native-gradient discrepancies separately, explicitly set
+TPR_OFFLINE_GRAD_SYNC_DTYPE=bf16; failure of the exact replica witness is
+a real numerical consistency problem, not a passing test. Do not use
+diagnostic-only policy to claim recompute correctness.
