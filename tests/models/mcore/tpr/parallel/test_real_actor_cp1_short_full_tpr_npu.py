@@ -299,26 +299,48 @@ def test_real_actor_cp1_short_full_vs_tpr():
         model.zero_grad(set_to_none=True)
         torch.npu.synchronize()
         torch.npu.reset_peak_memory_stats()
+        trace = None
+        if os.getenv("TPR_CP1_TRACE", "0") == "1" and mode != "one_node":
+            from .cp1_attention_attribution import CP1AttentionTrace
+            trace_dir = Path(os.environ["TPR_CP1_TRACE_DIR"])
+            trace = CP1AttentionTrace(
+                model=model, batch=batch, forest=forest, mode=mode,
+                directory=trace_dir,
+            ).install()
         start = time.perf_counter()
-        if mode == "full":
-            result = _run_controlled_full(
-                model, batch, loss_fn=loss_fn, forest=forest,
-            )
-        elif mode == "split_no_share":
-            result = _run_split_no_share(
-                model, engine, batch, loss_fn=loss_fn, forest=forest,
-            )
-        else:
-            from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
-            result = run_tpr_forward_backward_batch(
-                engine, batch, loss_fn, forward_only=False,
-            )
-            result = {
-                "loss": float(result["loss"][0]),
-                "logprobs": dict(engine._tpr_captured_log_probs),
-            }
-        torch.npu.synchronize()
-        seconds = time.perf_counter() - start
+        try:
+            if mode == "full":
+                result = _run_controlled_full(
+                    model, batch, loss_fn=loss_fn, forest=forest,
+                )
+            elif mode == "split_no_share":
+                result = _run_split_no_share(
+                    model, engine, batch, loss_fn=loss_fn, forest=forest,
+                )
+            else:
+                from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
+                result = run_tpr_forward_backward_batch(
+                    engine, batch, loss_fn, forward_only=False,
+                )
+                result = {
+                    "loss": float(result["loss"][0]),
+                    "logprobs": dict(engine._tpr_captured_log_probs),
+                }
+            torch.npu.synchronize()
+            seconds = time.perf_counter() - start
+            measured_alloc = torch.npu.max_memory_allocated() / 2**30
+            measured_reserved = torch.npu.max_memory_reserved() / 2**30
+        finally:
+            if trace is not None:
+                trace.close()
+        if trace is not None:
+            if mode == "split_no_share":
+                trace.replay_root_qkv_m(
+                    Path(os.environ["TPR_CP1_TRACE_DIR"]) / "full/trace.pt"
+                )
+            trace_path = Path(os.environ["TPR_CP1_TRACE_DIR"]) / mode / "trace.pt"
+            trace.save(trace_path)
+            print(f"TPR_CP1_STAGE_TRACE mode={mode} saved={trace_path}", flush=True)
         if not torch.isfinite(torch.tensor(result["loss"])):
             raise AssertionError("Nonfinite single-card PPO loss")
         expected_keys = {
@@ -366,8 +388,8 @@ def test_real_actor_cp1_short_full_vs_tpr():
             "gradient_witness": witness,
             "global_grad_norm": grad_norm,
             "fwd_bwd_seconds": seconds,
-            "peak_allocated_gib": torch.npu.max_memory_allocated() / 2**30,
-            "peak_reserved_gib": torch.npu.max_memory_reserved() / 2**30,
+            "peak_allocated_gib": measured_alloc,
+            "peak_reserved_gib": measured_reserved,
             "optimizer_step": False,
             "original_online_conditioning": False,
             "note": "Controlled cropped real-label PPO parity, NOT on-policy replay",
