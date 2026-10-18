@@ -1349,10 +1349,18 @@ def ordinary_ring_cp_attention(
     }
     # Native ordinary causal Ring consumes SBH, retaining GQA's smaller KV H.
     q, k, v = (x.flatten(2).contiguous() for x in (query, current_key, current_value))
-    return ringattn_context_parallel(
+    output = ringattn_context_parallel(
         q, k, v, config.query_heads, cp_para,
         softmax_scale=config.softmax_scale, dropout_p=0.0,
     )
+    if current_shard.valid_local_length != current_shard.local_length:
+        # Native causal Ring can process physical trailing Query tokens, but
+        # they must never contribute to the PPO loss or either gradient path.
+        # Masking the output (rather than only the objective) also protects
+        # Root Push/Pop when a caller supplies a nonzero padded dO.
+        valid = torch.arange(current_shard.local_length, device=output.device) < current_shard.valid_local_length
+        output = output.masked_fill(~valid[:, None, None], 0)
+    return output
 
 
 def ring_cp_attention(
@@ -1397,7 +1405,10 @@ class RingCPAttentionBackend:
         current_shard: SequenceShard,
         prefix_blocks_by_layer: Mapping[int, Sequence[RingLocalKVBlock]],
         cp_group: Any,
+        use_native_root: bool = False,
     ) -> None:
+        if type(use_native_root) is not bool:
+            raise TypeError("use_native_root must be a bool")
         if (
             not isinstance(global_prefix_length, int)
             or isinstance(global_prefix_length, bool)
@@ -1421,6 +1432,8 @@ class RingCPAttentionBackend:
                 raise ValueError("Prefix path must be identical across Ring attention layers")
             if sum(block.shard.global_length for block in blocks) != global_prefix_length:
                 raise ValueError(f"layer {layer} Prefix blocks do not cover the Prefix length")
+        if use_native_root and (global_prefix_length != 0 or any(normalized.values())):
+            raise ValueError("native Root Ring requires zero Prefix length and no Prefix KV blocks")
         first_blocks = next(iter(normalized.values()))
         layout = _prepare_ring_layout(first_blocks, current_shard, cp_group)
         for layer, blocks in normalized.items():
@@ -1433,6 +1446,7 @@ class RingCPAttentionBackend:
         self._cp_group = cp_group
         self._parallel_size = layout.cp_size
         self._first_layer = min(normalized)
+        self._use_native_root = use_native_root
 
     @property
     def global_prefix_length(self) -> int:
@@ -1463,6 +1477,14 @@ class RingCPAttentionBackend:
             blocks = self._prefix_blocks_by_layer[layer_number]
         except KeyError as exc:
             raise KeyError(f"Ring CP context has no layer {layer_number}") from exc
+        if self._use_native_root:
+            return ordinary_ring_cp_attention(
+                query, new_key, new_value,
+                current_shard=self._current_shard,
+                cp_group=self._cp_group,
+                softmax_scale=softmax_scale,
+                allow_trailing_padding=True,
+            )
         return ring_cp_attention(
             query,
             new_key,
@@ -1533,6 +1555,7 @@ class RingCPBackend:
     def make_attention_backend(
         self, kv_stack: KVStack, *, expected_layer_numbers: tuple[int, ...],
         current_shard: SequenceShard, past_anchors: PastKVAnchors | None,
+        use_native_root: bool = False,
     ) -> RingCPAttentionBackend:
         return RingCPAttentionBackend(
             global_prefix_length=(
@@ -1544,6 +1567,7 @@ class RingCPBackend:
                 kv_stack, past_anchors, expected_layer_numbers,
             ),
             cp_group=self._cp_group,
+            use_native_root=use_native_root,
         )
 
 
