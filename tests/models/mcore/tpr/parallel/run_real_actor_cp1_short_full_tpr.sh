@@ -62,7 +62,7 @@ PY
 
 # Each arm loads exactly the same initial Qwen3-4B weights from checkpoint.
 # A separate torchrun exits after backward; no optimizer step is performed.
-for mode in full one_node shared; do
+for mode in full one_node split_no_share shared; do
   export TPR_CP1_MODE="$mode"
   export TPR_CP1_OUTPUT="$ROOT/$mode/result.json"
   if [[ -f "$TPR_CP1_OUTPUT" ]]; then
@@ -81,9 +81,9 @@ for mode in full one_node shared; do
     2>&1 | tee "$ROOT/$mode.log"
 done
 
-if [[ ! -e "$ROOT/comparison.json" ]]; then
+if [[ ! -e "$ROOT/comparison_split_no_share.json" ]]; then
   python -m tests.models.mcore.tpr.parallel.compare_real_actor_cp1_short_full_tpr \
     "$ROOT" | tee "$ROOT/comparison.log"
 else
-  echo "TPR_CP1_SHORT_COMPARISON_REUSE=$ROOT/comparison.json"
+  echo "TPR_CP1_SHORT_COMPARISON_REUSE=$ROOT/comparison_split_no_share.json"
 fi
