@@ -234,6 +234,9 @@ class SegmentExecutor:
         self.kv_stack = KVStack() if kv_stack is None else kv_stack
         self.loss_scale_func = loss_scale_func
         self.cp_group = cp_group
+        # Explicit opt-in: only this tree's actual Root may use ordinary
+        # MindSpeed causal Ring. An empty Prefix on a non-root is not enough.
+        self._native_root_ring = os.getenv("TPR_ROOT_NATIVE_RING", "0") == "1"
         if cp_group is None:
             if cp_backend is not None:
                 raise ValueError("cp_backend requires a cp_group")
@@ -422,6 +425,11 @@ class SegmentExecutor:
                 expected_layer_numbers=self.expected_layer_numbers,
                 current_shard=shard,
                 past_anchors=sharded_past_anchors,
+                use_native_root=(
+                    self._native_root_ring
+                    and segment.segment_id == self.plan.root_id
+                    and segment.parent_id is None
+                ),
             )
         context = TPRAttentionContext(
             prefix_length=segment.prefix_length,
