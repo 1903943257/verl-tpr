@@ -608,3 +608,94 @@ def test_forward_backward_use_identical_cann_visibility(monkeypatch, visibility)
     if mask is not None:
         assert forward["atten_mask"].is_contiguous()
         torch.testing.assert_close(forward["atten_mask"], mask)
+
+
+@pytest.mark.parametrize("root_enabled", [False, True])
+def test_native_root_route_is_explicit_and_never_selected_by_empty_prefix_alone(
+    monkeypatch, root_enabled,
+):
+    """A Root flag, not zero Prefix length, chooses ordinary MindSpeed Ring."""
+    group = object()
+    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    policy = ring.RingCPBackend(group, parallel_size=2, parallel_rank=0)
+    shard = make_ring_sequence_shard(63, cp_rank=0, cp_size=2)
+    empty_stack = SimpleNamespace(prefix_length=0, segment_ids=())
+    backend = policy.make_attention_backend(
+        empty_stack, expected_layer_numbers=(1,), current_shard=shard,
+        past_anchors=None, use_native_root=root_enabled,
+    )
+    query = torch.randn(shard.local_length, 1, 4, 8)
+    key = torch.randn(shard.local_length, 1, 2, 8)
+    value = torch.randn_like(key)
+    calls = []
+
+    def native(q, k, v, **kwargs):
+        calls.append(("native", kwargs))
+        return q.flatten(2)
+
+    def tpr(q, k, v, **kwargs):
+        calls.append(("tpr", kwargs))
+        return q.flatten(2)
+
+    monkeypatch.setattr(ring, "ordinary_ring_cp_attention", native)
+    monkeypatch.setattr(ring, "ring_cp_attention", tpr)
+    actual = backend.attention(1, query, key, value, softmax_scale=0.25)
+    torch.testing.assert_close(actual, query.flatten(2))
+    assert calls[0][0] == ("native" if root_enabled else "tpr")
+    if root_enabled:
+        assert calls[0][1]["allow_trailing_padding"] is True
+
+    prefix_shard = make_ring_sequence_shard(32, cp_rank=0, cp_size=2)
+    prefix = ring.RingLocalKVBlock(
+        7, prefix_shard,
+        torch.zeros(prefix_shard.local_length, 1, 2, 8),
+        torch.zeros(prefix_shard.local_length, 1, 2, 8),
+    )
+    with pytest.raises(ValueError, match="zero Prefix"):
+        ring.RingCPAttentionBackend(
+            global_prefix_length=32, current_shard=shard,
+            prefix_blocks_by_layer={1: (prefix,)}, cp_group=group,
+            use_native_root=True,
+        )
+
+
+def test_native_root_masks_trailing_padding_output_and_upstream_gradient(monkeypatch):
+    """A virtual physical Query must not produce output or a graph gradient."""
+    group = object()
+    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    monkeypatch.setattr(ring.dist, "get_rank", lambda: 0)
+    shard = make_ring_sequence_shard(63, cp_rank=0, cp_size=2)
+    query = torch.randn(shard.local_length, 1, 4, 8, requires_grad=True)
+    key = torch.randn(shard.local_length, 1, 2, 8)
+    value = torch.randn_like(key)
+    calls = []
+
+    def fake_native(q, k, v, heads, cp_para, **kwargs):
+        calls.append((q, k, v, heads, cp_para))
+        return q * 2
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mindspeed.core.context_parallel.ring_context_parallel.ring_context_parallel",
+        SimpleNamespace(ringattn_context_parallel=fake_native),
+    )
+    with pytest.raises(ValueError, match="unpadded sequence"):
+        ring.ordinary_ring_cp_attention(
+            query, key, value, current_shard=shard, cp_group=group,
+        )
+    output = ring.ordinary_ring_cp_attention(
+        query, key, value, current_shard=shard, cp_group=group,
+        allow_trailing_padding=True,
+    )
+    assert len(calls) == 1
+    assert calls[0][3] == 4
+    torch.testing.assert_close(output[:shard.valid_local_length], query.flatten(2)[:shard.valid_local_length] * 2)
+    assert torch.count_nonzero(output[shard.valid_local_length:]) == 0
+    output.sum().backward()
+    assert torch.count_nonzero(query.grad[shard.valid_local_length:]) == 0
+    torch.testing.assert_close(
+        query.grad[:shard.valid_local_length],
+        torch.full_like(query.grad[:shard.valid_local_length], 2),
+    )
