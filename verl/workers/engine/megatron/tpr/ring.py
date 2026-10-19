@@ -31,6 +31,9 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
+# Keep the historical diagnostic and CP1 SBH import surface available.
+from verl.models.mcore.tpr.rectangular_attention import _compressed_causal_mask
+
 from .ring_layout import (
     SequenceRange,
     _validate_integer,

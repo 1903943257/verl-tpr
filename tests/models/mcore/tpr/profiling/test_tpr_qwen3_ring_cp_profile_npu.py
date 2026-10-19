@@ -62,6 +62,7 @@ import torch.distributed as dist
 from megatron.core import parallel_state
 
 import verl.workers.engine.megatron.tpr.ring as ring_attention
+import verl.workers.engine.megatron.tpr.ring_attention as ring_kernels
 import verl.models.mcore.tpr.attention as local_attention
 from verl.experimental.tpr.legacy.fixed_topology_scheduler import FixedTopologyScheduler, PhysicalExecutionKind
 from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
@@ -732,14 +733,14 @@ def _collect_breakdown(
         original_finalize = _finalize_cp_parameter_gradients
         original_ring_forward = ring_attention._RingTPRAttention.forward
         original_ring_backward = ring_attention._RingTPRAttention.backward
-        original_circulate = ring_attention._circulate_kv
-        original_reduce = ring_attention._reduce_ring_gradients_to_owner
+        original_circulate = ring_kernels._circulate_kv
+        original_reduce = ring_kernels._reduce_ring_gradients_to_owner
         ring_p2p, _ = ring_attention._load_mindspeed_ring_primitives()
         original_send_recv, original_wait = ring_p2p.async_send_recv, ring_p2p.wait
         active_transport = [None]
-        original_fa_forward = ring_attention._block_attention_forward
-        original_fa_backward = ring_attention._block_attention_backward
-        original_merge = ring_attention._merge_attention
+        original_fa_forward = ring_kernels._block_attention_forward
+        original_fa_backward = ring_kernels._block_attention_backward
+        original_merge = ring_kernels._merge_attention
 
         def phase_for(method_name: str) -> str:
             if path == "reference":
@@ -933,33 +934,33 @@ def _collect_breakdown(
                     )
                 )
                 stack.enter_context(
-                    patch.object(ring_attention, "_circulate_kv", timed_circulate)
+                    patch.object(ring_kernels, "_circulate_kv", timed_circulate)
                 )
                 stack.enter_context(patch.object(ring_p2p, "async_send_recv", timed_send_recv))
                 stack.enter_context(patch.object(ring_p2p, "wait", timed_wait))
                 stack.enter_context(
                     patch.object(
-                        ring_attention,
+                        ring_kernels,
                         "_reduce_ring_gradients_to_owner",
                         timed_reduce,
                     )
                 )
                 stack.enter_context(
                     patch.object(
-                        ring_attention,
+                        ring_kernels,
                         "_block_attention_forward",
                         timed_fa_forward,
                     )
                 )
                 stack.enter_context(
                     patch.object(
-                        ring_attention,
+                        ring_kernels,
                         "_block_attention_backward",
                         timed_fa_backward,
                     )
                 )
                 stack.enter_context(
-                    patch.object(ring_attention, "_merge_attention", timed_merge)
+                    patch.object(ring_kernels, "_merge_attention", timed_merge)
                 )
 
                 model.zero_grad(set_to_none=True)
