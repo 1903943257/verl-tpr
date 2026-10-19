@@ -21,6 +21,7 @@ case "${TPR_OFFLINE_RUN_MODES:-both}" in
    both) modes=(full tpr) ;;
    full) modes=(full) ;;
    tpr) modes=(tpr) ;;
+   split_no_share) modes=(split_no_share) ;;
    compare) modes=() ;;
    *) echo "Unknown TPR_OFFLINE_RUN_MODES" >&2; exit 2;;
 esac
@@ -43,6 +44,24 @@ if [[ "${#errors[@]}" == 0 ]] && \
    [[ "${TPR_OFFLINE_RUN_MODES:-both}" == "both" || "${TPR_OFFLINE_RUN_MODES:-both}" == "compare" ]]; then
     python tests/models/mcore/tpr/parallel/compare_real_actor_tp2cp4_offline_ppo.py \
       "$TPR_OFFLINE_OUTPUT_DIR" | tee "$TPR_OFFLINE_OUTPUT_DIR/comparison.log"
+fi
+# CP4 three-arm numerical attribution can reuse an existing full/tpr run.
+# The split_no_share mode runs ONLY the missing third arm (8 NPUs once).
+if [[ "${TPR_OFFLINE_RUN_MODES:-both}" == "split_no_share" ]] && \
+   [[ "${#errors[@]}" == 0 ]]; then
+    three_arms_ready=1
+    for mode in full split_no_share tpr; do
+        for rank in {0..7}; do
+            [[ -f "$TPR_OFFLINE_OUTPUT_DIR/${mode}_rank${rank}.pt" ]] || three_arms_ready=0
+        done
+    done
+    if [[ "$three_arms_ready" == 1 ]]; then
+        python -m tests.models.mcore.tpr.parallel.compare_cp4_split_no_share_cpu \
+          "$TPR_OFFLINE_OUTPUT_DIR" | \
+          tee "$TPR_OFFLINE_OUTPUT_DIR/cp4_three_arm_comparison.log"
+    else
+        echo "TPR_CP4_SPLIT saved; no three-arm comparison: full/tpr snapshots missing"
+    fi
 fi
 if (("${#errors[@]}" > 0)); then
     echo "TPR_OFFLINE failed_modes=${errors[*]} (logs preserved)" >&2
