@@ -25,6 +25,19 @@ case "${TPR_OFFLINE_RUN_MODES:-both}" in
    compare) modes=() ;;
    *) echo "Unknown TPR_OFFLINE_RUN_MODES" >&2; exit 2;;
 esac
+if [[ "${TPR_OFFLINE_RUN_MODES:-both}" == "split_no_share" ]]; then
+    [[ "${TPR_OFFLINE_FULL_RING_BACKEND:-custom}" == "custom" ]] || {
+        echo "CP4 split-no-share control requires custom Ring on all three arms" >&2
+        exit 2
+    }
+    [[ "${TPR_OFFLINE_SGD_LR:-1e-5}" == "0" ||
+       "${TPR_OFFLINE_SGD_LR:-1e-5}" == "0.0" ]] || {
+        echo "CP4 split-no-share controlled parity requires TPR_OFFLINE_SGD_LR=0" >&2
+        exit 2
+    }
+    python -m pytest -q \
+      tests/models/mcore/tpr/parallel/test_cp4_three_arm_comparison_cpu.py
+fi
 errors=()
 for mode in "${modes[@]}"; do
     export TPR_OFFLINE_MODE="$mode"
