@@ -60,12 +60,34 @@ assert all(x <= cap for x in audit["retained_lengths"])
 assert all(n > 0 for n in audit["supervised_tokens_per_row"])
 PY
 
+# TPR_CP1_SAVE_FULL_GRADS=1 stores ALL original BF16 parameter gradients
+# separately (four copies of 4B model gradients consume substantial disk).
+# Existing sampled-only results cannot be upgraded retroactively.
+if [[ "${TPR_CP1_SAVE_FULL_GRADS:-0}" != "0" &&
+      "${TPR_CP1_SAVE_FULL_GRADS:-0}" != "1" ]]; then
+  echo "TPR_CP1_SAVE_FULL_GRADS must be 0 or 1" >&2
+  exit 2
+fi
 # Each arm loads exactly the same initial Qwen3-4B weights from checkpoint.
 # A separate torchrun exits after backward; no optimizer step is performed.
 for mode in full one_node split_no_share shared; do
   export TPR_CP1_MODE="$mode"
   export TPR_CP1_OUTPUT="$ROOT/$mode/result.json"
   if [[ -f "$TPR_CP1_OUTPUT" ]]; then
+    if [[ "${TPR_CP1_SAVE_FULL_GRADS:-0}" == "1" ]]; then
+      python - "$TPR_CP1_OUTPUT" <<'PY'
+import json, os, sys
+from pathlib import Path
+record = json.loads(Path(sys.argv[1]).read_text())
+directory = record.get("full_grad_dir")
+if not directory or not (Path(directory) / "manifest.pt").is_file():
+    raise SystemExit(
+        "Existing CP1 result lacks complete parameter gradients. "
+        "Set a NEW TPR_CP1_ROOT for full-gradient experiment; "
+        "never silently reuse sampled-only results."
+    )
+PY
+    fi
     echo "TPR_CP1_SHORT_REUSE mode=$mode result=$TPR_CP1_OUTPUT"
     continue
   fi
