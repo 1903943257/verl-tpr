@@ -160,17 +160,28 @@ class SegmentPPOObjectiveAdapter:
         for ref in tree_plan.objective_refs:
             refs_by_segment[ref.segment_id].append(ref)
 
+        # Each segment's CP shard is immutable: use the same owner mapping
+        # for ref filtering and the eventual loss callback.
+        shards = {}
         if shard_for_segment is not None:
             for segment_id, refs in refs_by_segment.items():
-                shard = shard_for_segment(tree_plan.segment_plan.get(segment_id))
-                refs_by_segment[segment_id] = [ref for ref in refs if shard.owns(ref.query_offset)]
+                if refs:
+                    shard = shard_for_segment(tree_plan.segment_plan.get(segment_id))
+                    shards[segment_id] = shard
+                    refs_by_segment[segment_id] = [ref for ref in refs if shard.owns(ref.query_offset)]
         counts = {segment_id: len(refs) for segment_id, refs in refs_by_segment.items()}
 
         def segment_loss_fn(segment: SegmentSpec, logits: Tensor):
-            shard = None if shard_for_segment is None else shard_for_segment(segment)
-            return self.compute_loss(segment, logits, refs_by_segment[segment.segment_id], shard=shard)
+            return self.compute_loss(
+                segment, logits, refs_by_segment[segment.segment_id], shard=shards.get(segment.segment_id),
+            )
 
         return segment_loss_fn, counts
+
+    def prepare_batch(self) -> None:
+        """Resolve host-side PPO metadata before the first Segment forward."""
+        self._temperatures(())
+        self._prepare_batch_rows()
 
     def _temperatures(self, refs: Sequence[SegmentObjectiveRef]) -> list[float]:
         if self._temperature_values is None:
@@ -395,6 +406,9 @@ class SegmentPPOObjectiveAdapter:
         if entropy is not None:
             token_outputs["entropy"] = entropy
         packed = {key: [] for key in token_outputs}
+        # VERL's shift consumes one dummy slot per row; share these constant
+        # slots instead of allocating new device tensors inside the row loop.
+        dummy = {key: values.new_zeros(1) for key, values in token_outputs.items()}
         for local_row, row in enumerate(rows):
             selected = by_row[row]
             count = len(selected)
@@ -416,7 +430,7 @@ class SegmentPPOObjectiveAdapter:
                 ).to(dev)
             for key, values in token_outputs.items():
                 values = values.index_select(0, idx)
-                packed[key].extend((values, values.new_zeros(1)))
+                packed[key].extend((values, dummy[key]))
 
         compact = TensorDict(output_fields, batch_size=[n], device=dev)
         tu.assign_non_tensor(compact, **self._normalization)
