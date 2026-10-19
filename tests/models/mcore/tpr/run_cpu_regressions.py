@@ -46,6 +46,7 @@ PARALLEL = (
     "ring_cp_attention_contract", "cp_padding_contract", "cp_backend_contract",
     "cp_segment_execution_contract", "allgather_cp_attention_contract",
     "hybrid_cp_attention_contract", "ulysses_cp_attention_contract",
+    "cp1_n8_perf_contract_cpu",
 )
 
 
