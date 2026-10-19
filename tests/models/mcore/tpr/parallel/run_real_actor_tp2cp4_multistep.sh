@@ -25,22 +25,9 @@ fi
 mkdir -p "$TPR_OFFLINE_OUTPUT_DIR"
 python -m pytest -q \
   tests/models/mcore/tpr/parallel/test_native_full_dynamic_microbatches_cpu.py \
+  tests/models/mcore/tpr/parallel/test_multistep_artifact_recovery_cpu.py \
   | tee "$TPR_OFFLINE_OUTPUT_DIR/native_batch_preflight.log"
 
-# Re-run a failed mode without clobbering the opposite mode's successful
-# 8-rank snapshots. Snapshot sets must be all-or-nothing; a partially
-# completed optimizer trajectory CANNOT safely resume from step 1.
-declare -a expected_steps=()
-if [[ -n "${TPR_OFFLINE_CAPTURE_MANIFEST:-}" ]]; then
-  for ((s=1;s<=TPR_OFFLINE_STEPS;s++)); do expected_steps+=("$s"); done
-else
-  for s in 1 2 5 10 20 30 40 50; do
-    (( s <= TPR_OFFLINE_STEPS )) && expected_steps+=("$s")
-  done
-  if [[ " ${expected_steps[*]} " != *" ${TPR_OFFLINE_STEPS} "* ]]; then
-    expected_steps+=("$TPR_OFFLINE_STEPS")
-  fi
-fi
 case "${TPR_OFFLINE_RUN_MODES:-both}" in
     full) modes=(full);;
     tpr) modes=(tpr);;
@@ -48,25 +35,32 @@ case "${TPR_OFFLINE_RUN_MODES:-both}" in
     compare) modes=();;
     *) echo "TPR_OFFLINE_RUN_MODES must be full|tpr|both|compare" >&2; exit 2;;
 esac
+full_grad_arg=""
+if [[ "${TPR_OFFLINE_SAVE_FULL_GRADS:-0}" == "1" ]]; then
+    full_grad_arg="${TPR_OFFLINE_FULL_GRAD_STEPS:-}"
+fi
+recovery_manifest_flag=()
+if [[ -n "${TPR_OFFLINE_CAPTURE_MANIFEST:-}" ]]; then
+    recovery_manifest_flag=(--manifest)
+fi
 errors=()
 for mode in "${modes[@]}"; do
     export TPR_OFFLINE_MODE="$mode"
-    expected=0
-    existing=0
-    for step in "${expected_steps[@]}"; do
-        for rank in {0..7}; do
-            expected=$((expected+1))
-            [[ -f "$TPR_OFFLINE_OUTPUT_DIR/${mode}_step${step}_rank${rank}.pt" ]] &&
-                existing=$((existing+1))
-        done
-    done
-    if (( existing == expected && expected > 0 )); then
-        echo "TPR_FIXED_PPO_REUSE completed_mode=$mode snapshots=$existing"
+    # Snapshot files only appear AFTER optimizer.step. Full gradient
+    # directories appear BEFORE it. They are NOT resumable AdamW state.
+    # Archive only interrupted artifacts of the mode being restarted.
+    recovery_report=$(python -m tests.models.mcore.tpr.parallel.multistep_artifact_recovery \
+        --root "$TPR_OFFLINE_OUTPUT_DIR" \
+        --mode "$mode" --steps "$TPR_OFFLINE_STEPS" \
+        "${recovery_manifest_flag[@]}" \
+        --full-grad-steps "$full_grad_arg")
+    printf '%s\n' "$recovery_report"
+    recovery_state="${recovery_report##*$'\n'}"
+    if [[ "$recovery_state" == "reuse" ]]; then
         continue
-    elif (( existing > 0 )); then
-        echo "TPR_FIXED_PPO_PARTIAL mode=$mode snapshots=$existing/$expected; refusing unsafe restart. Use a new output directory for this mode." >&2
-        errors+=("$mode")
-        continue
+    elif [[ "$recovery_state" != "run" && "$recovery_state" != "replay" ]]; then
+        echo "Unexpected PPO recovery state: $recovery_state" >&2
+        exit 2
     fi
     echo "TPR_FIXED_PPO start=$mode steps=$TPR_OFFLINE_STEPS rows=$TPR_OFFLINE_ROWS"
     if torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29786 \
