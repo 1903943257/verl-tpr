@@ -17,19 +17,20 @@ from verl.workers.engine.megatron.tpr.tree import (
 
 
 def _records(forest):
-    """Compare the actual schedule, tokens and refs, without type identity."""
-    return [
-        (
-            tree.tree.uid, tree.tree.tree_index, tree.tree.member_rows,
+    """Compare the same physical schedule and refs across legacy and production."""
+    result = []
+    for item in forest.trees:
+        # Only the reference builder still exposes the obsolete .tree alias.
+        tree = getattr(item, "tree", item)
+        result.append((
+            tree.uid, tree.tree_index, tree.member_rows,
             [(segment.segment_id, segment.parent_id, segment.position_start,
               segment.prefix_length, segment.token_ids.tolist())
-             for segment in tree.segment_plan.segments.values()],
+             for segment in item.segment_plan.segments.values()],
             [(ref.segment_id, ref.query_offset, ref.target_token_id,
-              ref.sample_row, ref.response_offset) for ref in tree.objective_refs],
-        )
-        for tree in forest.trees
-    ]
-
+              ref.sample_row, ref.response_offset) for ref in item.objective_refs],
+        ))
+    return result
 
 @pytest.mark.parametrize("seed", range(48))
 @pytest.mark.parametrize("with_prompts", (False, True))
@@ -61,7 +62,7 @@ def test_turn_forest_matches_reference_for_branches_duplicates_and_masks(seed, w
     assert actual.logical_loss_tokens == sum(int(mask.sum()) for mask in masks)
     assert digest_forest_plan(actual) == digest_forest_plan(build_tree_execution_plans(keys, batch, **options))
     # The persisted topology is unique; metadata access does not materialize a second tree.
-    assert all(tree.tree is tree for tree in actual.trees)
+    assert all(not hasattr(tree, "tree") for tree in actual.trees)
     assert all(not hasattr(tree, "nodes") for tree in actual.trees)
 
 
@@ -124,6 +125,43 @@ def test_empty_response_and_full_length_loss_masks():
     forest = build_tree_execution_plans(["u_s_0", "v_s_0"], batch, require_loss_mask_alignment=True)
     assert forest.logical_loss_tokens == 1
     assert forest.segment_count == 2
+
+
+def test_active_segments_follow_query_owners_not_target_children():
+    batch = {
+        "input_ids": [torch.tensor([1, 151645, 2, 151645]), torch.tensor([1, 151645, 3, 151645])],
+        "response_mask": [torch.tensor([True, False]), torch.tensor([False, False])],
+    }
+    tree = build_tree_execution_plans(["u_s_0", "u_s_1"], batch, turn_min_segment_tokens=1).trees[0]
+    assert len(tree.segment_plan.segments) == 3
+    assert tree.objective_refs[0].target_token_id == 2
+    assert tree.active_segment_ids == frozenset({0})
+    batch["response_mask"][0] = torch.tensor([False, True])
+    tree = build_tree_execution_plans(["u_s_0", "u_s_1"], batch, turn_min_segment_tokens=1).trees[0]
+    child = tree.objective_refs[0].segment_id
+    assert tree.active_segment_ids == frozenset({0, child})
+    for mask in batch["response_mask"]:
+        mask.zero_()
+    tree = build_tree_execution_plans(["u_s_0", "u_s_1"], batch, turn_min_segment_tokens=1).trees[0]
+    assert tree.active_segment_ids == frozenset()
+
+
+def test_compression_handles_deep_terminal_chain_without_recursion():
+    from verl.workers.engine.megatron.tpr.tree import _compress, _TurnNode
+
+    depth = 1200
+    child = None
+    for offset in reversed(range(depth)):
+        node = _TurnNode(offset + 1, 0, terminal_rows=[offset])
+        if child is not None:
+            node.children[(offset,)] = child
+        child = node
+    segments, paths = [], {}
+    _compress(node, None, 0, [torch.arange(depth)], segments, paths, ())
+    assert len(segments) == depth
+    assert [(segment.segment_id, segment.parent_id, segment.position_start, segment.length)
+            for segment in segments] == [(i, i - 1 if i else None, i, 1) for i in range(depth)]
+    assert paths[depth - 1] == tuple(range(depth))
 
 
 @pytest.mark.parametrize("field,value", [("query_offset", True), ("target_token_id", -1)])

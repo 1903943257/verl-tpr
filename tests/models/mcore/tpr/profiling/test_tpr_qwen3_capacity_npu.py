@@ -39,7 +39,7 @@ from ..correctness.test_tpr_qwen3_compatibility_npu import (
     _make_qwen_model,
 )
 from ..equivalence.test_segment_push_pop_npu import _install_single_rank_runtime
-from verl.models.mcore.tpr import TPR_REQUEST_KEY, TPRForwardBackwardRequest
+from verl.experimental.tpr.legacy.engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import is_torch_npu_available
 

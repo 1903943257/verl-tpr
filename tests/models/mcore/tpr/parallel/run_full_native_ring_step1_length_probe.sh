@@ -23,7 +23,7 @@ export TPR_TURN_MIN_SEGMENT_TOKENS=128
 
 python - <<'PY'
 import inspect
-from verl.models.mcore.tpr.parallel.ring_attention import ordinary_ring_cp_attention
+from verl.workers.engine.megatron.tpr.ring import ordinary_ring_cp_attention
 assert "allow_trailing_padding" in inspect.signature(ordinary_ring_cp_attention).parameters
 print("NATIVE_RING_SIGNATURE=PASS", flush=True)
 PY

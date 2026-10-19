@@ -15,9 +15,8 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr import (
-    TPR_REQUEST_KEY,
-    TPRForwardBackwardRequest,
+from verl.experimental.tpr.legacy.engine_adapter import TPR_REQUEST_KEY, TPRForwardBackwardRequest
+from verl.experimental.tpr.legacy.plan import (
     PopSegment,
     PushSegment,
     SegmentLossTerm,

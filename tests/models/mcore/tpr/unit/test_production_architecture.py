@@ -6,8 +6,11 @@ protect separation of the Ring-only PPO runtime from optional experiments.
 from __future__ import annotations
 
 import ast
+import copy
+from dataclasses import dataclass, replace
 from pathlib import Path
-
+from types import SimpleNamespace
+from typing import TypeVar
 
 ROOT = Path(__file__).resolve().parents[5]
 ENGINE = ROOT / "verl/workers/engine/megatron/tpr"
@@ -32,13 +35,79 @@ def test_no_experimental_backend_in_production_imports() -> None:
         "verl.models.mcore.tpr.parallel.hybrid_attention",
         "verl.models.mcore.tpr.parallel.ulysses_attention",
     )
-    for name in PRODUCTION:
-        tree = ast.parse(_source(name))
+    files = [ENGINE / f"{name}.py" for name in PRODUCTION] + list(MODEL.glob("*.py"))
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
-                assert not any(node.module.startswith(v) for v in forbidden), (name, node.module)
+                assert not any(node.module.startswith(v) for v in forbidden), (path, node.module)
             elif isinstance(node, ast.Import):
-                assert not any(alias.name.startswith(v) for alias in node.names for v in forbidden), name
+                assert not any(alias.name.startswith(v) for alias in node.names for v in forbidden), path
+
+
+def test_production_has_no_recurrent_state_implementation_or_dispatch() -> None:
+    for base in (ENGINE, MODEL):
+        for path in base.glob("*.py"):
+            assert "gdn" not in path.read_text(encoding="utf-8").lower(), path
+
+
+def _expect_type_error(func, argument, message: str) -> None:
+    """The structural CI runs this file with stdlib Python only."""
+    try:
+        func(argument)
+    except TypeError as exc:
+        assert message in str(exc), str(exc)
+    else:
+        raise AssertionError(f"expected TypeError containing {message!r}")
+
+
+def test_ppo_dense_guard_checks_every_decoder_slot() -> None:
+    tree = ast.parse(_source("adapter"))
+    definition = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                      and node.name == "_assert_dense_model")
+
+    class Attention:
+        pass
+
+    namespace = {"Any": object, "TPRSelfAttention": Attention}
+    exec(compile(ast.Module(body=[definition], type_ignores=[]), "<adapter dense guard>", "exec"), namespace)
+    guard = namespace["_assert_dense_model"]
+    dense = SimpleNamespace(self_attention=Attention())
+    unsupported = SimpleNamespace(self_attention=object())
+    guard(SimpleNamespace(decoder=SimpleNamespace(layers=[dense, dense])))
+    for layers in ([], [unsupported], [dense, unsupported], [dense, SimpleNamespace()]):
+        _expect_type_error(guard, SimpleNamespace(decoder=SimpleNamespace(layers=layers)), "every decoder layer")
+    _expect_type_error(guard, SimpleNamespace(incidental_attention=Attention()), "every decoder layer")
+
+
+def test_module_spec_rejects_mixed_attention_without_model_mutation() -> None:
+    definition = next(node for node in ast.parse(_source("adapter")).body
+                      if isinstance(node, ast.FunctionDef) and node.name == "replace_self_attention_with_tpr")
+
+    @dataclass
+    class Spec:
+        module: object
+        submodules: object = None
+
+    class Dense:
+        pass
+
+    class Patched(Dense):
+        pass
+
+    namespace = {
+        "_SpecT": TypeVar("_SpecT"), "copy": copy, "ModuleSpec": Spec, "replace": replace,
+        "SelfAttention": Dense, "TPRSelfAttention": Patched,
+        "get_module": lambda spec: spec.module, "_get_layer_specs": lambda spec: spec.layer_specs,
+    }
+    exec(compile(ast.Module(body=[definition], type_ignores=[]), "<adapter module spec>", "exec"), namespace)
+    convert = namespace["replace_self_attention_with_tpr"]
+    dense = Spec(object, SimpleNamespace(self_attention=Spec(Dense)))
+    original = SimpleNamespace(layer_specs=[dense])
+    assert convert(original).layer_specs[0].submodules.self_attention.module is Patched
+    mixed = SimpleNamespace(layer_specs=[dense, Spec(object, SimpleNamespace(self_attention=Spec(object)))])
+    _expect_type_error(convert, mixed, "requires Megatron SelfAttention")
+    assert dense.submodules.self_attention.module is Dense
 
 
 def test_turn_tree_is_only_production_builder() -> None:
@@ -51,6 +120,7 @@ def test_turn_tree_is_only_production_builder() -> None:
     assert "class _TrieNode" not in source
     assert "def build_trajectory_trees(" not in source
     assert "class SegmentObjectiveRef" in source
+    assert "def tree(self)" not in source
 
 
 def test_ppo_executor_no_legacy_ce_gdn_paths() -> None:
@@ -90,6 +160,7 @@ def test_engine_owns_shard_tree_state() -> None:
     assert not eager_state_imports
     assert "class KVPrefixState:" in state
     assert "class KVStack:" in state
+    assert "sequence_length = global_length" not in state
     assert "class PrefixStateStack:" not in state
     assert "class ShardedPastKVAnchors" not in state
     assert "GDNPrefixState" not in state
@@ -154,7 +225,15 @@ def test_optional_cp_factories_are_experimental() -> None:
 
 def test_context_is_thin_and_has_no_eager_engine_imports() -> None:
     source = (MODEL / "context.py").read_text(encoding="utf-8")
-    assert len(source.splitlines()) <= 230
+    # Guard responsibilities rather than formatting/line count: the shared
+    # compact-storage helper is needed before each Push layer releases QKV.
+    definitions = {node.name for node in ast.parse(source).body
+                   if isinstance(node, (ast.ClassDef, ast.FunctionDef))}
+    assert definitions == {
+        "TPRAttentionBackend", "TPRAttentionContext", "_compact_kv_tensor",
+        "_validate_layer_number", "_validate_kv_pair", "_assert_layers",
+        "get_tpr_attention_context", "use_tpr_attention_context",
+    }
     assert "class TPRAttentionContext:" in source
     assert "def use_tpr_attention_context(" in source
     assert "def get_past_kv(" in source
@@ -185,14 +264,26 @@ def test_internal_relative_imports_resolve_after_relocation() -> None:
                     f"{file} has unresolved relative import: level={item.level} module={item.module}"
                 )
 
-def test_public_dense_symbols_resolve_to_canonical_engine() -> None:
-    """No exported production executor or Ring type may point to legacy copies."""
-    import ast
-
+def _model_public_exports() -> dict[str, str]:
     syntax = ast.parse((MODEL / "__init__.py").read_text(encoding="utf-8"))
-    exports = next(ast.literal_eval(node.value) for node in syntax.body if
-                   isinstance(node, ast.Assign) and
-                   any(isinstance(target, ast.Name) and target.id == "_PRODUCTION_EXPORTS" for target in node.targets))
+    return next(
+        ast.literal_eval(node.value)
+        for node in syntax.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "_PRODUCTION_EXPORTS"
+            for target in node.targets
+        )
+    )
+
+
+def test_model_public_api_has_only_canonical_exports() -> None:
+    """Expose the production engine directly, without transitional aliases."""
+    source = (MODEL / "__init__.py").read_text(encoding="utf-8")
+    exports = _model_public_exports()
+    assert "_LEGACY_EXPORTS" not in source and "_MODULES" not in source
+    assert not any(module.startswith("verl.experimental.tpr") for module in exports.values())
+    assert "SegmentPlan" not in exports and "SegmentSpec" not in exports
     engine_expected = {
         "RingCPBackend": "ring",
         "SegmentExecutor": "executor",
@@ -200,29 +291,22 @@ def test_public_dense_symbols_resolve_to_canonical_engine() -> None:
         "KVStack": "state",
         "SequenceShard": "ring",
     }
-    for name, module in engine_expected.items():
-        assert exports[name] == "verl.workers.engine.megatron.tpr." + module, name
+    for symbol, module in engine_expected.items():
+        assert exports[symbol] == f"verl.workers.engine.megatron.tpr.{module}", symbol
 
 
-
-def test_model_public_api_excludes_legacy_aliases() -> None:
-    """Production model exports stay canonical while old explicit imports transition."""
-    syntax = ast.parse((MODEL / "__init__.py").read_text(encoding="utf-8"))
-    maps = {
-        target.id: ast.literal_eval(node.value)
-        for node in syntax.body
-        if isinstance(node, ast.Assign)
-        for target in node.targets
-        if isinstance(target, ast.Name) and target.id in ("_PRODUCTION_EXPORTS", "_LEGACY_EXPORTS")
-    }
-    public = maps["_PRODUCTION_EXPORTS"]
-    legacy = maps["_LEGACY_EXPORTS"]
-    assert not (public.keys() & legacy.keys())
-    assert all(not module.startswith("verl.experimental.tpr") for module in public.values())
-    assert all(module.startswith("verl.experimental.tpr") for module in legacy.values())
-    assert public["RingCPBackend"] == "verl.workers.engine.megatron.tpr.ring"
-    assert public["SegmentExecutor"] == "verl.workers.engine.megatron.tpr.executor"
-    assert "SegmentPlan" not in public and "SegmentSpec" not in public
-    assert legacy["SegmentPlan"] == "verl.experimental.tpr.legacy.plan"
-    assert legacy["SegmentSpec"] == "verl.experimental.tpr.legacy.plan"
-    assert "parallel" not in public
+def test_historical_tests_use_explicit_experimental_imports() -> None:
+    """Do not accidentally reintroduce top-level legacy aliases."""
+    package_root = "verl.models.mcore.tpr"
+    model_submodules = {"attention", "context", "rectangular_attention"}
+    public = _model_public_exports()
+    obsolete = []
+    for root in (ROOT / "verl", ROOT / "tests/models/mcore/tpr"):
+        for file in root.rglob("*.py"):
+            tree = ast.parse(file.read_text(encoding="utf-8"), filename=str(file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module == package_root:
+                    for symbol in node.names:
+                        if symbol.name not in public and symbol.name not in model_submodules:
+                            obsolete.append(f"{file}: {symbol.name}")
+    assert not obsolete, "Obsolete TPR model imports:\\n" + "\\n".join(sorted(obsolete))

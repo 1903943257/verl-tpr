@@ -1,5 +1,9 @@
 # TPR Compact Runtime Inventory (2026-10-15)
 
+This is a dated snapshot, not a live line-count report. The subsequent
+[10/18 contract fixes](contract_fixes_20261018.md) add correctness guards and
+batch preparation; they do not claim another net source reduction.
+
 Counts are physical Python lines, including comments and blanks, using
 `str.splitlines()`. Baseline: `fa708bea` on
 `refactor/tpr-ppo-engine-ring-turn-20261015`. No test files are included.

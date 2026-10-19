@@ -14,8 +14,10 @@
 
 """Per-forward bridge between the Engine executor and Megatron attention layers.
 
-Only ephemeral references live here. The Engine state.py owns long-lived KV,
-detached Prefix caches and delayed gradients. This module never clones/detaches.
+The Engine state.py owns long-lived KV and delayed gradients. Push forwards
+can compact graph-free KV as each layer completes, avoiding QKV storage pinned
+by value views until the end of the entire model forward. Pop forwards retain
+the original tensors and their autograd graphs.
 """
 
 from __future__ import annotations
@@ -25,15 +27,24 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
+import torch
 from torch import Tensor
-
-if TYPE_CHECKING:
-    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
 
 KVPair = tuple[Tensor, Tensor]
 RotaryPosEmb = Tensor | tuple[Tensor, Tensor]
+
+
+def _compact_kv_tensor(tensor: Tensor) -> Tensor:
+    """Release oversized/view storage without copying an already compact tensor."""
+
+    if (
+        tensor.is_contiguous() and tensor.storage_offset() == 0
+        and tensor.untyped_storage().nbytes() == tensor.numel() * tensor.element_size()
+    ):
+        return tensor
+    return tensor.clone(memory_format=torch.contiguous_format)
 
 
 class TPRAttentionBackend(Protocol):
@@ -91,7 +102,7 @@ def _assert_layers(actual: Mapping[int, object], expected: Iterable[int], *, kin
         )
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, weakref_slot=True)
 class TPRAttentionContext:
     """One Segment forward: Prefix KV in, RoPE/backend in, per-layer new KV out."""
 
@@ -101,11 +112,8 @@ class TPRAttentionContext:
     suffix_rotary_pos_emb: RotaryPosEmb | None = None
     attention_backend: TPRAttentionBackend | None = None
 
-    # Legacy GDN extension uses the same forward scope; Dense PPO never fills it.
-    initial_gdn_states: Mapping[int, GDNLayerState] = field(default_factory=dict)
-    capture_gdn_final_state: bool = True
+    compact_new_kv: bool = False
     _new_key_values: dict[int, KVPair] = field(default_factory=dict, init=False, repr=False)
-    _new_gdn_states: dict[int, GDNLayerState] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         for name, value, minimum in (
@@ -114,13 +122,11 @@ class TPRAttentionContext:
         ):
             if type(value) is not int or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
-        if not isinstance(self.capture_gdn_final_state, bool):
-            raise TypeError("capture_gdn_final_state must be a bool")
+        if not isinstance(self.compact_new_kv, bool):
+            raise TypeError("compact_new_kv must be a bool")
         if self.prefix_length == 0:
             if self.past_key_values:
                 raise ValueError("past_key_values must be empty when prefix_length is 0")
-            if self.initial_gdn_states:
-                raise ValueError("initial_gdn_states must be empty when prefix_length is 0")
 
         backend = self.attention_backend
         if backend is not None:
@@ -144,14 +150,24 @@ class TPRAttentionContext:
             _validate_kv_pair(layer, *pair, expected_sequence_length=self.prefix_length, kind="past")
         self.past_key_values = MappingProxyType(dict(self.past_key_values))
 
-        for layer, state in self.initial_gdn_states.items():
-            _validate_layer_number(layer)
-            _validate_gdn_layer_state(layer, state)
-        self.initial_gdn_states = MappingProxyType(dict(sorted(self.initial_gdn_states.items())))
-
     @property
     def local_suffix_length(self) -> int:
         return self.suffix_length if self.attention_backend is None else self.attention_backend.local_suffix_length
+
+    def new_collector(self) -> TPRAttentionContext:
+        """Collect checkpoint K/V while sharing immutable prefix state.
+
+        The no-grad Push context owns any KV compaction. Replay collectors
+        must keep their gradient-carrying side outputs without compaction.
+        """
+        return TPRAttentionContext(
+            prefix_length=self.prefix_length,
+            suffix_length=self.suffix_length,
+            past_key_values=self.past_key_values,
+            suffix_rotary_pos_emb=self.suffix_rotary_pos_emb,
+            attention_backend=self.attention_backend,
+            compact_new_kv=False,
+        )
 
     @property
     def new_key_values(self) -> Mapping[int, KVPair]:
@@ -173,39 +189,14 @@ class TPRAttentionContext:
         if layer_number in self._new_key_values:
             raise RuntimeError(f"new KV for layer {layer_number} was already recorded")
         _validate_kv_pair(layer_number, key, value, expected_sequence_length=self.local_suffix_length, kind="new")
+        if self.compact_new_kv:
+            if torch.is_grad_enabled():
+                raise RuntimeError("compact_new_kv requires a no-grad Push forward")
+            key, value = (_compact_kv_tensor(tensor.detach()) for tensor in (key, value))
         self._new_key_values[layer_number] = (key, value)
 
     def assert_new_kv_layers(self, expected_layer_numbers: Iterable[int]) -> None:
         _assert_layers(self._new_key_values, expected_layer_numbers, kind="KV")
-
-    @property
-    def new_gdn_states(self) -> Mapping[int, GDNLayerState]:
-        return MappingProxyType(self._new_gdn_states)
-
-    def get_initial_gdn_state(self, layer_number: int) -> GDNLayerState | None:
-        _validate_layer_number(layer_number)
-        if self.prefix_length == 0:
-            return None
-        try:
-            return self.initial_gdn_states[layer_number]
-        except KeyError as exc:
-            raise KeyError(f"missing initial GDN state for layer {layer_number}") from exc
-
-    def set_new_gdn_state(self, layer_number: int, state: GDNLayerState) -> None:
-        _validate_layer_number(layer_number)
-        if layer_number in self._new_gdn_states:
-            raise RuntimeError(f"new GDN state for layer {layer_number} was already recorded")
-        _validate_gdn_layer_state(layer_number, state)
-        self._new_gdn_states[layer_number] = state
-
-    def assert_new_gdn_layers(self, expected_layer_numbers: Iterable[int]) -> None:
-        _assert_layers(self._new_gdn_states, expected_layer_numbers, kind="GDN")
-
-
-def _validate_gdn_layer_state(layer: int, state: GDNLayerState) -> None:
-    from verl.experimental.tpr.gdn.prefix_state import GDNLayerState
-    if not isinstance(state, GDNLayerState):
-        raise TypeError(f"layer {layer} GDN state must be GDNLayerState, got {type(state).__name__}")
 
 
 _CURRENT: ContextVar[TPRAttentionContext | None] = ContextVar("tpr_attention_context", default=None)

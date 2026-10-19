@@ -36,7 +36,7 @@ def test_real_tq_keys_survive_engine_side_plan_building():
     forest = build_tree_execution_plans(engine_keys, batch)
     assert len(forest.trees) == 1
     assert forest.segment_count == 15
-    assert set(forest.trees[0].tree.member_rows) == set(range(8))
+    assert set(forest.trees[0].member_rows) == set(range(8))
     assert forest.logical_loss_tokens > 0
 
     print(

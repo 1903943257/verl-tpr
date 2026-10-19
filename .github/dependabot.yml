@@ -1,5 +1,5 @@
-## Enabled the dependabot to check the dependencies of the project
-## Dependabot will open pull requests to update dependencies automatically
+# pip version-update PRs are paused while TPR development branches are consolidated.
+# Security updates are controlled separately in repository settings.
 
 version: 2
 updates:
@@ -7,3 +7,6 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # Version-update PRs are paused to keep TPR branch maintenance focused.
+    # Dependabot security updates remain independently configurable.
+    open-pull-requests-limit: 0

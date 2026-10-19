@@ -5,6 +5,9 @@ VERL-TPR implementation. The codebase targets Ascend NPU + Megatron; it is not
 an alternate PPO implementation. See the [development baseline](../tpr_development_baseline.md)
 for the reproducible imported starting point.
 
+The [10/18 local contract fixes](contract_fixes_20261018.md) require new NPU
+acceptance; prior accepted captures do not certify this working tree.
+
 ## Execution overview
 
 ```text
@@ -29,8 +32,9 @@ models.mcore.tpr.attention / context / rectangular_attention
 The model package `verl/models/mcore/tpr/` now physically contains only
 `attention.py`, `context.py`, `rectangular_attention.py` and its lazy
 `__init__.py`. The Engine owns all Segment plans, Prefix State, Shard/Padding,
-ModuleSpec installation and TP group agreement. Optional GDN lives in
-`experimental/tpr/gdn/`. Tree scheduling,
+ModuleSpec installation and TP group agreement. GDN state lives only in
+`experimental/tpr/gdn/`, including its separate Context subclass. Native
+non-TPR VERL model compatibility is unchanged. Tree scheduling,
 PPO ownership and distributed execution are Engine concerns and must not be
 imported by model-side primitives. The first-party `context.py` transfers
 per-forward prefix tensors, RoPE and new per-layer KV between the Executor and
@@ -54,6 +58,13 @@ native GPTModel layers using a ContextVar. It is **not** the persistent KV cache
 5. Every CP rank must participate in Ring backward, including ranks with no
    locally owned supervised tokens (use a connected zero objective). Forest
    gradients are accumulated under Megatron's no_sync and **finalized once**.
+
+Execution skips only branches outside the **global** objective-owner ancestor
+closure, never based on CP-local token counts. Model preparation is batch-scoped;
+the model structure remains fixed while live dropout settings are rechecked.
+Selected BF16/FP16 queries are promoted once to FP32 before temperature and
+native PPO processing, including FP32 accumulation across target/temperature
+expansions. Native GEMM shapes remain unchanged.
 
 ### Parallelism and support boundaries
 

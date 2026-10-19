@@ -15,7 +15,8 @@
 import pytest
 import torch
 
-from verl.models.mcore.tpr import KVStack, SegmentLossTerm, SegmentSpec
+from verl.models.mcore.tpr import KVStack
+from verl.experimental.tpr.legacy.plan import SegmentLossTerm, SegmentSpec
 
 
 def _segment(segment_id, parent_id, length, prefix_length):

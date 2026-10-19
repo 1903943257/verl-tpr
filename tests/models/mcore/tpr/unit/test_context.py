@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import weakref
+
 import pytest
 import torch
 
 from verl.models.mcore.tpr import (
-    GDNLayerState,
     TPRAttentionContext,
     get_tpr_attention_context,
     use_tpr_attention_context,
@@ -29,11 +31,15 @@ def _kv(sequence_length: int, *, requires_grad: bool = False):
     return key, value
 
 
-def _gdn_state(*, requires_grad: bool = False):
-    return GDNLayerState(
-        torch.randn(1, 12, 4, requires_grad=requires_grad),
-        torch.randn(1, 4, 8, 6, requires_grad=requires_grad),
-    )
+def test_context_supports_weak_references_for_checkpoint_replay():
+    # Reentrant Megatron checkpoint closures must only weak-reference their
+    # owning context, since it holds the checkpoint's K/V autograd outputs.
+    context = TPRAttentionContext(prefix_length=0, suffix_length=3)
+    reference = weakref.ref(context)
+    assert reference() is context
+    del context
+    gc.collect()
+    assert reference() is None
 
 
 def test_context_manager_sets_and_restores_context():
@@ -97,6 +103,52 @@ def test_new_kv_collector_preserves_tensor_identity_and_checks_layers():
     context.assert_new_kv_layers([1])
 
 
+def test_push_collector_compacts_fused_qkv_views_at_each_layer():
+    context = TPRAttentionContext(0, 3, compact_new_kv=True)
+    with torch.no_grad():
+        for layer in (1, 2):
+            fused_qkv = torch.randn(3, 1, 8, 8)
+            key, value = fused_qkv[:, :, 4:6], fused_qkv[:, :, 6:8]
+            context.set_new_kv(layer, key, value)
+            for cached, source in zip(context.new_key_values[layer], (key, value), strict=True):
+                torch.testing.assert_close(cached, source)
+                assert cached.is_contiguous() and cached.storage_offset() == 0
+                assert cached.untyped_storage().nbytes() == cached.numel() * cached.element_size()
+                assert cached.untyped_storage().data_ptr() != fused_qkv.untyped_storage().data_ptr()
+                assert cached.grad_fn is None and not cached.requires_grad
+
+
+def test_push_collector_does_not_copy_already_compact_storage():
+    context = TPRAttentionContext(0, 3, compact_new_kv=True)
+    key, value = _kv(3, requires_grad=True)
+    with torch.no_grad():
+        context.set_new_kv(1, key, value)
+    for cached, source in zip(context.new_key_values[1], (key, value), strict=True):
+        assert cached.data_ptr() == source.data_ptr()
+        assert cached.grad_fn is None and not cached.requires_grad
+
+
+def test_push_compaction_cannot_silently_detach_a_pop_graph():
+    context = TPRAttentionContext(0, 3, compact_new_kv=True)
+    with pytest.raises(RuntimeError, match="no-grad Push"):
+        context.set_new_kv(1, *_kv(3, requires_grad=True))
+    assert not context.new_key_values
+
+
+def test_legacy_no_grad_context_preserves_tensor_identity_without_opt_in():
+    context = TPRAttentionContext(0, 3)
+    key, value = _kv(3)
+    with torch.no_grad():
+        context.set_new_kv(1, key, value)
+    assert context.new_key_values[1][0] is key
+    assert context.new_key_values[1][1] is value
+
+
+def test_compaction_mode_must_be_a_boolean():
+    with pytest.raises(TypeError, match="compact_new_kv must be a bool"):
+        TPRAttentionContext(0, 3, compact_new_kv="push")
+
+
 def test_duplicate_new_kv_is_rejected():
     context = TPRAttentionContext(prefix_length=0, suffix_length=3)
     new_key, new_value = _kv(3)
@@ -106,43 +158,11 @@ def test_duplicate_new_kv_is_rejected():
         context.set_new_kv(1, new_key, new_value)
 
 
-def test_gdn_state_is_restored_and_collected_without_detaching():
-    initial_state = _gdn_state(requires_grad=True)
-    context = TPRAttentionContext(
-        prefix_length=6,
-        suffix_length=3,
-        initial_gdn_states={1: initial_state},
-    )
-    new_state = _gdn_state(requires_grad=True)
-
-    assert context.get_initial_gdn_state(1) is initial_state
-    assert context.get_initial_gdn_state(1).conv_state.requires_grad
-    context.set_new_gdn_state(1, new_state)
-    assert context.new_gdn_states[1] is new_state
-    context.assert_new_gdn_layers([1])
-
-
-def test_gdn_state_context_enforces_root_missing_and_duplicate_contracts():
-    with pytest.raises(ValueError, match="initial_gdn_states"):
-        TPRAttentionContext(
-            prefix_length=0,
-            suffix_length=3,
-            initial_gdn_states={1: _gdn_state()},
-        )
-
-    root_context = TPRAttentionContext(prefix_length=0, suffix_length=3)
-    assert root_context.get_initial_gdn_state(1) is None
-
-    suffix_context = TPRAttentionContext(
-        prefix_length=6,
-        suffix_length=3,
-        initial_gdn_states={1: _gdn_state()},
-    )
-    with pytest.raises(KeyError, match="layer 2"):
-        suffix_context.get_initial_gdn_state(2)
-    suffix_context.set_new_gdn_state(1, _gdn_state())
-    with pytest.raises(RuntimeError, match="already recorded"):
-        suffix_context.set_new_gdn_state(1, _gdn_state())
+def test_dense_context_has_no_experimental_recurrent_state_api():
+    context = TPRAttentionContext(0, 3)
+    assert not any("gdn" in name.lower() for name in dir(context))
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        TPRAttentionContext(0, 3, initial_gdn_states={})
 
 
 @pytest.mark.parametrize(
@@ -169,3 +189,14 @@ def test_collector_reports_missing_and_unexpected_layers():
 
     with pytest.raises(RuntimeError, match=r"missing=\[1\], unexpected=\[2\]"):
         context.assert_new_kv_layers([1])
+
+def test_pr7_recompute_collector_preserves_compaction_ownership():
+    original = TPRAttentionContext(prefix_length=0, suffix_length=3, compact_new_kv=True)
+    replay = original.new_collector()
+    assert replay is not original
+    assert replay.prefix_length == original.prefix_length
+    assert replay.suffix_length == original.suffix_length
+    assert replay.past_key_values == original.past_key_values
+    assert replay.attention_backend is original.attention_backend
+    assert replay.compact_new_kv is False
+    assert not replay.new_key_values

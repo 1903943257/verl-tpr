@@ -191,6 +191,8 @@ def _load(capture: Path,runtime,mode: str,dp:int):
         seqs=[list(map(int,x.tolist())) for x in all_batch["input_ids"].unbind()]
         plan=plan_tpr_dta_dp(
             seqs,all_keys,dp_size=dp,enforce_equal_rows=False,
+            prompt_lengths=[int(x.numel()) for x in all_batch["prompts"].unbind()],
+            turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
         )
         partitions=[list(p) for p in plan.partitions]
     if sorted(row for part in partitions for row in part)!=list(range(8)):

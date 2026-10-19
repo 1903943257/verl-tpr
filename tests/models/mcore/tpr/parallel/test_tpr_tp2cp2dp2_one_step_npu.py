@@ -1,10 +1,10 @@
 """One recorded PPO step: Qwen3-4B TPR TP2 x RingCP2 x DP2 on 8 NPUs.
 
-Compare against the EXISTING TP2 x CP4 x DP1 Native Full fixed-shape JSON.
-Same 8 original Sessions and HF checkpoint; no rollout and no AdamW.
-One *source* step is replayed for warmup/repeated F/B timing, without updates.
-The DP placement is the DFS minimax planner imported from PR #5; this is
-an isolated research experiment, NOT a production VERL DP2 enablement.
+Reuses the DFS minimax DP planner and original eight-session PPO capture.
+TPR_DP2_RECOMPUTE=1 enables the KV-aware full/uniform/1 adapter; default OFF
+preserves the historical benchmark. Optional full BF16 gradient snapshots and
+one CPU FP32-master AdamW step happen AFTER frozen-weight F/B timing.
+This is an isolated research experiment, NOT production VERL DP2 enablement.
 """
 from __future__ import annotations
 
@@ -26,8 +26,17 @@ from verl.workers.engine.megatron.tpr.placement import plan_tpr_dta_dp
 from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
 from verl.utils import tensordict_utils as tu
 
+# Avoid module-level NPU skip during checkpoint helper import, before
+# _runtime() is entered for this opt-in distributed test.
+if os.getenv("TPR_RUN_TP2CP2DP2_ONE_STEP") == "1":
+    import torch_npu  # noqa: F401
+
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
-from .test_real_actor_tp2cp4_offline_ppo_npu import _PPO, _load_real_pair
+from .test_real_actor_tp2cp4_offline_ppo_npu import (
+    _PPO,
+    _load_real_pair,
+    _sanitize_mindspeed_repatch_args,
+)
 
 pytestmark = pytest.mark.skipif(
     os.getenv("TPR_RUN_TP2CP2DP2_ONE_STEP") != "1",
@@ -65,7 +74,9 @@ def _runtime():
             pipeline_model_parallel_size=1,
             expert_model_parallel_size=1,
         )
-    assert get_full_args().context_parallel_algo == "megatron_cp_algo"
+    args = get_full_args()
+    _sanitize_mindspeed_repatch_args(args)
+    assert args.context_parallel_algo == "megatron_cp_algo"
     tp = parallel_state.get_tensor_model_parallel_group()
     cp = parallel_state.get_context_parallel_group()
     dp = parallel_state.get_data_parallel_group()
@@ -267,6 +278,8 @@ def _placement(capture, runtime, expected_tokens):
     sequences = [list(map(int, ids.tolist())) for ids in global_batch["input_ids"].unbind(0)]
     placement = plan_tpr_dta_dp(
         sequences, global_keys, dp_size=2, enforce_equal_rows=False,
+        prompt_lengths=[int(ids.numel()) for ids in global_batch["prompts"].unbind(0)],
+        turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
     )
     if (sorted(sum((list(p) for p in placement.partitions), [])) != list(range(8))
             or not all(placement.partitions)):
@@ -311,7 +324,11 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
     if os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") != "1":
         raise ValueError("Offline DP2 adapter gate was not explicitly enabled")
     if os.getenv("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "0") != "0":
-        raise ValueError("Full baseline and this TPR run must both disable recompute")
+        raise ValueError("Use the explicit KV-aware TPR checkpoint adapter, not native recompute")
+    setting = os.getenv("TPR_DP2_RECOMPUTE", "0")
+    if setting not in ("0", "1"):
+        raise ValueError("TPR_DP2_RECOMPUTE must be 0 or 1")
+    recompute_enabled = setting == "1"
     if os.getenv("TPR_TREE_POLICY") != "qwen_turn":
         raise ValueError("Use the same qwen_turn policy as the TP2CP4 Full comparison")
     if os.getenv("TPR_OFFLINE_MODE") != "tpr":
@@ -346,6 +363,38 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
         from .grad_sync_precision import offline_grad_sync_dtype
         grad_sync_dtype = offline_grad_sync_dtype()
         engine = _engine_with_dp_finalize(model, runtime)
+        installed_blocks = 0
+        if recompute_enabled:
+            from megatron.core.transformer.transformer_block import TransformerBlock
+            from verl.workers.engine.megatron.tpr.recompute import (
+                install_tpr_full_recompute, assert_tpr_full_recompute_installed,
+            )
+            model.config.recompute_granularity = "full"
+            model.config.recompute_method = "uniform"
+            model.config.recompute_num_layers = 1
+            blocks = [m for m in model.modules() if isinstance(m, TransformerBlock)]
+            if not blocks or any(m.config is not model.config for m in blocks):
+                raise AssertionError("TransformerBlocks must share the model checkpoint config")
+            installed_blocks = install_tpr_full_recompute(model, model.config)
+            if installed_blocks != len(blocks):
+                raise AssertionError("Incomplete TPR checkpoint adapter installation")
+            assert_tpr_full_recompute_installed(model, model.config)
+        else:
+            model.config.recompute_granularity = None
+            model.config.recompute_method = None
+            model.config.recompute_num_layers = None
+        expected = ("full", "uniform", 1) if recompute_enabled else (None, None, None)
+        actual = (model.config.recompute_granularity, model.config.recompute_method,
+                  model.config.recompute_num_layers)
+        if actual != expected:
+            raise AssertionError(f"Incorrect checkpoint configuration: {actual}")
+        if dist.get_rank() == 0:
+            print(
+                f"TPR_DP2_RECOMPUTE enabled={int(recompute_enabled)} "
+                f"granularity={actual[0]} method={actual[1]} "
+                f"num_layers={actual[2]} installed_tpr_blocks={installed_blocks}",
+                flush=True,
+            )
         if dist.get_rank() == 0:
             print(
                 f"TPR_DP2_GRAD_REDUCE_MODE dtype={grad_sync_dtype} "
@@ -353,6 +402,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 flush=True,
             )
         runs = []
+        local_profiles = [] if profile else None
         for iteration in range(warmups + repeats):
             model.zero_grad(set_to_none=True)
             dist.barrier()
@@ -364,6 +414,20 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             )
             torch.npu.synchronize()
             own_seconds = time.perf_counter() - start
+            # Lightweight native SegmentEventProfiler: NPU Events and allocator
+            # counters only. Materialize AFTER the existing synchronization;
+            # never enable torch_npu.profiler or emit an operator timeline.
+            segment_profile = None
+            if profile:
+                segment_profile = {
+                    "iteration": iteration,
+                    "warmup": iteration < warmups,
+                    "stage_host_ms": dict(engine._tpr_stage_profile),
+                    "segments": engine._tpr_segment_event_profiler.materialize(),
+                    "segment_peak_allocated_bytes": int(engine._tpr_segment_peak_allocated_bytes),
+                    "segment_peak_reserved_bytes": int(engine._tpr_segment_peak_reserved_bytes),
+                }
+                local_profiles.append(segment_profile)
 
             # Ascend 910B HCCL Reduce does NOT support float64. These
             # world MAX reductions must use FP32 or their outputs may stay
@@ -374,9 +438,13 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             dist.all_reduce(
                 critical, op=dist.ReduceOp.MAX, group=dist.group.WORLD,
             )
+            # SegmentEventProfiler resets local peak counters at event
+            # boundaries. Preserve the overall peak across those resets.
+            local_peak = int(torch.npu.max_memory_allocated())
+            if segment_profile is not None:
+                local_peak = max(local_peak, segment_profile["segment_peak_allocated_bytes"])
             peak = torch.tensor(
-                float(torch.npu.max_memory_allocated()),
-                dtype=torch.float32, device=runtime.device,
+                float(local_peak), dtype=torch.float32, device=runtime.device,
             )
             dist.all_reduce(
                 peak, op=dist.ReduceOp.MAX, group=dist.group.WORLD,
@@ -432,7 +500,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                     "stage_ms": {},
                 })
             if profile and dist.get_rank() == 0:
-                gathered[0]["stage_ms"] = dict(engine._tpr_stage_profile)
+                gathered[0]["stage_ms"] = dict(segment_profile["stage_host_ms"])
             from .tpr_dp2_loss_consistency import analyze_dp2_loss_report
             loss_report = analyze_dp2_loss_report(gathered)
             if dist.get_rank() == 0:
@@ -451,6 +519,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                     "peak_allocated_gib": float(peak.item()) / 2**30,
                     "loss": loss_report["global_reporting_loss"],
                     "loss_report": loss_report,
+                    "recompute": recompute_enabled,
                     "ranks": gathered,
                 }
                 runs.append(item)
@@ -466,6 +535,19 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 )
             dist.barrier()
 
+        if profile:
+            # One small JSON per rank: no HCCL object collectives, no trace
+            # parsing, no profiler threads, and no synchronization beyond the
+            # existing training/replay barriers.
+            output.mkdir(parents=True, exist_ok=True)
+            report = output / f"step{step}_rank{dist.get_rank()}_segments.json"
+            report.write_text(json.dumps({
+                "source_step": step, "rank": dist.get_rank(),
+                "topology": {"tp": 2, "cp": 2, "dp": 2},
+                "profile_kind": "npu_events_and_allocator_counters",
+                "runs": local_profiles,
+            }, indent=2), encoding="utf-8")
+
         gradient_witness = None
         replica_policy = os.getenv("TPR_BENCH_GRAD_REPLICA_POLICY", "strict")
         if replica_policy not in ("strict", "diagnostic"):
@@ -478,9 +560,20 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 model, runtime, mode="tpr_tp2cp2dp2",
                 require_exact_replicas=(replica_policy == "strict"),
             )
+        from .tpr_dp2_recompute_update import optional_dp2_verification
+        save_full_grads = os.getenv("TPR_DP2_SAVE_FULL_GRADS", "0")
+        optimizer_step = os.getenv("TPR_DP2_OPTIMIZER_STEP", "0")
+        if save_full_grads not in ("0", "1") or optimizer_step not in ("0", "1"):
+            raise ValueError("TPR_DP2_SAVE_FULL_GRADS/OPTIMIZER_STEP must be 0 or 1")
+        verify = optional_dp2_verification(
+            model, runtime, output, step,
+            save_full_grads=save_full_grads == "1",
+            optimizer_step=optimizer_step == "1",
+        )
         if dist.get_rank() == 0:
             output.mkdir(parents=True, exist_ok=True)
-            target = output / f"step{step}_tpr_tp2cp2dp2.json"
+            suffix = "_recompute_on" if recompute_enabled else ""
+            target = output / f"step{step}_tpr_tp2cp2dp2{suffix}.json"
             if target.exists():
                 raise FileExistsError(target)
             times = [r["critical_fwd_bwd_s"] for r in runs if not r["warmup"]]
@@ -491,6 +584,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 "source_capture": str(capture), "checkpoint": str(checkpoint),
                 "input_sha256": sha, "global_ppo_tokens": global_tokens,
                 "placement_policy": plan.policy,
+                "placement_cost_model": plan.cost_model,
                 "dp_partitions": [list(x) for x in plan.partitions],
                 "dp_tree_token_costs": list(plan.tree_tokens_by_rank),
                 "global_tree_tokens": plan.global_tree_tokens,
@@ -501,7 +595,14 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 "ppo_logprob_chunk_tokens": lp_chunk_tokens,
                 "gradient_sync_reduce_dtype": grad_sync_dtype,
                 "hccl_stats_reduce_dtype": "float32",
-                "recompute": False, "updated_weights": False,
+                "recompute": recompute_enabled,
+                "recompute_granularity": model.config.recompute_granularity,
+                "recompute_method": model.config.recompute_method,
+                "recompute_num_layers": model.config.recompute_num_layers,
+                "recompute_installed_tpr_blocks": installed_blocks,
+                "updated_weights": optimizer_step == "1",
+                "full_gradient_paths": verify["full_gradient_paths"],
+                "optimizer_step": verify["optimizer_step"],
                 "median_fwd_bwd_s": statistics.median(times),
                 "gradient_witness": gradient_witness,
                 "gradient_replica_policy": replica_policy,
@@ -513,7 +614,7 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
             }
             target.write_text(json.dumps(data, indent=2))
             print(
-                f"TPR_TP2CP2DP2_SUMMARY step={step} "
+                f"TPR_TP2CP2DP2_SUMMARY step={step} recompute={int(recompute_enabled)} "
                 f"median_fwd_bwd_s={data['median_fwd_bwd_s']:.6f} "
                 f"dp_rows={data['dp_partitions']} duplicated_tree_tokens="
                 f"{plan.duplicated_tree_tokens} output={target}",

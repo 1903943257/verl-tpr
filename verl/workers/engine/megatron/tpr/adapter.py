@@ -37,7 +37,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.megatron_utils import unwrap_model
 from verl.utils.metric import AggregationType, Metric
 
-from .executor import SegmentExecutor, SegmentEventProfiler
+from .executor import SegmentEventProfiler, SegmentExecutor, prepare_replay_model, validate_replay_plan
 from .ring import aggregate_cp_loss, resolve_engine_cp_runtime
 from .tree import ForestExecutionPlan, TreeExecutionPlan, assert_tp_plan_agreement, digest_forest_plan
 
@@ -57,10 +57,16 @@ def run_forest(
     total = None
     with nullcontext() if no_sync_context is None else no_sync_context():
         for tree in forest.trees:
+            # No objective anywhere below this root: neither replay nor dKV is
+            # needed. This is a global-tree decision, never a CP-local count.
+            if not tree.logical_loss_tokens:
+                continue
             loss = run_tree(tree)
             if not isinstance(loss, Tensor) or loss.numel() != 1:
                 raise TypeError("run_tree must return a scalar Tensor")
             total = loss.detach() if total is None else total + loss.detach()
+    if total is None:
+        raise ValueError("forest has no supervised logical response tokens")
     # A failed tree never reaches native gradient finalization.
     finalize_gradients()
     return total
@@ -84,7 +90,7 @@ class _PPOMetrics:
                     raise NotImplementedError(f"TPR PPO metric {name} requires unsupported {value.aggregation}")
             self.values.setdefault(name, []).append(value)
 
-    def scalar_lists(self):
+    def scalar_lists(self, cp_runtime=None):
         # V1 Trainer uses np.mean(list), so wrapped metrics must return ONE
         # additive scalar. Plain numeric diagnostics retain their list semantics.
         result = {}
@@ -93,7 +99,43 @@ class _PPOMetrics:
                 raise TypeError(f"TPR metric {name} mixes Metric and numeric values")
             values = [float(value.aggregate() if isinstance(value, Metric) else value) for value in values]
             result[name] = [sum(values)] if True in self.kinds[name] else values
-        return result
+        if cp_runtime is None or not cp_runtime.enabled:
+            return result
+
+        # Ranks with no owned refs may have no metric keys at all. Exchange the
+        # small, already-host-side scalar dictionaries once, not one collective
+        # per key (which would deadlock on an empty rank). SUMs and weighted
+        # MEANs are additive across CP; plain diagnostics keep list semantics.
+        import torch.distributed as dist
+
+        local = {name: (True in self.kinds[name], values) for name, values in result.items()}
+        peers = [None] * cp_runtime.size
+        dist.all_gather_object(peers, local, group=cp_runtime.group)
+        result, kinds = {}, {}
+        for peer in peers:
+            for name, (wrapped, values) in peer.items():
+                if name in kinds and kinds[name] != wrapped:
+                    raise TypeError(f"TPR metric {name} mixes Metric and numeric values across CP")
+                kinds[name] = wrapped
+                result.setdefault(name, []).extend(values)
+        return {name: [sum(values)] if kinds[name] else values for name, values in result.items()}
+
+
+def _assert_finite_tree_loss(loss: Tensor, *, tp_size: int, cp_size: int) -> None:
+    finite = torch.isfinite(loss.detach()).to(torch.int64)
+    if tp_size * cp_size > 1:
+        import torch.distributed as dist
+        from megatron.core import parallel_state
+
+        group = (parallel_state.get_tensor_and_context_parallel_group() if cp_size > 1
+                 else parallel_state.get_tensor_model_parallel_group())
+        if group is None:
+            raise RuntimeError("TPR cannot resolve the loss-check model-parallel group")
+        # All model-parallel peers reject before another tree or finalization;
+        # a rank-local exception here would strand finite peers in collectives.
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN, group=group)
+    if not bool(finite.item()):
+        raise FloatingPointError("non-finite TPR PPO tree loss; gradients will not be finalized")
 
 
 def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None:
@@ -208,6 +250,15 @@ def _trajectory_keys_from_minibatch(data: Any) -> tuple[str, ...]:
     return tuple(result)
 
 
+def _assert_dense_model(model: Any) -> None:
+    # Inspect the actual decoder slots, not just the presence of one supported
+    # module somewhere in a potentially mixed model. Native VERL is unchanged.
+    layers = getattr(getattr(model, "decoder", None), "layers", ())
+    if not layers or any(not isinstance(getattr(layer, "self_attention", None), TPRSelfAttention)
+                         for layer in layers):
+        raise TypeError("TPR PPO requires every decoder layer to use TPRSelfAttention")
+
+
 def run_tpr_forward_backward_batch(
     engine: MegatronEngine,
     data: Any,
@@ -257,8 +308,14 @@ def run_tpr_forward_backward_batch(
     config = get_model_config(wrapped_model)
     if not model.training:
         raise RuntimeError("TPR PPO requires model.train()")
+    # Native Full Checkpoint cannot export TPR KV autograd roots by itself.
+    # Only allow the isolated experimental adapter after installation checks.
+    # Preserve PR7's default OFF behavior; only installed full/uniform/1 is opt-in.
+    if getattr(config, "recompute_granularity", None) is not None:
+        from .recompute import assert_tpr_full_recompute_installed
+
+        assert_tpr_full_recompute_installed(model, config)
     unsupported = {
-        "Megatron recompute": getattr(config, "recompute_granularity", None) is not None,
         "calculate_per_token_loss": getattr(config, "calculate_per_token_loss", False),
         "FP8": getattr(config, "fp8", None) not in (None, False),
         "MoE": getattr(config, "num_moe_experts", None) is not None,
@@ -271,12 +328,8 @@ def run_tpr_forward_backward_batch(
             "TPR PPO phase-4 does not support: "
             + ", ".join(k for k, enabled in unsupported.items() if enabled)
         )
-    if any(getattr(module, "tpr_state_kind", None) == "gdn" for module in model.modules()):
-        raise NotImplementedError("GDN is an experimental TPR extension, not supported by production Dense PPO")
-    attentions = [module for module in model.modules() if isinstance(module, TPRSelfAttention)]
-    if not attentions:
-        raise TypeError("TPR PPO requires TPRSelfAttention installed during model initialization")
-    layer_numbers = tuple(sorted(attention.layer_number for attention in attentions))
+    _assert_dense_model(model)
+    prepared_model = prepare_replay_model(model)
 
     token_count = tu.get_non_tensor_data(data, key="batch_num_tokens", default=None)
     dp_size = tu.get_non_tensor_data(data, key="dp_size", default=None)
@@ -309,11 +362,19 @@ def run_tpr_forward_backward_batch(
         raise ValueError("TPR PPO mini-batch has no supervised response tokens")
     record_stage("tree_build_cpu_ms", profile_origin)
     tp_check_start = time.perf_counter()
-    if tp_size > 1:
-        assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size)
+    if tp_size * sizes["CP"] > 1:
+        assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size, cp_size=sizes["CP"])
     record_stage("tp_plan_collective_ms", tp_check_start)
     cp_runtime = resolve_engine_cp_runtime(engine, config)
     _validate_tpr_cp_combination(tp_size, cp_runtime, config, ppo=True)
+    # Reject unsupported physical shapes for the whole forest before any
+    # forward/backward can leave the mini-batch with partial gradients.
+    for tree_plan in forest.trees:
+        if tree_plan.logical_loss_tokens:
+            validate_replay_plan(
+                tree_plan.segment_plan, prepared_model, cp_size=cp_runtime.size,
+                active_segment_ids=tree_plan.active_segment_ids,
+            )
     # DP2+CP2 has twice the per-rank local sequence of the CP4 baseline.
     # Default this *isolated* experiment to recomputable PPO logprob chunks;
     # ordinary TPR and all other topologies remain unchanged.
@@ -354,7 +415,9 @@ def run_tpr_forward_backward_batch(
         executor = SegmentExecutor(
             model,
             tree_plan.segment_plan,
-            expected_layer_numbers=layer_numbers,
+            expected_layer_numbers=prepared_model.layer_numbers,
+            prepared_model=prepared_model,
+            active_segment_ids=tree_plan.active_segment_ids,
             loss_scale_func=getattr(config, "grad_scale_func", None),
             segment_loss_fn=callback,
             segment_loss_term_counts=counts,
@@ -365,8 +428,7 @@ def run_tpr_forward_backward_batch(
         loss = executor.run(event_profiler=event_profiler, tree_index=tree_number)
         tree_number += 1
         metrics_start = time.perf_counter() if detailed_profile else None
-        if not bool(torch.isfinite(loss).item()):
-            raise FloatingPointError("non-finite TPR PPO tree loss; gradients will not be finalized")
+        _assert_finite_tree_loss(loss, tp_size=tp_size, cp_size=cp_runtime.size)
         for segment_id, segment_metrics in executor.segment_loss_metrics:
             token_weight = counts[segment_id] / forest.logical_loss_tokens
             metrics.add(segment_metrics, token_weight)
@@ -394,6 +456,9 @@ def run_tpr_forward_backward_batch(
         segment.length for tree in forest.trees
         for segment in tree.segment_plan.segments.values()
     )
+    active_tree_tokens = sum(
+        tree.segment_plan.get(segment_id).length for tree in forest.trees for segment_id in tree.active_segment_ids
+    )
     # All segments share the original global batch denominator. Pass the
     # same additive objective to both legacy reduction slots.
     _, global_normalized_loss = aggregate_cp_loss(
@@ -414,8 +479,12 @@ def run_tpr_forward_backward_batch(
         "tpr/logical_input_tokens": logical_input_tokens,
         "tpr/unique_tree_tokens": unique_tree_tokens,
         "tpr/topology_token_reuse_ratio": logical_input_tokens / unique_tree_tokens,
+        # The historical keys above describe the unpruned topology. These are
+        # the globally supervised closure, not Push+Pop forward token totals.
+        "tpr/active_tree_tokens": active_tree_tokens,
+        "tpr/active_physical_segments": sum(len(tree.active_segment_ids) for tree in forest.trees),
     }
-    metric_lists = metrics.scalar_lists()
+    metric_lists = metrics.scalar_lists(cp_runtime)
     metric_lists.update({name: [float(value)] for name, value in diagnostics.items()})
 
     # VERL postprocess expects list-valued micro-batch metrics and a list of
@@ -467,14 +536,11 @@ def replace_self_attention_with_tpr(transformer_layer_spec: _SpecT) -> _SpecT:
         attention_module = get_module(attention_spec)
         if attention_module is TPRSelfAttention:
             continue
-        if (getattr(attention_module, "tpr_state_kind", None) == "gdn"
-                or getattr(attention_module, "__name__", None) == "GatedDeltaNet"):
-            raise NotImplementedError("Production TPR ModuleSpec supports Dense SelfAttention only")
         if attention_module is not SelfAttention:
             module_name = getattr(attention_module, "__name__", repr(attention_module))
             raise TypeError(
                 f"layer_specs[{index}] uses unsupported attention module {module_name}; "
-                "TPR requires Megatron SelfAttention or patched MindSpeed GatedDeltaNet"
+                "TPR requires Megatron SelfAttention"
             )
 
         layer_submodules.self_attention = replace(attention_spec, module=TPRSelfAttention)

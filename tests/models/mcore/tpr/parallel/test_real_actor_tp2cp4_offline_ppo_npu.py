@@ -24,6 +24,13 @@ import torch.distributed as dist
 from megatron.core import parallel_state
 
 from verl.utils import tensordict_utils as tu
+
+# The checkpoint helper imports legacy NPU-gated test utilities at module
+# collection time. For an explicitly requested eight-NPU replay, register
+# torch.npu before their module-level availability check runs.
+if os.getenv("TPR_RUN_REAL_ACTOR_TP2CP4") == "1":
+    import torch_npu  # noqa: F401
+
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 
 pytestmark = pytest.mark.skipif(
@@ -47,6 +54,23 @@ class _PPO:
 
     def get(self, key, default=None):
         return getattr(self, key, default)
+
+
+def _sanitize_mindspeed_repatch_args(args):
+    """Remove only the pytest/torchrun empty-key artifact before TransformerConfig.
+
+    MindSpeed turns unknown get_full_args() keys into dataclass fields.
+    A key named "" cannot be a field. Never silently discard other keys.
+    This helper is shared by TP2CP4 and TP2CP2DP2 offline replay runtimes.
+    """
+    full_args = vars(args)
+    if "" in full_args:
+        if not isinstance(full_args[""], str):
+            raise RuntimeError("Unexpected MindSpeed empty argument value type")
+        del full_args[""]
+    malformed = [repr(key) for key in full_args if not isinstance(key, str) or not key.isidentifier()]
+    if malformed:
+        raise RuntimeError(f"Invalid MindSpeed argument names after repatch: {malformed}")
 
 
 def _runtime():
@@ -79,16 +103,7 @@ def _runtime():
             expert_model_parallel_size=1,
         )
     args = get_full_args()
-    # MindSpeed repatch can inject an invalid empty-name entry under this
-    # pytest/torchrun launcher. It cannot represent a dataclass config field.
-    full_args = vars(args)
-    if "" in full_args:
-        if not isinstance(full_args[""], str):
-            raise RuntimeError("Unexpected MindSpeed empty argument value type")
-        del full_args[""]
-    malformed = [repr(key) for key in full_args if not isinstance(key, str) or not key.isidentifier()]
-    if malformed:
-        raise RuntimeError(f"Invalid MindSpeed argument names after repatch: {malformed}")
+    _sanitize_mindspeed_repatch_args(args)
     assert args.context_parallel_algo == "megatron_cp_algo"
     tp_group = parallel_state.get_tensor_model_parallel_group()
     cp_group = parallel_state.get_context_parallel_group()
@@ -108,7 +123,7 @@ def _runtime():
     )
 
 
-def _load_real_pair(path: Path, rows: tuple[int, int], mode: str):
+def _load_real_pair(path: Path, rows: tuple[int, ...], mode: str):
     if not path.is_file():
         raise FileNotFoundError(path)
     raw = torch.load(path, map_location="cpu", weights_only=False)
@@ -267,6 +282,13 @@ def test_recorded_full_vs_tpr_one_step():
     mode = os.environ.get("TPR_OFFLINE_MODE")
     if mode not in ("full", "tpr", "split_no_share"):
         raise AssertionError("Set TPR_OFFLINE_MODE=full, tpr, or split_no_share")
+    recompute_setting = os.getenv("TPR_OFFLINE_RECOMPUTE", "0")
+    if recompute_setting not in ("0", "1"):
+        raise ValueError("TPR_OFFLINE_RECOMPUTE must be 0 or 1")
+    recompute_enabled = recompute_setting == "1"
+    # ON supports both unshared Full (same TPR Ring/Executor without
+    # cross-trajectory sharing) and shared TPR. It does not turn this
+    # controlled Full comparator into a native Megatron Full run.
     rows_value = os.getenv("TPR_OFFLINE_ROWS", "4,6")
     if rows_value == "all":
         raw = torch.load(os.environ["TPR_REAL_ACTOR_MINIBATCH"],
@@ -288,6 +310,9 @@ def test_recorded_full_vs_tpr_one_step():
     tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
     if tree_policy != "qwen_turn":
         raise ValueError(f"offline Actor replay requires qwen_turn, got {tree_policy!r}")
+    tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
+    if tree_policy != "qwen_turn":
+        raise ValueError(f"Offline Actor replay requires qwen_turn, got {tree_policy!r}")
     runtime = _runtime()
     try:
         from verl.workers.utils.losses import ppo_loss
@@ -307,32 +332,63 @@ def test_recorded_full_vs_tpr_one_step():
             tree_policy=tree_policy,
             turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
         )
-        if mode == "full" and (len(forest.trees) != len(rows)
-                               or forest.segment_count != len(rows)):
-            raise AssertionError("Full control accidentally reused a prefix")
+        if mode == "full" and (
+            len(forest.trees) != len(rows)
+            or any(len(tree.member_rows) != 1 for tree in forest.trees)
+        ):
+            # Qwen turn-only builds multiple Segments even for an unshared
+            # trajectory.  Isolation is about row ownership, not Segments.
+            raise AssertionError("Full control accidentally reused tokens across rows")
         if mode == "split_no_share":
-            # This is an isolated NUMERICAL control, not a production tree
-            # policy. Clone the EXACT shared Root/Leaf physical boundaries
-            # separately for each sibling, preserving PPO objective refs.
+            # Experimental isolation only: preserve Main's replay/recompute path.
             from .test_real_actor_cp1_short_full_tpr_npu import _make_unshared_split
-            shared_forest = forest
-            if len(shared_forest.trees) != 1 or shared_forest.segment_count != 3:
-                raise AssertionError(
-                    "CP4 split-no-share expects one Root + two sibling Leaves"
-                )
-            forest = _make_unshared_split(shared_forest, batch)
+            if len(forest.trees) != 1 or forest.segment_count != 3:
+                raise AssertionError("Split-no-share needs one Root and two Leaves")
+            forest = _make_unshared_split(forest, batch)
             if len(forest.trees) != 2 or forest.segment_count != 4:
-                raise AssertionError(
-                    "CP4 split-no-share must be two separate Root/Leaf chains"
-                )
-        # Turn mode can yield multiple trees without shared complete turns.
+                raise AssertionError("Split-no-share needs two independent chains")
+        # Turn-only TPR may yield multiple trees if complete turns are not shared.
         ring_impl = _install_offline_full_ring_backend(mode)
         if hf.num_hidden_layers != 36:
             raise AssertionError("Not the real Qwen3-4B")
         model.config.no_sync_func = None
         model.config.grad_scale_func = None
         model.config.calculate_per_token_loss = False
-        model.config.recompute_granularity = None
+        # Match the OFF baseline's model, checkpoint, tree and PPO exactly;
+        # only the per-layer activation checkpoint behavior may differ.
+        if recompute_enabled:
+            from megatron.core.transformer.transformer_block import TransformerBlock
+            from verl.workers.engine.megatron.tpr.recompute import (
+                assert_tpr_full_recompute_installed,
+                install_tpr_full_recompute,
+            )
+
+            model.config.recompute_granularity = "full"
+            model.config.recompute_method = "uniform"
+            model.config.recompute_num_layers = 1
+            blocks = [module for module in model.modules() if isinstance(module, TransformerBlock)]
+            if not blocks or any(block.config is not model.config for block in blocks):
+                raise AssertionError("Real Qwen TransformerBlock config is not the model config")
+            installed_blocks = install_tpr_full_recompute(model, model.config)
+            if installed_blocks != len(blocks):
+                raise AssertionError(
+                    f"Recompute installed on {installed_blocks} of {len(blocks)} TransformerBlocks"
+                )
+            assert_tpr_full_recompute_installed(model, model.config)
+        else:
+            model.config.recompute_granularity = None
+            model.config.recompute_method = None
+            model.config.recompute_num_layers = None
+            installed_blocks = 0
+        if os.environ.get("RANK", "0") == "0":
+            print(
+                f"TPR_RECOMPUTE_CONFIG mode={mode} enabled={recompute_enabled} "
+                f"granularity={model.config.recompute_granularity} "
+                f"method={model.config.recompute_method} "
+                f"num_layers={model.config.recompute_num_layers} "
+                f"installed_blocks={installed_blocks}",
+                flush=True,
+            )
         finalize_sec = [0.0]
 
         def finalize(chunks, num_tokens, *, force_all_reduce=False, **kwargs):
@@ -421,6 +477,11 @@ def test_recorded_full_vs_tpr_one_step():
         after = _witness(model, grads=False)
         payload = {
             "mode": mode, "rank": dist.get_rank(),
+            "recompute_enabled": recompute_enabled,
+            "recompute_granularity": model.config.recompute_granularity,
+            "recompute_method": model.config.recompute_method,
+            "recompute_num_layers": model.config.recompute_num_layers,
+            "recompute_installed_blocks": installed_blocks,
             "tp_rank": runtime.tp_rank, "cp_rank": runtime.cp_rank,
             "world": 8, "tp": 2, "cp": 4, "dp": 1,
             "model": "Qwen3-4B", "checkpoint": str(checkpoint),
@@ -459,7 +520,8 @@ def test_recorded_full_vs_tpr_one_step():
             raise FileExistsError(output_path)
         torch.save(payload, output_path)
         print(
-            f"TPR_OFFLINE_REPLAY mode={mode} rank={dist.get_rank()} "
+            f"TPR_OFFLINE_REPLAY mode={mode} recompute={int(recompute_enabled)} "
+            f"installed_blocks={installed_blocks} rank={dist.get_rank()} "
             f"rows={rows} loss={payload['loss']:.9g} "
             f"global_grad_norm={grad_norm:.9g} "
             f"fwd_bwd_sec={fwd_bwd_sec:.3f} "
