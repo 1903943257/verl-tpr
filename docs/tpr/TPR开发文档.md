@@ -1,9 +1,8 @@
 # TPR开发文档
 
 > **项目**：VERL-TPR（**Tree Prefix Reuse，树形前缀复用**）  
-> **代码基线**：`verl-tpr/main` — [`93b24dff`](https://github.com/1903943257/verl-tpr/commit/93b24dff45d959a56b609cd99893ea90c1b94212)，2026-10-19（已合入 Ring/数值归因 PR #10）  
-> **用途**：项目交付、代码评审、组件维护；本文以当前主线为稳定基线，并单独记录尚未合并的 DP2 / Ring 三文件开发分支。
-> **在研分支**：[`PR #11：feat/tpr-production-dp2-ring-3files-20261019`](https://github.com/1903943257/verl-tpr/pull/11)，核对提交 [`ab153872`](https://github.com/1903943257/verl-tpr/commit/ab153872478c996e071bb06da50eac63e7914cc8)；Draft，**不等于 main 已支持或已完成 NPU 生产验收**。
+> **源码**：[verl-tpr](https://github.com/1903943257/verl-tpr)；框架接入位于 `verl/workers/engine/megatron/`，TPR 执行模块位于 `verl/workers/engine/megatron/tpr/`。  
+> **用途**：描述 TPR 的整体架构、模块依赖、算法流程、并行方案、源码职责和工程验证入口。
 
 ## 1. 项目功能与实现范围
 
@@ -17,7 +16,7 @@ TPR 针对 Agent RL actor 更新中多条轨迹具有相同对话前缀、而 Fu
 - **直接复用**：VERL rollout/reward/actor update、原生 PPO clipping 与 loss callback、Megatron QKV/输出投影/TP、原生 optimizer/scheduler、Megatron 进程组及梯度 finalize、MindSpeed RingP2P、Ascend CANN Attention。
 - **不做的事**：不独立实现 PPO 算法、不替换整个 RL Trainer、不重新实现 TP 通信，也不在不同 DP replica 间复用 Prefix KV。
 
-生产 Dense Actor PPO 的并行与模型范围以 §9 和运行时门禁为准。源码存在或单项离线 PASS，不自动表示生产端到端训练已经支持。
+模型、并行配置与相关约束见 §9；性能和正确性实验另见 [《TPR实验结果》](TPR实验结果.md)。
 
 ## 2. 与原生 VERL 的接口边界
 
@@ -47,70 +46,71 @@ TPR 针对 Agent RL actor 更新中多条轨迹具有相同对话前缀、而 Fu
 RayPPOTrainer.fit()
   └─ _update_actor(batch)
       └─ actor_rollout_wg.update_actor(batch_td)
-          └─ TrainingWorker.train_mini_batch()
-              └─ TrainingWorker.train_batch()
-                  └─ engine.train_batch(data, loss_function=self.loss_fn)  [原生]
-                      ├─ optimizer_zero_grad()                              [原生]
-                      ├─ MegatronEngine.forward_backward_batch()
-                      │   ├─ 原生计算 GLOBAL batch_num_tokens / dp_size
-                      │   ├─ tpr_enabled=False → 原生 prepare_micro_batches + Full F/B
-                      │   └─ tpr_enabled=True  → adapter.run_tpr_forward_backward_batch()
-                      │       ├─ Turn Forest 构建、TP×CP plan 校验
-                      │       ├─ SegmentPPOObjectiveAdapter
-                      │       ├─ run_forest() → 每棵树 SegmentExecutor.run()
-                      │       │   └─ Push / Visit / Pop → TPRSelfAttention
-                      │       │       └─ CP1 rectangular 或 CP>1 Ring
-                      │       │           → 原生 PPO loss_fn → backward + Prefix dKV
-                      │       └─ Megatron finalize_model_grads_func() 一次
-                      └─ optimizer_step()                                  [原生]
+          └─ VERL 原生 DP mini-batch 分发（每个 replica 持有本地训练数据）
+              └─ TrainingWorker.train_mini_batch()
+                  └─ TrainingWorker.train_batch()
+                      └─ engine.train_batch(data, loss_function=self.loss_fn)
+                          ├─ optimizer_zero_grad()                           [原生]
+                          ├─ MegatronEngine.forward_backward_batch()
+                          │   ├─ 原生计算 GLOBAL batch_num_tokens / dp_size
+                          │   ├─ tpr_enabled=False → prepare_micro_batches + Full F/B
+                          │   └─ tpr_enabled=True → adapter.run_tpr_forward_backward_batch()
+                          │       ├─ 在 DP replica 内构建 Turn Forest
+                          │       ├─ 同一 TP×CP 模型并行组校验执行计划
+                          │       ├─ SegmentPPOObjectiveAdapter → 原生 PPO loss
+                          │       ├─ run_forest() → 各 Tree 的 SegmentExecutor
+                          │       │   └─ Push / Visit / Pop → TPRSelfAttention
+                          │       │       ├─ CP1：rectangular_attention.py
+                          │       │       └─ CP>1：ring.py / ring_layout.py / ring_attention.py
+                          │       │           → 前反向计算与 Prefix dKV 接力
+                          │       └─ Megatron finalize_model_grads_func()
+                          │           └─ 原生 TP/CP/DP 梯度同步
+                          └─ optimizer_step()                               [原生]
 ```
 
-**时序要求**：TPR 在原生 `batch_num_tokens` 和 `dp_size` 计算完成后、原生 `prepare_micro_batches()` 之前分流；不能先把可能共享 Prefix 的兄弟轨迹拆成彼此不可见的 micro-batch。TPR 自己完成 Segment backward，但不替代 Engine optimizer step。
+**执行边界**：原生 VERL 负责 DP 数据分发和 Actor mini-batch 调用；每个 DP replica 在本地 mini-batch 上独立构建 Forest，Prefix KV 仅在该 replica 内复用。TPR 在原生 `batch_num_tokens` 和 `dp_size` 计算完成后、`prepare_micro_batches()` 之前进入前反向分支。DP 梯度同步、Optimizer 和学习率更新继续使用 Megatron 的原生实现。
 
 ## 3. TPR 新增组件与源码职责
 
 ### 3.1 各模块之间的依赖图
 
-下图将**原生 VERL 的 DP 数据分发和 Megatron 的 DP 梯度归约**显式放入正常训练主链；这并不代表 main 已放开 TPR 的 DP2。**DP2 PPO 代码门禁及 Ring 三文件拆分仍属于 PR #11 Draft**，DTA-style `placement.py` 也未接管原生数据分发，三者单列在「非 main 运行路径」中，**不与 main 的执行链相连**。箭头从调用方/依赖方指向被调用方/依赖组件；实线表示原生/TPR 已有调用关系，虚线表示可选或注入关系。
+图中包含完整 Actor 训练链、DP 数据与梯度流，以及 TPR 的 Tree、KV、PPO、Ring 和模型实现。箭头从调用方或依赖方指向被调用模块；虚线表示配置注入或可选实现。
 
 ```mermaid
 flowchart TB
-    subgraph Native["原生 VERL / Megatron（main 的实际训练链）"]
-        Trainer["ray_trainer.py<br/>RayPPOTrainer"]
-        DPDispatch["VERL / Ray 原生 DP 数据分发<br/>按 replica 分发 mini-batch"]
-        Worker["engine_workers.py<br/>TrainingWorker"]
-        Base["engine/base.py<br/>train_batch / optimizer_step"]
-        Engine["transformer_impl.py<br/>MegatronEngine"]
-        Config["config/engine.py<br/>TPR 配置"]
-        PPO["workers/utils/losses.py<br/>原生 ppo_loss"]
-        Finalize["Megatron 原生梯度 finalize<br/>含 DP 梯度归约 / TP 与 Optimizer"]
+    subgraph Native["原生 VERL / Megatron"]
+        Trainer["RayPPOTrainer<br/>Actor Update"]
+        DPDispatch["VERL 原生 DP 分发<br/>各 replica mini-batch"]
+        Worker["TrainingWorker<br/>train_mini_batch / train_batch"]
+        Base["BaseEngine<br/>train_batch"]
+        Engine["MegatronEngine<br/>forward_backward_batch"]
+        Config["McoreEngineConfig<br/>tpr_enabled / CP 设置"]
+        PPO["VERL 原生 PPO loss"]
+        Finalize["Megatron gradient finalize<br/>TP / CP / DP 梯度同步"]
+        Optimizer["Megatron 原生 Optimizer<br/>optimizer_step"]
     end
 
-    subgraph TPR["TPR Engine（main 已接入的运行时）"]
-        Adapter["adapter.py<br/>Forest 入口 / 并行门禁"]
-        Tree["tree.py<br/>Turn Forest / SegmentPlan / Ref"]
+    subgraph TPR["TPR Engine：workers/engine/megatron/tpr"]
+        Adapter["adapter.py<br/>Forest 调度 / DP·TP·CP 入口"]
+        Tree["tree.py<br/>Turn Forest / Segment / Ref"]
         Executor["executor.py<br/>DFS Push / Visit / Pop"]
-        State["state.py<br/>KV Stack / Prefix dKV"]
-        Objective["objective.py<br/>物理 logits → 逻辑 PPO"]
-        Ring["ring.py<br/>Shard / Padding / Prefix Ring"]
-        Recompute["recompute.py<br/>可选实验性 checkpoint"]
+        State["state.py<br/>KVStack / Prefix dKV"]
+        Objective["objective.py<br/>逻辑 PPO 监督映射"]
+        RingFacade["ring.py<br/>Ring CP Backend / 公共 API"]
+        RingLayout["ring_layout.py<br/>SequenceShard / Zigzag / Padding"]
+        RingAttention["ring_attention.py<br/>RingP2P / FA F-B / Online Softmax"]
+        Recompute["recompute.py<br/>可选层级 checkpoint"]
     end
 
-    subgraph Model["TPR 模型侧"]
+    subgraph Model["模型侧：models/mcore/tpr"]
         Attention["attention.py<br/>TPRSelfAttention"]
-        Context["context.py<br/>单次 Forward 的 KV Context"]
+        Context["context.py<br/>TPRAttentionContext"]
         Rect["rectangular_attention.py<br/>CP1 矩形因果 Attention"]
     end
 
-    subgraph Reuse["底层复用"]
-        MindSpeed["MindSpeed<br/>RingP2P / Native Ring"]
+    subgraph NativeKernels["复用的底层实现"]
+        MindSpeed["MindSpeed<br/>RingP2P / 原生 TP·CP"]
         CANN["torch-npu / CANN<br/>Fusion Attention"]
-    end
-
-    subgraph OffMain["非 main 运行路径（独立于上述主链）"]
-        Placement["placement.py<br/>DTA-style DP 树放置<br/>尚未接入 VERL dispatch"]
-        DraftDP["PR #11 Draft<br/>TP2×CP2×DP2 PPO 代码门禁<br/>8 NPU 连续更新待验收"]
-        DraftRing["PR #11 Draft<br/>Ring 拆分为 3 文件<br/>尚未合入 main"]
     end
 
     Trainer --> DPDispatch
@@ -118,56 +118,46 @@ flowchart TB
     Worker --> Base
     Base --> Engine
     Config -.-> Engine
-    Base --> Finalize
+    Base --> Optimizer
     Engine --> Adapter
     Engine -.-> Recompute
+    Adapter --> Finalize
+    Finalize --> Optimizer
 
     Adapter --> Tree
     Adapter --> Executor
     Adapter --> Objective
-    Adapter --> Ring
-    Adapter -.->|安装 SelfAttention ModuleSpec| Attention
-    Adapter -.->|调用原生梯度 finalize| Finalize
-
-    Executor --> Tree
     Executor --> State
-    Executor --> Ring
     Executor --> Context
-    Executor -.->|模型 forward| Attention
-    State --> Tree
-    State --> Context
-    State --> Ring
+    Executor --> RingFacade
+    Executor -.->|model forward| Attention
     Objective --> Tree
-    Objective --> Ring
+    Objective --> RingFacade
     Objective --> PPO
+    State --> Tree
+    State --> RingFacade
 
     Attention --> Context
     Attention --> Rect
-    Context -.->|运行时注入 CP>1 后端| Ring
-    Recompute --> Attention
-    Recompute --> Context
-    Ring --> Rect
-    Ring --> MindSpeed
-    Ring --> CANN
+    Context -.->|CP>1 backend| RingFacade
+    RingFacade --> RingLayout
+    RingFacade --> RingAttention
+    RingAttention --> RingLayout
+    RingAttention --> MindSpeed
+    RingAttention --> CANN
     Rect --> CANN
-
-    style Placement stroke-dasharray: 5 5
-    style DraftDP stroke-dasharray: 5 5
-    style DraftRing stroke-dasharray: 5 5
+    Recompute --> Context
+    Recompute --> Attention
 ```
 
-**关键边界和阅读方式：**
+**组件边界：**
 
-- **框架接入**：`transformer_impl.py` 仅在模型构建与训练前反向两个位置接入 TPR；`adapter.py` 统一构树、创建单树 Executor、收集指标与触发原生梯度 finalize。原生 `BaseEngine.train_batch()` 仍负责 optimizer zero-grad/step。
-- **树调度**：`tree.py` 生成 Forest/Tree/Segment 和 ObjectiveRef；**`executor.py` 只负责 Tree 内 DFS**；`adapter.run_forest()` 负责 Tree 间顺序执行和整个 mini-batch 的梯度收尾。
-- **Prefix KV**：`executor.py` 操作 `state.py` 的长期 KV/dKV；`context.py` 仅管理一次模型 forward；`attention.py` 从 Context 读取外部 Prefix KV。CP1 经 `rectangular_attention.py`，CP>1 由 Context 注入 Ring backend。
-- **PPO 适配**：`objective.py` 依赖 `tree.py` 的逻辑 Ref 和 `ring.py` 的 CP 位置映射，但**最终调用的是原生 `ppo_loss()`**，不依赖实验数据采集脚本。
-- **DP 的位置与版本边界**：原生 VERL/Ray DP 数据分发属于训练主链，Megatron DP 梯度归约属于原生梯度 finalize；但 **main 的 TPR PPO 仅支持 DP1**。PR #11 提议的 `TP2×CP2×DP2` 代码门禁尚未合并，`placement.py` 的 DTA-style 树放置也**没有接入原生 dispatch**，不能把它们画成 main 的前向执行组件。
-- **Ring 与可选路径**：main 的 `ring.py` 维护 SequenceShard、Padding、逻辑/物理索引及 Prefix-aware Ring，复用 MindSpeed 传输；PR #11 的三文件拆分尚未合入。`recompute.py` 是显式开启的实验性路径。TP 一致性验证位于 `tree.py`，没有单独的 TPR TP 算法模块。
+- **DP/Trainer**：VERL 将 mini-batch 分发至各 DP replica，每个 replica 运行自己的 Tree/Segment 计划；Megatron 完成梯度 finalize 与 Optimizer 更新。
+- **Tree/Executor/State**：`tree.py` 管理 Forest 和逻辑监督引用，`executor.py` 执行 DFS，`state.py` 持有跨 Segment KV 与 dKV；`adapter.py` 管理整个 mini-batch 的梯度累积和收尾。
+- **Attention/Ring**：`context.py` 提供单次模型 Forward 的 KV 上下文；CP1 使用矩形 Attention，CP>1 经 `ring.py` 将布局处理交给 `ring_layout.py`、Ring FA 前反向交给 `ring_attention.py`。
+- **PPO**：`objective.py` 负责物理 logits 到原始逻辑 token 的映射，调用原生 `ppo_loss()`，不重复实现 PPO clipping。
 
 ### 3.2 Engine 侧：`verl/workers/engine/megatron/tpr/`
-
-以下是 `main@93b24dff` 的文件布局；PR #11 的 Ring 三文件职责单独列于 §3.5。
 
 | 文件 | 主要职责 | 关键接口 |
 | --- | --- | --- |
@@ -176,8 +166,10 @@ flowchart TB
 | [`executor.py`](../../verl/workers/engine/megatron/tpr/executor.py) | 单棵树确定性 DFS、Push/Visit/Pop、forward/backward、RoPE Segment 位置、replay 校验 | `SegmentExecutor.run()`、`push()`、`visit_leaf()`、`pop()` |
 | [`state.py`](../../verl/workers/engine/megatron/tpr/state.py) | DFS 路径 KV 栈、graph-free Push 缓存、祖先 gradient anchor、dKV 累计和释放 | `KVStack`、`KVPrefixState`、`PastKVAnchors` |
 | [`objective.py`](../../verl/workers/engine/megatron/tpr/objective.py) | Segment logits 到原始逻辑响应 token 的映射，构造原生 PPO loss 所需 compact 数据 | `SegmentPPOObjectiveAdapter.bind_tree()`、`compute_loss()` |
-| [`ring.py`](../../verl/workers/engine/megatron/tpr/ring.py) | CP Segment Shard/Padding、Prefix+Current Ring 块调度、有效性 mask、online-softmax、dKV 反向路由 | `SequenceShard`、`make_ring_sequence_shard()`、`RingCPBackend` |
-| [`placement.py`](../../verl/workers/engine/megatron/tpr/placement.py) | 按树代价做 DP 规划；**尚未接管 VERL 生产 Trainer dispatch** | `DPPlacementPlan`、`plan_tpr_dta_dp()` |
+| [`ring.py`](../../verl/workers/engine/megatron/tpr/ring.py) | Ring CP 公共 API、Backend、Engine CP runtime、CP loss 聚合、可选原生 Root Ring | `RingCPBackend`、`RingCPAttentionBackend`、`resolve_engine_cp_runtime()`、`aggregate_cp_loss()` |
+| [`ring_layout.py`](../../verl/workers/engine/megatron/tpr/ring_layout.py) | SequenceShard、Zigzag 逻辑/物理位置、Padding、Ring block 分类与输入形状校验 | `SequenceShard`、`make_ring_sequence_shard()`、`classify_ring_block()` |
+| [`ring_attention.py`](../../verl/workers/engine/megatron/tpr/ring_attention.py) | Prefix-aware Ring 通信、FA 前反向、Padding Mask、FP32 online Softmax、远端 dKV 归还 | `_RingTPRAttention`、`_circulate_kv()`、`_reduce_ring_gradients_to_owner()` |
+| [`placement.py`](../../verl/workers/engine/megatron/tpr/placement.py) | 可选 Tree 代价与 DP 放置规划工具；原生 mini-batch 分发由 VERL 管理 | `DPPlacementPlan`、`plan_tpr_dta_dp()` |
 | [`recompute.py`](../../verl/workers/engine/megatron/tpr/recompute.py) | 可选 TPR-aware TransformerBlock checkpoint，保留外部 KV graph roots；**实验性** | `install_tpr_full_recompute()`、`assert_tpr_full_recompute_installed()` |
 | [`__init__.py`](../../verl/workers/engine/megatron/tpr/__init__.py) | 子包入口 | — |
 
@@ -190,37 +182,11 @@ flowchart TB
 | [`rectangular_attention.py`](../../verl/models/mcore/tpr/rectangular_attention.py) | CP1 使用 CANN/torch-npu 矩形因果 Attention |
 | [`__init__.py`](../../verl/models/mcore/tpr/__init__.py) | 模型接口导出 |
 
-`context.py` 是**一次 forward 的上下文**，`state.py` 是**多 Segment 间持久的 KV/dKV 状态**，职责不同。**main** 的 Ring/Padding/Sharding 统一实现在 Engine `ring.py`；**PR #11** 在保持 Engine 所有权的前提下将其拆为 `ring_layout.py`、`ring_attention.py` 和公共入口 `ring.py`，见 §3.5。
+`context.py` 是**单次 forward 的上下文**，`state.py` 是**多 Segment 间持久的 KV/dKV 状态**；Ring 的三个 Engine 模块分别负责公共 API、Shard/Padding Layout 和核心 FA/通信。
 
 ### 3.4 实验代码与生产代码的区分
 
 `verl/experimental/tpr/` 中的 `actor_capture.py`、AllGather/Ulysses/Hybrid CP、GDN/Linear、offload 与 `legacy/` 实现，分别用于数据留存、对照、探索和历史回归；**不等于默认生产 Dense PPO 执行路径**。Ring 的公共运行时 API 仍位于 Engine `tpr/ring.py`，不是历史实验实现。
-
-### 3.5 PR #11：Ring 三文件模块职责（开发分支，尚未合入 main）
-
-在分支 [`feat/tpr-production-dp2-ring-3files-20261019`](https://github.com/1903943257/verl-tpr/tree/feat/tpr-production-dp2-ring-3files-20261019) 上，原先约 1,638 行的 `ring.py` 拆分为三个 Engine 内模块。此项是**责任边界重组和接口兼容迁移**，不是增加第三套 Ring 后端，也不能仅凭文件拆分宣称性能提升。
-
-| 文件（仅 PR #11 分支） | 模块职责 | 关键实现 / 对外接口 |
-| --- | --- | --- |
-| [`ring_layout.py`](https://github.com/1903943257/verl-tpr/blob/feat/tpr-production-dp2-ring-3files-20261019/verl/workers/engine/megatron/tpr/ring_layout.py) | Segment 逻辑/物理布局、双区间 zigzag、Padding、Shard 索引、配置/形状验证、块可见性分类 | `SequenceShard`、`make_ring_sequence_shard()`、`classify_ring_block()`、`_RingStaticLayout` |
-| [`ring_attention.py`](https://github.com/1903943257/verl-tpr/blob/feat/tpr-production-dp2-ring-3files-20261019/verl/workers/engine/megatron/tpr/ring_attention.py) | RingP2P 正向 KV 环流、CANN FA F/B、Padding mask、FP32 online Softmax、Prefix Q/KV merge、反向 dKV 归还 | `_RingTPRAttention`、`_circulate_kv()`、`_merge_attention()`、`_reduce_ring_gradients_to_owner()` |
-| [`ring.py`](https://github.com/1903943257/verl-tpr/blob/feat/tpr-production-dp2-ring-3files-20261019/verl/workers/engine/megatron/tpr/ring.py) | 对外兼容入口、Engine CP runtime/backend、原生 Root Ring 可选入口、CP Loss 聚合 | `RingCPBackend`、`RingCPAttentionBackend`、`ring_cp_attention()`、`resolve_engine_cp_runtime()`、`aggregate_cp_loss()` |
-
-```mermaid
-flowchart LR
-    Engine["adapter.py / executor.py"] --> Facade["ring.py<br/>Engine API / CP Backend"]
-    State["state.py / objective.py"] --> Facade
-    Facade --> Layout["ring_layout.py<br/>Shard / Padding / Mask metadata"]
-    Facade --> Attention["ring_attention.py<br/>Ring FA F/B / dKV"]
-    Attention --> Layout
-    Attention --> MindSpeed["MindSpeed RingP2P"]
-    Attention --> CANN["torch-npu / CANN"]
-```
-
-- `executor.py`、`state.py`、`objective.py` 等调用方**继续从 `ring.py` 获取公开符号或兼容 re-export**；它们无需引入第二套 `SequenceShard`。
-- **实际定义的拥有者**已移动：`SequenceShard` 在 `ring_layout.py`，`_RingTPRAttention` 和底层通信在 `ring_attention.py`。对实现细节进行 monkeypatch、埋点或 NPU profiler 归因时，必须定位**定义所在模块**，不能只改 `ring.py` 的 re-export 别名。
-- 原有 Q/KV/Padded Prefix 合并变量 `TPR_RING_COALESCE_PREFIX_FULL/QUERY/PADDED` 均仍**默认关闭**。分支意图保持 Ring 的可见性、数学计算与通信顺序不变，CP2/CP4 NPU 前反向回归仍是合并门禁。
-- 相应测试已迁移内部注入位置，并增加 [DP2 门禁单测](https://github.com/1903943257/verl-tpr/blob/feat/tpr-production-dp2-ring-3files-20261019/tests/models/mcore/tpr/unit/test_tpr_production_dp2_gate_cpu.py)；见 §9.2。
 
 ## 4. 数据结构与树调度
 
@@ -344,22 +310,21 @@ Attention 形状: [S, P+S]，使用全局位置保证因果性
 - 后代对祖先 KV 的梯度需要经 CP Ring backward 返回正确 rank，再汇入 Tree 的 dKV。
 - CP rank 即便没有本地受监督 token，仍要参与必要的 Ring collective。
 
-因此 TPR **复用** MindSpeed RingP2P 和原生 CP Process Group，但需要 Prefix-aware block schedule、online-softmax 合并和 dKV 路由。`ring.py` 是这部分新增逻辑，不是一套新的 TP/CP 通信基础设施。
+因此 TPR **复用** MindSpeed RingP2P 和原生 CP Process Group，通过 `ring_layout.py` 处理 Prefix-aware block schedule 与 Padding，通过 `ring_attention.py` 实现 online-softmax、CANN FA 和 dKV 回送，再由 `ring.py` 统一对外提供 CP Backend 接口。
 
 更完整的通信/计算/反向合同、Padding/Shard 实例和 Root/qkvmerge 选项见 [《TPR Ring CP 方案》](ring_design.md)。
 
 ### 7.2 Padding 与 Shard 各自负责什么
 
-**main** 将下列功能集中在 `ring.py`；**PR #11** 将 Shard/布局移动到 `ring_layout.py`、FA F/B 与 Mask 放到 `ring_attention.py`，并继续通过 `ring.py` 对外暴露兼容接口。两种布局都**没有重复维护独立 Padding/Sharding 体系**：
+Shard 和 Padding 的逻辑统一在 `ring_layout.py`，Ring Attention 的计算与 Mask 在 `ring_attention.py`，外部模块通过 `ring.py` 访问公共 API；保持一套统一的逻辑/物理 Token 位置契约：
 
-| 接口 | 职责 | 是否可以复用/简化 |
+| 接口 | 所在模块 | 作用 |
 | --- | --- | --- |
-| `round_up_sequence_length()` | 计算满足 `2×CP` 对齐的物理长度 | 简单算术，可复用 |
-| `make_ring_sequence_shard()` | 按 MindSpeed 对称双区间 zigzag 给出 CP Rank 的两段物理范围 | 遵循已有布局，不应另发明布局 |
-| `SequenceShard` | 保存**有效逻辑 token**与**含 Padding 的物理张量**之间的范围及映射 | 必须保留等价的元数据，类/接口可精简 |
-| `SequenceShard.select()` | 从全局 Segment 取 Rank 本地 token，并补齐物理张量 | 可复用通用 Padding 算子，但仍需有效区间 |
-| `global_to_local()` / `local_to_global()` | 为 PPO query、RoPE、Prefix KV 和梯度找到正确本地位置 | CP>1 不可直接省略 |
-| `_physical_block_attention_mask()` | 防止 Padding KV 参与 Softmax，控制 causal/validity | 有 Padding 时必需 |
+| `round_up_sequence_length()` | `ring_layout.py` | 计算满足 `2×CP` 对齐的物理长度 |
+| `make_ring_sequence_shard()` | `ring_layout.py` | 构造 MindSpeed 对称 Zigzag 两区间 Shard |
+| `SequenceShard` / `select()` | `ring_layout.py` | 保存逻辑 token 与含 Padding 的本地物理张量位置，执行本地数据选择 |
+| `global_to_local()` / `local_to_global()` | `ring_layout.py` | 解析 PPO Query、RoPE 与梯度的 Rank-local 位置 |
+| `_physical_block_attention_mask()` | `ring_attention.py` | 屏蔽虚拟 Padding Key/Query、控制因果可见性 |
 
 这里的“逻辑/物理地址”**不是设备内存虚拟地址**，而是原始序列位置与 CP Rank 本地张量索引。
 
@@ -394,23 +359,18 @@ SP 继续复用 Megatron 的 QKV 前 AllGather 等原生机制。当前支持范
 
 ### 8.3 Data Parallel（DP）
 
-`placement.py` 提供以树成本为基础的放置规划，但没有替换 VERL actor mini-batch dispatcher。
+数据并行直接沿用 VERL 和 Megatron 原有机制：
 
-**当前 main**：PPO 生产路径仍以 **DP1** 为限；DP2 仅有显式环境门禁下的离线一致性实验。
+1. **Mini-batch 分发**：VERL 将 actor 训练数据按原生等数量策略分发给不同 DP replica；每个 replica 在自己的局部 mini-batch 上构建 `ForestExecutionPlan`。
+2. **局部前缀复用**：同一 DP replica 内相关轨迹经 Turn Tree 合并共享 Prefix KV；不同 replica 的 KV 不互通，跨 replica 的 Forest 不要求执行同一 Segment 序列。
+3. **一致性与归一化**：同一 replica 的 TP×CP peers 执行一致的 Forest；PPO Loss 使用原生 global token-mean 归一化，Engine 传入全局 `batch_num_tokens` 和 `dp_size`。
+4. **梯度同步与更新**：TPR 负责每个 replica 内 Segment 的前反向及一次梯度 finalize 入口；Megatron 原生机制执行 DP 梯度归约和 Optimizer 更新。
 
-**PR #11（Draft，未合并）**：在 `adapter.py::_validate_tpr_parallel_sizes()` 放开**唯一新增 PPO 并行组合 `TP=2, CP=2, DP=2`（8 NPU，PP=EP=1）**，无需 `TPR_EXPERIMENTAL_OFFLINE_DP2` 等离线开关。其余未验证 DP>1 组合（包括 `TP2×CP4×DP2`）、非 PPO DP2 仍 fail-closed；历史 10K 特殊 parity 路径仍需各自实验开关。
+**并行配置**：PPO 路由支持 DP1 下的 TP1CP1/2、TP2CP1/2/4，并包含 **TP2×CP2×DP2（8 NPU，PP=EP=1）**。其余 DP>1 组合由并行拓扑门禁限制。
 
-| 项目 | PR #11 的实现边界 |
-| --- | --- |
-| 数据分发 | **直接沿用原生 VERL 等数量 mini-batch 分发**，没有在 Trainer 中接入新的树调度或 `placement.py` |
-| Prefix 共享 | 每个 **DP replica 内部**构建 Forest/共享 KV；**不同 DP replica 之间不会共享**，同组 sibling 若被原生分发拆开便无法跨组复用 |
-| Loss 归一化 | 沿用原生 global token-mean 分母和 Engine 的 DP size；不能按每 replica 的局部 token 数随意归一化 |
-| 梯度与参数更新 | 继续由 Megatron 原生 gradient finalize / Optimizer 负责，不新写 DP AllReduce 或 AdamW |
-| 约束与验收 | 放宽代码门禁 ≠ 多步生产验收；需要实际 ActorWorker → Engine → **连续 5 步 PPO optimizer 更新**，检查 DP/TP/CP 副本、梯度、optimizer state 与完整耗时 |
+`placement.py` 提供基于 Tree 代价的 DP 放置规划接口；默认训练链使用 VERL 原生分发。该分发策略不按 Tree 聚合 sibling，因此一个 Group 拆至不同 DP replica 时，Prefix 复用范围也随 replica 边界拆分。
 
-**DP 复用率风险**：默认等数量分发并不以共享前缀的 Tree 为最小单元；同一 group 的 8 个 sibling 不保证全部留在一个 DP replica。与 `placement.py` 的 DTA-style 按树划分是两种方案，不可把后者的离线性能直接作为前者生产 DP2 的收益。
-
-## 9. 当前主线配置与支持边界
+## 9. 配置与支持边界
 
 | 项目 | 当前可进入的路径 |
 | --- | --- |
@@ -418,12 +378,12 @@ SP 继续复用 Megatron 的 QKV 前 AllGather 等原生机制。当前支持范
 | TP/CP | PPO：TP1+CP1/2，TP2+CP1/2/4；CP>1 使用 Ring |
 | SP | TP2+CP1 的受限原生 SP；Segment 长度门禁 |
 | PP/EP | PP=1、VPP=1、EP=1 |
-| DP | **main**：生产 DP1，DP2 为显式离线 parity；**PR #11 Draft**：PPO TP2×CP2×DP2 放开代码门禁，8 NPU 多步生产验收待完成 |
+| DP | PPO：DP1 支持上述 TP/CP 组合；DP2 支持 TP2×CP2×DP2；其他 DP>1 组合受门禁限制 |
 | PPO | 原生 VERL Vanilla Actor PPO，`token-mean` |
 | Recompute | 默认关闭原生层级 recompute；可选 **TPR-aware full/uniform/1** 实验性接入，不能当作任意 Megatron checkpoint 均兼容 |
-| 未开放组合 | TP>2、TP+SP+CP、动态 CP、MoE、PP/EP>1、非 Qwen Turn builder、FP8 等；除 PR #11 提议的 TP2×CP2×DP2 外，其他 DP>1 仍未开放 |
+| 未开放组合 | TP>2、TP+SP+CP、动态 CP、MoE、PP/EP>1、非 Qwen Turn builder、FP8，以及 TP2×CP4×DP2 等其他 DP>1 拓扑 |
 
-主要运行时门禁见 [`adapter.py:_validate_tpr_parallel_sizes()`](../../verl/workers/engine/megatron/tpr/adapter.py)、`_validate_tpr_cp_combination()` 和 `run_tpr_forward_backward_batch()`；模型构建期的 recompute 适配在 [`transformer_impl.py`](../../verl/workers/engine/megatron/transformer_impl.py)。部分新的实验在 `main` 已有实现和离线测试，但**不等于组合生产验收完成**。
+拓扑与模型约束由 [`adapter.py:_validate_tpr_parallel_sizes()`](../../verl/workers/engine/megatron/tpr/adapter.py)、`_validate_tpr_cp_combination()` 和 `run_tpr_forward_backward_batch()` 检查；模型构建期的 Recompute 适配位于 [`transformer_impl.py`](../../verl/workers/engine/megatron/transformer_impl.py)。
 
 ### 9.1 主要配置
 
@@ -435,24 +395,10 @@ SP 继续复用 Megatron 的 QKV 前 AllGather 等原生机制。当前支持范
 | `TPR_TURN_MIN_SEGMENT_TOKENS` | 最短合并区间；默认 `128` |
 | `TPR_EXEC_PROFILE=1` / `TPR_MEM_TRACE=1` | 诊断 Segment 时间与内存，正式性能测量时关闭 |
 | `TPR_PPO_LOGPROB_CHUNK_TOKENS` | 可选的 PPO 计算中间态分块/重算；普通路径默认关闭 |
-| `TPR_EXPERIMENTAL_OFFLINE_DP2` | main / 特殊 parity 测试的 DP2 实验门禁之一；**PR #11 新增 TP2×CP2×DP2 PPO 路径不要求该开关**，但仍待 NPU 验收 |
+| `TPR_EXPERIMENTAL_OFFLINE_DP2` | 仅供额外 DP2 离线一致性测试使用；TP2×CP2×DP2 PPO 路由不依赖此变量 |
 | `TPR_SELECTED_LOGITS_FP32=1` | 可选数值诊断；默认关闭 |
 | `TPR_RING_COALESCE_PREFIX_*` | Ring Prefix 相关合并实验；默认关闭 |
 | `TPR_CAPTURE_ACTOR_MINIBATCH_DIR` | 真实 actor 更新 mini-batch 留存；仅实验用途 |
-
-### 9.2 开发分支进度与验收（PR #11，2026-10-19）
-
-| 检查项 | PR #11 当前状态 | 不能推断的结论 |
-| --- | --- | --- |
-| Ring 三文件拆分 / 导入与结构 | 代码已提交，保持 `ring.py` 兼容导出，单元测试对实现文件迁移了埋点 | 不能仅从接口/AST 通过推断 NPU FA backward 行为不变 |
-| DP2 PPO 拓扑门禁 | `TP2×CP2×DP2` 已放开；CPU 新增 positive/negative gate 测试 | 不能说明 VERL Actor 更新已跑通 |
-| CPU 回归 | [PR #11](https://github.com/1903943257/verl-tpr/pull/11) 记录 **694 passed**、结构和语法检查通过 | 不等于 NPU 正确性/性能验收 |
-| 8 NPU 真实 Actor PPO | **未完成**连续 5 步 ActorWorker→Megatron Optimizer 门禁；PR 仍为 Draft | 不得写成 DP2 已正式生产可用 |
-| Ring NPU 对照 | CP2/CP4 Ring kernel / Padding / Q-KV Merge、真实 Qwen PPO 与旧 main 的同 capture 对比仍待验证 | 不能声称拆分完全数值等价或已经提高加速比 |
-
-合并前必须分别完成：（1）真实 ActorWorker + Megatron optimizer 的 **TP2×CP2×DP2 连续 5 次更新**；（2）拆分后 CP2/CP4 Ring 数值与完整梯度回归；（3）在同一个 30K/40K capture 上对比旧 main、新分支的 logprob、PPO loss、**完整参数梯度**、峰值显存与无埋点耗时，且将 **F/B+finalize** 与 **完整 Actor train_batch（含 optimizer）**分开统计。此前 TP2CP2DP2 **离线 F/B 或手写单次 AdamW** 只能算独立证据，不能替代这项验收。
-
-分支自身的变更与测试要求见 [DP2 / Ring 三文件验收说明（PR #11）](https://github.com/1903943257/verl-tpr/blob/feat/tpr-production-dp2-ring-3files-20261019/docs/tpr/production_dp2_ring_three_files_20261019.md)。
 
 ## 10. 正确性、性能与诊断
 
@@ -477,7 +423,7 @@ python -B tests/models/mcore/tpr/run_cpu_regressions.py
 - [Shard](../../tests/models/mcore/tpr/unit/test_sequence_shard_cpu.py)、[Ring 合并调度](../../tests/models/mcore/tpr/unit/test_ring_coalescing_schedule.py)、[recompute 合同](../../tests/models/mcore/tpr/unit/test_tpr_full_recompute_cpu.py)；
 - [Ring NPU](../../tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py)、[真实 TP2CP4 Actor PPO 回放](../../tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_offline_ppo.sh)、[多步离线对照](../../tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_multistep.sh)；
 - [CP1 Full / 无共享分段 / 共享 TPR 对照](../../tests/models/mcore/tpr/parallel/run_real_actor_cp1_short_full_tpr.sh)；
-- [实验 DP2 一步](../../tests/models/mcore/tpr/parallel/test_tpr_tp2cp2dp2_one_step_npu.py)。
+- [DP2 拓扑合同](../../tests/models/mcore/tpr/unit/test_tpr_production_dp2_gate_cpu.py)、[TP2CP2DP2 离线验证](../../tests/models/mcore/tpr/parallel/test_tpr_tp2cp2dp2_one_step_npu.py)。
 
 ### 10.2 已知差异与分析原则
 
@@ -496,8 +442,8 @@ TPR-aware Activation Checkpoint 的必要性、显式 KV 输出、weakref 生命
 
 1. **添加模型聊天模板**：扩展 `tree.py` 的 Turn 边界与可共享条件，须验证 SegmentObjectiveRef 的 `t-1` query 映射；不能只替换 Qwen 特殊 token 常量。
 2. **调整构树或 Executor**：必须保证所有 TP×CP peer 的计划一致、内部节点 dKV 可归还、每棵树执行后 KVStack 为空；不能跳过空本地 loss 的 CP Rank。
-3. **调整 Ring/Padding**：main 是单一 `ring.py`；PR #11 是 `ring_layout.py`（位置/布局）、`ring_attention.py`（FA/F/B/通信）、`ring.py`（公共 Engine API）三个文件。必须保持逻辑/物理索引、Mask、梯度归属一致；复用 MindSpeed 通信，不再维护第二套 Ring 实现。
-4. **增加 DP 或 recompute 组合**：PR #11 放开 TP2CP2DP2 代码门禁后，仍须独立验收原生等数量分发下的 Prefix 复用率、global PPO denominator、跨 replica 梯度同步、连续 optimizer 更新与显存峰值；不能将 DP2 离线门禁或 CPU 回归当生产支持声明。
+3. **调整 Ring/Padding**：以 `ring.py` 为 Engine 公共 API、`ring_layout.py` 为位置/布局/Shard 所有者、`ring_attention.py` 为 FA 前反向和 Ring 通信所有者；保持逻辑/物理索引、Mask 与梯度归属一致，复用 MindSpeed 通信。
+4. **扩展 DP 或 Recompute**：保持原生 VERL 分发、global PPO denominator、Megatron 跨 replica 梯度归约与 Optimizer 语义；扩展并行拓扑时检查 Prefix 复用率、全参数梯度及连续更新行为。
 5. **简化 Objective**：可以减少中间结构和重复数据准备，但必须保留原始 PPO 字段与原生 `ppo_loss()` callback，不得重复实现 clipping。
 6. **生产精简**：`actor_capture.py` 与 Worker 插桩、专项实验/诊断代码可与核心运行时解耦；不要误删真正的 TPR 训练入口。
 
