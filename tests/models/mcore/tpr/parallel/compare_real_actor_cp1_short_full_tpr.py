@@ -15,6 +15,57 @@ from pathlib import Path
 MODES = ("full", "one_node", "split_no_share", "shared")
 
 
+def _complete_cp1_parameter_gradient_metrics(a: dict, b: dict) -> dict | None:
+    """Stream ALL TP1/CP1 gradients for a single Qwen3-4B PPO update.
+
+    The prior canonical witness samples parameter values. The new optional
+    manifests contain every original BF16 parameter gradient. Accumulate
+    exact vector sums in FP64 on CPU, one tensor/chunk at a time.
+    """
+    left, right = a.get("full_grad_dir"), b.get("full_grad_dir")
+    if left is None and right is None:
+        return None
+    if not left or not right:
+        raise AssertionError("Only one CP1 mode has full gradients")
+    import torch
+    ma = torch.load(Path(left) / "manifest.pt", map_location="cpu", weights_only=False)
+    mb = torch.load(Path(right) / "manifest.pt", map_location="cpu", weights_only=False)
+    if ma != mb or not ma:
+        raise AssertionError("CP1 full gradient manifests differ")
+    sq_a = sq_b = diff_sq = dot = 0.0
+    count = 0
+    layers = []
+    for entry in ma:
+        xa = torch.load(Path(left) / entry["filename"], map_location="cpu", weights_only=True)
+        xb = torch.load(Path(right) / entry["filename"], map_location="cpu", weights_only=True)
+        if xa.shape != xb.shape or xa.dtype != xb.dtype or xa.dtype != torch.bfloat16:
+            raise AssertionError(f"CP1 full gradient dtype/shape differs: {entry['name']}")
+        va, vb = xa.flatten(), xb.flatten()
+        param_diff_sq = 0.0
+        for start in range(0, va.numel(), 1_048_576):
+            x = va[start:start + 1_048_576].double()
+            y = vb[start:start + 1_048_576].double()
+            d = y - x
+            sq_a += float((x*x).sum())
+            sq_b += float((y*y).sum())
+            diff_sq += float((d*d).sum())
+            param_diff_sq += float((d*d).sum())
+            dot += float((x*y).sum())
+        layers.append((entry["name"], math.sqrt(param_diff_sq)))
+        count += va.numel()
+        del xa, xb, va, vb
+    norm_a, norm_b = math.sqrt(sq_a), math.sqrt(sq_b)
+    return {
+        "complete_parameter_elements": count,
+        "full_norm": norm_a,
+        "candidate_norm": norm_b,
+        "relative_l2": math.sqrt(diff_sq/max(sq_a, 1e-30)),
+        "cosine": dot/max(norm_a*norm_b, 1e-30),
+        "norm_relative_gap": abs(norm_a-norm_b)/max(norm_a, 1e-30),
+        "top_absolute_gradient_errors": sorted(layers, key=lambda item: item[1], reverse=True)[:12],
+    }
+
+
 def _metrics(a: list[float], b: list[float]) -> dict:
     if len(a) != len(b) or not a:
         raise AssertionError("Witness coordinates mismatch or empty")
@@ -110,6 +161,7 @@ def compare(directory: Path) -> dict:
             ),
             "canonical_sampled_grad": _metrics(ga["values"], gb["values"]),
             "complete_norm_grad": _metrics(na["values"], nb["values"]),
+            "complete_parameter_grad": _complete_cp1_parameter_gradient_metrics(a, b),
             "global_grad_norm_reference": a["global_grad_norm"],
             "global_grad_norm_candidate": b["global_grad_norm"],
             "global_grad_norm_relative_gap": (
@@ -129,8 +181,20 @@ def compare(directory: Path) -> dict:
             "sampled_grad_rel_l2_lt_0.05": one["canonical_sampled_grad"]["relative_l2"] < 0.05,
             "complete_norm_grad_rel_l2_lt_0.05": one["complete_norm_grad"]["relative_l2"] < 0.05,
         }
+        if a.get("full_grad_dir") or b.get("full_grad_dir"):
+            if one["complete_parameter_grad"] is None:
+                raise AssertionError("Requested full-parameter gradients missing")
+            witness_norm = one["complete_parameter_grad"]["full_norm"]
+            actual_norm = float(a["global_grad_norm"])
+            if abs(witness_norm - actual_norm) / max(actual_norm, 1e-30) > 2e-3:
+                raise AssertionError(
+                    f"CP1 exact full-gradient norm disagrees with recorded global norm: {name}"
+                )
         outcomes[name] = one
     report = {
+        "full_parameter_gradients_saved": all(
+            results[mode].get("full_grad_dir") for mode in MODES
+        ),
         "source_capture": full["source_capture"],
         "input_sha256": full["input_sha256"],
         "initial_weights_witness_sha256": full["initial_weights_witness_sha256"],
@@ -143,7 +207,8 @@ def compare(directory: Path) -> dict:
         "caveat": (
             "Full is the same model's no-context square-CANN path, NOT native "
             "unmodified VERL/MindSpeed Engine. Short capture changes conditioning. "
-            "Canonical sampled gradients are NOT complete all-parameter L2."
+            "Canonical sampled gradients are NOT complete all-parameter L2. "
+            "complete_parameter_grad is exact ALL-parameter BF16 L2 only when saved."
         ),
     }
     return report
@@ -168,6 +233,14 @@ def main() -> None:
                 "logprob_rel_l2": metrics["logprob"]["relative_l2"],
                 "sampled_grad_rel_l2": metrics["canonical_sampled_grad"]["relative_l2"],
                 "complete_norm_rel_l2": metrics["complete_norm_grad"]["relative_l2"],
+            "full_grad_rel_l2": (
+                metrics["complete_parameter_grad"]["relative_l2"]
+                if metrics["complete_parameter_grad"] is not None else None
+            ),
+            "full_grad_cos": (
+                metrics["complete_parameter_grad"]["cosine"]
+                if metrics["complete_parameter_grad"] is not None else None
+            ),
                 "grad_cos": metrics["canonical_sampled_grad"]["cosine"],
                 "gates": metrics["provisional_gates"],
             }
