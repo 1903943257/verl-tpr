@@ -45,6 +45,24 @@ def _native_microbatch_count(count: int, global_tokens: int, recorded_batch_size
     return count
 
 
+def _aggregate_native_local_reporting_loss(loss_parts):
+    """Sum detached CP-local PPO loss contributions in a uniform FP32 dtype.
+
+    Some CP ranks own no supervised tokens. Their zero-loss graph is BF16,
+    while ranks with PPO tokens have an FP32 loss. Reducing torch.stack()
+    directly across CP ranks is an INVALID mixed-dtype HCCL collective and
+    was observed to corrupt the reported Loss (not the backward).
+    """
+    if not loss_parts:
+        raise ValueError("Cannot report an empty native PPO microbatch")
+    values = []
+    for part in loss_parts:
+        if part.numel() != 1 or part.requires_grad:
+            raise ValueError("Native reporting loss must be detached scalar")
+        values.append(part.float().reshape(()))
+    return torch.stack(values).sum(dtype=torch.float32)
+
+
 def native_cp_query_indices(length: int, cp_rank: int, cp_size: int = 4,
                             tp_size: int = 2) -> tuple[int, ...]:
     """Exact zigzag physical→logical position order used by preprocess_thd_engine.
@@ -305,7 +323,12 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
     torch.npu.synchronize()
     finalize_seconds = time.perf_counter() - t0
 
-    loss_value = torch.stack(loss_parts).sum()
+    # Reporting-only reduction: all CP participants MUST pass the same dtype
+    # to HCCL. CP ranks without response tokens generated detached BF16 zeros,
+    # whereas ranks with PPO tokens produced FP32 losses. The original
+    # torch.stack(...).sum() retained per-rank dtype and silently disagreed.
+    # Forward/backward and weight-gradient collectives are not changed.
+    loss_value = _aggregate_native_local_reporting_loss(loss_parts)
     dist.all_reduce(loss_value, op=dist.ReduceOp.SUM, group=runtime.cp_group)
     return NativeFullResult(
         loss=float(loss_value.item()),
