@@ -44,7 +44,7 @@ UNIT = (
     "dp_placement", "gdn_context",
 )
 PARALLEL = (
-    "ring_cp_attention_contract", "ring_numerics_cpu", "ordinary_ring_adapter",
+    "ring_cp_attention_contract", "ring_numerics_cpu",
     "cp_padding_contract", "cp_backend_contract",
     "cp_segment_execution_contract", "allgather_cp_attention_contract",
     "hybrid_cp_attention_contract", "ulysses_cp_attention_contract",
