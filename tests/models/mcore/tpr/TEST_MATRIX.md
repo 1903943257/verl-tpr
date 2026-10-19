@@ -23,7 +23,7 @@ not a completed physical migration of every historical file.
 
 | Stage | Core question | Primary command/test | Required evidence |
 | --- | --- | --- | --- |
-| CPU foundation | Scheduling, tree ownership, PPS/optimizer input, KV lifetime | `run_suite.py run cpu-core` | Selected unit contracts actually run (not skipped) |
+| CPU foundation | Scheduling, tree ownership, PPO/optimizer input, KV lifetime | `run_suite.py run cpu-core` | Selected unit contracts actually run (not skipped) |
 | Primitive FA | Full vs rectangular causal Attention fwd/bwd | `run_suite.py run npu-core --ack-npu` | Loss/output, Q/K/V & Prefix dK/dV |
 | Ring CP | Shard/padding/CP Ring numerical equivalence | `run_suite.py run npu-ring --ack-npu` | Physical vs logical ownership, per-rank allreduce and dKV |
 | Native TP | Native Megatron TP2 with TPR | `run_suite.py run npu-tp --ack-npu` | Full gradients across TP ranks |
