@@ -1,41 +1,100 @@
-# TPR tests
+# TPR testing: one entry point, explicit acceptance boundaries
 
-This VERL branch is the development source for TPR code and tests. The
-`/workspace/bridge` pull and `rsync` instructions below record earlier
-experiments; do not use them to update this checkout. Fetch TPR changes through
-the VERL Git remote once it is configured. See
-`docs/tpr_development_baseline.md` for the source commits and server migration
-status.
+All commands are relative to the **verl-tpr repository root**. Do not copy tests
+from the obsolete `bridge` checkout into this tree. Production runtime code
+lives in `verl/workers/engine/megatron/tpr/` and
+`verl/models/mcore/tpr/`; the tests also include frozen historical and
+experimental references.
 
-- `unit/`: CPU-friendly component contracts and scheduler behavior.
-- `equivalence/`: NPU forward/backward equivalence through attention, model, and engine layers.
-- `correctness/`: full-result and multi-step optimizer comparisons.
-- `profiling/`: opt-in latency, memory, capacity, and long-context measurements.
-- `parallel/`: phase-two Context Parallel and Linear Attention capability gates.
+## Start here
 
-Run tests from the verl repository root so package-relative test helpers resolve consistently.
+```bash
+python tests/models/mcore/tpr/run_suite.py list
+python tests/models/mcore/tpr/run_suite.py inventory
+python tests/models/mcore/tpr/run_suite.py check
+python tests/models/mcore/tpr/run_suite.py show cpu-core
+python tests/models/mcore/tpr/run_suite.py run cpu-core
+```
 
-## P0-1 native CP numerical control
+The registry (`suite_catalog.py`) is the **curated gate shortlist**, not a claim
+that all files under this directory are maintained or passing. `check` is
+dependency-free and validates the selected file references; it does not run
+numerical tests. `inventory` enumerates physical pytest files and identifies
+the scope of remaining consolidation.
 
-On the **host** run `cd /workspace/bridge && git pull --ff-only`.
-Then **inside Docker** synchronize
-`/workspace/bridge/tests/models/mcore/tpr/` into
-`/workspace/uni-agent/verl/tests/models/mcore/tpr/` using `rsync -av`.
-Still inside Docker, run
-`cd /workspace/uni-agent/verl` and
-`bash tests/models/mcore/tpr/parallel/run_native_cp_drift.sh`.
-Never pull Git repositories from the Docker runtime checkout.
-The launcher uses `127.0.0.1` plus explicit ports for CP1/2/4;
-it never uses standalone rendezvous. See
-`/workspace/bridge/docs/p0_native_cp_drift_20261011.md`.
+For real NPU gates, first inspect the command, then explicitly opt in:
 
-## P0-B real-TQ 50-step native CP training control
+```bash
+python tests/models/mcore/tpr/run_suite.py show npu-ring
+python tests/models/mcore/tpr/run_suite.py run npu-ring --ack-npu
+```
 
-On **host** `cd /workspace/bridge && git pull --ff-only`. Inside
-**Docker** `rsync -av /workspace/bridge/tests/models/mcore/tpr/
-/workspace/uni-agent/verl/tests/models/mcore/tpr/`, then in
-`/workspace/uni-agent/verl`, set `TPR_REAL_TQ_BATCH` and run
-`bash tests/models/mcore/tpr/parallel/run_native_cp_multistep.sh`.
-This is NLL with FP32 master AdamW and fixed real TQ row order,
-**not** production PPO or a Megatron DistributedOptimizer benchmark.
-See `/workspace/bridge/docs/p0_native_cp_multistep_20261011.md`.
+Set `ASCEND_RT_VISIBLE_DEVICES` and confirm the installed MindSpeed/Megatron
+version and fixture topology **before** running a distributed gate. The small
+suite launcher uses fixed, local rendezvous and invokes one curated pytest file
+at a time; it is not a replacement for dedicated 8-rank real-actor wrappers.
+
+**Important:** an exit code of zero with all tests skipped is *not* acceptance.
+Inspect the pytest summary, skip reasons, every rank's output, numerical
+thresholds, gradient witnesses, and recorded model/data hashes. No native NPU
+tests were executed merely by reorganizing this directory.
+
+## Physical directories and ownership
+
+| Directory | What belongs there | Qualification |
+| --- | --- | --- |
+| `unit/` | CPU shape, graph, scheduler, PPO, DP, engine contracts | Some require actual Megatron; isolated runner covers only its explicit whitelist |
+| `equivalence/` | Narrow NPU operator/model numerical equivalence | Device gate, not complete PPO |
+| `correctness/` | Real-model, PPO, multi-step and historical DTA comparisons | Heavy and often asset-gated |
+| `integration/` | Uni-Agent actor integration and real-TQ preparation contracts | Requires external capture or application environment |
+| `parallel/` | CP/Ring/TP/DP parity **plus legacy launchers and analysis scripts** | Mixed historical folder; do not run blindly |
+| `profiling/` | Latency, memory, capacity, offload and backend probes | Not correctness acceptance |
+| `linear/` | Experimental GDN/Hybrid-linear model coverage | Outside production Dense FA gate |
+
+Do not move a helper in `parallel/` simply because its name looks like a
+diagnostic: many comparison tools import sibling files by filename and shell
+launchers embed fixed repository-relative paths. Consolidation must preserve
+these dependencies or update all of their callers in the same change.
+
+## Gate priority
+
+Read [TEST_MATRIX.md](TEST_MATRIX.md) for explicit feature-to-test mapping,
+configuration, negative controls, stage ownership, and the separate 8-rank
+offline PPO procedures.
+
+- **P0 CPU:** `cpu-core` on every TPR runtime refactor; plain
+  `run_cpu_regressions.py` remains the historical, stable entry.
+- **P1 NPU primitive:** `npu-core` for rectangular Attention and Prefix
+  backward; `npu-ring` and `npu-tp` for parallel changes.
+- **P2 model and real PPO:** `npu-qwen`, followed by the dataset-specific
+  scripts linked in TEST_MATRIX, with identical capture/checkpoint/optimizer.
+- **P3 recompute:** `cpu-recompute`, `npu-recompute-primitive`, then
+  CP1/CP2/TP2xCP4 whole-model OFF/ON and full-gradient comparisons.
+- **P4 performance:** only after P0–P3, measured without diagnostic probes.
+
+The `npu-recompute-negative` suite is deliberately expected to fail: it
+demonstrates why unadapted native full checkpointing cannot export TPR KV roots.
+It must **never** be counted as a passing production acceptance case. The
+positive KV-replay primitive alone also does not establish Qwen3/Ring PPO
+correctness.
+
+## Test maintenance policy
+
+1. Newly added production coverage must identify one mainline gate and provide
+   an explicit pass condition. Keep negative controls and profiler probes out of
+   passing acceptance suites.
+2. Prefer an existing numerical reference and a same-input OFF/ON comparison
+   over another bespoke experiment driver. Reuse the original VERL PPO loss.
+3. Preserve historical tests until a replacement covers the same contract and
+   independent evidence exists. A file move must update every direct import and
+   shell path, not silently strand the old launcher.
+4. Every performance result must record model, NPU, TP/CP/DP, data/hash, kernel
+   flags, warmups/repeats, recompute state, peak allocated/reserved and measured
+   scope (operator / forward+backward / optimizer step / online E2E).
+5. Never turn on Fixed Tile as a test workaround. Do not loosen tolerances just
+   to absorb backend gradient noise; report the independent baseline noise.
+
+Legacy host/docker instructions previously embedded in this README are
+historical only; current commands should use the active `verl-tpr` checkout.
+See `docs/tpr/architecture.md` and `docs/tpr/recompute_prototype.md` for
+runtime ownership and the recompute feature gates.
