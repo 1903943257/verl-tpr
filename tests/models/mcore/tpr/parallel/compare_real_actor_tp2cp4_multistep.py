@@ -20,6 +20,68 @@ else:
     )
 
 
+def _sampled_cp_grad_replica_audit(items) -> dict:
+    """Compare saved BF16-gradient witness across CP replicas, per TP shard.
+
+    The saved global_grad_norm_preclip is already world-all-reduced and
+    therefore identical on every rank BY CONSTRUCTION. Its zero rank-spread
+    cannot prove that post-finalize parameter-gradient replicas agree.
+    """
+    if any(not x.get("gradient_samples") for x in items):
+        return {"status": "not_captured"}
+    rank_map = {(int(x["tp_rank"]), int(x["cp_rank"])): x
+                for x in items}
+    if len(rank_map) != 8:
+        raise AssertionError("Expected 2 TP * 4 CP unique gradient witnesses")
+    report = {}
+    for tp in (0, 1):
+        base = rank_map[(tp, 0)]["gradient_samples"]
+        for cp in (1, 2, 3):
+            peer = rank_map[(tp, cp)]["gradient_samples"]
+            if base.keys() != peer.keys():
+                raise AssertionError(f"CP gradient witness names differ tp={tp} cp={cp}")
+            diff_sq = ref_sq = 0.0
+            max_abs = 0.0
+            affected = 0
+            elements = 0
+            top = []
+            for name in base:
+                a, z = base[name], peer[name]
+                if (a["shape"] != z["shape"]
+                        or not torch.equal(a["indices"], z["indices"])):
+                    raise AssertionError(
+                        f"CP gradient witness shape/indices differ tp={tp} "
+                        f"cp={cp} param={name}"
+                    )
+                v = a["values"].double().flatten()
+                w = z["values"].double().flatten()
+                d = v - w
+                if not torch.isfinite(v).all() or not torch.isfinite(w).all():
+                    raise FloatingPointError(
+                        f"Nonfinite saved CP gradient witness tp={tp} cp={cp}"
+                    )
+                diff_sq += float((d*d).sum())
+                ref_sq += float((v*v).sum())
+                peak = float(d.abs().max()) if d.numel() else 0.0
+                if peak:
+                    top.append((name, peak))
+                max_abs = max(max_abs, peak)
+                affected += int(torch.count_nonzero(d))
+                elements += d.numel()
+            report[f"tp{tp}_cp{cp}"] = {
+                "sampled_relative_l2": math.sqrt(
+                    diff_sq / max(ref_sq, 1e-30)
+                ),
+                "sampled_max_abs": max_abs,
+                "sampled_changed_elements": affected,
+                "sampled_total_elements": elements,
+                "top_parameter_max_abs": sorted(
+                    top, key=lambda item: item[1], reverse=True
+                )[:5],
+            }
+    return {"status": "measured", "cp_vs_cp0_by_tp": report}
+
+
 def _rank_replica_audit(items, label: str, step: int) -> dict:
     """Audit saved PPO scalars and TP replicas without modifying either result.
 
@@ -77,6 +139,7 @@ def _rank_replica_audit(items, label: str, step: int) -> dict:
     lp_disagree = [abs(lp0[k] - lp1[k]) for k in lp0.keys() & lp1.keys()]
     scalar_spread = spread(loss_values)
     norm_spread = spread(norm_values)
+    cp_grad_witness = _sampled_cp_grad_replica_audit(items)
     result = {
         "mode": label,
         "step": step,
@@ -86,6 +149,8 @@ def _rank_replica_audit(items, label: str, step: int) -> dict:
         "loss_spread_by_cp": {k: spread(v) for k, v in losses_by_cp.items()},
         "loss_by_tp": losses_by_tp,
         "global_grad_norm_spread": norm_spread,
+        "global_grad_norm_rank_spread_is_not_replica_parity": True,
+        "sampled_cp_gradient_replica": cp_grad_witness,
         "tp_logprob_keys_identical": keys_match,
         "tp_logprob_shared_tokens": len(lp_disagree),
         "tp_logprob_max_abs": max(lp_disagree, default=None),
@@ -107,6 +172,7 @@ def _rank_replica_audit(items, label: str, step: int) -> dict:
         f"loss_span={scalar_spread:.9g} "
         f"loss_span_by_tp={result['loss_spread_by_tp']} "
         f"gradnorm_span={norm_spread:.9g} "
+        f"cp_sampled_grad_max_abs={max((x['sampled_max_abs'] for x in cp_grad_witness.get('cp_vs_cp0_by_tp', {}).values()), default=None)} "
         f"tp_lp_max_abs={result['tp_logprob_max_abs']} "
         f"lp_tp_keys_identical={keys_match} "
         f"loss_gate={result['loss_gate_ok']} norm_gate={result['norm_gate_ok']} "
