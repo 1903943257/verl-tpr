@@ -132,7 +132,9 @@ def compare(outdir: Path, steps: int):
             else "SEQUENTIAL_20_DISTINCT_REAL_CAPTURES"
         )
     else:
-        milestones = tuple(n for n in (1,2,5,10,20,30,40,50) if n <= steps)
+        milestones = tuple(sorted(
+            {n for n in (1,2,5,10,20,30,40,50) if n <= steps} | {steps}
+        ))
         run_protocol = "REPEATED_FIXED_PPO_DATA_NOT_ON_POLICY"
     del first_snap
     observed = []
