@@ -198,10 +198,10 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    Engine["adapter.py / executor.py"] --> Facade["ring.py\nEngine API / CP Backend"]
+    Engine["adapter.py / executor.py"] --> Facade["ring.py<br/>Engine API / CP Backend"]
     State["state.py / objective.py"] --> Facade
-    Facade --> Layout["ring_layout.py\nShard / Padding / Mask metadata"]
-    Facade --> Attention["ring_attention.py\nRing FA F/B / dKV"]
+    Facade --> Layout["ring_layout.py<br/>Shard / Padding / Mask metadata"]
+    Facade --> Attention["ring_attention.py<br/>Ring FA F/B / dKV"]
     Attention --> Layout
     Attention --> MindSpeed["MindSpeed RingP2P"]
     Attention --> CANN["torch-npu / CANN"]
@@ -425,7 +425,7 @@ SP 继续复用 Megatron 的 QKV 前 AllGather 等原生机制。当前支持范
 | `TPR_TURN_MIN_SEGMENT_TOKENS` | 最短合并区间；默认 `128` |
 | `TPR_EXEC_PROFILE=1` / `TPR_MEM_TRACE=1` | 诊断 Segment 时间与内存，正式性能测量时关闭 |
 | `TPR_PPO_LOGPROB_CHUNK_TOKENS` | 可选的 PPO 计算中间态分块/重算；普通路径默认关闭 |
-| `TPR_EXPERIMENTAL_OFFLINE_DP2` | DP2 离线实验门禁之一，**不是 DP2 正式上线开关** |
+| `TPR_EXPERIMENTAL_OFFLINE_DP2` | main / 特殊 parity 测试的 DP2 实验门禁之一；**PR #11 新增 TP2×CP2×DP2 PPO 路径不要求该开关**，但仍待 NPU 验收 |
 | `TPR_SELECTED_LOGITS_FP32=1` | 可选数值诊断；默认关闭 |
 | `TPR_RING_COALESCE_PREFIX_*` | Ring Prefix 相关合并实验；默认关闭 |
 | `TPR_CAPTURE_ACTOR_MINIBATCH_DIR` | 真实 actor 更新 mini-batch 留存；仅实验用途 |
