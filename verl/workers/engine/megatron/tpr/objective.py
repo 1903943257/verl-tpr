@@ -382,12 +382,6 @@ class SegmentPPOObjectiveAdapter:
         for i, ref in enumerate(refs):
             by_row[ref.sample_row].append(i)
         rows = sorted(by_row)
-        for row in rows:
-            by_row[row].sort(key=lambda i: refs[i].response_offset)
-            offsets = [refs[i].response_offset for i in by_row[row]]
-            if len(set(offsets)) != len(offsets):
-                raise ValueError(f"duplicate logical token ownership on row {row}")
-
         self._prepare_batch_rows()
         response_rows, field_rows = self._response_rows, self._field_rows
         n = len(rows)
@@ -410,9 +404,11 @@ class SegmentPPOObjectiveAdapter:
         # slots instead of allocating new device tensors inside the row loop.
         dummy = {key: values.new_zeros(1) for key, values in token_outputs.items()}
         for local_row, row in enumerate(rows):
-            selected = by_row[row]
+            selected = sorted(by_row[row], key=lambda i: refs[i].response_offset)
             count = len(selected)
             offsets = [refs[i].response_offset for i in selected]
+            if len(set(offsets)) != count:
+                raise ValueError(f"duplicate logical token ownership on row {row}")
             if any(i < 0 or i >= response_rows[row].numel() for i in offsets):
                 raise ValueError(f"response_offset out of bounds for row {row}")
             if not bool(response_rows[row][offsets].all()):
