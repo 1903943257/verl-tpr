@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 from pathlib import Path
 
 import torch
@@ -66,10 +65,20 @@ def analyze(arms: dict[str, list[dict]], *, read_full_grads: bool = True) -> dic
             trees, segments
         ):
             raise AssertionError(f"Bad physical topology for {mode}: {topology[mode]}")
-        if topology[mode]["ring"] != "tpr_custom_ring":
+        ring_backends = {row["ring_attention_impl"] for row in arms[mode]}
+        if ring_backends != {"tpr_custom_ring"}:
             raise AssertionError(
-                f"Not same custom Ring backend for {mode}: {topology[mode]['ring']}"
+                f"Not same custom Ring backend for {mode}: {ring_backends}"
             )
+        expected_physical = (trees, segments)
+        if any(
+            (row["forest_trees"], row["forest_segments"]) != expected_physical
+            for row in arms[mode]
+        ):
+            raise AssertionError(f"Rank-disagreeing physical tree layout: {mode}")
+        if any(row["optimizer"] != "diagnostic_bf16_sgd_lr_0.0"
+               for row in arms[mode]):
+            raise AssertionError("Numerical attribution requires SGD=0")
     pairings = {}
     for label, a, b in PAIRINGS:
         left, right = arms[a], arms[b]
