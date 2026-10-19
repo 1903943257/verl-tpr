@@ -40,6 +40,7 @@ UNIT = (
     "tp_validation", "rope", "gdn_prefix_state", "tpr_batch_runner",
     "control_plane_gloo_cpu",
     "replay_bootstrap_cpu",
+    "suite_registry_cpu",
     "dp_placement", "gdn_context",
 )
 PARALLEL = (
