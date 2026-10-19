@@ -10,9 +10,14 @@ import json
 import math
 from pathlib import Path
 import torch
-from compare_real_actor_tp2cp4_offline_ppo import (
-    _l2_pair, _logprobs, _complete_gradient_metrics,
-)
+if __package__:
+    from .compare_real_actor_tp2cp4_offline_ppo import (
+        _l2_pair, _logprobs, _complete_gradient_metrics,
+    )
+else:
+    from compare_real_actor_tp2cp4_offline_ppo import (
+        _l2_pair, _logprobs, _complete_gradient_metrics,
+    )
 
 
 def _rank_replica_audit(items, label: str, step: int) -> dict:
