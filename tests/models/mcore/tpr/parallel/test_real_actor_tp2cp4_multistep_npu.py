@@ -175,7 +175,7 @@ def test_recorded_fixed_ppo_optimizer_drift():
     all_milestones = (1, 2, 5, 10, 20, 30, 40, 50)
     milestones = (tuple(range(1, steps+1))
                   if os.getenv("TPR_OFFLINE_CAPTURE_MANIFEST") else
-                  tuple(x for x in all_milestones if x <= steps))
+                  tuple(sorted({x for x in all_milestones if x <= steps} | {steps})))
     full_grad_steps = {
         int(x) for x in os.getenv("TPR_OFFLINE_FULL_GRAD_STEPS", "").split(",") if x
     }
