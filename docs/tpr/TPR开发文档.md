@@ -118,14 +118,14 @@ flowchart TB
     Adapter --> Executor
     Adapter --> Objective
     Adapter --> Ring
-    Adapter -. "安装 SelfAttention ModuleSpec" .-> Attention
-    Adapter -. "梯度 finalize" .-> Finalize
+    Adapter -.->|安装 SelfAttention ModuleSpec| Attention
+    Adapter -.->|梯度 finalize| Finalize
 
     Executor --> Tree
     Executor --> State
     Executor --> Ring
     Executor --> Context
-    Executor -. "模型 forward" .-> Attention
+    Executor -.->|模型 forward| Attention
     State --> Tree
     State --> Context
     State --> Ring
@@ -135,7 +135,7 @@ flowchart TB
 
     Attention --> Context
     Attention --> Rect
-    Context -. "注入 CP>1 Attention backend" .-> Ring
+    Context -.->|运行时注入 CP>1 backend| Ring
     Recompute --> Attention
     Recompute --> Context
     Ring --> Rect
