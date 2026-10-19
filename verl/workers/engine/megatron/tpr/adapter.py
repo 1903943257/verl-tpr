@@ -365,6 +365,9 @@ def run_tpr_forward_backward_batch(
                 tree_plan.segment_plan, prepared_model, cp_size=cp_runtime.size,
                 active_segment_ids=tree_plan.active_segment_ids,
             )
+            if cp_runtime.backend is not None:
+                for segment in tree_plan.segment_plan.segments.values():
+                    cp_runtime.backend.validate_segment_length(segment.length)
     # DP2+CP2 has twice the per-rank local sequence of the CP4 baseline.
     # Default this *isolated* experiment to recomputable PPO logprob chunks;
     # ordinary TPR and all other topologies remain unchanged.
@@ -408,6 +411,7 @@ def run_tpr_forward_backward_batch(
             model,
             tree_plan.segment_plan,
             prepared_model=prepared_model,
+            validated_plan=tree_plan.segment_plan,
             active_segment_ids=tree_plan.active_segment_ids,
             loss_scale_func=grad_scale,
             segment_loss_fn=callback,
