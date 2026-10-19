@@ -251,9 +251,12 @@ class SegmentExecutor:
         segment_loss_term_counts: Mapping[SegmentId, int] | None = None,
         active_segment_ids: frozenset[SegmentId] | None = None,
         prepared_model: PreparedReplayModel | None = None,
+        validated_plan: SegmentPlan | None = None,
     ) -> None:
         if not isinstance(plan, SegmentPlan):
             raise TypeError(f"plan must be SegmentPlan, got {type(plan).__name__}")
+        if validated_plan is not None and validated_plan is not plan:
+            raise ValueError("validated_plan must be the exact SegmentPlan being executed")
         self._external_preparation = prepared_model is not None
         if prepared_model is None:
             prepared_model = prepare_replay_model(model, expected_layer_numbers=expected_layer_numbers)
@@ -308,15 +311,17 @@ class SegmentExecutor:
                 )
             else:
                 raise NotImplementedError("Production TPR only supports Ring CP")
-            for segment in plan.segments.values():
-                try:
-                    self.cp_backend.validate_segment_length(segment.length)
-                except ValueError as exc:
-                    raise ValueError(
-                        f"segment {segment.segment_id} {exc}"
-                    ) from exc
-        validate_replay_plan(plan, prepared_model, cp_size=self.cp_size,
-                             active_segment_ids=active_segment_ids)
+            if validated_plan is None:
+                for segment in plan.segments.values():
+                    try:
+                        self.cp_backend.validate_segment_length(segment.length)
+                    except ValueError as exc:
+                        raise ValueError(
+                            f"segment {segment.segment_id} {exc}"
+                        ) from exc
+        if validated_plan is None:
+            validate_replay_plan(plan, prepared_model, cp_size=self.cp_size,
+                                 active_segment_ids=active_segment_ids)
         self._failed = False
         self._ran = False
         self._operation_depth = 0
