@@ -32,6 +32,7 @@ import torch.distributed as dist
 from torch import Tensor
 
 import verl.workers.engine.megatron.tpr.ring as ring
+from verl.workers.engine.megatron.tpr import ring_attention as ring_kernels
 from verl.models.mcore.tpr import RingLocalKVBlock, make_ring_sequence_shard
 from verl.utils.device import is_torch_npu_available
 
@@ -118,13 +119,13 @@ def _assert_padding_zero(tensor, shard):
 
 @contextmanager
 def _kernel_probe():
-    original_forward = ring._block_attention_forward
-    original_backward = ring._block_attention_backward
+    original_forward = ring_kernels._block_attention_forward
+    original_backward = ring_kernels._block_attention_backward
     calls = {"forward": [], "backward": []}
     transport = {"forward": 0, "backward": 0}
-    original_circulate = ring._circulate_kv
-    original_reduce = ring._reduce_ring_gradients_to_owner
-    original_storage_trace = ring._trace_ring_storage
+    original_circulate = ring_kernels._circulate_kv
+    original_reduce = ring_kernels._reduce_ring_gradients_to_owner
+    original_storage_trace = ring_kernels._trace_ring_storage
     storage_events = []
 
     def circulate(*args, **kwargs):
@@ -157,11 +158,11 @@ def _kernel_probe():
         )
         return original_backward(*args, **kwargs)
 
-    ring._circulate_kv = circulate
-    ring._reduce_ring_gradients_to_owner = reduce
-    ring._block_attention_forward = traced_forward
-    ring._block_attention_backward = traced_backward
-    ring._trace_ring_storage = lambda **event: storage_events.append(event)
+    ring_kernels._circulate_kv = circulate
+    ring_kernels._reduce_ring_gradients_to_owner = reduce
+    ring_kernels._block_attention_forward = traced_forward
+    ring_kernels._block_attention_backward = traced_backward
+    ring_kernels._trace_ring_storage = lambda **event: storage_events.append(event)
     try:
         yield calls
         assert transport["forward"] == transport["backward"]
@@ -173,11 +174,11 @@ def _kernel_probe():
             if expected is not None:
                 assert event["storage_count"] == expected
     finally:
-        ring._circulate_kv = original_circulate
-        ring._reduce_ring_gradients_to_owner = original_reduce
-        ring._block_attention_forward = original_forward
-        ring._block_attention_backward = original_backward
-        ring._trace_ring_storage = original_storage_trace
+        ring_kernels._circulate_kv = original_circulate
+        ring_kernels._reduce_ring_gradients_to_owner = original_reduce
+        ring_kernels._block_attention_forward = original_forward
+        ring_kernels._block_attention_backward = original_backward
+        ring_kernels._trace_ring_storage = original_storage_trace
 
 
 @pytest.mark.parametrize(

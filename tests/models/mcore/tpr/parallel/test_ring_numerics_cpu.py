@@ -24,6 +24,8 @@ import pytest
 import torch
 
 import verl.workers.engine.megatron.tpr.ring as ring
+from verl.workers.engine.megatron.tpr import ring_layout as ring_layout
+from verl.workers.engine.megatron.tpr import ring_attention as ring_kernels
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -126,12 +128,12 @@ def test_long_prefix_query_gradient_matches_dense(monkeypatch, ancestors, coales
     monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_PADDED", "0")
     monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", str(int(coalesce_full)))
     monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", str(int(coalesce_query)))
-    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda group: (cp_size, 0))
-    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda group: tuple(range(cp_size)))
-    monkeypatch.setattr(ring, "_block_attention_forward", _fa_forward)
-    monkeypatch.setattr(ring, "_block_attention_backward", _fa_backward)
-    monkeypatch.setattr(ring, "_circulate_kv", _circulate_symmetric_sources)
-    monkeypatch.setattr(ring, "_reduce_ring_gradients_to_owner", _replay_symmetric_sources)
+    monkeypatch.setattr(ring_layout, "_group_world_size_and_rank", lambda group: (cp_size, 0))
+    monkeypatch.setattr(ring_layout, "_process_group_global_ranks", lambda group: tuple(range(cp_size)))
+    monkeypatch.setattr(ring_kernels, "_block_attention_forward", _fa_forward)
+    monkeypatch.setattr(ring_kernels, "_block_attention_backward", _fa_backward)
+    monkeypatch.setattr(ring_kernels, "_circulate_kv", _circulate_symmetric_sources)
+    monkeypatch.setattr(ring_kernels, "_reduce_ring_gradients_to_owner", _replay_symmetric_sources)
 
     global_query = torch.zeros(length, 1, heads, head_dim, dtype=dtype)
     prefix_key, prefix_value = torch.zeros_like(global_query), torch.zeros_like(global_query)
@@ -197,10 +199,10 @@ def test_padded_query_and_kv_gradients_match_dense(monkeypatch, rank, coalesce_f
     monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", str(int(coalesce_full)))
     monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", str(int(coalesce_query)))
     monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_PADDED", "1")
-    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda group: (cp_size, rank))
-    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda group: tuple(range(cp_size)))
-    monkeypatch.setattr(ring, "_block_attention_forward", _fa_forward)
-    monkeypatch.setattr(ring, "_block_attention_backward", _fa_backward)
+    monkeypatch.setattr(ring_layout, "_group_world_size_and_rank", lambda group: (cp_size, rank))
+    monkeypatch.setattr(ring_layout, "_process_group_global_ranks", lambda group: tuple(range(cp_size)))
+    monkeypatch.setattr(ring_kernels, "_block_attention_forward", _fa_forward)
+    monkeypatch.setattr(ring_kernels, "_block_attention_backward", _fa_backward)
     segment_calls = {"forward": 0, "backward": 0}
 
     def source_kv(segment, source):
@@ -227,8 +229,8 @@ def test_padded_query_and_kv_gradients_match_dense(monkeypatch, rank, coalesce_f
                 owner_gradients = dk, dv
         return owner_gradients
 
-    monkeypatch.setattr(ring, "_circulate_kv", circulate)
-    monkeypatch.setattr(ring, "_reduce_ring_gradients_to_owner", replay)
+    monkeypatch.setattr(ring_kernels, "_circulate_kv", circulate)
+    monkeypatch.setattr(ring_kernels, "_reduce_ring_gradients_to_owner", replay)
     blocks = tuple(ring.RingLocalKVBlock(index, shard, key, value) for index, (shard, key, value) in enumerate(
         zip(shards[:-1], local_keys[:-1], local_values[:-1], strict=True)
     ))
