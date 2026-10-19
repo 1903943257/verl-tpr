@@ -15,6 +15,99 @@ from compare_real_actor_tp2cp4_offline_ppo import (
 )
 
 
+def _rank_replica_audit(items, label: str, step: int) -> dict:
+    """Audit saved PPO scalars and TP replicas without modifying either result.
+
+    Native Full reports global loss after CP all-reduce. A TP rank mismatch
+    may be a genuine loss-parity problem, not a reason to silently average
+    or increase the tolerance. Collect every rank and TP-specific logprob
+    before deciding whether the comparison is valid.
+    """
+    records = sorted((
+        {
+            "world_rank": int(x["rank"]) if x.get("rank") == x.get("tp_rank") else int(idx),
+            "snapshot_index": idx,
+            "tp": int(x["tp_rank"]), "cp": int(x["cp_rank"]),
+            "loss": float(x["loss"]),
+            "global_grad_norm_preclip": float(x["global_grad_norm_preclip"]),
+        }
+        for idx, x in enumerate(items)
+    ), key=lambda v: v["snapshot_index"])
+    loss_values = [x["loss"] for x in records]
+    norm_values = [x["global_grad_norm_preclip"] for x in records]
+    if not all(math.isfinite(v) for v in loss_values + norm_values):
+        raise AssertionError(f"{label} step={step}: nonfinite PPO loss or norm")
+    losses_by_tp = {
+        str(tp): [x["loss"] for x in records if x["tp"] == tp]
+        for tp in (0, 1)
+    }
+    losses_by_cp = {
+        str(cp): [x["loss"] for x in records if x["cp"] == cp]
+        for cp in range(4)
+    }
+    def spread(vals):
+        return max(vals) - min(vals) if vals else None
+
+    per_tp_logprobs = {}
+    duplicate_token_owners = {}
+    for tp in (0, 1):
+        merged = {}
+        duplicates = []
+        for x in items:
+            if x["tp_rank"] != tp:
+                continue
+            for k, v in x["logprobs"].items():
+                key = tuple(k)
+                if key in merged:
+                    duplicates.append(key)
+                else:
+                    merged[key] = float(v)
+        per_tp_logprobs[tp] = merged
+        duplicate_token_owners[str(tp)] = len(duplicates)
+    lp0, lp1 = per_tp_logprobs[0], per_tp_logprobs[1]
+    keys_match = lp0.keys() == lp1.keys()
+    lp_disagree = [abs(lp0[k] - lp1[k]) for k in lp0.keys() & lp1.keys()]
+    scalar_spread = spread(loss_values)
+    norm_spread = spread(norm_values)
+    result = {
+        "mode": label,
+        "step": step,
+        "per_rank": records,
+        "loss_global_spread": scalar_spread,
+        "loss_spread_by_tp": {k: spread(v) for k, v in losses_by_tp.items()},
+        "loss_spread_by_cp": {k: spread(v) for k, v in losses_by_cp.items()},
+        "loss_by_tp": losses_by_tp,
+        "global_grad_norm_spread": norm_spread,
+        "tp_logprob_keys_identical": keys_match,
+        "tp_logprob_shared_tokens": len(lp_disagree),
+        "tp_logprob_max_abs": max(lp_disagree, default=None),
+        "tp_logprob_mean_abs": (
+            sum(lp_disagree) / len(lp_disagree) if lp_disagree else None
+        ),
+        "tp_logprob_ownership_duplicates": duplicate_token_owners,
+        "loss_gate_ok": scalar_spread < 1e-4,
+        "norm_gate_ok": norm_spread < 1e-5,
+        "tp_logprob_gate_ok": keys_match and not any(
+            duplicate_token_owners.values()
+        ) and (
+            max(lp_disagree, default=0.0) <= 1e-4
+        ),
+    }
+    print(
+        f"TPR_PPO_REPLICA_AUDIT step={step} mode={label} "
+        f"loss_by_rank={[(x['snapshot_index'], x['tp'], x['cp'], x['loss']) for x in records]} "
+        f"loss_span={scalar_spread:.9g} "
+        f"loss_span_by_tp={result['loss_spread_by_tp']} "
+        f"gradnorm_span={norm_spread:.9g} "
+        f"tp_lp_max_abs={result['tp_logprob_max_abs']} "
+        f"lp_tp_keys_identical={keys_match} "
+        f"loss_gate={result['loss_gate_ok']} norm_gate={result['norm_gate_ok']} "
+        f"lp_gate={result['tp_logprob_gate_ok']}",
+        flush=True,
+    )
+    return result
+
+
 def _master_update(a, b):
     aa, bb = 0., 0.
     dot, delta = 0., 0.
@@ -138,6 +231,7 @@ def compare(outdir: Path, steps: int):
         run_protocol = "REPEATED_FIXED_PPO_DATA_NOT_ON_POLICY"
     del first_snap
     observed = []
+    replica_gate_failures = []
     for step in milestones:
         mode = {}
         for label in ("full", "tpr"):
@@ -184,12 +278,21 @@ def compare(outdir: Path, steps: int):
                     raise AssertionError(f"Full vs TPR step={step} mismatch in {field}")
         if f[0]["steps"] != steps:
             raise AssertionError("Replay output has unexpected total step count")
+        replica_audit = {}
         for label, items in mode.items():
-            if max(abs(x["loss"] - items[0]["loss"]) for x in items) >= 1e-4:
-                raise AssertionError(f"{label} loss differs across ranks")
-            if max(abs(x["global_grad_norm_preclip"] -
-                       items[0]["global_grad_norm_preclip"]) for x in items) >= 1e-5:
-                raise AssertionError(f"{label} global norm differs across ranks")
+            audit = _rank_replica_audit(items, label, step)
+            replica_audit[label] = audit
+            for gate in ("loss_gate_ok", "norm_gate_ok", "tp_logprob_gate_ok"):
+                if not audit[gate]:
+                    replica_gate_failures.append({
+                        "step": step, "mode": label, "gate": gate,
+                        "loss_spread": audit["loss_global_spread"],
+                        "global_grad_norm_spread": audit["global_grad_norm_spread"],
+                        "tp_logprob_max_abs": audit["tp_logprob_max_abs"],
+                    })
+        # Keep producing independent full-parameter and token-level diagnostic
+        # metrics. Never treat them as a numerical PASS if a replica gate
+        # failed. Saved weights/gradients are immutable.
         for label, items in mode.items():
             if len({x.get("ring_attention_impl","legacy_custom") for x in items}) != 1:
                 raise AssertionError(f"inconsistent {label} Ring backend among ranks")
@@ -203,6 +306,11 @@ def compare(outdir: Path, steps: int):
         tpr_norm = t[0]["global_grad_norm_preclip"]
         record = {
             "step":step,
+            "replica_audit":replica_audit,
+            "replica_numerical_gate_ok": all(
+                audit[g] for audit in replica_audit.values()
+                for g in ("loss_gate_ok", "norm_gate_ok", "tp_logprob_gate_ok")
+            ),
             "source_online_global_step":f[0].get("source_online_global_step"),
             "source_capture_index":f[0].get("source_capture_index"),
             "full_attention_impl":f[0].get("ring_attention_impl","legacy_custom"),
@@ -265,7 +373,12 @@ def compare(outdir: Path, steps: int):
             f"allocated_saving={record['peak_allocated_saving_fraction']:.2%}", flush=True
         )
     result = {
-        "status": "DIAGNOSTIC_SEQUENTIAL_OFFLINE_PPO_REPLAY",
+        "status": (
+            "NUMERICAL_REPLICA_GATE_FAILED_DIAGNOSTICS_ONLY"
+            if replica_gate_failures
+            else "DIAGNOSTIC_SEQUENTIAL_OFFLINE_PPO_REPLAY"
+        ),
+        "replica_gate_failures": replica_gate_failures,
         "run_protocol":run_protocol,
         "steps_completed":steps,
         "milestones":observed,
@@ -292,6 +405,14 @@ def compare(outdir: Path, steps: int):
         raise FileExistsError(target)
     target.write_text(json.dumps(result, indent=2, ensure_ascii=False))
     print(f"TPR_50STEP_SUMMARY status={result['status']} saved={target}", flush=True)
+    if replica_gate_failures:
+        print(
+            f"TPR_50STEP_WARNING replica_gates_failed={len(replica_gate_failures)}. "
+            "Full/TPR loss and parameter diagnostics were generated, but "
+            "replica correctness is NOT validated. Inspect replica_audit "
+            "before judging numerical parity.",
+            flush=True,
+        )
     return result
 
 
