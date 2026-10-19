@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 
 from .compare_real_actor_tp2cp4_offline_ppo import _logprobs
+from .native_full_megatron_schedule import native_cp_query_indices
 
 
 def _ppo_from_token_vectors(new: torch.Tensor, old: torch.Tensor,
@@ -60,9 +61,23 @@ def audit(root: Path, steps: tuple[int, ...]) -> dict:
             # Gather ORIGINAL PPO data only from the exact supervised
             # response offsets recorded by the 8-rank execution.
             old, adv, new, weights = [], [], [], []
+            cp_token_ownership = {str(cp): 0 for cp in range(4)}
             has_weights = "rollout_is_weights" in batch
             for row_index, source_row in enumerate(rows):
                 masks = batch["response_mask"].unbind(0)[source_row].bool()
+                tokens = batch["input_ids"].unbind(0)[source_row]
+                prompt_len = len(batch["prompts"].unbind(0)[source_row])
+                logit_indices = {
+                    prompt_len + offset - 1
+                    for offset in torch.nonzero(masks, as_tuple=False).flatten().tolist()
+                }
+                for cp in range(4):
+                    physically_owned = set(
+                        native_cp_query_indices(len(tokens), cp)
+                    )
+                    cp_token_ownership[str(cp)] += len(
+                        physically_owned & logit_indices
+                    )
                 old_row = batch["old_log_probs"].unbind(0)[source_row]
                 adv_row = batch["advantages"].unbind(0)[source_row]
                 weight_row = (
@@ -80,6 +95,10 @@ def audit(root: Path, steps: tuple[int, ...]) -> dict:
                         weights.append(float(weight_row[offset]))
             if len(new) != len(lp) or len(new) != saved[0]["tokens"]:
                 raise AssertionError("Saved Logprobs do not exactly cover original PPO tokens")
+            if sum(cp_token_ownership.values()) != len(new):
+                raise AssertionError(
+                    f"Native CP ownership does not cover tokens: {cp_token_ownership}"
+                )
             canonical = _ppo_from_token_vectors(
                 torch.tensor(new), torch.tensor(old), torch.tensor(adv),
                 torch.tensor(weights) if has_weights else None,
@@ -90,6 +109,7 @@ def audit(root: Path, steps: tuple[int, ...]) -> dict:
             }
             modes[mode] = {
                 "reconstructed_fp32_loss": canonical,
+                "native_cp_original_supervised_token_counts": cp_token_ownership,
                 "saved_by_cp": original_losses,
                 "saved_minus_fp32_by_cp": {
                     k: v-canonical for k,v in original_losses.items()
@@ -99,6 +119,7 @@ def audit(root: Path, steps: tuple[int, ...]) -> dict:
             print(
                 f"TPR_SAVED_PPO_LOSS_AUDIT step={step} mode={mode} "
                 f"fp32_recomputed={canonical:.9g} "
+                f"native_cp_owned_ppo_tokens={cp_token_ownership} "
                 f"old_saved_by_cp={original_losses} "
                 f"saved_minus_recomputed={modes[mode]['saved_minus_fp32_by_cp']}",
                 flush=True,
