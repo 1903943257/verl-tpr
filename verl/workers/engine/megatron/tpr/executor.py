@@ -255,8 +255,11 @@ class SegmentExecutor:
     ) -> None:
         if not isinstance(plan, SegmentPlan):
             raise TypeError(f"plan must be SegmentPlan, got {type(plan).__name__}")
-        if validated_plan is not None and validated_plan is not plan:
-            raise ValueError("validated_plan must be the exact SegmentPlan being executed")
+        if validated_plan is not None:
+            if validated_plan is not plan:
+                raise ValueError("validated_plan must be the exact SegmentPlan being executed")
+            if prepared_model is None:
+                raise ValueError("validated_plan requires batch-prepared model facts")
         self._external_preparation = prepared_model is not None
         if prepared_model is None:
             prepared_model = prepare_replay_model(model, expected_layer_numbers=expected_layer_numbers)
