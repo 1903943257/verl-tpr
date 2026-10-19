@@ -6,6 +6,7 @@ from contextlib import ExitStack, contextmanager
 from unittest.mock import patch
 
 import verl.workers.engine.megatron.tpr.ring as ring
+import verl.workers.engine.megatron.tpr.ring_attention as ring_kernels
 from verl.experimental.tpr.legacy.segment_executor import SegmentExecutor
 
 
@@ -74,7 +75,7 @@ def ring_block_probe(model, runtime):
     ) for layer in model.decoder.layers]
     try:
         with ExitStack() as stack:
-            stack.enter_context(patch.object(ring, "_trace_ring_block", trace))
+            stack.enter_context(patch.object(ring_kernels, "_trace_ring_block", trace))
             stack.enter_context(patch.object(ring._RingTPRAttention, "forward", staticmethod(forward)))
             stack.enter_context(patch.object(ring._RingTPRAttention, "backward", staticmethod(backward)))
             for name in ("push", "visit_leaf", "pop"):
