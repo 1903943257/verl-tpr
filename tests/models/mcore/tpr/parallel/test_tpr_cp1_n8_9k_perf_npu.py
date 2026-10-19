@@ -86,8 +86,9 @@ def test_cp1_n8_p8192_s1024_perf():
             batch, dp_size=1, global_batch_size=BRANCHES,
             batch_num_tokens=tokens, tpr_capture_log_probs=False,
         )
+        from verl.workers.engine.megatron.tpr.adapter import _trajectory_keys_from_minibatch
         forest = build_tree_execution_plans(
-            tu.get_non_tensor_data(batch, key="tpr_trajectory_keys"),
+            _trajectory_keys_from_minibatch(batch),
             batch, tree_policy="qwen_turn", turn_min_segment_tokens=128,
         )
         if mode == "full":
