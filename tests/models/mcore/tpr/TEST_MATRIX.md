@@ -1,0 +1,110 @@
+# TPR test matrix and consolidation plan (2026-10-19)
+
+This is the canonical **test-selection** document for `verl-tpr`. It is not a
+retrospective PASS report. Source paths are deliberately stable while the many
+`parallel/` script-to-script imports are audited. For the executable, curated
+subset use `python tests/models/mcore/tpr/run_suite.py list`.
+
+## Acceptance ladder
+
+| Stage | Core question | Primary command/test | Required evidence |
+| --- | --- | --- | --- |
+| CPU foundation | Scheduling, tree ownership, PPS/optimizer input, KV lifetime | `run_suite.py run cpu-core` | Selected unit contracts actually run (not skipped) |
+| Primitive FA | Full vs rectangular causal Attention fwd/bwd | `run_suite.py run npu-core --ack-npu` | Loss/output, Q/K/V & Prefix dK/dV |
+| Ring CP | Shard/padding/CP Ring numerical equivalence | `run_suite.py run npu-ring --ack-npu` | Physical vs logical ownership, per-rank allreduce and dKV |
+| Native TP | Native Megatron TP2 with TPR | `run_suite.py run npu-tp --ack-npu` | Full gradients across TP ranks |
+| Qwen3 | Real-model compatibility | `run_suite.py run npu-qwen --ack-npu` | Model inputs, logprob, loss, parameter gradients |
+| Actor PPO | One to five optimizer steps on fixed real capture | See offline wrapper below | Fixed capture/hash, full grads, FP32 master and optimizer states |
+| Recompute primitive | Hidden/K/V explicit checkpoint outputs | `run_suite.py run npu-recompute-primitive --ack-npu` | Replay context, KV anchors, leaf and root gradients |
+| Recompute full model | CP1 then CP2 then TP2xCP4 OFF/ON | See dedicated wrapper below | Full grads, optimizer delta, collective order, peak memory |
+| Performance | Training-side fwd+bwd + optimizer and (separately) online E2E | `run_suite.py show npu-performance` | Memory/speed and numerics under matched conditions |
+
+For the `cpu-recompute` suite, install real Megatron/MindSpeed Python modules:
+the fake-block test exercises a mocked transformer under the *actual* package
+type, not the stubbed isolated CPU bootstrap.
+
+## Real-actor PPO and recompute: manual asset-gated workflows
+
+The following intentionally remain **outside the generic suite runner**:
+their launchers control artifact output directories, fixed captures, model
+paths and world layouts. Use the existing wrappers, not a bare pytest command.
+
+### Fixed capture TP2 x CP4 actor PPO
+
+```bash
+TPR_OFFLINE_RECOMPUTE=0 \
+TPR_OFFLINE_RUN_MODES=tpr \
+TPR_OFFLINE_OUTPUT_DIR=/workspace/tpr_off_unique \
+bash tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_offline_ppo.sh
+
+TPR_OFFLINE_RECOMPUTE=1 \
+TPR_OFFLINE_RUN_MODES=tpr \
+TPR_OFFLINE_OUTPUT_DIR=/workspace/tpr_on_unique \
+bash tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_offline_ppo.sh
+
+python tests/models/mcore/tpr/parallel/compare_tpr_recompute_off_on.py \
+  /workspace/tpr_off_unique /workspace/tpr_on_unique \
+  --require-full-grads
+```
+
+**Both runs must save full gradients** using the launcher-supported
+`TPR_OFFLINE_SAVE_FULL_GRADS=1`, share the same capture and initial checkpoint,
+and confirm identical PPO labels and tree policy. These comparisons must not
+be called native Megatron Full parity: the baseline here is an unshared
+SegmentExecutor/Ring execution.
+
+### TP2 x CP2 x DP2 recompute validation
+
+```bash
+bash tests/models/mcore/tpr/parallel/run_tpr_dp2_recompute_validation.sh \
+  /workspace/real_actor_40k_manifest.json \
+  /workspace/tpr_dp2_recompute_new_results 6
+```
+
+This wrapper checks an existing 20-step, eight-session manifest, requires
+Qwen3-4B assets and NPUs 8..15 by default, and creates output directories
+exclusively. It uses the **offline** FP32 gradient synchronization control
+unless explicitly changed. BF16 production DP synchronization is a distinct
+gate. Do not reuse a prior output directory or call an ON-only test an OFF/ON
+comparison.
+
+### Negative control, not a regression gate
+
+`correctness/test_tpr_native_recompute_contract_npu.py` is the original
+naive-checkpoint compatibility probe and deliberately makes assertions that
+are not satisfied without KV-aware adaptation. It is never included in
+positive suites. The explicit-KV-output probe is
+`correctness/test_tpr_kv_checkpoint_replay_npu.py`.
+
+## Historical / diagnostic boundaries
+
+The following are useful investigations, **not** substitutes for mainline
+acceptance:
+
+- `correctness/_qwen17_*reference.py` and `test_qwen3_1_7b_*_npu.py`:
+  legacy HF/AReaL/DTA precision comparisons. Keep the baselines frozen.
+- `parallel/compare_*.py`, `parallel/analyze_*.py`,
+  `parallel/probe_*.py`, `parallel/prepare_*.py`:
+  offline artifacts, diagnosis and extraction tools, not pytests.
+- `parallel/run_*.sh`: launcher-specific topology, fixed capture formats,
+  and environment; no blanket execution.
+- `profiling/`: measured performance and memory, not general correctness.
+- `linear/`: research GDN and hybrid models, outside current production Dense.
+- `parallel/test_native_*_npu.py`: native baseline controls, not TPR parity
+  unless paired with explicit same-input TPR runs.
+
+## Physical follow-up: dependency-safe migration
+
+The current `parallel/` folder contains many sibling imports, for example
+`compare_tpr_recompute_matrix.py` imports
+`compare_real_actor_tp2cp4_offline_ppo.py` by module basename. Moving these
+files individually breaks command-line execution and the wrappers calling
+them. Before each physical move, record imports, shell invocations, dataset
+prerequisites and source hashes, then migrate a whole dependency island in
+one commit with compatibility checks. Do not create duplicate copies of tests
+or delete previous numerical references merely to reduce the file count.
+
+The first cleanup step therefore introduces one maintained gate registry,
+a zero-dependency path check, regression tests of the registry and an
+accurate README. Subsequent moves should occur only after their dependency
+islands and runtime owners are verified.
