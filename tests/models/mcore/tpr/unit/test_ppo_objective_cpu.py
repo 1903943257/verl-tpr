@@ -334,6 +334,41 @@ def test_batch_rows_and_host_masks_are_cached_across_segments(monkeypatch):
         torch.testing.assert_close(captured[0][1][key][0], expected)
 
 
+def test_batch_prepare_and_owned_cp_shard_are_reused_by_segment_callback(monkeypatch):
+    batch = _batch(1.0, False)
+    calls = []
+    objective = SegmentPPOObjectiveAdapter(
+        batch, _loss_callback([]), log_prob_fn=_log_probs,
+    )
+    original_rows = objective_module._rows
+
+    def count_rows(batch, key):
+        calls.append(("rows", key))
+        return original_rows(batch, key)
+
+    monkeypatch.setattr(objective_module, "_rows", count_rows)
+    objective.prepare_batch()
+    prepared_fields = tuple(calls)
+    assert len(prepared_fields) == 3  # response_mask, old_log_probs, advantages
+
+    segment = SegmentSpec(0, None, torch.tensor([3, 4]), 0, 0)
+    tree = TreeExecutionPlan(
+        "one", 0, (0,), SegmentPlan((segment,), 0),
+        (SegmentObjectiveRef(0, 0, 2, 0, 0),),
+    )
+    from verl.workers.engine.megatron.tpr.ring import SequenceShard
+
+    def make_shard(segment):
+        calls.append(("shard", segment.segment_id))
+        return SequenceShard.full(segment.length)
+
+    callback, counts = objective.bind_tree(tree, shard_for_segment=make_shard)
+    assert counts == {0: 1}
+    logits = torch.randn(1, 2, 7, requires_grad=True)
+    callback(segment, logits)
+    assert calls == [*prepared_fields, ("shard", 0)]
+
+
 def test_batch_row_preparation_rejects_mismatched_response_fields():
     batch = _batch(1.0, False)
     batch["advantages"] = torch.ones(2, 1)
