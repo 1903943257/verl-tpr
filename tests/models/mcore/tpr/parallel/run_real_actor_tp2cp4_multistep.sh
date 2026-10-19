@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Offline FIXED-data 1-50 real-PPO optimizer steps, same capture for both modes.
+# Real Actor PPO optimizer replay: fixed 1-50-step capture or chronological
+# 8-Session step manifest. Native Megatron microbatch count equals input rows.
+# Complete prior mode snapshots may be reused after the other mode fails.
 # Resource note: CPU FP32-master AdamW allocates 3x TP-shard parameters
 # on exactly two CP-leader processes (not 8 replicated optimizer states).
 set -euo pipefail
@@ -21,6 +23,24 @@ fi
 [[ -d "$TPR_QWEN_4B_PATH" ]] || { echo "Missing real 4B checkpoint" >&2; exit 2; }
 
 mkdir -p "$TPR_OFFLINE_OUTPUT_DIR"
+python -m pytest -q \
+  tests/models/mcore/tpr/parallel/test_native_full_dynamic_microbatches_cpu.py \
+  | tee "$TPR_OFFLINE_OUTPUT_DIR/native_batch_preflight.log"
+
+# Re-run a failed mode without clobbering the opposite mode's successful
+# 8-rank snapshots. Snapshot sets must be all-or-nothing; a partially
+# completed optimizer trajectory CANNOT safely resume from step 1.
+declare -a expected_steps=()
+if [[ -n "${TPR_OFFLINE_CAPTURE_MANIFEST:-}" ]]; then
+  for ((s=1;s<=TPR_OFFLINE_STEPS;s++)); do expected_steps+=("$s"); done
+else
+  for s in 1 2 5 10 20 30 40 50; do
+    (( s <= TPR_OFFLINE_STEPS )) && expected_steps+=("$s")
+  done
+  if [[ " ${expected_steps[*]} " != *" ${TPR_OFFLINE_STEPS} "* ]]; then
+    expected_steps+=("$TPR_OFFLINE_STEPS")
+  fi
+fi
 case "${TPR_OFFLINE_RUN_MODES:-both}" in
     full) modes=(full);;
     tpr) modes=(tpr);;
@@ -31,6 +51,23 @@ esac
 errors=()
 for mode in "${modes[@]}"; do
     export TPR_OFFLINE_MODE="$mode"
+    expected=0
+    existing=0
+    for step in "${expected_steps[@]}"; do
+        for rank in {0..7}; do
+            expected=$((expected+1))
+            [[ -f "$TPR_OFFLINE_OUTPUT_DIR/${mode}_step${step}_rank${rank}.pt" ]] &&
+                existing=$((existing+1))
+        done
+    done
+    if (( existing == expected && expected > 0 )); then
+        echo "TPR_FIXED_PPO_REUSE completed_mode=$mode snapshots=$existing"
+        continue
+    elif (( existing > 0 )); then
+        echo "TPR_FIXED_PPO_PARTIAL mode=$mode snapshots=$existing/$expected; refusing unsafe restart. Use a new output directory for this mode." >&2
+        errors+=("$mode")
+        continue
+    fi
     echo "TPR_FIXED_PPO start=$mode steps=$TPR_OFFLINE_STEPS rows=$TPR_OFFLINE_ROWS"
     if torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29786 \
         -m pytest -vv -s -x \
