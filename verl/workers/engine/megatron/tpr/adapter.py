@@ -379,6 +379,7 @@ def run_tpr_forward_backward_batch(
         data, loss_function, dp_group=engine.get_data_parallel_group(),
         log_prob_chunk_size=lp_chunk_tokens or None,
     )
+    objective.prepare_batch()
 
     # Native Megatron uses /M inside its PP schedule. That schedule is bypassed;
     # the objective already carries the full VERL global denominator, so do
@@ -393,6 +394,7 @@ def run_tpr_forward_backward_batch(
     metrics = _PPOMetrics()
     event_profiler = SegmentEventProfiler() if detailed_profile else None
     tree_number = 0
+    grad_scale = getattr(config, "grad_scale_func", None)
     shard_for_segment = (
         None if cp_runtime.backend is None
         else lambda segment: cp_runtime.backend.make_sequence_shard(segment.length)
@@ -405,10 +407,9 @@ def run_tpr_forward_backward_batch(
         executor = SegmentExecutor(
             model,
             tree_plan.segment_plan,
-            expected_layer_numbers=prepared_model.layer_numbers,
             prepared_model=prepared_model,
             active_segment_ids=tree_plan.active_segment_ids,
-            loss_scale_func=getattr(config, "grad_scale_func", None),
+            loss_scale_func=grad_scale,
             segment_loss_fn=callback,
             segment_loss_term_counts=counts,
             cp_group=cp_runtime.group,
