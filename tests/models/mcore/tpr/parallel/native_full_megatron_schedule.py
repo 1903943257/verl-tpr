@@ -5,9 +5,11 @@ GPT attention module, VERL's THD/zigzag-CP preprocessing and PPO/log-prob
 functions, and Megatron's get_forward_backward_func() schedule. The existing
 offline CPU FP32-master AdamW is deliberately shared with the TPR experiment.
 
-One original trajectory is one native Megatron microbatch. The eight losses
-use the same 8-trajectory global PPO-token denominator, and the schedule's
-1 / num_microbatches scaling is explicitly canceled. We average finalized
+One original trajectory is one native Megatron microbatch. The per-batch
+PPO-token denominator comes from the captured minibatch (two sibling rows
+in the fixed-PPO smoke, eight independent Sessions in real online-Step
+replay), and the schedule's 1 / num_microbatches scaling is explicitly
+canceled. We average finalized
 grads over CP replicas once, as in the existing offline experiment.
 """
 from __future__ import annotations
@@ -86,7 +88,7 @@ def _compact_native_ppo(loss_function, logprobs, response_offsets, batch, row,
 
 def run_native_full_step(model, batch, runtime, loss_function, *,
                          capture_logprobs: bool) -> NativeFullResult:
-    """Execute real no-PP Megatron F/B schedule over eight CP-sharded rows.
+    """Execute the real no-PP Megatron F/B schedule over CP-sharded rows.
 
     Deliberately fails rather than silently falling back to SegmentExecutor.
     Native model and schedule versions need an 8-NPU integration gate.
@@ -115,8 +117,20 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
         raise ValueError("Native Full requires original global batch_num_tokens")
     global_tokens = int(global_tokens)
     count = len(input_rows)
-    if count != 8 or global_tokens <= 0:
-        raise AssertionError("Native Full expects complete 8-Session PPO mini-batch")
+    # The native no-PP schedule accepts a dynamic number of original rows;
+    # num_microbatches=count below, and the loss hook multiplies by count
+    # to exactly cancel Megatron's 1/count schedule scaling. Fixed-data
+    # two-sibling PPO must not be confused with a real eight-Session group.
+    recorded_batch_size = tu.get_non_tensor_data(
+        batch, key="global_batch_size", default=None
+    )
+    if count <= 0 or global_tokens <= 0:
+        raise AssertionError("Native Full needs nonempty PPO rows and supervised tokens")
+    if recorded_batch_size is None or int(recorded_batch_size) != count:
+        raise AssertionError(
+            f"Native Full global_batch_size={recorded_batch_size} "
+            f"does not match physical PPO rows={count}"
+        )
 
     # Keep native configuration responsible for the native model's CP setup.
     model.config.no_sync_func = None
@@ -248,7 +262,8 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
                   f"peak_gib={torch.npu.max_memory_allocated()/2**30:.3f}",
                   flush=True)
             # Megatron's 2-tuple loss branch already multiplies by CP size
-            # and divides by num_microbatches. Because each local_loss uses
+            # and divides by num_microbatches (which equals count).
+            # Because each local_loss uses
             # the ORIGINAL global PPO-token denominator, cancel only /M:
             #   (local_loss * M) * CP / M = local_loss * CP.
             # The explicit CP grad all-reduce + /CP below then gives the
