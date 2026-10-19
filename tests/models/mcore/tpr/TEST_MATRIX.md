@@ -5,6 +5,20 @@ retrospective PASS report. Source paths are deliberately stable while the many
 `parallel/` script-to-script imports are audited. For the executable, curated
 subset use `python tests/models/mcore/tpr/run_suite.py list`.
 
+## Baseline inventory at branch creation
+
+The source tree contains **189 pytest-named files**: unit 79, parallel 61,
+correctness 17, profiling 14, equivalence 9, integration 5 and linear 4.
+In addition, `parallel/` alone holds approximately 49 launchers/comparison
+tools and 32 other Python helpers, which explains why a blanket
+`pytest tests/models/mcore/tpr/parallel` is not a meaningful pass/fail gate.
+
+The curated registry intentionally selects **11 entry points in 10 suites**.
+Unselected tests are *not deleted, passed, failed or deprecated by default*;
+they remain discoverable through `run_suite.py inventory` and the original
+paths. The initial reorganization is a **non-breaking test governance pass**,
+not a completed physical migration of every historical file.
+
 ## Acceptance ladder
 
 | Stage | Core question | Primary command/test | Required evidence |
