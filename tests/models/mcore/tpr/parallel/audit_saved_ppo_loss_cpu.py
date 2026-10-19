@@ -233,7 +233,11 @@ def audit(root: Path, steps: tuple[int, ...]) -> dict:
             f"audited_ppo_loss_gap={cross['loss_tpr_minus_full']:.9g}",
             flush=True,
         )
-    target = root / "saved_logprob_based_ppo_loss_audit.json"
+    target = root / "saved_ppo_loss_and_upstream_audit.json"
+    if target.exists():
+        raise FileExistsError(
+            f"Original saved PPO upstream audit exists; refusing overwrite: {target}"
+        )
     target.write_text(json.dumps(result, indent=2, ensure_ascii=False))
     print(f"TPR_SAVED_PPO_LOSS_AUDIT_REPORT={target}", flush=True)
     return result
