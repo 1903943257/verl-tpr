@@ -398,6 +398,39 @@ def test_batch_preparation_is_reused_for_multiple_trees_without_module_scans(mon
         executor.kv_stack.assert_empty()
 
 
+def test_batch_prevalidated_plan_skips_only_duplicate_executor_scan(monkeypatch):
+    from verl.workers.engine.megatron.tpr import executor as executor_module
+
+    model = _PrefixModel()
+    template = _executor(model)
+    prepared = prepare_replay_model(model, expected_layer_numbers=(1,))
+    validate_replay_plan(template.plan, prepared)
+    validator = executor_module.validate_replay_plan
+    calls = []
+
+    def counting_validator(*args, **kwargs):
+        calls.append(args[0])
+        return validator(*args, **kwargs)
+
+    monkeypatch.setattr(executor_module, "validate_replay_plan", counting_validator)
+    kwargs = dict(prepared_model=prepared, segment_loss_fn=template.segment_loss_fn,
+                  segment_loss_term_counts=template.segment_loss_term_counts)
+    prevalidated = SegmentExecutor(model, template.plan, validated_plan=template.plan, **kwargs)
+    assert not calls
+    ordinary = SegmentExecutor(model, template.plan, **kwargs)
+    assert calls == [template.plan]
+    torch.testing.assert_close(prevalidated.run(), ordinary.run(), rtol=0, atol=0)
+
+    with pytest.raises(ValueError, match="exact SegmentPlan"):
+        SegmentExecutor(model, template.plan, validated_plan=object(), **kwargs)
+    with pytest.raises(ValueError, match="batch-prepared"):
+        SegmentExecutor(
+            model, template.plan, validated_plan=template.plan, expected_layer_numbers=(1,),
+            segment_loss_fn=template.segment_loss_fn,
+            segment_loss_term_counts=template.segment_loss_term_counts,
+        )
+
+
 def test_tp_sp_odd_segment_is_rejected_before_any_forward():
     executor = _executor(_PrefixModel())
     model = executor.model
