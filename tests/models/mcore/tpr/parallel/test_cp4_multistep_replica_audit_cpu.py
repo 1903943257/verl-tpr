@@ -41,3 +41,33 @@ def test_tp_logprob_mismatch_not_silently_ignored():
     assert not audit["tp_logprob_gate_ok"]
     assert audit["tp_logprob_max_abs"] == pytest.approx(0.003)
     assert audit["tp_logprob_keys_identical"]
+
+
+def test_cp_gradient_witness_detects_replica_mismatch_not_seen_by_global_norm():
+    import torch
+    snapshots = _snapshots()
+    for item in snapshots:
+        item["gradient_samples"] = {
+            "decoder.layers.0.mlp.linear_fc1.weight": {
+                "shape": (4,), "indices": torch.tensor([0, 2]),
+                "values": torch.tensor([1.0, 2.0]),
+            }
+        }
+    mismatched = next(x for x in snapshots
+                      if x["tp_rank"] == 0 and x["cp_rank"] == 2)
+    mismatched["gradient_samples"][
+        "decoder.layers.0.mlp.linear_fc1.weight"
+    ]["values"] = torch.tensor([1.0, 2.5])
+    audit = _rank_replica_audit(snapshots, "full", 1)
+    assert audit["global_grad_norm_spread"] == 0
+    assert audit["global_grad_norm_rank_spread_is_not_replica_parity"]
+    report = audit["sampled_cp_gradient_replica"]
+    assert report["status"] == "measured"
+    assert report["cp_vs_cp0_by_tp"]["tp0_cp2"]["sampled_max_abs"] == 0.5
+    assert report["cp_vs_cp0_by_tp"]["tp0_cp2"]["sampled_changed_elements"] == 1
+    assert report["cp_vs_cp0_by_tp"]["tp1_cp2"]["sampled_max_abs"] == 0.0
+
+
+def test_missing_cp_gradient_witness_is_explicitly_unavailable():
+    audit = _rank_replica_audit(_snapshots(), "tpr", 1)
+    assert audit["sampled_cp_gradient_replica"]["status"] == "not_captured"
