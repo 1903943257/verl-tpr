@@ -170,6 +170,13 @@ def _validate_length(name: str, value: int, *, allow_zero: bool) -> None:
         raise ValueError(f"{name} must be a {qualifier} integer, got {value!r}")
 
 
+def _native_root_enabled_for_stage(*, enabled: bool, phase: str, no_grad: bool) -> bool:
+    """Only experiment with the native Root path at the requested DFS stage."""
+    if phase not in ("both", "push", "pop"):
+        raise ValueError("TPR_ROOT_NATIVE_RING_PHASE must be both, push, or pop")
+    return enabled and (phase == "both" or (phase == "push") == no_grad)
+
+
 @dataclass(frozen=True, slots=True)
 class PreparedReplayModel:
     """Batch-scoped static model facts and live stochastic-setting references.
@@ -289,6 +296,14 @@ class SegmentExecutor:
         self.kv_stack = KVStack() if kv_stack is None else kv_stack
         self.loss_scale_func = loss_scale_func
         self.cp_group = cp_group
+        # Explicit opt-in: only this tree's actual Root may use ordinary
+        # MindSpeed causal Ring. An empty Prefix on a non-root is not enough.
+        self._native_root_ring = os.getenv("TPR_ROOT_NATIVE_RING", "0") == "1"
+        self._native_root_ring_phase = os.getenv("TPR_ROOT_NATIVE_RING_PHASE", "both")
+        if self._native_root_ring:
+            _native_root_enabled_for_stage(
+                enabled=True, phase=self._native_root_ring_phase, no_grad=True,
+            )
         if cp_group is None:
             if cp_backend is not None:
                 raise ValueError("cp_backend requires a cp_group")
@@ -486,6 +501,15 @@ class SegmentExecutor:
                 expected_layer_numbers=self.expected_layer_numbers,
                 current_shard=shard,
                 past_anchors=sharded_past_anchors,
+                use_native_root=(
+                    segment.segment_id == self.plan.root_id
+                    and segment.parent_id is None
+                    and _native_root_enabled_for_stage(
+                        enabled=self._native_root_ring,
+                        phase=self._native_root_ring_phase,
+                        no_grad=no_grad,
+                    )
+                ),
             )
         context = TPRAttentionContext(
             prefix_length=segment.prefix_length,

@@ -10,9 +10,176 @@ import json
 import math
 from pathlib import Path
 import torch
-from compare_real_actor_tp2cp4_offline_ppo import (
-    _l2_pair, _logprobs, _complete_gradient_metrics,
-)
+if __package__:
+    from .compare_real_actor_tp2cp4_offline_ppo import (
+        _l2_pair, _logprobs, _complete_gradient_metrics,
+    )
+else:
+    from compare_real_actor_tp2cp4_offline_ppo import (
+        _l2_pair, _logprobs, _complete_gradient_metrics,
+    )
+
+
+def _sampled_cp_grad_replica_audit(items) -> dict:
+    """Compare saved BF16-gradient witness across CP replicas, per TP shard.
+
+    The saved global_grad_norm_preclip is already world-all-reduced and
+    therefore identical on every rank BY CONSTRUCTION. Its zero rank-spread
+    cannot prove that post-finalize parameter-gradient replicas agree.
+    """
+    if any(not x.get("gradient_samples") for x in items):
+        return {"status": "not_captured"}
+    rank_map = {(int(x["tp_rank"]), int(x["cp_rank"])): x
+                for x in items}
+    if len(rank_map) != 8:
+        raise AssertionError("Expected 2 TP * 4 CP unique gradient witnesses")
+    report = {}
+    for tp in (0, 1):
+        base = rank_map[(tp, 0)]["gradient_samples"]
+        for cp in (1, 2, 3):
+            peer = rank_map[(tp, cp)]["gradient_samples"]
+            if base.keys() != peer.keys():
+                raise AssertionError(f"CP gradient witness names differ tp={tp} cp={cp}")
+            diff_sq = ref_sq = 0.0
+            max_abs = 0.0
+            affected = 0
+            elements = 0
+            top = []
+            for name in base:
+                a, z = base[name], peer[name]
+                if (a["shape"] != z["shape"]
+                        or not torch.equal(a["indices"], z["indices"])):
+                    raise AssertionError(
+                        f"CP gradient witness shape/indices differ tp={tp} "
+                        f"cp={cp} param={name}"
+                    )
+                v = a["values"].double().flatten()
+                w = z["values"].double().flatten()
+                d = v - w
+                if not torch.isfinite(v).all() or not torch.isfinite(w).all():
+                    raise FloatingPointError(
+                        f"Nonfinite saved CP gradient witness tp={tp} cp={cp}"
+                    )
+                diff_sq += float((d*d).sum())
+                ref_sq += float((v*v).sum())
+                peak = float(d.abs().max()) if d.numel() else 0.0
+                if peak:
+                    top.append((name, peak))
+                max_abs = max(max_abs, peak)
+                affected += int(torch.count_nonzero(d))
+                elements += d.numel()
+            report[f"tp{tp}_cp{cp}"] = {
+                "sampled_relative_l2": math.sqrt(
+                    diff_sq / max(ref_sq, 1e-30)
+                ),
+                "sampled_max_abs": max_abs,
+                "sampled_changed_elements": affected,
+                "sampled_total_elements": elements,
+                "top_parameter_max_abs": sorted(
+                    top, key=lambda item: item[1], reverse=True
+                )[:5],
+            }
+    return {"status": "measured", "cp_vs_cp0_by_tp": report}
+
+
+def _rank_replica_audit(items, label: str, step: int) -> dict:
+    """Audit saved PPO scalars and TP replicas without modifying either result.
+
+    Native Full reports global loss after CP all-reduce. A TP rank mismatch
+    may be a genuine loss-parity problem, not a reason to silently average
+    or increase the tolerance. Collect every rank and TP-specific logprob
+    before deciding whether the comparison is valid.
+    """
+    records = sorted((
+        {
+            # Offline snapshots' "rank" field is TP rank, not WORLD rank.
+            # File list is ordered full_step<step>_rank0..7.pt.
+            "world_rank": idx,
+            "recorded_rank_field": int(x["rank"]),
+            "snapshot_index": idx,
+            "tp": int(x["tp_rank"]), "cp": int(x["cp_rank"]),
+            "loss": float(x["loss"]),
+            "global_grad_norm_preclip": float(x["global_grad_norm_preclip"]),
+        }
+        for idx, x in enumerate(items)
+    ), key=lambda v: v["snapshot_index"])
+    loss_values = [x["loss"] for x in records]
+    norm_values = [x["global_grad_norm_preclip"] for x in records]
+    if not all(math.isfinite(v) for v in loss_values + norm_values):
+        raise AssertionError(f"{label} step={step}: nonfinite PPO loss or norm")
+    losses_by_tp = {
+        str(tp): [x["loss"] for x in records if x["tp"] == tp]
+        for tp in (0, 1)
+    }
+    losses_by_cp = {
+        str(cp): [x["loss"] for x in records if x["cp"] == cp]
+        for cp in range(4)
+    }
+    def spread(vals):
+        return max(vals) - min(vals) if vals else None
+
+    per_tp_logprobs = {}
+    duplicate_token_owners = {}
+    for tp in (0, 1):
+        merged = {}
+        duplicates = []
+        for x in items:
+            if x["tp_rank"] != tp:
+                continue
+            for k, v in x["logprobs"].items():
+                key = tuple(k)
+                if key in merged:
+                    duplicates.append(key)
+                else:
+                    merged[key] = float(v)
+        per_tp_logprobs[tp] = merged
+        duplicate_token_owners[str(tp)] = len(duplicates)
+    lp0, lp1 = per_tp_logprobs[0], per_tp_logprobs[1]
+    keys_match = lp0.keys() == lp1.keys()
+    lp_disagree = [abs(lp0[k] - lp1[k]) for k in lp0.keys() & lp1.keys()]
+    scalar_spread = spread(loss_values)
+    norm_spread = spread(norm_values)
+    cp_grad_witness = _sampled_cp_grad_replica_audit(items)
+    result = {
+        "mode": label,
+        "step": step,
+        "per_rank": records,
+        "loss_global_spread": scalar_spread,
+        "loss_spread_by_tp": {k: spread(v) for k, v in losses_by_tp.items()},
+        "loss_spread_by_cp": {k: spread(v) for k, v in losses_by_cp.items()},
+        "loss_by_tp": losses_by_tp,
+        "global_grad_norm_spread": norm_spread,
+        "global_grad_norm_rank_spread_is_not_replica_parity": True,
+        "sampled_cp_gradient_replica": cp_grad_witness,
+        "tp_logprob_keys_identical": keys_match,
+        "tp_logprob_shared_tokens": len(lp_disagree),
+        "tp_logprob_max_abs": max(lp_disagree, default=None),
+        "tp_logprob_mean_abs": (
+            sum(lp_disagree) / len(lp_disagree) if lp_disagree else None
+        ),
+        "tp_logprob_ownership_duplicates": duplicate_token_owners,
+        "loss_gate_ok": scalar_spread < 1e-4,
+        "norm_gate_ok": norm_spread < 1e-5,
+        "tp_logprob_gate_ok": keys_match and not any(
+            duplicate_token_owners.values()
+        ) and (
+            max(lp_disagree, default=0.0) <= 1e-4
+        ),
+    }
+    print(
+        f"TPR_PPO_REPLICA_AUDIT step={step} mode={label} "
+        f"loss_by_rank={[(x['snapshot_index'], x['tp'], x['cp'], x['loss']) for x in records]} "
+        f"loss_span={scalar_spread:.9g} "
+        f"loss_span_by_tp={result['loss_spread_by_tp']} "
+        f"gradnorm_span={norm_spread:.9g} "
+        f"cp_sampled_grad_max_abs={max((x['sampled_max_abs'] for x in cp_grad_witness.get('cp_vs_cp0_by_tp', {}).values()), default=None)} "
+        f"tp_lp_max_abs={result['tp_logprob_max_abs']} "
+        f"lp_tp_keys_identical={keys_match} "
+        f"loss_gate={result['loss_gate_ok']} norm_gate={result['norm_gate_ok']} "
+        f"lp_gate={result['tp_logprob_gate_ok']}",
+        flush=True,
+    )
+    return result
 
 
 def _master_update(a, b):
@@ -132,10 +299,15 @@ def compare(outdir: Path, steps: int):
             else "SEQUENTIAL_20_DISTINCT_REAL_CAPTURES"
         )
     else:
-        milestones = tuple(n for n in (1,2,5,10,20,30,40,50) if n <= steps)
+        milestones = tuple(sorted(
+            {n for n in (1,2,5,10,20,30,40,50) if n <= steps} | {steps}
+        ))
         run_protocol = "REPEATED_FIXED_PPO_DATA_NOT_ON_POLICY"
     del first_snap
     observed = []
+    replica_gate_failures = []
+    replica_checks = []
+    audit_path = outdir / "multistep_replica_audit.json"
     for step in milestones:
         mode = {}
         for label in ("full", "tpr"):
@@ -182,12 +354,33 @@ def compare(outdir: Path, steps: int):
                     raise AssertionError(f"Full vs TPR step={step} mismatch in {field}")
         if f[0]["steps"] != steps:
             raise AssertionError("Replay output has unexpected total step count")
+        replica_audit = {}
         for label, items in mode.items():
-            if max(abs(x["loss"] - items[0]["loss"]) for x in items) >= 1e-4:
-                raise AssertionError(f"{label} loss differs across ranks")
-            if max(abs(x["global_grad_norm_preclip"] -
-                       items[0]["global_grad_norm_preclip"]) for x in items) >= 1e-5:
-                raise AssertionError(f"{label} global norm differs across ranks")
+            audit = _rank_replica_audit(items, label, step)
+            replica_audit[label] = audit
+            for gate in ("loss_gate_ok", "norm_gate_ok", "tp_logprob_gate_ok"):
+                if not audit[gate]:
+                    replica_gate_failures.append({
+                        "step": step, "mode": label, "gate": gate,
+                        "loss_spread": audit["loss_global_spread"],
+                        "global_grad_norm_spread": audit["global_grad_norm_spread"],
+                        "tp_logprob_max_abs": audit["tp_logprob_max_abs"],
+                    })
+        replica_checks.append({"step": step, "modes": replica_audit})
+        # Write checkpoint-by-checkpoint audit before heavier full-grad
+        # comparisons, so the exact rank disagreement survives later errors.
+        audit_path.write_text(json.dumps({
+            "run_protocol": run_protocol,
+            "replica_checks": replica_checks,
+            "replica_gate_failures": replica_gate_failures,
+            "status": (
+                "NUMERICAL_REPLICA_GATE_FAILED_DIAGNOSTICS_ONLY"
+                if replica_gate_failures else "RANK_REPLICA_AUDIT_OK"
+            ),
+        }, indent=2, ensure_ascii=False))
+        # Keep producing independent full-parameter and token-level diagnostic
+        # metrics. Never treat them as a numerical PASS if a replica gate
+        # failed. Saved weights/gradients are immutable.
         for label, items in mode.items():
             if len({x.get("ring_attention_impl","legacy_custom") for x in items}) != 1:
                 raise AssertionError(f"inconsistent {label} Ring backend among ranks")
@@ -201,6 +394,11 @@ def compare(outdir: Path, steps: int):
         tpr_norm = t[0]["global_grad_norm_preclip"]
         record = {
             "step":step,
+            "replica_audit":replica_audit,
+            "replica_numerical_gate_ok": all(
+                audit[g] for audit in replica_audit.values()
+                for g in ("loss_gate_ok", "norm_gate_ok", "tp_logprob_gate_ok")
+            ),
             "source_online_global_step":f[0].get("source_online_global_step"),
             "source_capture_index":f[0].get("source_capture_index"),
             "full_attention_impl":f[0].get("ring_attention_impl","legacy_custom"),
@@ -263,7 +461,12 @@ def compare(outdir: Path, steps: int):
             f"allocated_saving={record['peak_allocated_saving_fraction']:.2%}", flush=True
         )
     result = {
-        "status": "DIAGNOSTIC_SEQUENTIAL_OFFLINE_PPO_REPLAY",
+        "status": (
+            "NUMERICAL_REPLICA_GATE_FAILED_DIAGNOSTICS_ONLY"
+            if replica_gate_failures
+            else "DIAGNOSTIC_SEQUENTIAL_OFFLINE_PPO_REPLAY"
+        ),
+        "replica_gate_failures": replica_gate_failures,
         "run_protocol":run_protocol,
         "steps_completed":steps,
         "milestones":observed,
@@ -290,6 +493,14 @@ def compare(outdir: Path, steps: int):
         raise FileExistsError(target)
     target.write_text(json.dumps(result, indent=2, ensure_ascii=False))
     print(f"TPR_50STEP_SUMMARY status={result['status']} saved={target}", flush=True)
+    if replica_gate_failures:
+        print(
+            f"TPR_50STEP_WARNING replica_gates_failed={len(replica_gate_failures)}. "
+            "Full/TPR loss and parameter diagnostics were generated, but "
+            "replica correctness is NOT validated. Inspect replica_audit "
+            "before judging numerical parity.",
+            flush=True,
+        )
     return result
 
 

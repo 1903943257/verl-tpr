@@ -455,3 +455,31 @@ def test_failure_releases_cached_kv_and_dkv_and_invalidates_anchors(monkeypatch)
     executor.kv_stack.assert_empty()
     with pytest.raises(RuntimeError, match="failed"):
         executor.run()
+
+
+@pytest.mark.parametrize(
+    ("enabled", "phase", "no_grad", "expected"),
+    [
+        (False, "both", True, False),
+        (False, "both", False, False),
+        (True, "both", True, True),
+        (True, "both", False, True),
+        (True, "push", True, True),
+        (True, "push", False, False),
+        (True, "pop", True, False),
+        (True, "pop", False, True),
+    ],
+)
+def test_native_root_ring_phase_gates_push_and_pop(enabled, phase, no_grad, expected):
+    from verl.workers.engine.megatron.tpr.executor import _native_root_enabled_for_stage
+
+    assert _native_root_enabled_for_stage(
+        enabled=enabled, phase=phase, no_grad=no_grad,
+    ) is expected
+
+
+def test_native_root_ring_phase_rejects_invalid_mode():
+    from verl.workers.engine.megatron.tpr.executor import _native_root_enabled_for_stage
+
+    with pytest.raises(ValueError, match="TPR_ROOT_NATIVE_RING_PHASE"):
+        _native_root_enabled_for_stage(enabled=True, phase="invalid", no_grad=True)

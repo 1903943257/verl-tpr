@@ -139,7 +139,7 @@ def _load_real_pair(path: Path, rows: tuple[int, ...], mode: str):
         raise ValueError("Select at least one valid original captured row")
     data = tu.index_select_tensor_dict(raw["tensordict"], list(rows))
     original_keys = tuple(raw["keys"][i] for i in rows)
-    if mode == "tpr":
+    if mode in ("tpr", "split_no_share"):
         keys = original_keys
     else:
         # Force independent one-root forests: physically complete trajectories,
@@ -280,8 +280,8 @@ def _install_offline_full_ring_backend(mode: str) -> str:
 
 def test_recorded_full_vs_tpr_one_step():
     mode = os.environ.get("TPR_OFFLINE_MODE")
-    if mode not in ("full", "tpr"):
-        raise AssertionError("Set TPR_OFFLINE_MODE=full or tpr")
+    if mode not in ("full", "tpr", "split_no_share"):
+        raise AssertionError("Set TPR_OFFLINE_MODE=full, tpr, or split_no_share")
     recompute_setting = os.getenv("TPR_OFFLINE_RECOMPUTE", "0")
     if recompute_setting not in ("0", "1"):
         raise ValueError("TPR_OFFLINE_RECOMPUTE must be 0 or 1")
@@ -306,6 +306,13 @@ def test_recorded_full_vs_tpr_one_step():
     destination = Path(os.getenv(
         "TPR_OFFLINE_OUTPUT_DIR", "/workspace/tpr_offline_qwen4b_tp2cp4"
     ))
+    # Reject stale topology flags before initializing HCCL or loading 4B.
+    tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
+    if tree_policy != "qwen_turn":
+        raise ValueError(f"offline Actor replay requires qwen_turn, got {tree_policy!r}")
+    tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
+    if tree_policy != "qwen_turn":
+        raise ValueError(f"Offline Actor replay requires qwen_turn, got {tree_policy!r}")
     runtime = _runtime()
     try:
         from verl.workers.utils.losses import ppo_loss
@@ -319,9 +326,10 @@ def test_recorded_full_vs_tpr_one_step():
             run_tpr_forward_backward_batch, _trajectory_keys_from_minibatch,
         )
         from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans
+        # Production TPR supports only complete Qwen/ChatML Turn sharing.
         forest = build_tree_execution_plans(
             _trajectory_keys_from_minibatch(batch), batch,
-            tree_policy=os.getenv("TPR_TREE_POLICY", "qwen_turn"),
+            tree_policy=tree_policy,
             turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
         )
         if mode == "full" and (
@@ -331,6 +339,14 @@ def test_recorded_full_vs_tpr_one_step():
             # Qwen turn-only builds multiple Segments even for an unshared
             # trajectory.  Isolation is about row ownership, not Segments.
             raise AssertionError("Full control accidentally reused tokens across rows")
+        if mode == "split_no_share":
+            # Experimental isolation only: preserve Main's replay/recompute path.
+            from .test_real_actor_cp1_short_full_tpr_npu import _make_unshared_split
+            if len(forest.trees) != 1 or forest.segment_count != 3:
+                raise AssertionError("Split-no-share needs one Root and two Leaves")
+            forest = _make_unshared_split(forest, batch)
+            if len(forest.trees) != 2 or forest.segment_count != 4:
+                raise AssertionError("Split-no-share needs two independent chains")
         # Turn-only TPR may yield multiple trees if complete turns are not shared.
         ring_impl = _install_offline_full_ring_backend(mode)
         if hf.num_hidden_layers != 36:
@@ -414,9 +430,28 @@ def test_recorded_full_vs_tpr_one_step():
         start_reserved = torch.npu.memory_reserved()
         before = _witness(model, grads=False)
         before_time = time.perf_counter()
-        out = run_tpr_forward_backward_batch(
-            engine, batch, partial(ppo_loss, config=_PPO()), forward_only=False
-        )
+        if mode == "split_no_share":
+            # run_tpr_forward_backward_batch builds its forest internally.
+            # Substitute ONLY its diagnostic forest builder during this call.
+            # Do not change the production adapter, Attention or PPO Loss.
+            from unittest.mock import patch
+            from verl.workers.engine.megatron.tpr import tree as tree_module
+            with patch.object(
+                tree_module, "build_tree_execution_plans", return_value=forest,
+            ) as builder:
+                out = run_tpr_forward_backward_batch(
+                    engine, batch, partial(ppo_loss, config=_PPO()),
+                    forward_only=False,
+                )
+                if builder.call_count != 1:
+                    raise AssertionError(
+                        "Unexpected production forest reconstruction count"
+                    )
+        else:
+            out = run_tpr_forward_backward_batch(
+                engine, batch, partial(ppo_loss, config=_PPO()),
+                forward_only=False,
+            )
         torch.npu.synchronize()
         fwd_bwd_sec = time.perf_counter() - before_time
         grad = _witness(model, grads=True)
@@ -457,7 +492,8 @@ def test_recorded_full_vs_tpr_one_step():
                 "full_unshared_MindSpeed_native_Ring"
                 if mode == "full" and ring_impl.startswith("mindspeed_")
                 else "full_unshared_same_Ring_backend" if mode == "full"
-                else "TPR_shared_Ring"
+                else "TPR_split_no_share_same_Ring_backend"
+                if mode == "split_no_share" else "TPR_shared_Ring"
             ),
             "ring_attention_impl":ring_impl,
             "optimizer": f"diagnostic_bf16_sgd_lr_{lr}",

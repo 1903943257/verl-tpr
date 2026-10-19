@@ -5,9 +5,11 @@ GPT attention module, VERL's THD/zigzag-CP preprocessing and PPO/log-prob
 functions, and Megatron's get_forward_backward_func() schedule. The existing
 offline CPU FP32-master AdamW is deliberately shared with the TPR experiment.
 
-One original trajectory is one native Megatron microbatch. The eight losses
-use the same 8-trajectory global PPO-token denominator, and the schedule's
-1 / num_microbatches scaling is explicitly canceled. We average finalized
+One original trajectory is one native Megatron microbatch. The per-batch
+PPO-token denominator comes from the captured minibatch (two sibling rows
+in the fixed-PPO smoke, eight independent Sessions in real online-Step
+replay), and the schedule's 1 / num_microbatches scaling is explicitly
+canceled. We average finalized
 grads over CP replicas once, as in the existing offline experiment.
 """
 from __future__ import annotations
@@ -29,6 +31,36 @@ class NativeFullResult:
     logprobs: dict
     microbatches: int
     finalize_seconds: float
+
+
+def _native_microbatch_count(count: int, global_tokens: int, recorded_batch_size: int | None) -> int:
+    """Validate original PPO cardinality; microbatch count is not hardcoded to N=8."""
+    if count <= 0 or global_tokens <= 0:
+        raise AssertionError("Native Full needs nonempty PPO rows and supervised tokens")
+    if recorded_batch_size is None or int(recorded_batch_size) != count:
+        raise AssertionError(
+            f"Native Full global_batch_size={recorded_batch_size} "
+            f"does not match physical PPO rows={count}"
+        )
+    return count
+
+
+def _aggregate_native_local_reporting_loss(loss_parts):
+    """Sum detached CP-local PPO loss contributions in a uniform FP32 dtype.
+
+    Some CP ranks own no supervised tokens. Their zero-loss graph is BF16,
+    while ranks with PPO tokens have an FP32 loss. Reducing torch.stack()
+    directly across CP ranks is an INVALID mixed-dtype HCCL collective and
+    was observed to corrupt the reported Loss (not the backward).
+    """
+    if not loss_parts:
+        raise ValueError("Cannot report an empty native PPO microbatch")
+    values = []
+    for part in loss_parts:
+        if part.numel() != 1 or part.requires_grad:
+            raise ValueError("Native reporting loss must be detached scalar")
+        values.append(part.float().reshape(()))
+    return torch.stack(values).sum(dtype=torch.float32)
 
 
 def native_cp_query_indices(length: int, cp_rank: int, cp_size: int = 4,
@@ -86,7 +118,7 @@ def _compact_native_ppo(loss_function, logprobs, response_offsets, batch, row,
 
 def run_native_full_step(model, batch, runtime, loss_function, *,
                          capture_logprobs: bool) -> NativeFullResult:
-    """Execute real no-PP Megatron F/B schedule over eight CP-sharded rows.
+    """Execute the real no-PP Megatron F/B schedule over CP-sharded rows.
 
     Deliberately fails rather than silently falling back to SegmentExecutor.
     Native model and schedule versions need an 8-NPU integration gate.
@@ -115,8 +147,14 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
         raise ValueError("Native Full requires original global batch_num_tokens")
     global_tokens = int(global_tokens)
     count = len(input_rows)
-    if count != 8 or global_tokens <= 0:
-        raise AssertionError("Native Full expects complete 8-Session PPO mini-batch")
+    # The native no-PP schedule accepts a dynamic number of original rows;
+    # num_microbatches=count below, and the loss hook multiplies by count
+    # to exactly cancel Megatron's 1/count schedule scaling. Fixed-data
+    # two-sibling PPO must not be confused with a real eight-Session group.
+    recorded_batch_size = tu.get_non_tensor_data(
+        batch, key="global_batch_size", default=None
+    )
+    count = _native_microbatch_count(count, global_tokens, recorded_batch_size)
 
     # Keep native configuration responsible for the native model's CP setup.
     model.config.no_sync_func = None
@@ -248,7 +286,8 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
                   f"peak_gib={torch.npu.max_memory_allocated()/2**30:.3f}",
                   flush=True)
             # Megatron's 2-tuple loss branch already multiplies by CP size
-            # and divides by num_microbatches. Because each local_loss uses
+            # and divides by num_microbatches (which equals count).
+            # Because each local_loss uses
             # the ORIGINAL global PPO-token denominator, cancel only /M:
             #   (local_loss * M) * CP / M = local_loss * CP.
             # The explicit CP grad all-reduce + /CP below then gives the
@@ -284,7 +323,12 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
     torch.npu.synchronize()
     finalize_seconds = time.perf_counter() - t0
 
-    loss_value = torch.stack(loss_parts).sum()
+    # Reporting-only reduction: all CP participants MUST pass the same dtype
+    # to HCCL. CP ranks without response tokens generated detached BF16 zeros,
+    # whereas ranks with PPO tokens produced FP32 losses. The original
+    # torch.stack(...).sum() retained per-rank dtype and silently disagreed.
+    # Forward/backward and weight-gradient collectives are not changed.
+    loss_value = _aggregate_native_local_reporting_loss(loss_parts)
     dist.all_reduce(loss_value, op=dist.ReduceOp.SUM, group=runtime.cp_group)
     return NativeFullResult(
         loss=float(loss_value.item()),

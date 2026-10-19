@@ -118,6 +118,94 @@ only after numerical and throughput parity. Ring layout, validity mask and
 logical/physical Padding share one canonical implementation, but padded CP
 backward still requires an NPU parity gate.
 
+### Prefix FA call-count diagnostics (opt-in)
+
+Core Ring accepts physical right-padding and masks invalid tokens. By default,
+the Prefix KV coalescing fast path requires an unpadded Prefix. For experiments,
+`TPR_RING_COALESCE_PREFIX_PADDED=1` in combination with
+`TPR_RING_COALESCE_PREFIX_FULL=1` allows the **valid** zero-copy portion of
+each source rank's padded Prefix KV to participate in one FULL FA call.
+Communication buffers remain physically padded; gradient slices map back into
+their original source buffers. With all three flags enabled,
+`TPR_RING_COALESCE_PREFIX_QUERY=1` now merges the physical local Query for
+Prefix FULL FA even if the Current Segment is padded. The Query path masks
+virtual-Query upstream gradients and dQ; Prefix dK/dV updates only valid
+source KV slices. Ranks with an entirely padded local Query chunk fall back
+to the two-range Query schedule, and a Prefix source with no real tokens
+skips its FULL FA without changing Ring transport. Neither optimization
+changes Current causal FA. All Merge optimizations remain **off by default**
+and padded Query+KV Merge is experimental until CP2/CP4 NPU correctness passes.
+
+Set `TPR_RING_BLOCK_STATS=1` to print JSON `TPR_RING_BLOCK_STATS` records on
+CP rank zero, for the first transformer layer of each executed Segment.
+Forward and Backward are reported separately, including the effective
+`fa_prefix_kv_merged`, `fa_prefix_query_merged`,
+`fa_prefix_unmerged_reference` and `fa_prefix_calls_saved`. A requested
+flag with `fa_prefix_calls_saved=0` is **not** a Merge performance result.
+Counters are untimed, do not synchronize the NPU, and do not retain remote KV.
+
+CPU gate:
+
+```bash
+python -m pytest -q tests/models/mcore/tpr/parallel/test_ring_cp_attention_contract.py
+```
+
+NPU padded-KV-only gates with explicit localhost rendezvous:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=8,9 torchrun --master_addr=localhost --master_port=29505 \
+  --nproc_per_node=2 -m pytest -xvs \
+  tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py \
+  -k padded_prefix_full_coalescing_off_on
+ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 torchrun --master_addr=localhost --master_port=29506 \
+  --nproc_per_node=4 -m pytest -xvs \
+  tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py \
+  -k padded_prefix_full_coalescing_off_on
+```
+
+To exercise padded **joint Query+KV Merge** on a real Actor capture, set:
+
+```bash
+TPR_RING_BLOCK_STATS=1 \
+TPR_RING_COALESCE_PREFIX_FULL=1 \
+TPR_RING_COALESCE_PREFIX_PADDED=1 \
+TPR_RING_COALESCE_PREFIX_QUERY=1 \
+TPR_OFFLINE_RUN_MODES=tpr \
+TPR_TREE_POLICY=qwen_turn \
+TPR_OFFLINE_OUTPUT_DIR=/workspace/tpr_ring_qkv_padded_on \
+bash tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_offline_ppo.sh
+```
+
+For CP4 and a single Prefix with all four source ranks owning real
+KV, enabling only padded KV Merge changes a leaf's Prefix FA calls
+from 16 to 8. Adding padded Query Merge reduces them further to 4
+(total 25 -> 13 including nine unchanged Current FA calls).
+Enable `TPR_RING_BLOCK_STATS=1` to **verify the actual call counts**,
+not infer eligibility from environment variables. A low-level CPU contract
+does not establish Ascend NPU numerical parity.
+
+CP2/CP4 NPU Query+KV OFF/ON verification:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=8,9 torchrun --master_addr=localhost --master_port=29507 \
+  --nproc_per_node=2 -m pytest -xvs \
+  tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py \
+  -k padded_prefix_query_kv_coalescing_off_on
+ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 torchrun --master_addr=localhost --master_port=29508 \
+  --nproc_per_node=4 -m pytest -xvs \
+  tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py \
+  -k padded_prefix_query_kv_coalescing_off_on
+```
+
+For the existing eight-rank captured PPO replay, enable
+`TPR_RING_BLOCK_STATS=1` and compare a baseline with
+`TPR_RING_COALESCE_PREFIX_FULL=0` against an experimental run with
+`TPR_RING_COALESCE_PREFIX_FULL=1`,
+`TPR_RING_COALESCE_PREFIX_PADDED=1` and
+`TPR_RING_COALESCE_PREFIX_QUERY=0`. Use separate output directories. The
+existing BF16 reproducibility/gradient gates must be interpreted separately
+from whether the number of actual FA launches decreased.
+
 ### Validation gate
 
 Before a production merge, compare **old TPR vs new TPR on identical actor
@@ -136,3 +224,163 @@ python -m pytest -q tests/models/mcore/tpr/unit/test_production_architecture.py
 
 NPU integration tests require a configured Ascend 910 / MindSpeed / Megatron
 stack and authentic actor captures. Record every skipped gate explicitly.
+
+### Ring maintenance branch (2026-10-18)
+
+Continue Ring implementation, QKV experiments and their acceptance tests on
+`refactor/tpr-ring-layout-validation-main-20261016`. The canonical source is
+`verl/workers/engine/megatron/tpr/ring.py`.
+
+The gradient/contract fixes from `75b53c15` are adapted to this Engine-owned
+implementation: FP32 dQ accumulation, shared CANN visibility parameters,
+single-sequence TND statistics conversion and shared K/Q slice metadata for
+V/dO. The prepared per-Segment layout, padded joint Query+KV merging, valid
+KV gradient scatter, virtual Query masking, native whole-Ring reference and
+effective FA counters are retained. FULL/QUERY/PADDED merging remains opt-in
+with all three flags defaulting to zero.
+
+The historical experimental AllGather/Ulysses references remain available on
+this branch. The old Ring-only branch's removal of those test parameters does
+not apply to these independent references. Deep-Prefix CPU and NPU regression
+tests supplement the existing padded CP2/CP4 gates; CPU validation does not
+establish CANN/HCCL numerical or throughput acceptance.
+
+
+### Experimental Fast Root Ring (2026-10-18)
+
+Set `TPR_ROOT_NATIVE_RING_PHASE` to `both` (default), `push`, or `pop`
+when `TPR_ROOT_NATIVE_RING=1`. Push-only switches graph-free Root KV
+creation; Pop-only switches the recomputed Root forward/backward. These
+are diagnostic ablations, not independent production configurations.
+Record the phase in the output directory name, and keep the same captured
+Actor batch, qwen_turn topology, Prefix Merge settings and model weights.
+
+Use `TPR_ROOT_NATIVE_RING=1` to opt in; default is `0`. Only the actual tree
+Root (`segment_id == plan.root_id`, no parent) switches to MindSpeed's native
+`ringattn_context_parallel()` via the existing `ordinary_ring_cp_attention()`.
+An empty Prefix alone is NOT a Root signal. Internal and Leaf Segments retain
+the existing TPR Prefix/Current Ring schedule.
+
+Root Push keeps its graph-free cached K/V; Root Pop recomputes graph-connected
+K/V and accepts relayed descendant dK/dV without changing tree ownership.
+Native Root Ring uses only trailing physical padding. Virtual Query output
+rows are zeroed before returning so even a nonzero padded upstream dO has
+zero Root graph gradient. Native causal visibility excludes virtual Keys
+from all real Queries. No new Ring transport or backward implementation.
+
+CPU routing and padding contract:
+
+```bash
+python -m pytest -q tests/models/mcore/tpr/parallel/test_ring_cp_attention_contract.py -k native_root
+```
+
+NPU Root Push/Pop numerical checks (run sequentially):
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=8,9 torchrun --master_addr=127.0.0.1 --master_port=29797 \
+  --nproc_per_node=2 -m pytest -xvs \
+  tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py \
+  -k native_root_ring_matches_tpr_root_with_relayed_kv_gradients
+ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 torchrun --master_addr=127.0.0.1 --master_port=29797 \
+  --nproc_per_node=4 -m pytest -xvs \
+  tests/models/mcore/tpr/parallel/test_ring_cp_attention_npu.py \
+  -k native_root_ring_matches_tpr_root_with_relayed_kv_gradients
+```
+
+Next gate: same authentic Actor capture with `TPR_ROOT_NATIVE_RING=0` vs `1`,
+keeping Prefix Merge settings fixed. Compare Root Push/Pop time, end-to-end
+loss/logprob, full parameter gradients, actual FA calls, and memory. Kernel
+parity does not establish complete PPO/optimizer acceptance.
+
+
+### Controlled single-card Qwen3-4B PPO Full vs TPR (2026-10-18)
+
+Run `bash tests/models/mcore/tpr/parallel/run_real_actor_cp1_short_full_tpr.sh`
+from the synced Docker worktree with physical NPU 8 available. The script
+uses fixed `127.0.0.1:29797`, a 2048-token cap per trajectory, and the
+existing real Actor PPO capture rows (4,6). It produces four independent
+checkpoint-loaded TP1/CP1/DP1 runs:
+
+- `full`: whole-sequence GPT forward/backward **without** TPR context,
+  using the controlled square-CANN CP1 core; **not** native VERL Engine.
+- `one_node`: two independent TPR one-Root-leaf plans; no shared KV.
+- `split_no_share`: two independent Root/Leaf chains with exactly the same
+  boundary and PPO query/target refs as `shared`, but no inter-row KV reuse.
+- `shared`: one `qwen_turn` tree, Root Push / two siblings / Root Pop.
+
+The derivation keeps an identical trailing prompt window and selects an
+original supervised response window around the first sibling divergence.
+It never synthesizes PPO labels or alters values of the retained
+`old_log_probs`, `advantages`, response/loss masks or temperatures.
+**Left-truncating the prompt and shifting the response window changes
+conditioning**: this is a deterministic controlled numerical comparison,
+not equivalent to the original online PPO objective. The output capture
+audit records original row IDs, offset, lengths and fingerprints. Scripts
+reject missing branches or missing PPO supervision rather than claiming
+reuse without an actual shared Root.
+
+The original three-arm `comparison.json` remains untouched. The updated
+comparator writes `comparison_split_no_share.json` and adds one-node vs
+split-no-share (segmentation effect) and split-no-share vs shared (actual
+KV reuse effect). All comparisons include token logprob/Loss, canonical sampled
+parameter gradients, complete Norm-only gradients and global grad norms.
+Neither the 64-sample canonical witness nor the Norm-only vector is a
+complete all-parameter gradient L2. No optimizer step is executed. Full,
+one-node, split-no-share and shared use the same Qwen3-4B BF16 weights, VERL vanilla PPO
+objective and optional chunked logprob computation; dropout=0 and model
+recompute disabled. Root Native Ring is forced OFF: CP1 cannot validate
+Native Ring correctness by itself.
+
+CPU capture contract:
+
+```bash
+python -m pytest -q tests/models/mcore/tpr/parallel/test_cp1_short_capture_cpu.py
+```
+
+After CP1 is well characterized, use the established TP2CP1 and TP2CP4
+replay matrices to isolate tensor/context parallelism and then return to
+Fast Root Native Push-only drift on the original 4B Actor sibling capture.
+
+
+### Complete CP1 TPRSelfAttention numerical attribution (2026-10-18)
+
+Single-card Qwen3-4B real-label PPO diagnostic:
+
+```bash
+bash tests/models/mcore/tpr/parallel/run_cp1_attention_attribution.sh
+```
+
+The runner isolates physical NPU 8, 2048 tokens, and the current
+production qwen_turn Root/Leaf boundary. It runs syntax and CPU
+preflight checks, then four checkpoint-loaded Full / One-node /
+Split-no-share / Shared PPO arms, instrumenting three of them.
+
+- Full: no TPR context. Captures native BF16 layer-1 QKV, projection,
+  FC1 and FC2 inputs, plus bounded stage activation and gradient probes.
+- Split-no-share: Root Push / Leaf / Root Pop independently per row,
+  with stages at layers 1,2,3,4,8,16,36 in absolute query coordinates.
+  Replays the same original Megatron BF16 projection modules with
+  **identical Full input and weights**, changing only GEMM physical M
+  from Full to Root; cross-checks native outputs before attribution.
+- Shared: one cached Root for two siblings. Compares Root Push/Pop KV
+  and BF16 dKV accumulation with a non-invasive FP32 CPU sum oracle.
+- Attention control: holds actual Q/K/V fixed and compares each
+  Leaf's CANN rectangular causal output with the corresponding
+  suffix of a CANN square causal output using the Root queries.
+
+Results print an autogenerated verdict with all four-arm real PPO
+Logprob/Loss/gradient values; no manual raw-log inspection is needed.
+Persistent files in the dedicated audit root:
+
+- `ATTENTION_ATTRIBUTION_CONCLUSION.txt`: readable final findings
+- `ATTENTION_ATTRIBUTION_FINAL.json`: detailed metrics and limitations
+- `{full,split_no_share,shared}/trace.pt`: bounded tensor witnesses
+- `full_run.log`: source replay stdout/stderr for investigation
+
+These are diagnostic hooks only; original BF16 GEMMs, the production
+TPR implementation, PPO loss, full reference and gradient accumulator
+are unchanged. Fixed Tile is forbidden. The CPU FP32 dKV comparison
+is NOT injected into training. All stage rel-L2 metrics are sampled
+over fixed absolute-token coordinates; GEMM-M replay proves local
+shape sensitivity, not automatic correctness for the full 36-layer
+backward or CP4 Native Root. Cropped real labels change conditioning.

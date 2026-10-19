@@ -34,15 +34,29 @@ case "${TPR_OFFLINE_RUN_MODES:-both}" in
    both) modes=(full tpr) ;;
    full) modes=(full) ;;
    tpr) modes=(tpr) ;;
+   split_no_share) modes=(split_no_share) ;;
    compare) modes=() ;;
    *) echo "Unknown TPR_OFFLINE_RUN_MODES" >&2; exit 2;;
 esac
+if [[ "${TPR_OFFLINE_RUN_MODES:-both}" == "split_no_share" ]]; then
+    [[ "${TPR_OFFLINE_FULL_RING_BACKEND:-custom}" == "custom" ]] || {
+        echo "CP4 split-no-share control requires custom Ring on all three arms" >&2
+        exit 2
+    }
+    [[ "${TPR_OFFLINE_SGD_LR:-1e-5}" == "0" ||
+       "${TPR_OFFLINE_SGD_LR:-1e-5}" == "0.0" ]] || {
+        echo "CP4 split-no-share controlled parity requires TPR_OFFLINE_SGD_LR=0" >&2
+        exit 2
+    }
+    python -m pytest -q \
+      tests/models/mcore/tpr/parallel/test_cp4_three_arm_comparison_cpu.py
+fi
 errors=()
 for mode in "${modes[@]}"; do
     export TPR_OFFLINE_MODE="$mode"
     echo "TPR_OFFLINE_START mode=$mode recompute=$TPR_OFFLINE_RECOMPUTE rows=$TPR_OFFLINE_ROWS device=$ASCEND_RT_VISIBLE_DEVICES results=$TPR_OFFLINE_OUTPUT_DIR"
     # An OOM in Full must not prevent the independent TPR memory experiment.
-    if torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29784 \
+    if torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29797 \
        -m pytest -vv -s -x \
        tests/models/mcore/tpr/parallel/test_real_actor_tp2cp4_offline_ppo_npu.py \
        2>&1 | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_${mode}_recompute_${recompute_label}.log"; then
@@ -65,6 +79,24 @@ if [[ "${#errors[@]}" == 0 ]] && \
     python tests/models/mcore/tpr/parallel/compare_real_actor_tp2cp4_offline_ppo.py \
       "$TPR_OFFLINE_OUTPUT_DIR" "${compare_args[@]}" \
       2>&1 | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_comparison_recompute_${recompute_label}.log"
+fi
+# CP4 three-arm numerical attribution can reuse an existing full/tpr run.
+# The split_no_share mode runs ONLY the missing third arm (8 NPUs once).
+if [[ "${TPR_OFFLINE_RUN_MODES:-both}" == "split_no_share" ]] && \
+   [[ "${#errors[@]}" == 0 ]]; then
+    three_arms_ready=1
+    for mode in full split_no_share tpr; do
+        for rank in {0..7}; do
+            [[ -f "$TPR_OFFLINE_OUTPUT_DIR/${mode}_rank${rank}.pt" ]] || three_arms_ready=0
+        done
+    done
+    if [[ "$three_arms_ready" == 1 ]]; then
+        python -m tests.models.mcore.tpr.parallel.compare_cp4_split_no_share_cpu \
+          "$TPR_OFFLINE_OUTPUT_DIR" | \
+          tee "$TPR_OFFLINE_OUTPUT_DIR/cp4_three_arm_comparison.log"
+    else
+        echo "TPR_CP4_SPLIT saved; no three-arm comparison: full/tpr snapshots missing"
+    fi
 fi
 if (("${#errors[@]}" > 0)); then
     echo "TPR_OFFLINE failed_modes=${errors[*]} (logs preserved)" >&2

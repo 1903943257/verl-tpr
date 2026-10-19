@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import sys
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -267,6 +269,8 @@ def test_query_coalescing_slices_head_major_statistics_and_reassembles():
 def test_query_coalescing_requires_original_contiguous_unpadded_view():
     config = SimpleNamespace(
         coalesce_prefix_full=True, coalesce_prefix_query=True,
+        coalesce_prefix_padded=False,
+        current_shard=make_ring_sequence_shard(64, cp_rank=0, cp_size=2),
         segment_lengths=(128, 64), segment_padded_lengths=(128, 64),
     )
     q = torch.randn(16, 1, 4, 8)
@@ -278,3 +282,420 @@ def test_query_coalescing_requires_original_contiguous_unpadded_view():
     assert not ring._can_coalesce_prefix_query(noncontiguous, config)
     config.segment_padded_lengths = (128, 72)
     assert not ring._can_coalesce_prefix_query(q, config)
+    config.coalesce_prefix_padded = True
+    assert ring._can_coalesce_prefix_query(q, config)
+    config.coalesce_prefix_padded = False
+    # A rank containing an entirely virtual Query chunk cannot restore full
+    # head-major merged-query statistics; use the original two-range path.
+    config.current_shard = make_ring_sequence_shard(1, cp_rank=0, cp_size=4)
+    assert not ring._can_coalesce_prefix_query(q, config)
+
+
+def test_prepared_ring_layout_matches_full_validation_without_rechecking_placement(monkeypatch):
+    """Preparation is once per Segment; every Layer still checks the live K/V."""
+    group = object()
+    current_shard = make_ring_sequence_shard(63, cp_rank=0, cp_size=2)
+    prefix_shard = make_ring_sequence_shard(127, cp_rank=0, cp_size=2)
+    q = torch.randn(current_shard.local_length, 1, 4, 8)
+    k = torch.randn(current_shard.local_length, 1, 2, 8)
+    v = torch.randn_like(k)
+    blocks = (
+        ring.RingLocalKVBlock(
+            7, prefix_shard,
+            torch.randn(prefix_shard.local_length, 1, 2, 8),
+            torch.randn(prefix_shard.local_length, 1, 2, 8),
+        ),
+    )
+    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    context = ring.RingCPAttentionBackend(
+        global_prefix_length=127, current_shard=current_shard,
+        prefix_blocks_by_layer={1: blocks, 2: blocks},
+        cp_group=group,
+    )
+    _, ordinary = ring._normalize_inputs(
+        q, k, v, prefix_blocks=blocks, current_shard=current_shard,
+        cp_group=group, softmax_scale=None,
+    )
+    prepared = context._ring_layout
+    assert (prepared.segment_lengths, prepared.segment_padded_lengths) == ((127, 63), (128, 64))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("static Ring placement was recomputed per layer")
+
+    monkeypatch.setattr(ring, "_group_world_size_and_rank", forbidden)
+    monkeypatch.setattr(ring, "_validate_ring_shard", forbidden)
+    monkeypatch.setattr(ring, "_process_group_global_ranks", forbidden)
+    _, optimized = ring._normalize_inputs(
+        q, k, v, prefix_blocks=blocks, current_shard=current_shard,
+        cp_group=group, softmax_scale=None, _layout=prepared,
+    )
+    assert optimized == ordinary
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", "1")
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", "1")
+    _, with_merge = ring._normalize_inputs(
+        q, k, v, prefix_blocks=blocks, current_shard=current_shard,
+        cp_group=group, softmax_scale=None, _layout=prepared,
+    )
+    assert with_merge.coalesce_prefix_full and with_merge.coalesce_prefix_query
+    with pytest.raises(ValueError, match="dtype and device"):
+        ring._normalize_inputs(
+            q, k.double(), v, prefix_blocks=blocks, current_shard=current_shard,
+            cp_group=group, softmax_scale=None, _layout=prepared,
+        )
+    with pytest.raises(ValueError, match="Prefix segment placement"):
+        ring._normalize_inputs(
+            q, k, v,
+            prefix_blocks=(ring.RingLocalKVBlock(8, prefix_shard, blocks[0].key, blocks[0].value),),
+            current_shard=current_shard, cp_group=group,
+            softmax_scale=None, _layout=prepared,
+        )
+    with pytest.raises(ValueError, match="CP group"):
+        ring._normalize_inputs(
+            q, k, v, prefix_blocks=blocks, current_shard=current_shard,
+            cp_group=object(), softmax_scale=None, _layout=prepared,
+        )
+
+
+def test_unified_ring_prefix_builder_keeps_anchored_autograd_leaves(monkeypatch):
+    """Cached and anchored Prefix KV have identical placement, different graph ownership."""
+    group = object()
+    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    shard = make_ring_sequence_shard(64, cp_rank=0, cp_size=2)
+    current = make_ring_sequence_shard(32, cp_rank=0, cp_size=2)
+    kv = (
+        torch.randn(shard.local_length, 1, 2, 8),
+        torch.randn(shard.local_length, 1, 2, 8),
+    )
+    cached_state = SimpleNamespace(shard=shard, key_values={1: kv})
+    stack = SimpleNamespace(
+        segment_ids=(4,), prefix_length=64,
+        get=lambda segment_id: SimpleNamespace(kv=cached_state),
+    )
+    leaves = tuple(t.detach().clone().requires_grad_() for t in kv)
+    anchor = SimpleNamespace(segment_id=4, shard=shard, key_values={1: leaves})
+    past = SimpleNamespace(entries=(anchor,), global_prefix_length=64)
+    policy = ring.RingCPBackend(group, parallel_size=2, parallel_rank=0)
+    cached = policy.make_attention_backend(
+        stack, expected_layer_numbers=(1,), current_shard=current, past_anchors=None,
+    )
+    anchored = policy.make_attention_backend(
+        stack, expected_layer_numbers=(1,), current_shard=current, past_anchors=past,
+    )
+    original = cached._prefix_blocks_by_layer[1][0]
+    leaf = anchored._prefix_blocks_by_layer[1][0]
+    assert original.segment_id == leaf.segment_id == 4
+    assert original.shard == leaf.shard == shard
+    assert original.key is kv[0] and original.value is kv[1]
+    assert leaf.key is leaves[0] and leaf.value is leaves[1]
+    (leaf.key.sum() + leaf.value.sum()).backward()
+    assert all(t.grad is not None for t in leaves)
+    assert all(t.grad is None for t in kv)
+
+
+def test_prepared_ring_layout_rejects_cross_layer_shard_mismatch(monkeypatch):
+    group = object()
+    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    regular = make_ring_sequence_shard(64, cp_rank=0, cp_size=2)
+    padded = make_ring_sequence_shard(64, cp_rank=0, cp_size=2, padded_length=96)
+    current = make_ring_sequence_shard(32, cp_rank=0, cp_size=2)
+    def block(shard):
+        return ring.RingLocalKVBlock(
+            4, shard,
+            torch.zeros(shard.local_length, 1, 2, 8),
+            torch.zeros(shard.local_length, 1, 2, 8),
+        )
+    with pytest.raises(ValueError, match="placement differs"):
+        ring.RingCPAttentionBackend(
+            global_prefix_length=64, current_shard=current,
+            prefix_blocks_by_layer={1: (block(regular),), 2: (block(padded),)},
+            cp_group=group,
+        )
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize("length", [1, 7, 17, 127])
+def test_padded_prefix_kv_merge_uses_zero_copy_valid_view(cp_size, length):
+    """Local valid Zigzag tokens precede virtual tail-padding on every source rank."""
+    full = torch.arange(length, dtype=torch.float32)
+    for rank in range(cp_size):
+        shard = make_ring_sequence_shard(length, cp_rank=rank, cp_size=cp_size)
+        local = shard.select(full).detach().requires_grad_()
+        chunks = ring._prefix_full_slices(local, shard, enabled=True)
+        valid = shard.valid_local_length
+        if valid == 0:
+            assert chunks == ()
+            continue
+        assert len(chunks) == 1
+        block = chunks[0]
+        assert block.logical_range == block.physical_range == (0, valid)
+        assert block.local_slice == slice(0, valid)
+        assert block.tensor.untyped_storage().data_ptr() == local.untyped_storage().data_ptr()
+        torch.testing.assert_close(block.tensor, local[:valid], rtol=0, atol=0)
+        # No Padding K/V position gets an attention gradient.
+        grad = torch.autograd.grad(block.tensor.sum(), local)[0]
+        torch.testing.assert_close(grad[:valid], torch.ones_like(grad[:valid]))
+        torch.testing.assert_close(grad[valid:], torch.zeros_like(grad[valid:]))
+
+
+def test_padded_prefix_merge_requires_both_explicit_flags():
+    cfg = SimpleNamespace(coalesce_prefix_full=True, coalesce_prefix_padded=False)
+    assert ring._can_coalesce_prefix_kv(128, 128, cfg)
+    assert not ring._can_coalesce_prefix_kv(127, 128, cfg)
+    cfg.coalesce_prefix_padded = True
+    assert ring._can_coalesce_prefix_kv(127, 128, cfg)
+    cfg.coalesce_prefix_full = False
+    assert not ring._can_coalesce_prefix_kv(127, 128, cfg)
+
+
+def test_ring_block_stats_report_effective_fa_counts(capsys):
+    current_shard = make_ring_sequence_shard(64, cp_rank=0, cp_size=2)
+    cfg = ring._RingAttentionConfig(
+        cp_group=None, global_ranks=(0, 1), cp_size=2, cp_rank=0,
+        segment_lengths=(127, 64), segment_padded_lengths=(128, 64),
+        current_shard=current_shard, query_heads=4, head_dim=8,
+        softmax_scale=8**-0.5, coalesce_prefix_full=True,
+        coalesce_prefix_padded=True, trace_layer=1,
+    )
+    ring._emit_ring_block_stats(
+        cfg, Counter(prefix_kv=4, current=5), phase="forward", query_merged=False,
+    )
+    line = capsys.readouterr().out.strip()
+    assert line.startswith("TPR_RING_BLOCK_STATS ")
+    report = json.loads(line.removeprefix("TPR_RING_BLOCK_STATS "))
+    assert report["prefix_lengths"] == [127]
+    assert report["prefix_padded_lengths"] == [128]
+    assert report["kv_merge_requested"] is True
+    assert report["padded_kv_merge_requested"] is True
+    assert report["query_merge_eligible"] is False
+    assert report["fa_prefix_unmerged_reference"] == 8
+    assert report["fa_prefix_kv_merged"] == 4
+    assert report["fa_current"] == 5
+    assert report["fa_total"] == 9
+    assert report["fa_prefix_calls_saved"] == 4
+
+
+@pytest.mark.parametrize("cp_size", [2, 4])
+@pytest.mark.parametrize("prefix_length", [1, 7, 17, 127, 17479])
+def test_padded_merged_query_sources_trim_kv_without_copy(cp_size, prefix_length):
+    """Full Query source K/V are trimmed only after RingP2P transport."""
+    cp_rank = 0
+    config = ring._RingAttentionConfig(
+        cp_group=None, global_ranks=tuple(range(cp_size)),
+        cp_size=cp_size, cp_rank=cp_rank,
+        segment_lengths=(prefix_length, 63),
+        segment_padded_lengths=(
+            ring.round_up_sequence_length(prefix_length, 2 * cp_size),
+            ring.round_up_sequence_length(63, 2 * cp_size),
+        ),
+        current_shard=make_ring_sequence_shard(63, cp_rank=cp_rank, cp_size=cp_size),
+        query_heads=4, head_dim=8, softmax_scale=8 ** -0.5,
+        coalesce_prefix_full=True, coalesce_prefix_query=True,
+        coalesce_prefix_padded=True,
+    )
+    for source_rank in range(cp_size):
+        shard = make_ring_sequence_shard(
+            prefix_length, cp_rank=source_rank, cp_size=cp_size,
+        )
+        key = torch.randn(shard.local_length, 1, 2, 8)
+        value = torch.randn_like(key)
+        result = ring._source_merged_prefix_kv(key, value, config, 0, source_rank)
+        valid = shard.valid_local_length
+        if valid == 0:
+            assert result is None
+            continue
+        k, v = result
+        assert k.shape == v.shape == (valid, 2, 8)
+        assert k.untyped_storage().data_ptr() == key.untyped_storage().data_ptr()
+        assert v.untyped_storage().data_ptr() == value.untyped_storage().data_ptr()
+        torch.testing.assert_close(k, key[:valid, 0], rtol=0, atol=0)
+        torch.testing.assert_close(v, value[:valid, 0], rtol=0, atol=0)
+
+
+def test_padded_query_merge_allows_real_ragged_agent_lengths():
+    cp = 4
+    prefix, current = 17479, 863
+    shard = make_ring_sequence_shard(current, cp_rank=0, cp_size=cp)
+    cfg = ring._RingAttentionConfig(
+        cp_group=None, global_ranks=(0, 1, 2, 3), cp_size=cp, cp_rank=0,
+        segment_lengths=(prefix, current),
+        segment_padded_lengths=(17480, 864),
+        current_shard=shard, query_heads=16, head_dim=128,
+        softmax_scale=128 ** -0.5,
+        coalesce_prefix_full=True, coalesce_prefix_query=True,
+        coalesce_prefix_padded=True,
+    )
+    q = torch.randn(shard.local_length, 1, 16, 128)
+    assert ring._can_coalesce_prefix_query(q, cfg)
+    from dataclasses import replace
+    assert not ring._can_coalesce_prefix_query(q, replace(cfg, coalesce_prefix_padded=False))
+
+
+def test_all_padded_query_rank_falls_back_from_query_merge():
+    cp = 4
+    for rank in range(cp):
+        shard = make_ring_sequence_shard(1, cp_rank=rank, cp_size=cp)
+        cfg = ring._RingAttentionConfig(
+            cp_group=None, global_ranks=(0, 1, 2, 3), cp_size=cp, cp_rank=rank,
+            segment_lengths=(17, 1), segment_padded_lengths=(24, 8),
+            current_shard=shard, query_heads=4, head_dim=8,
+            softmax_scale=8 ** -0.5, coalesce_prefix_full=True,
+            coalesce_prefix_query=True, coalesce_prefix_padded=True,
+        )
+        q = torch.zeros(shard.local_length, 1, 4, 8)
+        assert not ring._can_coalesce_prefix_query(q, cfg)
+
+
+@pytest.mark.parametrize("four_dimensional", [False, True])
+@pytest.mark.parametrize("noncontiguous", [False, True])
+def test_single_sequence_statistics_preserve_head_major_values(four_dimensional, noncontiguous):
+    length, heads, lanes = 7, 3, 8
+    head_major = torch.arange(heads * length * lanes).reshape(heads, length, lanes).float()
+    shape = (1, heads, length, lanes) if four_dimensional else (length, heads, lanes)
+    statistics = head_major.reshape(shape)
+    if noncontiguous:
+        statistics = torch.stack((statistics, -statistics), dim=-1)[..., 0]
+    flattened = ring._flatten_tnd_softmax(statistics, (length,))
+    torch.testing.assert_close(flattened, head_major.transpose(0, 1), rtol=0, atol=0)
+    if not noncontiguous:
+        assert flattened.untyped_storage().data_ptr() == statistics.untyped_storage().data_ptr()
+    restored = ring._unflatten_tnd_softmax(flattened, (length,))
+    assert restored.is_contiguous()
+    torch.testing.assert_close(restored, head_major.reshape(length, heads, lanes), rtol=0, atol=0)
+    for invalid_lengths in ((length - 1,), (3, 4)):
+        with pytest.raises(ValueError, match="one matching query length"):
+            ring._flatten_tnd_softmax(statistics, invalid_lengths)
+
+
+@pytest.mark.parametrize("visibility", ["full", "causal", "padded"])
+def test_forward_backward_use_identical_cann_visibility(monkeypatch, visibility):
+    calls = []
+    query = torch.zeros(4, 2, 8)
+    key = value = torch.zeros(4, 1, 8)
+    statistics = torch.ones(4, 2, 8)
+
+    def fused(*args, **kwargs):
+        calls.append(kwargs)
+        return query, statistics, statistics
+
+    monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace(
+        npu_fusion_attention=fused, npu_fusion_attention_grad=fused,
+    ))
+    kind = RingBlockKind.FULL if visibility == "full" else RingBlockKind.CAUSAL
+    mask = None
+    if visibility == "padded":
+        mask = torch.zeros(4, 8, dtype=torch.bool)[:, ::2]
+        mask[:, -1] = True
+    common = dict(query_heads=2, softmax_scale=0.25, block_kind=kind, attention_mask=mask)
+    ring._block_attention_forward(query, key, value, **common)
+    ring._block_attention_backward(query, key, value, query,
+        attention_output=query, softmax_max=statistics, softmax_sum=statistics, **common)
+    forward, backward = calls
+    assert forward.pop("scale") == backward.pop("scale_value") == 0.25
+    assert forward.pop("inner_precise") == 0
+    for name in ("attention_in", "softmax_max", "softmax_sum"):
+        backward.pop(name)
+    assert forward.keys() == backward.keys()
+    for name in forward:
+        if isinstance(forward[name], torch.Tensor):
+            torch.testing.assert_close(forward[name], backward[name], rtol=0, atol=0)
+        else:
+            assert forward[name] == backward[name]
+    assert forward["sparse_mode"] == (3 if visibility == "causal" else 0)
+    assert forward["next_tockens"] == (0 if visibility == "causal" else 2**31 - 1)
+    if mask is not None:
+        assert forward["atten_mask"].is_contiguous()
+        torch.testing.assert_close(forward["atten_mask"], mask)
+
+
+@pytest.mark.parametrize("root_enabled", [False, True])
+def test_native_root_route_is_explicit_and_never_selected_by_empty_prefix_alone(
+    monkeypatch, root_enabled,
+):
+    """A Root flag, not zero Prefix length, chooses ordinary MindSpeed Ring."""
+    group = object()
+    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    policy = ring.RingCPBackend(group, parallel_size=2, parallel_rank=0)
+    shard = make_ring_sequence_shard(63, cp_rank=0, cp_size=2)
+    empty_stack = SimpleNamespace(prefix_length=0, segment_ids=())
+    backend = policy.make_attention_backend(
+        empty_stack, expected_layer_numbers=(1,), current_shard=shard,
+        past_anchors=None, use_native_root=root_enabled,
+    )
+    query = torch.randn(shard.local_length, 1, 4, 8)
+    key = torch.randn(shard.local_length, 1, 2, 8)
+    value = torch.randn_like(key)
+    calls = []
+
+    def native(q, k, v, **kwargs):
+        calls.append(("native", kwargs))
+        return q.flatten(2)
+
+    def tpr(q, k, v, **kwargs):
+        calls.append(("tpr", kwargs))
+        return q.flatten(2)
+
+    monkeypatch.setattr(ring, "ordinary_ring_cp_attention", native)
+    monkeypatch.setattr(ring, "ring_cp_attention", tpr)
+    actual = backend.attention(1, query, key, value, softmax_scale=0.25)
+    torch.testing.assert_close(actual, query.flatten(2))
+    assert calls[0][0] == ("native" if root_enabled else "tpr")
+    if root_enabled:
+        assert calls[0][1]["allow_trailing_padding"] is True
+
+    prefix_shard = make_ring_sequence_shard(32, cp_rank=0, cp_size=2)
+    prefix = ring.RingLocalKVBlock(
+        7, prefix_shard,
+        torch.zeros(prefix_shard.local_length, 1, 2, 8),
+        torch.zeros(prefix_shard.local_length, 1, 2, 8),
+    )
+    with pytest.raises(ValueError, match="zero Prefix"):
+        ring.RingCPAttentionBackend(
+            global_prefix_length=32, current_shard=shard,
+            prefix_blocks_by_layer={1: (prefix,)}, cp_group=group,
+            use_native_root=True,
+        )
+
+
+def test_native_root_masks_trailing_padding_output_and_upstream_gradient(monkeypatch):
+    """A virtual physical Query must not produce output or a graph gradient."""
+    group = object()
+    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    monkeypatch.setattr(ring.dist, "get_rank", lambda: 0)
+    shard = make_ring_sequence_shard(63, cp_rank=0, cp_size=2)
+    query = torch.randn(shard.local_length, 1, 4, 8, requires_grad=True)
+    key = torch.randn(shard.local_length, 1, 2, 8)
+    value = torch.randn_like(key)
+    calls = []
+
+    def fake_native(q, k, v, heads, cp_para, **kwargs):
+        calls.append((q, k, v, heads, cp_para))
+        return q * 2
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mindspeed.core.context_parallel.ring_context_parallel.ring_context_parallel",
+        SimpleNamespace(ringattn_context_parallel=fake_native),
+    )
+    with pytest.raises(ValueError, match="unpadded sequence"):
+        ring.ordinary_ring_cp_attention(
+            query, key, value, current_shard=shard, cp_group=group,
+        )
+    output = ring.ordinary_ring_cp_attention(
+        query, key, value, current_shard=shard, cp_group=group,
+        allow_trailing_padding=True,
+    )
+    assert len(calls) == 1
+    assert calls[0][3] == 4
+    torch.testing.assert_close(output[:shard.valid_local_length], query.flatten(2)[:shard.valid_local_length] * 2)
+    assert torch.count_nonzero(output[shard.valid_local_length:]) == 0
+    output.sum().backward()
+    assert torch.count_nonzero(query.grad[shard.valid_local_length:]) == 0
+    torch.testing.assert_close(
+        query.grad[:shard.valid_local_length],
+        torch.full_like(query.grad[:shard.valid_local_length], 2),
+    )

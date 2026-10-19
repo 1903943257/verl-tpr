@@ -339,14 +339,36 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
     transport = calls.pop("transport")
     assert transport == {"forward": len(prefix_lengths) + 1, "backward": len(prefix_lengths) + 1}
     coalesce = os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "0") == "1"
+    padded_merge = os.getenv("TPR_RING_COALESCE_PREFIX_PADDED", "0") == "1"
     query_merge = (coalesce and os.getenv("TPR_RING_COALESCE_PREFIX_QUERY", "0") == "1"
                    and bool(prefix_lengths) and not noncontiguous_query
-                   and all(length % (2 * _EXPECTED_WORLD_SIZE) == 0
-                           for length in (*prefix_lengths, current_length)))
-    expected_calls = 2 * _EXPECTED_WORLD_SIZE + 1 + sum(
-        (1 if query_merge else 2 if coalesce and length % (2 * _EXPECTED_WORLD_SIZE) == 0 else 4)
-        * _EXPECTED_WORLD_SIZE for length in prefix_lengths
+                   and len(current_shard.global_ranges) == len(current_shard.ranges)
+                   and (padded_merge or all(
+                       length % (2 * _EXPECTED_WORLD_SIZE) == 0
+                       for length in (*prefix_lengths, current_length)
+                   )))
+    q_ranges = current_shard.global_ranges
+    expected_current = sum(
+        ring.classify_ring_block(qr, kr, is_prefix=False) is not ring.RingBlockKind.SKIP
+        for source in range(_EXPECTED_WORLD_SIZE)
+        for kr in make_ring_sequence_shard(
+            current_length, cp_rank=source, cp_size=_EXPECTED_WORLD_SIZE,
+        ).global_ranges
+        for qr in q_ranges
     )
+    expected_prefix = 0
+    for length in prefix_lengths:
+        for source in range(_EXPECTED_WORLD_SIZE):
+            shard = make_ring_sequence_shard(
+                length, cp_rank=source, cp_size=_EXPECTED_WORLD_SIZE,
+            )
+            if query_merge:
+                expected_prefix += int(shard.valid_local_length > 0)
+            elif coalesce and (padded_merge or length % (2 * _EXPECTED_WORLD_SIZE) == 0):
+                expected_prefix += len(q_ranges) * int(shard.valid_local_length > 0)
+            else:
+                expected_prefix += len(q_ranges) * len(shard.global_ranges)
+    expected_calls = expected_current + expected_prefix
     assert len(calls["forward"]) == expected_calls
     assert len(calls["backward"]) == expected_calls
     assert ring.RingBlockKind.CAUSAL in {
@@ -371,15 +393,21 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
             prefix_shard.padded_length // (2 * _EXPECTED_WORLD_SIZE)
         )
     if coalesce:
-        physical_kv_chunks.update(
-            length // _EXPECTED_WORLD_SIZE for length in prefix_lengths
-            if length % (2 * _EXPECTED_WORLD_SIZE) == 0
-        )
+        for length in prefix_lengths:
+            if padded_merge or length % (2 * _EXPECTED_WORLD_SIZE) == 0:
+                physical_kv_chunks.update(
+                    make_ring_sequence_shard(
+                        length, cp_rank=source, cp_size=_EXPECTED_WORLD_SIZE,
+                    ).valid_local_length
+                    for source in range(_EXPECTED_WORLD_SIZE)
+                )
     assert {
         call["kv_length"] for phase in calls.values() for call in phase
     }.issubset(physical_kv_chunks)
     has_padding = current_shard.padded_length != current_shard.global_length or any(
-        length % (2 * _EXPECTED_WORLD_SIZE) != 0 for length in prefix_lengths
+        length % (2 * _EXPECTED_WORLD_SIZE) != 0
+        and not (coalesce and padded_merge)
+        for length in prefix_lengths
     )
     mask_phases = torch.tensor(
         [
@@ -414,6 +442,7 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
 
 @pytest.mark.parametrize("prefix_lengths,current_length", [((128,), 128), ((128, 64), 64), ((127,), 63)])
 def test_prefix_full_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths, current_length):
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_PADDED", "0")
     monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", "0")
     snapshots = []
     for enabled in ("0", "1"):
@@ -435,6 +464,7 @@ def test_prefix_full_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths, 
     ((128,), 63, False), ((128,), 128, True),
 ])
 def test_prefix_query_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths, current_length, noncontiguous):
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_PADDED", "0")
     monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", "1")
     snapshots = []
     for enabled in ("0", "1"):
@@ -451,3 +481,256 @@ def test_prefix_query_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths,
                                         for length in (*prefix_lengths, current_length))
     saved = _EXPECTED_WORLD_SIZE * len(prefix_lengths) if eligible else 0
     assert before[2] - after[2] == before[3] - after[3] == saved
+
+
+@pytest.mark.parametrize("prefix_lengths,current_length", [
+    ((127,), 63),
+    ((63, 31), 15),
+])
+def test_padded_prefix_full_coalescing_off_on(cp_runtime, monkeypatch, prefix_lengths, current_length):
+    """The padded opt-in reduces FA blocks without losing padded dK/dV ownership."""
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_PADDED", "1")
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", "0")
+    snapshots = []
+    for enabled in ("0", "1"):
+        monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", enabled)
+        snapshots.append(_check_ring_cp_attention(
+            cp_runtime, prefix_lengths, current_length, 4, 2,
+        ))
+    before, after = snapshots
+    _assert_close(after[0], before[0])
+    for actual, expected in zip(after[1], before[1], strict=True):
+        _assert_close(actual, expected, gradient=True)
+    saved = 2 * _EXPECTED_WORLD_SIZE * len(prefix_lengths)
+    assert before[2] - after[2] == before[3] - after[3] == saved
+
+
+@pytest.mark.parametrize("prefix_lengths,current_length,noncontiguous", [
+    ((127,), 63, False),            # Both Prefix and Current padded
+    ((127,), 128, False),           # Only Prefix padded
+    ((128,), 63, False),            # Only Current padded
+    ((63, 31), 15, False),          # Two independent Prefix anchors
+    ((127,), 63, True),             # Non-contiguous Q: must fall back
+])
+def test_padded_prefix_query_kv_coalescing_off_on(
+    cp_runtime, monkeypatch, prefix_lengths, current_length, noncontiguous,
+):
+    """Padded joint Query+KV FULL FA matches original dQ/dK/dV and saves calls."""
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", "1")
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_PADDED", "1")
+    before = after = None
+    for enabled in ("0", "1"):
+        monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", enabled)
+        snapshot = _check_ring_cp_attention(
+            cp_runtime, prefix_lengths, current_length, 16, 8,
+            noncontiguous_query=noncontiguous, head_dim=128,
+        )
+        if enabled == "0":
+            before = snapshot
+        else:
+            after = snapshot
+    _assert_close(after[0], before[0])
+    for actual, reference in zip(after[1], before[1], strict=True):
+        _assert_close(actual, reference, gradient=True)
+    expected_saved = sum(
+        sum(
+            make_ring_sequence_shard(
+                length, cp_rank=source, cp_size=_EXPECTED_WORLD_SIZE,
+            ).valid_local_length > 0
+            for source in range(_EXPECTED_WORLD_SIZE)
+        )
+        for length in prefix_lengths
+    )
+    # KV Merge: two Q chunks/source; Joint Query Merge: one/source.
+    expected_saved = 0 if noncontiguous else expected_saved
+    assert before[2] - after[2] == before[3] - after[3] == expected_saved
+
+
+@pytest.mark.parametrize("ancestors", [18, 26, 48])
+@pytest.mark.parametrize("merge_mode", ["off", "kv", "query"])
+def test_long_prefix_query_gradient_matches_dense(cp_runtime, monkeypatch, ancestors, merge_mode):
+    """Catch repeated BF16 dQ rounding with real CANN kernels and Ring transport."""
+    device, cp_group = cp_runtime
+    cp_size, rank = dist.get_world_size(cp_group), dist.get_rank(cp_group)
+    heads, head_dim = 2, 64
+    length, scale = 2 * cp_size, head_dim**-0.5
+    shard = make_ring_sequence_shard(length, cp_rank=rank, cp_size=cp_size)
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_FULL", "0" if merge_mode == "off" else "1")
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_QUERY", "1" if merge_mode == "query" else "0")
+
+    monkeypatch.setenv("TPR_RING_COALESCE_PREFIX_PADDED", "0")
+
+    global_query = torch.zeros(length, 1, heads, head_dim, device=device, dtype=_DTYPE)
+    prefix_key, prefix_value = torch.zeros_like(global_query), torch.zeros_like(global_query)
+    signs = torch.tensor([-1.0] * cp_size + [1.0] * cp_size, device=device, dtype=_DTYPE)
+    prefix_key[:, 0, :, 0] = signs[:, None] * 8
+    prefix_value[:, 0, :, 0] = signs[:, None] * torch.tensor([1.0, 2.0], device=device, dtype=_DTYPE)
+    prefix_blocks = tuple(
+        RingLocalKVBlock(index, shard, _local_leaf(prefix_key, shard), _local_leaf(prefix_value, shard))
+        for index in range(ancestors)
+    )
+    local_query = _local_leaf(global_query, shard)
+    actual = ring.ring_cp_attention(
+        local_query,
+        _local_leaf(global_query, shard),
+        _local_leaf(global_query, shard),
+        prefix_blocks=prefix_blocks,
+        current_shard=shard,
+        cp_group=cp_group,
+        softmax_scale=scale,
+    )
+    global_gradient = torch.zeros(length, 1, heads * head_dim, device=device, dtype=_DTYPE)
+    global_gradient[0, 0, ::head_dim] = 1
+    actual.backward(shard.select(global_gradient))
+
+    # Keep the independent dense autograd oracle on CPU in FP32, so neither
+    # CANN backward nor BF16 leaf-gradient casting supplies the expected dQ.
+    reference_query = global_query.detach().cpu().float().requires_grad_(True)
+    expected = _reference(
+        reference_query,
+        [prefix_key.detach().cpu().float()] * ancestors,
+        [prefix_value.detach().cpu().float()] * ancestors,
+        torch.zeros_like(reference_query),
+        torch.zeros_like(reference_query),
+        scale,
+    )
+    expected.backward(global_gradient.detach().cpu().float())
+    assert local_query.grad.dtype == _DTYPE
+    _assert_close(local_query.grad, shard.select(reference_query.grad).to(device), gradient=True)
+    # Q=0 makes dK zero; nonzero Prefix dK is intentionally not a contract here.
+    dist.barrier(group=cp_group)
+
+
+def _assert_native_root_bf16_parity(actual, expected, *, name, rank):
+    """Retain the normal elementwise gate, with a tightly bounded BF16 tail.
+
+    Native MindSpeed and TPR blockwise Ring may sum FP/BF16 partial gradients
+    in different orders. A handful of cancellation-sensitive elements can
+    exceed rtol=3% even when the global gradient error is negligible.
+    Keep the original tolerance for ALL other entries, and reject a drift
+    in density, magnitude, or relative L2. Do not change the common _assert_close
+    used by the wider Ring NPU suite.
+    """
+    if actual.shape != expected.shape or actual.dtype != expected.dtype:
+        raise AssertionError(f"{name}: gradient shape/dtype mismatch")
+    actual_fp32 = actual.detach().float()
+    expected_fp32 = expected.detach().float()
+    delta = (actual_fp32 - expected_fp32).abs()
+    threshold = _GRAD_ATOL + _GRAD_RTOL * expected_fp32.abs()
+    violations = delta > threshold
+    count = int(violations.sum().item())
+    rel_l2 = (torch.linalg.vector_norm(delta) /
+              torch.linalg.vector_norm(expected_fp32).clamp_min(1e-8)).item()
+    max_abs = delta.max().item()
+    if rank == 0 or count:
+        print(
+            f"TPR_FAST_ROOT_GRAD name={name} cp={_EXPECTED_WORLD_SIZE} "
+            f"rank={rank} mismatches={count}/{delta.numel()} "
+            f"max_abs={max_abs:.9g} rel_l2={rel_l2:.9g}",
+            flush=True,
+        )
+    if count == 0:
+        return
+    # Accept at most two isolated BF16-rounding outliers per gradient tensor,
+    # each <= 2^-5 absolute, while requiring strong global agreement.
+    # No such exception is ever available to FP32 or to the normal Ring gate.
+    assert actual.dtype == torch.bfloat16, f"{name}: non-BF16 parity failure"
+    assert count <= 2, f"{name}: too many elements outside normal gradient tolerance"
+    assert max_abs <= 0.03125, f"{name}: excessive BF16 absolute drift"
+    assert rel_l2 <= 0.005, f"{name}: excessive aggregate gradient drift"
+
+
+@pytest.mark.parametrize("length", [128, 127])
+def test_native_root_ring_matches_tpr_root_with_relayed_kv_gradients(cp_runtime, length):
+    """Exercise native Root Push/Pop attention and descendant dKV relay on CP2/4.
+
+    No Prefix is present in Root attention, but backward must still accept
+    gradients originating from later Segments through the newly created K/V.
+    """
+    device, cp_group = cp_runtime
+    rank = dist.get_rank(cp_group)
+    shard = make_ring_sequence_shard(length, cp_rank=rank, cp_size=_EXPECTED_WORLD_SIZE)
+    q_heads, kv_heads, head_dim = 4, 2, 64
+    scale = head_dim**-0.5
+    query = _randn((length, 1, q_heads, head_dim), seed=710, device=device)
+    key = _randn((length, 1, kv_heads, head_dim), seed=711, device=device)
+    value = _randn((length, 1, kv_heads, head_dim), seed=712, device=device)
+    gradient = shard.select(_randn((length, 1, q_heads * head_dim), seed=713, device=device))
+    relay_key = shard.select(_randn((length, 1, kv_heads, head_dim), seed=714, device=device))
+    relay_value = shard.select(_randn((length, 1, kv_heads, head_dim), seed=715, device=device))
+    padding = _padding_mask(shard, device=device)
+    if torch.any(padding).item():
+        gradient[padding] = 1  # Virtual Query upstream gradient must be ignored.
+
+    policy = ring.RingCPBackend(
+        cp_group, parallel_size=_EXPECTED_WORLD_SIZE, parallel_rank=rank,
+    )
+    stack = type("_EmptyRootStack", (), {"prefix_length": 0, "segment_ids": ()})()
+    native_backend = policy.make_attention_backend(
+        stack, expected_layer_numbers=(1,), current_shard=shard,
+        past_anchors=None, use_native_root=True,
+    )
+    original_backend = policy.make_attention_backend(
+        stack, expected_layer_numbers=(1,), current_shard=shard,
+        past_anchors=None, use_native_root=False,
+    )
+
+    # Root Push: graph-free, but still produces a normal output for real Q.
+    with torch.no_grad():
+        pushed = native_backend.attention(
+            1, shard.select(query), shard.select(key), shard.select(value),
+            softmax_scale=scale,
+        )
+    assert not pushed.requires_grad
+    _assert_padding_zero(pushed, shard)
+
+    def run(backend, *, with_attention=True, with_relay=True):
+        q = _local_leaf(query, shard)
+        k = _local_leaf(key, shard)
+        v = _local_leaf(value, shard)
+        output = backend.attention(1, q, k, v, softmax_scale=scale)
+        _assert_padding_zero(output, shard)
+        # Root Pop: descendant gradients are separate autograd roots.
+        torch.autograd.backward(
+            (output, k, v),
+            (
+                gradient if with_attention else torch.zeros_like(gradient),
+                relay_key if with_relay else torch.zeros_like(relay_key),
+                relay_value if with_relay else torch.zeros_like(relay_value),
+            ),
+        )
+        return output.detach(), (q.grad, k.grad, v.grad)
+
+    # Check the Attention gradient without randomized descendant relays, which
+    # otherwise may nearly cancel dK/dV and amplify one BF16 rounding difference.
+    reference_output, attention_reference = run(original_backend, with_relay=False)
+    native_output, attention_native = run(native_backend, with_relay=False)
+    _assert_close(native_output, reference_output)
+    _assert_close(native_output, pushed)
+    for name, actual, expected in zip(
+        ("dQ_attention", "dK_attention", "dV_attention"),
+        attention_native, attention_reference, strict=True,
+    ):
+        _assert_native_root_bf16_parity(actual, expected, name=name, rank=rank)
+
+    # A pure descendant relay must not be lost or accidentally applied to Q.
+    _, pure_relay = run(native_backend, with_attention=False)
+    torch.testing.assert_close(pure_relay[0], torch.zeros_like(pure_relay[0]), rtol=0, atol=0)
+    torch.testing.assert_close(pure_relay[1], relay_key, rtol=0, atol=0)
+    torch.testing.assert_close(pure_relay[2], relay_value, rtol=0, atol=0)
+
+    # Check real combined Root Pop gradients, retaining a sparse BF16
+    # cancellation allowance while rejecting non-local systematic drift.
+    _, reference_grads = run(original_backend)
+    _, native_grads = run(native_backend)
+    for name, actual, expected in zip(
+        ("dQ_combined", "dK_combined", "dV_combined"),
+        native_grads, reference_grads, strict=True,
+    ):
+        _assert_native_root_bf16_parity(actual, expected, name=name, rank=rank)
+    _assert_padding_zero(native_grads[0], shard)
+    if torch.any(padding).item():
+        # Relayed gradients refer to logical K/V, never virtual padding.
+        _assert_padding_zero(native_grads[1], shard)
+        _assert_padding_zero(native_grads[2], shard)
+    dist.barrier(group=cp_group)
