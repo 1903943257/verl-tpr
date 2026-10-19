@@ -25,10 +25,10 @@ MILESTONES = (1, 2, 5, 10, 20, 30, 40, 50)
 def expected_snapshots(steps: int, *, has_manifest: bool) -> tuple[int, ...]:
     if not 1 <= steps <= 1000:
         raise ValueError("Replay steps must be within 1..1000")
-    # Mirror test_real_actor_tp2cp4_multistep_npu.py EXACTLY. The fixed
-    # capture test does not save a last-step snapshot if non-milestone.
+    # Mirror test_real_actor_tp2cp4_multistep_npu.py EXACTLY; always save
+    # a last-step snapshot so partial optimizer runs cannot look completed.
     return (tuple(range(1, steps + 1)) if has_manifest else
-            tuple(step for step in MILESTONES if step <= steps))
+            tuple(sorted({step for step in MILESTONES if step <= steps} | {steps})))
 
 
 def _is_owned_artifact(name: str, mode: str) -> bool:
