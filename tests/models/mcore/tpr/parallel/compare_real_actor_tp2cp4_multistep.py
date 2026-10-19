@@ -240,6 +240,8 @@ def compare(outdir: Path, steps: int):
     del first_snap
     observed = []
     replica_gate_failures = []
+    replica_checks = []
+    audit_path = outdir / "multistep_replica_audit.json"
     for step in milestones:
         mode = {}
         for label in ("full", "tpr"):
@@ -298,6 +300,18 @@ def compare(outdir: Path, steps: int):
                         "global_grad_norm_spread": audit["global_grad_norm_spread"],
                         "tp_logprob_max_abs": audit["tp_logprob_max_abs"],
                     })
+        replica_checks.append({"step": step, "modes": replica_audit})
+        # Write checkpoint-by-checkpoint audit before heavier full-grad
+        # comparisons, so the exact rank disagreement survives later errors.
+        audit_path.write_text(json.dumps({
+            "run_protocol": run_protocol,
+            "replica_checks": replica_checks,
+            "replica_gate_failures": replica_gate_failures,
+            "status": (
+                "NUMERICAL_REPLICA_GATE_FAILED_DIAGNOSTICS_ONLY"
+                if replica_gate_failures else "RANK_REPLICA_AUDIT_OK"
+            ),
+        }, indent=2, ensure_ascii=False))
         # Keep producing independent full-parameter and token-level diagnostic
         # metrics. Never treat them as a numerical PASS if a replica gate
         # failed. Saved weights/gradients are immutable.
