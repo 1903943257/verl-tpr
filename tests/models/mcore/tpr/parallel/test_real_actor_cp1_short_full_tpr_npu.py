@@ -359,6 +359,15 @@ def test_real_actor_cp1_short_full_vs_tpr():
         )
         if witness is None:
             raise AssertionError("Missing CP1 canonical gradient witness")
+        full_grad_dir = None
+        if os.getenv("TPR_CP1_SAVE_FULL_GRADS", "0") == "1":
+            from .test_real_actor_tp2cp4_offline_ppo_npu import _save_complete_grads
+            # Single-card TP1/CP1 has no replicated parameter shards:
+            # persist every finalized BF16 gradient exactly once. This
+            # reuses the tested CP4 file format and never alters autograd.
+            full_grad_dir = _save_complete_grads(
+                model, runtime, destination.parent, mode, step=1,
+            )
         stats = {
             "mode": mode,
             "reference": (
@@ -387,6 +396,8 @@ def test_real_actor_cp1_short_full_vs_tpr():
             ),
             "gradient_witness": witness,
             "global_grad_norm": grad_norm,
+            "full_grad_dir": full_grad_dir,
+            "full_gradient_scope": "ALL_PARAMETERS_BF16_TP1_CP1" if full_grad_dir else None,
             "fwd_bwd_seconds": seconds,
             "peak_allocated_gib": measured_alloc,
             "peak_reserved_gib": measured_reserved,
