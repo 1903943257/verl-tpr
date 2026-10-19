@@ -307,6 +307,8 @@ Attention 形状: [S, P+S]，使用全局位置保证因果性
 
 因此 TPR **复用** MindSpeed RingP2P 和原生 CP Process Group，但需要 Prefix-aware block schedule、online-softmax 合并和 dKV 路由。`ring.py` 是这部分新增逻辑，不是一套新的 TP/CP 通信基础设施。
 
+更完整的通信/计算/反向合同、Padding/Shard 实例和 Root/qkvmerge 选项见 [《TPR Ring CP 方案》](ring_design.md)。
+
 ### 7.2 Padding 与 Shard 各自负责什么
 
 当前 `ring.py` 中**没有两个独立的 Padding/Sharding 文件**：
@@ -418,6 +420,8 @@ python -B tests/models/mcore/tpr/run_cpu_regressions.py
 - 关闭 profiler、数据 capture、额外日志及实验优化变量后再测正式性能；区分 Attention F/B、整个 Actor train_batch（含 optimizer）和 rollout+训练端到端收益。
 
 **已有正确性与性能结果汇总见 [《TPR实验结果》](TPR实验结果.md)**（按实验版本、测试拓扑和统计口径记录，性能表支持后续重测替换）。
+
+TPR-aware Activation Checkpoint 的必要性、显式 KV 输出、weakref 生命周期和验证见 [《TPR Recompute 方案》](recompute_design.md)。
 
 已有分阶段数值归因和特定复现实验见 [主线架构与校验说明](architecture.md)、[Ring 性能/验证计划](performance_plan_20261017.md)、[实验性 Recompute 记录](recompute_prototype.md)。这些历史实验的**PASS 仅针对对应的测试条件**。
 

@@ -193,6 +193,8 @@ Qwen3-4B、TP2CP2DP2、8 NPU、真实 Step6、同 capture、FP32 梯度归约，
 ## 5. 相关文档与快捷入口
 
 - [TPR开发文档](TPR开发文档.md)：架构、依赖、组件边界、真实训练调用链。
+- [TPR Ring CP 方案](ring_design.md)：基础 Ring F/B、Shard/Pad、Root 和合并优化。
+- [TPR Recompute 方案](recompute_design.md)：层级 checkpoint 机制和历史 OFF/ON 证据。
 - [TPR 主线架构](architecture.md)：Ring 执行、数值归因与 NPU 门禁。
 - [历史性能/优化计划](performance_plan_20261017.md)：阶段性正确性验收与生产化计划。
 - [30K 三路径记录](../tpr_tp2cp2dp2_one_step_20261014.md)：同源 Full / TPR CP4 / TPR CP2DP2 详情。
