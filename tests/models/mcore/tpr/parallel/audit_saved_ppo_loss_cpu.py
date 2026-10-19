@@ -37,6 +37,76 @@ def _ppo_from_token_vectors(new: torch.Tensor, old: torch.Tensor,
     return float(pg.sum().item() / new.numel())
 
 
+def _ppo_token_gradient_diagnostics(
+    full_new: torch.Tensor, tpr_new: torch.Tensor,
+    old: torch.Tensor, adv: torch.Tensor,
+    weights: torch.Tensor | None = None,
+) -> dict:
+    """Compare independent FP32 PPO upstream gradients on *identical* labels.
+
+    Diagnostic derivative of compute_policy_loss_vanilla token-mean loss;
+    this is NOT the gradient through BF16 logits or Megatron and does not
+    describe parameter-grad differences caused by attention/backward.
+    """
+    a, b, old, adv = [
+        x.to(torch.float32).flatten() for x in
+        (full_new, tpr_new, old, adv)
+    ]
+    if not a.numel() or any(x.shape != a.shape for x in (b, old, adv)):
+        raise ValueError("PPO token diagnostic shapes must match")
+    if weights is None:
+        weight = torch.ones_like(a)
+    else:
+        weight = weights.to(torch.float32).flatten()
+        if weight.shape != a.shape:
+            raise ValueError("PPO importance-weight shape mismatch")
+
+    def gradient_and_effective_clip(new):
+        log_ratio = new - old
+        ratio = log_ratio.clamp(-20.0, 20.0).exp()
+        # VERL's dual-clip option imposes an additional A<0 ratio>3
+        # saturation, beyond the ordinary PPO lower-clip boundary.
+        ineffective = (
+            ((adv > 0) & (ratio > 1.2)) |
+            ((adv < 0) & ((ratio < 0.8) | (ratio > 3.0))) |
+            (log_ratio < -20.0) |
+            (log_ratio > 20.0)
+        )
+        active_gradient = torch.where(
+            ineffective, torch.zeros_like(ratio),
+            -adv * ratio * weight / a.numel(),
+        )
+        return active_gradient, ineffective, ratio
+
+    g_full, clip_full, ratio_full = gradient_and_effective_clip(a)
+    g_tpr, clip_tpr, ratio_tpr = gradient_and_effective_clip(b)
+    full_norm = torch.linalg.vector_norm(g_full).item()
+    tpr_norm = torch.linalg.vector_norm(g_tpr).item()
+    diff_norm = torch.linalg.vector_norm(g_tpr - g_full).item()
+    dot = torch.dot(g_full, g_tpr).item()
+    abs_lp = (b-a).abs()
+    return {
+        "tokens": int(a.numel()),
+        "logprob_mean_abs": float(abs_lp.mean()),
+        "logprob_max_abs": float(abs_lp.max()),
+        "logprob_rel_l2": float(
+            torch.linalg.vector_norm(b-a).item() /
+            max(torch.linalg.vector_norm(a).item(), 1e-30)
+        ),
+        "ratio_mean_abs": float((ratio_tpr-ratio_full).abs().mean()),
+        "effective_clip_full": int(clip_full.sum()),
+        "effective_clip_tpr": int(clip_tpr.sum()),
+        "effective_clip_flip": int((clip_full ^ clip_tpr).sum()),
+        "effective_clip_flip_fraction": float((clip_full ^ clip_tpr).float().mean()),
+        "upstream_ppo_gradient_rel_l2": diff_norm / max(full_norm, 1e-30),
+        "upstream_ppo_gradient_cosine": (
+            dot / max(full_norm*tpr_norm, 1e-30)
+        ),
+        "upstream_ppo_gradient_full_norm": full_norm,
+        "upstream_ppo_gradient_tpr_norm": tpr_norm,
+    }
+
+
 def audit(root: Path, steps: tuple[int, ...]) -> dict:
     result = {"kind": "INDEPENDENT_CPU_FP32_PPO_SCALAR_RECONSTRUCTION",
               "caution": (
@@ -47,6 +117,7 @@ def audit(root: Path, steps: tuple[int, ...]) -> dict:
               ), "steps": []}
     for step in steps:
         modes = {}
+        token_evidence = {}
         for mode in ("full", "tpr"):
             saved = [
                 torch.load(root / f"{mode}_step{step}_rank{rank}.pt",
@@ -99,9 +170,17 @@ def audit(root: Path, steps: tuple[int, ...]) -> dict:
                 raise AssertionError(
                     f"Native CP ownership does not cover tokens: {cp_token_ownership}"
                 )
+            token_evidence[mode] = {
+                "new": torch.tensor(new),
+                "old": torch.tensor(old),
+                "adv": torch.tensor(adv),
+                "weights": torch.tensor(weights) if has_weights else None,
+            }
             canonical = _ppo_from_token_vectors(
-                torch.tensor(new), torch.tensor(old), torch.tensor(adv),
-                torch.tensor(weights) if has_weights else None,
+                token_evidence[mode]["new"],
+                token_evidence[mode]["old"],
+                token_evidence[mode]["adv"],
+                token_evidence[mode]["weights"],
             )
             original_losses = {
                 str(x["cp_rank"]): float(x["loss"]) for x in saved
@@ -124,7 +203,36 @@ def audit(root: Path, steps: tuple[int, ...]) -> dict:
                 f"saved_minus_recomputed={modes[mode]['saved_minus_fp32_by_cp']}",
                 flush=True,
             )
-        result["steps"].append({"step": step, "modes": modes})
+        full, tpr = token_evidence["full"], token_evidence["tpr"]
+        for field in ("old", "adv", "weights"):
+            x, y = full[field], tpr[field]
+            if (x is None) != (y is None) or (
+                x is not None and not torch.equal(x, y)
+            ):
+                raise AssertionError(
+                    f"Step {step}: original PPO {field} differs across modes"
+                )
+        cross = _ppo_token_gradient_diagnostics(
+            full["new"], tpr["new"], full["old"], full["adv"],
+            full["weights"],
+        )
+        cross["loss_tpr_minus_full"] = (
+            modes["tpr"]["reconstructed_fp32_loss"] -
+            modes["full"]["reconstructed_fp32_loss"]
+        )
+        result["steps"].append({
+            "step": step, "modes": modes,
+            "full_vs_tpr_ppo_upstream_diagnostics": cross,
+        })
+        print(
+            f"TPR_SAVED_PPO_UPSTREAM_AUDIT step={step} "
+            f"lp_mae={cross['logprob_mean_abs']:.9g} "
+            f"clip_flip={cross['effective_clip_flip']}/{cross['tokens']} "
+            f"dloss_dlp_rel_l2={cross['upstream_ppo_gradient_rel_l2']:.9g} "
+            f"dloss_dlp_cos={cross['upstream_ppo_gradient_cosine']:.9g} "
+            f"audited_ppo_loss_gap={cross['loss_tpr_minus_full']:.9g}",
+            flush=True,
+        )
     target = root / "saved_logprob_based_ppo_loss_audit.json"
     target.write_text(json.dumps(result, indent=2, ensure_ascii=False))
     print(f"TPR_SAVED_PPO_LOSS_AUDIT_REPORT={target}", flush=True)
