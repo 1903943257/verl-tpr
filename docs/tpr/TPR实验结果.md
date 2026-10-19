@@ -1,7 +1,7 @@
 # TPR实验结果
 
 > **项目**：Tree Prefix Reuse（TPR）  
-> **整理日期**：2026-10-19；**对照代码基线**：[`verl-tpr/main@93b24dff`](https://github.com/1903943257/verl-tpr/commit/93b24dff45d959a56b609cd99893ea90c1b94212)。  
+> **更新日期**：2026-10-19；**文档维护基线**：[`verl-tpr/main@25478d3`](https://github.com/1903943257/verl-tpr/commit/25478d3c5e1e585fcbf328c000b11e667013af10)。各阶段实验仍按各自历史代码、数据和测量口径解读。  
 > **文档性质**：已有实验的**结果索引与临时性能快照**。所引历史测量日期、代码版本和测试边界不能自动升级为当前 main 的生产验收。未在仓库留存数值输出的实验，记录实现及复现实验入口，**不补造结果**。
 
 ## 1. 结果摘要与验收状态
@@ -13,6 +13,8 @@
 | Qwen3-4B Step6 / 30K 三路径数值对照 | 同数据 Full CP4、TPR CP4、TPR CP2DP2 的 PPO loss 可比；**稀疏**梯度误差仍有 45.58%–50.27% | 不能用小 loss gap 或 CP/DP 副本一致判定 Full/TPR 算法梯度正确 |
 | 真实 PPO 20 Step Full↔TPR（**历史汇总，未核原始 artifact**） | 历史报告：Loss 平均绝对差 **0.000794**、最大 **0.005623**；Logprob MAE 平均 **0.1891**、最大 **0.2744**；GradNorm 平均相对差 **3.76%**、最大 **15.70%** | 只能说明既有统计中 **Loss 未持续扩大、Logprob 中期抬升、GradNorm 有尖峰**；原始 `multistep_comparison.json` / rank snapshots 未随仓归档，不作为当前 main 多步数值验收 |
 | AReaL DTA 对照实现 | 已有 **HF Full↔AReaL DTA**、**Megatron Full↔TPR** 和跨框架基线脚本 | 实验逻辑与输出项已在仓；**没有在本仓文档发现可直接引用的同次四路径运行数值**，需导入原始 artifact 才能填写 |
+| 历史 Qwen3-1.7B CP1 长 Prefix，N8 | P8192/S1024（8:1）**3.002×**；P4096/S1024（4:1）**2.234×** | 2026-09 合成 Prefix/Suffix 受控 F/B，不是 PPO；原始日志尚未进仓；§3.1 |
+| 历史 Qwen3-1.7B RingCP4 | P16K/S4K：Prefix FA 不合并 **1.078×**；Q+KV Merge **1.249×** | 同 CP/P/S/N 的优化对照；Merge 默认关闭；FA 调度调用数不等于 kernel trace；§3.2 |
 | 30K 固定数据性能 | Full CP4→TPR CP4 **1.0944×**；Full CP4→TPR CP2DP2 **1.3268×** | 均为 8 NPU 的**固定权重 F/B + 手工梯度 finalize**；不含 optimizer/rollout，DP 版本改变了 CP 拓扑 |
 | 40K 固定数据性能 | 不开 recompute：Full **23.1378 s**、TPR **21.8022 s**，**1.0613×** | 仍是单步离线 F/B；开 recompute 数据有 GC 诊断差异，不能当正式性能收益 |
 | 30K DP2 Recompute | ON/OFF PPO loss gap `3.73e-9`；**完整 BF16 梯度 shard** rel-L2 **0.9223%**；峰值 allocated **-59.65%** | 使用**实验 FP32 梯度同步**，不证明默认 BF16 生产同步或连续 GRPO |
@@ -152,7 +154,47 @@ bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
 
 ## 3. 已有性能测量（**可替换历史快照**）
 
-### 3.1 30K：同一数据、三种并行组合
+**分组原则**：§3.1–3.2 为历史 Qwen3-1.7B **人工共享 Prefix/Suffix** 的受控模型前反向 Profile；§3.3–3.5 为 Qwen3-4B **真实 Actor 捕获的离线 PPO**，包含 PPO Loss 与梯度 Finalize，不包含 Megatron 生产 Optimizer 或在线 Rollout。不同模型、TP/CP/DP、P/S/N、以及 Merge ON/OFF 的加速比都**不能混算平均值**。加速比为对应行 Full 时间 / TPR 时间；历史日期不代表最新主线复测。
+
+
+### 3.1 Qwen3-1.7B：历史长 Prefix、CP1（2026-09）
+
+真实 Qwen3-1.7B 权重（约 1.721B 参数），人工构造 **1 个共享 Prefix + N=8 个 Suffix**；以 8 条完整 `P+S` 轨迹的 Full 训练前反向为参考。CP1 不使用 Ring。以下摘录 **2026-09-15、09-16、09-20** 的历史 Profile 日志，**不是 VERL Actor PPO 完整训练**。
+
+| Prefix P | Suffix S | P:S | Full（ms） | TPR（ms） | 加速比 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 2,048 | 512 | 4:1 | 3,167.4 | 2,566.6 | **1.234×** |
+| 4,096 | 4,096 | 1:1 | 6,363.3 | 4,623.6 | **1.376×** |
+| 6,144 | 2,048 | 3:1 | 6,337.7 | 3,563.7 | **1.778×** |
+| **8,192** | **1,024** | **8:1** | **6,216.3** | **2,070.6** | **3.002×** |
+| 4,096 | 1,024 | 4:1 | 3,121.8 | 1,397.7 | **2.234×** |
+
+对 `P8192/S1024/N8`：Full 的逻辑 Token 数为 `8×(8192+1024)=73728`，共享方案去重的逻辑 Token 数为 `8192+8×1024=16384`，**理论 Token 共享比例 = 77.78%**；对应前反向加速 **3.002×**。77.78% 不是实际耗时节省比例，且没有计入 Push/Pop 重算的重复算力；注意力复杂度、BF16 GEMM 形状、词表 Head、调度等都会影响时间。各行总长度不同，不能视为严格等总工作量的单变量 P:S 消融。
+
+**可追溯性**：数值来自已发现的历史原始 Profile 日志摘录，**完整 `.log` 及运行 Commit/输入 SHA 尚未随仓保存**；不是本次在当前 `main` 上重跑的结果。仓库现有 [真实 Qwen CP1 Profile](../../tests/models/mcore/tpr/profiling/test_tpr_qwen3_profile_npu.py) 和 [共享 Profiling Harness](../../tests/models/mcore/tpr/profiling/test_tpr_engine_profile_npu.py) 可用于查阅方法，但不应认定它们与 9 月原始日志的代码版本完全相同。
+
+### 3.2 Qwen3-1.7B：CP4 Ring 与 Prefix 合并（2026-09）
+
+同样采用真实 Qwen3-1.7B 权重和 **N=8** 受控 Prefix/Suffix，但启用 **Ring CP4**；Full 为独立完整轨迹，TPR 为共享 Prefix。2026-09-18～20 的历史结果：
+
+| Prefix P | Suffix S | P:S | Prefix FA 优化 | Full（ms） | TPR（ms） | 加速比 |
+| ---: | ---: | ---: | --- | ---: | ---: | ---: |
+| 16,384 | 4,096 | 4:1 | 不合并 Prefix FA | 7,989.2 | 7,411.9 | **1.078×** |
+| 16,384 | 4,096 | 4:1 | Prefix Q+KV Merge | 8,001.3 | 6,406.9 | **1.249×** |
+| 16,384 | 16,384 | 1:1 | Prefix KV Merge | 13,790.7 | 13,517.8 | **1.020×** |
+| 16,384 | 16,384 | 1:1 | Prefix Q+KV Merge | 13,763.2 | 12,950.2 | **1.063×** |
+
+**同一 CP4 / P16K / S4K 的 Merge 对照**：将 Prefix Q+KV Merge 开启后，TPR 耗时从 **7,411.9 降至 6,406.9 ms**（减少 **13.56%**），相对 Full 加速从 **1.078× 提高至 1.249×**。两次 Full 时间略有差异，不是完全固定分母。
+
+关联的**调度层前向 FA 调用数**由 **6,104 → 3,416**（每 Rank，28 层、8 个分支并包含 Push/Pop，减少 **44.0%**）。该调用数可由 [Ring Prefix Coalescing](../../tests/models/mcore/tpr/profiling/RING_PREFIX_COALESCING.md) 的 **shape-only/dispatch 统计合同**支持，**不是本仓已归档的 NPU 硬件 kernel trace 实测**；不能直接把 44% 的调用数降低解释为等比例硬件算力节约，Ring 通信次数也不会因此同步减少。
+
+`P16K/S16K (1:1)` 的 Q+KV Merge 只有 **1.063×**。这与较低共享 Prefix 比例、分块 FA/通信等成本共同相关，但缺少完整的设备级归因记录。
+
+**CP1 与 CP4 不能直接消融**：CP1 的 `P4K/S1K/N8` 为 **2.234×**；CP4 的 `P16K/S4K/N8` 即使 Q+KV Merge 为 **1.249×**。两组虽均为 4:1、CP4 全局长度为 CP1 四倍且 Rank-local 长度近似，**全局工作量、通信、算子切分与 Profile 路径不同**，不能把差额全部归因于 Ring CP 开销。应优先使用**同一 CP4 P/S/N 的 Merge OFF/ON**分析 FA 调度成本。
+
+`TPR_RING_COALESCE_PREFIX_FULL/QUERY/PADDED` 均为**默认关闭的可选优化**；以上 Merge ON 不代表生产默认速度。历史延迟来自 2026-09 Profile 日志摘录（完整日志尚未进仓），优化方法和调度数见 [Coalescing 文档](../../tests/models/mcore/tpr/profiling/RING_PREFIX_COALESCING.md)，参考运行入口为 [真实 Qwen Ring CP Profile](../../tests/models/mcore/tpr/profiling/test_tpr_qwen3_ring_cp_profile_npu.py)。后续补充原始日志时应附 SHA、配置及实际 FA trace。
+
+### 3.3 真实 Actor PPO 30K：同一数据、三种并行组合
 
 2026-10-15 完成的三路径实验，Qwen3-4B-128K、8×Ascend NPU、原始 Step6 30K 派生数据、36,933 监督 PPO token、1 次 warmup + 3 次测量、BF16，**F/B + 手工梯度 finalize**，不包含 optimizer、rollout 或完整 GRPO。
 
@@ -171,7 +213,7 @@ bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
 
 来源：[30K 完整实验](../tpr_tp2cp2dp2_one_step_20261014.md)。
 
-### 3.2 40K：相同 Step 6，原生 Full 与 TPR
+### 3.4 真实 Actor PPO 40K：相同 Step 6，原生 Full 与 TPR
 
 2026-10-16 记录：Qwen3-4B、8 NPUs、同输入 SHA、TP2CP4、1 warmup + 3 measured，F/B 固定形状对照：
 
@@ -186,7 +228,7 @@ bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
 
 来源：[recompute_prototype.md：40K 固定形状](recompute_prototype.md)。
 
-### 3.3 30K：TPR-aware Recompute 的时间/显存交换
+### 3.5 真实 Actor PPO 30K：Recompute 的时间/显存交换
 
 Qwen3-4B、TP2CP2DP2、8 NPU、真实 Step6、同 capture、FP32 梯度归约，**TPR OFF/ON** 的固定数据实验：
 
@@ -202,14 +244,16 @@ Qwen3-4B、TP2CP2DP2、8 NPU、真实 Step6、同 capture、FP32 梯度归约，
 
 来源：[recompute_prototype.md：DP2 结果](recompute_prototype.md)。
 
-### 3.4 尚未具备可替换数值的性能维度
+### 3.6 尚缺严格同配置对照的性能维度
 
 当前代码具有多种测试入口，但这些不应自动展示为已完成结果：
 
 | 维度 | 已有入口 / 现状 | 后续报告时必填 |
 | --- | --- | --- |
-| 固定 8 sibling，Prefix:Suffix=1:1 / 8:1 | [Stage 4.5 Prefix 性能规范](../../tests/models/mcore/tpr/parallel/STAGE45_PERFORMANCE.md) 有设计，**文件本身明确 NPU 数据 pending** | P/S/N、实际复用率、Full/TPR 各重复耗时 |
-| CP1 vs RingCP2/CP4 | [Ring profile NPU](../../tests/models/mcore/tpr/profiling/test_tpr_qwen3_ring_cp_profile_npu.py) | 相同样本/模型/TP、Ring 真实通信时间 |
+| Qwen3-4B 固定 N8、约 9K、8:1 CP1 | 已有的是 §3.1 **Qwen3-1.7B** 的 8:1 高收益历史；Qwen3-4B 同类实验尚未完成 | 同权重与样本、P/S/N、Full/TPR 多次无埋点耗时 |
+| Qwen3 同 P/S/N/TP 的 CP1、CP2、CP4 | §3.1 和 §3.2 的 CP1/CP4 不同形状，**CP2 完整独立曲线也未找到** | 同模型/同全局长度/同输入，不把 CP2DP2 与 CP4 的差额仅归于 CP |
+| Qwen3.5 Stage 4.5 AllGather CP2 | [Stage 4.5 性能规范](../../tests/models/mcore/tpr/parallel/STAGE45_PERFORMANCE.md) 自身数据 pending，且模型/后端不同于历史 Qwen3 Ring | AllGather 与 Ring 独立报告、P/S/N、真实通信时间 |
+| Ring 合并的设备级消耗归因 | §3.2 仅有历史耗时与调度层 FA 调用数，缺少与历史版本匹配的 NPU Kernel/通信 trace | Prefix/Current FA F/B、Ring P2P、launch overhead、peak memory |
 | 完整 Actor 更新（含 optimizer） | [多步对比工具](../../tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_multistep.sh) | 原生 Full/TPR 的训练 Step wall time、更新和 gradnorm |
 | Rollout + GRPO + Actor E2E | 主线已有 native rollout 和 Actor 更新能力，**此文未收录可比 TPR E2E 吞吐基准** | trajectories/s、tokens/s、rollout/train 占比 |
 | Padding/Shard、Root Ring 和 Prefix Q/K/V merge | [主线架构与验证说明](architecture.md) 中存在 opt-in 诊断 | CPU/NPU 数值门禁、FA 调用数、实际时间收益 |
@@ -224,7 +268,7 @@ Qwen3-4B、TP2CP2DP2、8 NPU、真实 Step6、同 capture、FP32 梯度归约，
 4. **性能**：warmup/repeats、rank-max critical median、峰值 allocated/reserved、是否包含 finalize/optimizer/rollout、是否启用 profiler/capture、OOM 情况；不能拿不同拓扑的比例当纯 TPR 加速。
 5. **结果状态**：`历史快照` / `同当前 main 重验` / `诊断通过、算法门禁失败` / `未执行`。新数据附输出文件或日志、Commit SHA 和完整配置，**替换对应表格，不覆盖旧原始 artifact**。
 
-后续如果新增同源 8 分支、P:S=1:1 / 8:1、CP=1/2/4 的完整训练 benchmark，优先替换 §3 的历史性能摘要，并在旧版记录中保留来源和适用范围。数值漂移问题优先采用四臂分段隔离和 AReaL DTA **同后端相对 Full** 的结果，不将不同后端的 raw gap 当作算法误差。
+当前先保留历史 **CP1 3.002× / CP4 Ring 1.078× / CP4 Q+KV Merge 1.249×** 的条件性证据，不为补齐 8:1 立即重跑长实验。后续有同模型、同 P/S/N、同 TP 的 CP1/2/4 数据时，再单独报告跨 CP 代价并保留原日志来源；不能覆盖不同模型的历史快照。数值漂移问题优先采用四臂分段隔离和 AReaL DTA **同后端相对 Full** 的结果，不将不同后端的 raw gap 当作算法误差。
 
 ## 5. 相关文档与快捷入口
 
@@ -236,4 +280,6 @@ Qwen3-4B、TP2CP2DP2、8 NPU、真实 Step6、同 capture、FP32 梯度归约，
 - [30K 三路径记录](../tpr_tp2cp2dp2_one_step_20261014.md)：同源 Full / TPR CP4 / TPR CP2DP2 详情。
 - [Recompute 原始实验记录](recompute_prototype.md)：DP2 OFF/ON、40K 结果与内存问题。
 - [Qwen3-1.7B GEMM/精度记录](../../tests/models/mcore/tpr/profiling/QWEN17_NUMERICS_AND_GEMM.md)：早期数值差异及隔离实验。
+- [Qwen3 CP1 受控 Profile](../../tests/models/mcore/tpr/profiling/test_tpr_qwen3_profile_npu.py)、[Qwen3 Ring CP Profile](../../tests/models/mcore/tpr/profiling/test_tpr_qwen3_ring_cp_profile_npu.py)：人工 Prefix/Suffix 性能分析入口。
+- [Ring Prefix Coalescing](../../tests/models/mcore/tpr/profiling/RING_PREFIX_COALESCING.md)：Prefix KV/Q 合并原理、FA 调度数与验证合同。
 - [CPU 回归总入口](../../tests/models/mcore/tpr/run_cpu_regressions.py)：结构验证；**不是 NPU 算法正确性结论**。
