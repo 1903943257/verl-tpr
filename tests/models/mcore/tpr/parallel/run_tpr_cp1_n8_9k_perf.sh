@@ -36,6 +36,9 @@ mkdir -p "$ROOT"
 python -m py_compile \
   tests/models/mcore/tpr/parallel/prepare_tpr_cp1_n8_perf_capture.py \
   tests/models/mcore/tpr/parallel/test_tpr_cp1_n8_9k_perf_npu.py
+# Fail fast on data/metric regression before allocating 4B model weights.
+python -m pytest -q   tests/models/mcore/tpr/parallel/test_cp1_n8_perf_contract_cpu.py
+
 if [[ ! -f "$CAPTURE" ]]; then
   python -m tests.models.mcore.tpr.parallel.prepare_tpr_cp1_n8_perf_capture \
     "$SOURCE" "$CAPTURE"
