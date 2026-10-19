@@ -7,6 +7,7 @@ Never use these as sequential PPO training steps or online reward evidence.
 """
 from __future__ import annotations
 
+import gc
 import json
 import os
 import statistics
@@ -60,10 +61,29 @@ def test_fixed_shape_40k_one_mode():
     warmups = int(os.environ.get("TPR_BENCH_WARMUPS", "1"))
     repeats = int(os.environ.get("TPR_BENCH_REPEATS", "3"))
     capture_logprobs = os.environ.get("TPR_BENCH_CAPTURE_LOGPROBS", "1") == "1"
+    recompute_setting = os.getenv("TPR_BENCH_RECOMPUTE", "0")
+    if recompute_setting not in ("0", "1"):
+        raise ValueError("TPR_BENCH_RECOMPUTE must be 0 or 1")
+    recompute_enabled = recompute_setting == "1"
+    if os.getenv("TPR_BENCH_MEM_AUDIT", "0") not in ("0", "1"):
+        raise ValueError("TPR_BENCH_MEM_AUDIT must be 0 or 1")
+    mem_audit = os.getenv("TPR_BENCH_MEM_AUDIT", "0") == "1"
+    ref_audit = os.getenv("TPR_RECOMPUTE_REF_AUDIT", "0") == "1"
+    if ref_audit and not mem_audit:
+        raise ValueError("TPR_RECOMPUTE_REF_AUDIT=1 requires TPR_BENCH_MEM_AUDIT=1")
     if not 0 <= warmups <= 10 or not 1 <= repeats <= 20:
         raise ValueError("Require 0..10 warmups and 1..20 measured repeats")
-    if os.environ.get("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "0") != "0":
-        raise ValueError("Native Full recompute must be OFF")
+    # _qwen3_tp_checkpoint constructs native MCore recompute config before
+    # creating TransformerBlock. This benchmark switch is the sole source
+    # of truth: reject inherited native-recompute settings on unrelated jobs.
+    if os.getenv("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "0") not in ("0",):
+        raise ValueError(
+            "Unset TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS; "
+            "use TPR_BENCH_RECOMPUTE=0/1 for both benchmark modes"
+        )
+    os.environ["TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS"] = (
+        "1" if recompute_enabled and mode == "full" else "0"
+    )
     output_dir = Path(os.environ["TPR_BENCH_OUTPUT_DIR"])
     checkpoint = Path(os.environ.get("TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"))
     runtime = _runtime()
@@ -103,9 +123,50 @@ def test_fixed_shape_40k_one_mode():
             sequence_parallel=False, profile="4b", native_attention=(mode == "full"),
         )
         assert hf.num_hidden_layers == 36
-        model.config.recompute_granularity = None
         finalize_time = [0.0]
         engine = _make_engine(model, runtime, finalize_time) if mode == "tpr" else None
+        installed_blocks = 0
+        if mode == "tpr" and recompute_enabled:
+            from megatron.core.transformer.transformer_block import TransformerBlock
+            from verl.workers.engine.megatron.tpr.recompute import (
+                assert_tpr_full_recompute_installed,
+                install_tpr_full_recompute,
+            )
+            model.config.recompute_granularity = "full"
+            model.config.recompute_method = "uniform"
+            model.config.recompute_num_layers = 1
+            blocks = [m for m in model.modules() if isinstance(m, TransformerBlock)]
+            if not blocks or any(m.config is not model.config for m in blocks):
+                raise AssertionError("TPR TransformerBlock config does not match model")
+            installed_blocks = install_tpr_full_recompute(model, model.config)
+            if installed_blocks != len(blocks):
+                raise AssertionError("Not all TPR TransformerBlocks received the KV-aware adapter")
+            assert_tpr_full_recompute_installed(model, model.config)
+        elif not recompute_enabled:
+            # Preserve the historical OFF baseline path. _make_engine also
+            # clears this field for TPR; native starts disabled in its factory.
+            model.config.recompute_granularity = None
+            model.config.recompute_method = None
+            model.config.recompute_num_layers = None
+
+        expected = ("full", "uniform", 1) if recompute_enabled else (None, None, None)
+        actual = (
+            model.config.recompute_granularity,
+            model.config.recompute_method,
+            model.config.recompute_num_layers,
+        )
+        if actual != expected:
+            raise AssertionError(
+                f"{mode}: incorrect full/uniform/1 checkpoint config: {actual} != {expected}"
+            )
+        if dist.get_rank() == 0:
+            print(
+                f"TPR_FIXED_SHAPE_RECOMPUTE mode={mode} enabled={int(recompute_enabled)} "
+                f"granularity={actual[0]} method={actual[1]} num_layers={actual[2]} "
+                f"installed_tpr_blocks={installed_blocks} "
+                f"native_checkpoint={int(mode == 'full' and recompute_enabled)}",
+                flush=True,
+            )
         if os.getenv("TPR_EXEC_PROFILE", "0") not in ("0", "1"):
             raise ValueError("TPR_EXEC_PROFILE must be 0 or 1")
         from .grad_sync_precision import offline_grad_sync_dtype
@@ -188,22 +249,70 @@ def test_fixed_shape_40k_one_mode():
                 "loss": loss,
                 "input_sha256": data_sha,
                 "ppo_tokens": tokens,
-                "recompute": False,
+                "recompute": recompute_enabled,
+                "recompute_method": model.config.recompute_method,
+                "recompute_num_layers": model.config.recompute_num_layers,
+                "recompute_installed_tpr_blocks": installed_blocks,
                 "updated_weights": False,
                 "profiler_enabled": os.getenv("TPR_EXEC_PROFILE", "0") == "1",
+                "mem_audit": mem_audit,
                 "capture_logprobs": capture_logprobs,
                 "profiles": profiles,
             }
             if dist.get_rank() == 0:
                 print(
-                    f"TPR_FIXED_SHAPE step={step} mode={mode} iter={iteration} "
-                    f"warmup={int(iteration < warmups)} "
+                    f"TPR_FIXED_SHAPE step={step} mode={mode} recompute={int(recompute_enabled)} "
+                    f"iter={iteration} warmup={int(iteration < warmups)} "
                     f"critical_fwd_bwd_s={record['critical_fwd_bwd_s']:.6f} "
                     f"peak_gib={record['peak_allocated_gib']:.3f} "
                     f"loss={loss:.9g} sha256={data_sha[:16]}",
                     flush=True,
                 )
                 runs.append(record)
+            # Only opt-in diagnostics change the sequence of operations.
+            # gc.collect is intentionally outside the timed forward/backward:
+            # if allocated memory drops here, tensors were kept in Python
+            # reference cycles rather than being required by the next step.
+            if mem_audit:
+                torch.npu.synchronize()
+                live_before = torch.npu.memory_allocated()
+                collected = gc.collect()
+                torch.npu.synchronize()
+                live_after = torch.npu.memory_allocated()
+                audit = torch.tensor(
+                    [live_before / 2**30, live_after / 2**30],
+                    dtype=torch.float32, device=runtime.device,
+                )
+                dist.all_reduce(audit, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+                ref_counts = None
+                if ref_audit:
+                    from verl.workers.engine.megatron.tpr.recompute import (
+                        tpr_recompute_live_ref_counts,
+                    )
+                    refs = tpr_recompute_live_ref_counts()
+                    ref_max = torch.tensor(
+                        [refs["checkpoint_run_functions"], refs["attention_contexts"]],
+                        dtype=torch.float32, device=runtime.device,
+                    )
+                    dist.all_reduce(ref_max, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+                    ref_counts = {
+                        "checkpoint_run_functions": int(ref_max[0].item()),
+                        "attention_contexts": int(ref_max[1].item()),
+                    }
+                if dist.get_rank() == 0:
+                    record["live_alloc_before_gc_gib_worst"] = float(audit[0].item())
+                    record["live_alloc_after_gc_gib_worst"] = float(audit[1].item())
+                    if ref_counts is not None:
+                        record["live_recompute_refs"] = ref_counts
+                    print(
+                        f"TPR_FIXED_SHAPE_MEM_AUDIT mode={mode} "
+                        f"recompute={int(recompute_enabled)} iter={iteration} "
+                        f"live_before_gc_gib={float(audit[0]):.3f} "
+                        f"live_after_gc_gib={float(audit[1]):.3f} "
+                        f"live_recompute_refs={ref_counts} "
+                        f"local_collected_objects={collected}",
+                        flush=True,
+                    )
             dist.barrier()
         gradient_witness = None
         if os.getenv("TPR_BENCH_GRAD_WITNESS", "0") == "1":
@@ -214,12 +323,18 @@ def test_fixed_shape_40k_one_mode():
             )
         if dist.get_rank() == 0:
             output_dir.mkdir(parents=True, exist_ok=True)
-            target = output_dir / f"step{step}_{mode}_fixed_shape.json"
+            suffix = "_recompute_on" if recompute_enabled else ""
+            target = output_dir / f"step{step}_{mode}{suffix}_fixed_shape.json"
             if target.exists():
                 raise FileExistsError(f"Refuse to overwrite benchmark: {target}")
             measured = [r["critical_fwd_bwd_s"] for r in runs if not r["warmup"]]
             target.write_text(json.dumps({
                 "source_step": step, "mode": mode,
+                "recompute": recompute_enabled,
+                "recompute_granularity": model.config.recompute_granularity,
+                "recompute_method": model.config.recompute_method,
+                "recompute_num_layers": model.config.recompute_num_layers,
+                "recompute_installed_tpr_blocks": installed_blocks,
                 "topology": {"tp": 2, "cp": 4, "dp": 1, "world": 8},
                 "effective_sequence_cap": int(item.get("effective_sequence_cap", 40960)),
                 "input_sha256": data_sha, "source_capture": str(capture),
@@ -236,6 +351,7 @@ def test_fixed_shape_40k_one_mode():
             }, indent=2))
             print(
                 f"TPR_FIXED_SHAPE_SUMMARY step={step} mode={mode} "
+                f"recompute={int(recompute_enabled)} "
                 f"median_fwd_bwd_s={statistics.median(measured):.6f} "
                 f"n={len(measured)} output={target}", flush=True,
             )

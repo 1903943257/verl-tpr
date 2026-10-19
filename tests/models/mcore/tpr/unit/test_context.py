@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
+import weakref
+
 import pytest
 import torch
 
@@ -26,6 +29,17 @@ def _kv(sequence_length: int, *, requires_grad: bool = False):
     key = torch.randn(sequence_length, 1, 2, 8, requires_grad=requires_grad)
     value = torch.randn(sequence_length, 1, 2, 8, requires_grad=requires_grad)
     return key, value
+
+
+def test_context_supports_weak_references_for_checkpoint_replay():
+    # Reentrant Megatron checkpoint closures must only weak-reference their
+    # owning context, since it holds the checkpoint's K/V autograd outputs.
+    context = TPRAttentionContext(prefix_length=0, suffix_length=3)
+    reference = weakref.ref(context)
+    assert reference() is context
+    del context
+    gc.collect()
+    assert reference() is None
 
 
 def test_context_manager_sets_and_restores_context():
@@ -175,3 +189,14 @@ def test_collector_reports_missing_and_unexpected_layers():
 
     with pytest.raises(RuntimeError, match=r"missing=\[1\], unexpected=\[2\]"):
         context.assert_new_kv_layers([1])
+
+def test_pr7_recompute_collector_preserves_compaction_ownership():
+    original = TPRAttentionContext(prefix_length=0, suffix_length=3, compact_new_kv=True)
+    replay = original.new_collector()
+    assert replay is not original
+    assert replay.prefix_length == original.prefix_length
+    assert replay.suffix_length == original.suffix_length
+    assert replay.past_key_values == original.past_key_values
+    assert replay.attention_backend is original.attention_backend
+    assert replay.compact_new_kv is False
+    assert not replay.new_key_values

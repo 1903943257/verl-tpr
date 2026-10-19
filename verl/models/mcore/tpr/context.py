@@ -102,7 +102,7 @@ def _assert_layers(actual: Mapping[int, object], expected: Iterable[int], *, kin
         )
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, weakref_slot=True)
 class TPRAttentionContext:
     """One Segment forward: Prefix KV in, RoPE/backend in, per-layer new KV out."""
 
@@ -153,6 +153,21 @@ class TPRAttentionContext:
     @property
     def local_suffix_length(self) -> int:
         return self.suffix_length if self.attention_backend is None else self.attention_backend.local_suffix_length
+
+    def new_collector(self) -> TPRAttentionContext:
+        """Collect checkpoint K/V while sharing immutable prefix state.
+
+        The no-grad Push context owns any KV compaction. Replay collectors
+        must keep their gradient-carrying side outputs without compaction.
+        """
+        return TPRAttentionContext(
+            prefix_length=self.prefix_length,
+            suffix_length=self.suffix_length,
+            past_key_values=self.past_key_values,
+            suffix_rotary_pos_emb=self.suffix_rotary_pos_emb,
+            attention_backend=self.attention_backend,
+            compact_new_kv=False,
+        )
 
     @property
     def new_key_values(self) -> Mapping[int, KVPair]:
