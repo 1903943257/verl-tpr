@@ -5,7 +5,11 @@ Megatron schedule. No fake rows and no extra normalization by 8 are allowed.
 """
 import pytest
 
-from .native_full_megatron_schedule import _native_microbatch_count
+from .native_full_megatron_schedule import (
+    _native_microbatch_count,
+    _aggregate_native_local_reporting_loss,
+)
+import torch
 
 
 @pytest.mark.parametrize("rows,supervised_tokens", [(1, 64), (2, 4616), (8, 24792)])
@@ -28,3 +32,26 @@ def test_native_original_row_count_is_dynamic(rows, supervised_tokens):
 def test_native_rejects_invalid_original_batch(rows, tokens, metadata):
     with pytest.raises(AssertionError):
         _native_microbatch_count(rows, tokens, metadata)
+
+
+def test_cp_reporting_loss_is_uniform_fp32_with_empty_token_ranks():
+    # CP0/3 have supervised tokens while CP1/2 have BF16 dummy zero losses.
+    rank0 = _aggregate_native_local_reporting_loss([
+        torch.tensor(-1.7549911737442017, dtype=torch.float32),
+        torch.tensor(0.0, dtype=torch.bfloat16),
+    ])
+    rank1 = _aggregate_native_local_reporting_loss([
+        torch.tensor(0.0, dtype=torch.bfloat16),
+        torch.tensor(0.0, dtype=torch.bfloat16),
+    ])
+    assert rank0.dtype == torch.float32
+    assert rank1.dtype == torch.float32
+    assert rank1.item() == 0
+    assert (rank0 + rank1).item() == pytest.approx(-1.7549911737442017)
+
+
+def test_reporting_loss_rejects_grad_tracking():
+    with pytest.raises(ValueError, match="detached scalar"):
+        _aggregate_native_local_reporting_loss([
+            torch.tensor(1.0, requires_grad=True),
+        ])
