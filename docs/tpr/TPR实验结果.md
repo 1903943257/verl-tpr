@@ -11,6 +11,7 @@
 | 构树 / PPO / KV / Ring CPU 合同 | 主线具备回归与差分单测；历史 PR7 清理报告 `594 passed, 1 skipped` | 这是**当时分支 CPU**结果，不是当前 main 的 NPU 验收 |
 | 真实 Qwen3-4B 两 sibling（TP2×CP4） | 旧 main / PR7 冻结对照：loss / logprob 相同，**完整参数梯度 rel-L2 = 1.027872%**，cos=0.99994723 | 通过当时 2% 阶段门禁；**未通过 1% 门禁**；不视为当前主线重新实测 |
 | Qwen3-4B Step6 / 30K 三路径数值对照 | 同数据 Full CP4、TPR CP4、TPR CP2DP2 的 PPO loss 可比；**稀疏**梯度误差仍有 45.58%–50.27% | 不能用小 loss gap 或 CP/DP 副本一致判定 Full/TPR 算法梯度正确 |
+| 真实 PPO 20 Step Full↔TPR（**历史汇总，未核原始 artifact**） | 历史报告：Loss 平均绝对差 **0.000794**、最大 **0.005623**；Logprob MAE 平均 **0.1891**、最大 **0.2744**；GradNorm 平均相对差 **3.76%**、最大 **15.70%** | 只能说明既有统计中 **Loss 未持续扩大、Logprob 中期抬升、GradNorm 有尖峰**；原始 `multistep_comparison.json` / rank snapshots 未随仓归档，不作为当前 main 多步数值验收 |
 | AReaL DTA 对照实现 | 已有 **HF Full↔AReaL DTA**、**Megatron Full↔TPR** 和跨框架基线脚本 | 实验逻辑与输出项已在仓；**没有在本仓文档发现可直接引用的同次四路径运行数值**，需导入原始 artifact 才能填写 |
 | 30K 固定数据性能 | Full CP4→TPR CP4 **1.0944×**；Full CP4→TPR CP2DP2 **1.3268×** | 均为 8 NPU 的**固定权重 F/B + 手工梯度 finalize**；不含 optimizer/rollout，DP 版本改变了 CP 拓扑 |
 | 40K 固定数据性能 | 不开 recompute：Full **23.1378 s**、TPR **21.8022 s**，**1.0613×** | 仍是单步离线 F/B；开 recompute 数据有 GC 诊断差异，不能当正式性能收益 |
@@ -113,6 +114,41 @@ bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
 | CPU FP32-master 单次 AdamW 样本更新 max abs gap | **3.05175781e-5** |
 
 采用实验性**FP32 逐参数梯度归约**，不是默认 BF16 生产通信。单次实验性 AdamW 验证不能推出多步在线 GRPO 收敛。来源：[recompute_prototype.md](recompute_prototype.md)。
+
+### 2.6 真实 PPO 20 Step：Loss / Logprob / GradNorm 历史漂移（仅归档，不新增实验）
+
+> **证据级别：历史对话中已报告的统计摘要，未在当前仓库复核原始 20-Step artifact。** 相关离线测试和比较器存在，但当前文档分支没有附上对应的 `multistep_comparison.json`、`full_step*_rank*.pt`、`tpr_step*_rank*.pt` 或同次日志，因此下表为**待原始文件复核的历史数值**，不能把“支持连续更新的脚本存在”当成“本次重新证明运行成功”。本节按历史资料保存，不计划为此再补实验。
+
+**历史记录中的设置**：Qwen3-4B-128K，BF16，TP2×RingCP4，8×Ascend NPU；真实 GRPO/Actor 捕获的 PPO 数据（group_size=8、40K 截断）；Full 和 TPR 使用同一初始权重、各自的 CPU FP32-master AdamW 状态；数据和 historical `old_log_probs` / advantages 固定，非每 Step 重新采样的 on-policy 训练。以上是历史报告口径，**具体 20 步源 Capture / SHA、选取行数、Recompute 状态及完整运行配置仍须以原始 artifact 为准**。
+
+| Step | PPO Loss 绝对差（Full vs TPR） | Response Logprob MAE | 全局 GradNorm 相对差 |
+| ---: | ---: | ---: | ---: |
+| 1 | 0.000111 | 0.0331 | 3.97% |
+| 2 | 0.000417 | 0.0541 | 2.75% |
+| 3 | 0.000444 | 0.0885 | 6.11% |
+| 4 | 0.000130 | 0.1407 | 1.45% |
+| 5 | 0.001587 | 0.2387 | 3.92% |
+| 10 | 0.000678 | 0.2185 | 1.93% |
+| 13 | 0.005623 | 0.2744 | 9.10% |
+| 14 | 0.000641 | 0.2623 | 15.70% |
+| 20 | 0 | 0.1733 | 0% |
+| **历史 20 Step 汇总** | **平均 0.000794；最大 0.005623（Step 13）** | **平均 0.1891；最大 0.2744（Step 13）** | **平均 3.76%；最大 15.70%（Step 14）** |
+
+**解读及边界**：
+
+1. **PPO Loss**：历史汇总中多数 Step 的绝对差很小，Step 13 的差值较高，但未呈现持续单调放大；**这不是 Reward/在线收敛的保证**。
+2. **Logprob**：MAE 从 Step 1 的 **0.0331** 抬升至 Step 13 的 **0.2744**，Step 20 回落至 **0.1733**；说明中期存在明显数值漂移，不能由小 Loss gap 推断 Logprob parity。
+3. **GradNorm**：平均相对差 **3.76%**，Step 14 峰值 **15.70%**；这是**全局梯度范数的标量差异**，**不是完整梯度向量 rel-L2，也不是梯度方向 cosine**。小 GradNorm gap 不表示两个梯度向量一致。
+4. 历史记录还注明 Step **11/12/16/19/20** 的两路 PPO Loss / 有效梯度为零；若从原始快照证实，相关 Step 的 GradNorm gap=0 **不构成梯度正确性的正向证据**。即便新梯度为零，AdamW 也可能受历史动量影响继续更新权重。
+5. **实验口径**：固定录制轨迹、旧策略 Logprob 和 Advantages 的离线多步回放，不是逐步重新 Rollout 的 on-policy GRPO；也不能自动证明当前 `main@93b24dff`、新 Ring / Recompute / DP 组合下的数值行为。
+
+**已有代码入口（可查证对比定义，非新的实测）**：
+[`run_real_actor_tp2cp4_multistep.sh`](../../tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_multistep.sh) →
+[`test_real_actor_tp2cp4_multistep_npu.py`](../../tests/models/mcore/tpr/parallel/test_real_actor_tp2cp4_multistep_npu.py) →
+[`compare_real_actor_tp2cp4_multistep.py`](../../tests/models/mcore/tpr/parallel/compare_real_actor_tp2cp4_multistep.py)。
+比较器定义了 `loss_gap`、`logprob.mean_abs`、`grad_norm_relative_gap`，并另外支持梯度向量、FP32 master 参数累计更新和副本审计。**本节只有上表三个标量指标的历史摘要，未归档完整梯度 cosine / 参数更新 rel-L2 / 共同 Full oracle 评估数据。**
+
+**阶段性处理**：本轮将该历史多步漂移作为**已观察到、存在证据边界的风险**记录，暂不补做 20 Step；项目其余单步正确性结论维持各自原有门禁，不将本节提升为“当前代码多步严格 parity PASS”。
 
 ## 3. 已有性能测量（**可替换历史快照**）
 
