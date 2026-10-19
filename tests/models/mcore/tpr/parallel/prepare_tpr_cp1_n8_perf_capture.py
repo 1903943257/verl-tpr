@@ -139,8 +139,9 @@ def derive_capture(source: Path, target: Path) -> dict:
     payload["performance_changed_conditioning"] = True
     payload["performance_synthetic_uid"] = True
     digest = hashlib.sha256()
-    for i in range(BRANCHES):
-        for key in ("input_ids", "response_mask", "old_log_probs", "advantages"):
+    # Match _load_real_pair's canonical serialization: field-major, row-minor.
+    for key in ("input_ids", "response_mask", "old_log_probs", "advantages"):
+        for i in range(BRANCHES):
             val = derived[key][i].contiguous()
             digest.update(val.view(torch.uint8).numpy().tobytes())
     audit = {
