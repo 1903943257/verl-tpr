@@ -51,6 +51,7 @@ GATES: dict[str, Gate] = {
     "npu-tp": Gate(
         "tests/models/mcore/tpr/parallel/test_tpr_tp2_npu.py",
         kind="torchrun", ranks=2,
+        opt_in=(("TPR_RUN_TP2", "1"),),
         note="Megatron native tensor parallel TPR gate.",
     ),
     "npu-recompute-kv": Gate(
@@ -69,11 +70,13 @@ GATES: dict[str, Gate] = {
     "npu-qwen": Gate(
         "tests/models/mcore/tpr/correctness/test_tpr_qwen3_compatibility_npu.py",
         kind="torchrun", ranks=1,
+        opt_in=(("TPR_RUN_QWEN_COMPAT", "1"),),
         note="Qwen3 model compatibility; model assets and NPU are required.",
     ),
     "npu-ring-profile": Gate(
         "tests/models/mcore/tpr/profiling/test_tpr_qwen3_ring_cp_profile_npu.py",
         kind="torchrun", ranks=4,
+        opt_in=(("TPR_RUN_QWEN_RING_CP_PROFILE", "1"),),
         note="OPT-IN profiling, not a correctness gate; inspect its case switches.",
     ),
 }
