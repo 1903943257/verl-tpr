@@ -14,8 +14,7 @@
 | 真实 PPO 20 Step Full↔TPR（**历史汇总，未核原始 artifact**） | 历史报告：Loss 平均绝对差 **0.000794**、最大 **0.005623**；Logprob MAE 平均 **0.1891**、最大 **0.2744**；GradNorm 平均相对差 **3.76%**、最大 **15.70%** | 只能说明既有统计中 **Loss 未持续扩大、Logprob 中期抬升、GradNorm 有尖峰**；原始 `multistep_comparison.json` / rank snapshots 未随仓归档，不作为当前 main 多步数值验收 |
 | AReaL DTA 对照实现 | 已有 **HF Full↔AReaL DTA**、**Megatron Full↔TPR** 和跨框架基线脚本 | 实验逻辑与输出项已在仓；**没有在本仓文档发现可直接引用的同次四路径运行数值**，需导入原始 artifact 才能填写 |
 | 历史 Qwen3-1.7B CP1 长 Prefix，N8 | P8192/S1024（8:1）**3.002×**；P4096/S1024（4:1）**2.234×** | 2026-09 合成 Prefix/Suffix 受控 F/B，不是 PPO；原始日志尚未进仓；§3.1 |
-| 更早约 0.566B GPT，CP1 | P16K/S1K/N8 **4.30×**；P16K/S2K/N8 **3.71×** | 不同模型与历史实现，不和 Qwen3 合并统计；§3.2 |
-| 历史 Qwen3-1.7B RingCP4 | P16K/S4K：Prefix FA 不合并 **1.078×**；Q+KV Merge **1.249×** | 同 CP/P/S/N 的优化对照；Merge 默认关闭；FA 调度调用数不等于 kernel trace；§3.3 |
+| 历史 Qwen3-1.7B RingCP4 | P16K/S4K：Prefix FA 不合并 **1.078×**；Q+KV Merge **1.249×** | 同 CP/P/S/N 的优化对照；Merge 默认关闭；FA 调度调用数不等于 kernel trace；§3.2 |
 | 30K 固定数据性能 | Full CP4→TPR CP4 **1.0944×**；Full CP4→TPR CP2DP2 **1.3268×** | 均为 8 NPU 的**固定权重 F/B + 手工梯度 finalize**；不含 optimizer/rollout，DP 版本改变了 CP 拓扑 |
 | 40K 固定数据性能 | 不开 recompute：Full **23.1378 s**、TPR **21.8022 s**，**1.0613×** | 仍是单步离线 F/B；开 recompute 数据有 GC 诊断差异，不能当正式性能收益 |
 | 30K DP2 Recompute | ON/OFF PPO loss gap `3.73e-9`；**完整 BF16 梯度 shard** rel-L2 **0.9223%**；峰值 allocated **-59.65%** | 使用**实验 FP32 梯度同步**，不证明默认 BF16 生产同步或连续 GRPO |
@@ -155,7 +154,7 @@ bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
 
 ## 3. 已有性能测量（**可替换历史快照**）
 
-**分组原则**：§3.1–3.3 为历史 Qwen3-1.7B / 0.566B GPT **人工共享 Prefix/Suffix** 的受控模型前反向 Profile；§3.4–3.6 为 Qwen3-4B **真实 Actor 捕获的离线 PPO**，包含 PPO Loss 与梯度 Finalize，不包含 Megatron 生产 Optimizer 或在线 Rollout。不同模型、TP/CP/DP、P/S/N、以及 Merge ON/OFF 的加速比都**不能混算平均值**。加速比为对应行 Full 时间 / TPR 时间；历史日期不代表最新主线复测。
+**分组原则**：§3.1–3.2 为历史 Qwen3-1.7B **人工共享 Prefix/Suffix** 的受控模型前反向 Profile；§3.3–3.5 为 Qwen3-4B **真实 Actor 捕获的离线 PPO**，包含 PPO Loss 与梯度 Finalize，不包含 Megatron 生产 Optimizer 或在线 Rollout。不同模型、TP/CP/DP、P/S/N、以及 Merge ON/OFF 的加速比都**不能混算平均值**。加速比为对应行 Full 时间 / TPR 时间；历史日期不代表最新主线复测。
 
 
 ### 3.1 Qwen3-1.7B：历史长 Prefix、CP1（2026-09）
@@ -174,19 +173,7 @@ bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
 
 **可追溯性**：数值来自已发现的历史原始 Profile 日志摘录，**完整 `.log` 及运行 Commit/输入 SHA 尚未随仓保存**；不是本次在当前 `main` 上重跑的结果。仓库现有 [真实 Qwen CP1 Profile](../../tests/models/mcore/tpr/profiling/test_tpr_qwen3_profile_npu.py) 和 [共享 Profiling Harness](../../tests/models/mcore/tpr/profiling/test_tpr_engine_profile_npu.py) 可用于查阅方法，但不应认定它们与 9 月原始日志的代码版本完全相同。
 
-### 3.2 早期约 0.566B GPT：长 Prefix、CP1
-
-另一套**不同模型与历史实现**的 Dense GPT 合成基线，固定 `P=16384`，前反向测量如下：
-
-| Prefix P | Suffix S | N | Full（ms） | TPR（ms） | 加速比 |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 16,384 | 1,024 | 2 | 6,244.5 | 3,896.5 | **1.60×** |
-| 16,384 | 1,024 | 8 | 24,148.7 | 5,607.9 | **4.30×** |
-| 16,384 | 2,048 | 8 | 27,841.4 | 7,503.6 | **3.71×** |
-
-同样的 P/S，N 从 2 增到 8 时共享的累计收益扩大；N8、P16K/S1K 达 **4.30×**。**该 0.566B GPT 不是 Qwen3-1.7B/4B**，也不是当前默认 Profiling Harness 的受支持模型；**不要合并不同模型的加速比求平均**。这是独立的历史快照，原始 `.log` 尚未作为仓库 artifact 归档。
-
-### 3.3 Qwen3-1.7B：CP4 Ring 与 Prefix 合并（2026-09）
+### 3.2 Qwen3-1.7B：CP4 Ring 与 Prefix 合并（2026-09）
 
 同样采用真实 Qwen3-1.7B 权重和 **N=8** 受控 Prefix/Suffix，但启用 **Ring CP4**；Full 为独立完整轨迹，TPR 为共享 Prefix。2026-09-18～20 的历史结果：
 
@@ -207,7 +194,7 @@ bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
 
 `TPR_RING_COALESCE_PREFIX_FULL/QUERY/PADDED` 均为**默认关闭的可选优化**；以上 Merge ON 不代表生产默认速度。历史延迟来自 2026-09 Profile 日志摘录（完整日志尚未进仓），优化方法和调度数见 [Coalescing 文档](../../tests/models/mcore/tpr/profiling/RING_PREFIX_COALESCING.md)，参考运行入口为 [真实 Qwen Ring CP Profile](../../tests/models/mcore/tpr/profiling/test_tpr_qwen3_ring_cp_profile_npu.py)。后续补充原始日志时应附 SHA、配置及实际 FA trace。
 
-### 3.4 真实 Actor PPO 30K：同一数据、三种并行组合
+### 3.3 真实 Actor PPO 30K：同一数据、三种并行组合
 
 2026-10-15 完成的三路径实验，Qwen3-4B-128K、8×Ascend NPU、原始 Step6 30K 派生数据、36,933 监督 PPO token、1 次 warmup + 3 次测量、BF16，**F/B + 手工梯度 finalize**，不包含 optimizer、rollout 或完整 GRPO。
 
@@ -226,7 +213,7 @@ bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
 
 来源：[30K 完整实验](../tpr_tp2cp2dp2_one_step_20261014.md)。
 
-### 3.5 真实 Actor PPO 40K：相同 Step 6，原生 Full 与 TPR
+### 3.4 真实 Actor PPO 40K：相同 Step 6，原生 Full 与 TPR
 
 2026-10-16 记录：Qwen3-4B、8 NPUs、同输入 SHA、TP2CP4、1 warmup + 3 measured，F/B 固定形状对照：
 
@@ -241,7 +228,7 @@ bash tests/models/mcore/tpr/correctness/run_qwen17_dta_tpr_triplet.sh
 
 来源：[recompute_prototype.md：40K 固定形状](recompute_prototype.md)。
 
-### 3.6 真实 Actor PPO 30K：Recompute 的时间/显存交换
+### 3.5 真实 Actor PPO 30K：Recompute 的时间/显存交换
 
 Qwen3-4B、TP2CP2DP2、8 NPU、真实 Step6、同 capture、FP32 梯度归约，**TPR OFF/ON** 的固定数据实验：
 
@@ -257,16 +244,16 @@ Qwen3-4B、TP2CP2DP2、8 NPU、真实 Step6、同 capture、FP32 梯度归约，
 
 来源：[recompute_prototype.md：DP2 结果](recompute_prototype.md)。
 
-### 3.7 尚缺严格同配置对照的性能维度
+### 3.6 尚缺严格同配置对照的性能维度
 
 当前代码具有多种测试入口，但这些不应自动展示为已完成结果：
 
 | 维度 | 已有入口 / 现状 | 后续报告时必填 |
 | --- | --- | --- |
 | Qwen3-4B 固定 N8、约 9K、8:1 CP1 | 已有的是 §3.1 **Qwen3-1.7B** 的 8:1 高收益历史；Qwen3-4B 同类实验尚未完成 | 同权重与样本、P/S/N、Full/TPR 多次无埋点耗时 |
-| Qwen3 同 P/S/N/TP 的 CP1、CP2、CP4 | §3.1 和 §3.3 的 CP1/CP4 不同形状，**CP2 完整独立曲线也未找到** | 同模型/同全局长度/同输入，不把 CP2DP2 与 CP4 的差额仅归于 CP |
+| Qwen3 同 P/S/N/TP 的 CP1、CP2、CP4 | §3.1 和 §3.2 的 CP1/CP4 不同形状，**CP2 完整独立曲线也未找到** | 同模型/同全局长度/同输入，不把 CP2DP2 与 CP4 的差额仅归于 CP |
 | Qwen3.5 Stage 4.5 AllGather CP2 | [Stage 4.5 性能规范](../../tests/models/mcore/tpr/parallel/STAGE45_PERFORMANCE.md) 自身数据 pending，且模型/后端不同于历史 Qwen3 Ring | AllGather 与 Ring 独立报告、P/S/N、真实通信时间 |
-| Ring 合并的设备级消耗归因 | §3.3 仅有历史耗时与调度层 FA 调用数，缺少与历史版本匹配的 NPU Kernel/通信 trace | Prefix/Current FA F/B、Ring P2P、launch overhead、peak memory |
+| Ring 合并的设备级消耗归因 | §3.2 仅有历史耗时与调度层 FA 调用数，缺少与历史版本匹配的 NPU Kernel/通信 trace | Prefix/Current FA F/B、Ring P2P、launch overhead、peak memory |
 | 完整 Actor 更新（含 optimizer） | [多步对比工具](../../tests/models/mcore/tpr/parallel/run_real_actor_tp2cp4_multistep.sh) | 原生 Full/TPR 的训练 Step wall time、更新和 gradnorm |
 | Rollout + GRPO + Actor E2E | 主线已有 native rollout 和 Actor 更新能力，**此文未收录可比 TPR E2E 吞吐基准** | trajectories/s、tokens/s、rollout/train 占比 |
 | Padding/Shard、Root Ring 和 Prefix Q/K/V merge | [主线架构与验证说明](architecture.md) 中存在 opt-in 诊断 | CPU/NPU 数值门禁、FA 调用数、实际时间收益 |
