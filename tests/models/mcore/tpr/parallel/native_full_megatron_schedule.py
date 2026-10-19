@@ -33,6 +33,18 @@ class NativeFullResult:
     finalize_seconds: float
 
 
+def _native_microbatch_count(count: int, global_tokens: int, recorded_batch_size: int | None) -> int:
+    """Validate original PPO cardinality; microbatch count is not hardcoded to N=8."""
+    if count <= 0 or global_tokens <= 0:
+        raise AssertionError("Native Full needs nonempty PPO rows and supervised tokens")
+    if recorded_batch_size is None or int(recorded_batch_size) != count:
+        raise AssertionError(
+            f"Native Full global_batch_size={recorded_batch_size} "
+            f"does not match physical PPO rows={count}"
+        )
+    return count
+
+
 def native_cp_query_indices(length: int, cp_rank: int, cp_size: int = 4,
                             tp_size: int = 2) -> tuple[int, ...]:
     """Exact zigzag physical→logical position order used by preprocess_thd_engine.
@@ -124,13 +136,7 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
     recorded_batch_size = tu.get_non_tensor_data(
         batch, key="global_batch_size", default=None
     )
-    if count <= 0 or global_tokens <= 0:
-        raise AssertionError("Native Full needs nonempty PPO rows and supervised tokens")
-    if recorded_batch_size is None or int(recorded_batch_size) != count:
-        raise AssertionError(
-            f"Native Full global_batch_size={recorded_batch_size} "
-            f"does not match physical PPO rows={count}"
-        )
+    count = _native_microbatch_count(count, global_tokens, recorded_batch_size)
 
     # Keep native configuration responsible for the native model's CP setup.
     model.config.no_sync_func = None
