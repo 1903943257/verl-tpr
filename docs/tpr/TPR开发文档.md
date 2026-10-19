@@ -417,6 +417,8 @@ python -B tests/models/mcore/tpr/run_cpu_regressions.py
 - 不应通过改变原生 Full GEMM 形状、强制 Fixed Tile 或调 PPO 标签来“修复”与 Full 的比较；记录真实模型、权重、配置、输入 SHA 和监督字段。
 - 关闭 profiler、数据 capture、额外日志及实验优化变量后再测正式性能；区分 Attention F/B、整个 Actor train_batch（含 optimizer）和 rollout+训练端到端收益。
 
+**已有正确性与性能结果汇总见 [《TPR实验结果》](TPR实验结果.md)**（按实验版本、测试拓扑和统计口径记录，性能表支持后续重测替换）。
+
 已有分阶段数值归因和特定复现实验见 [主线架构与校验说明](architecture.md)、[Ring 性能/验证计划](performance_plan_20261017.md)、[实验性 Recompute 记录](recompute_prototype.md)。这些历史实验的**PASS 仅针对对应的测试条件**。
 
 ## 11. 后续维护与扩展约束

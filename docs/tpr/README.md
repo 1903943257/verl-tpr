@@ -1,6 +1,7 @@
 # TPR开发文档
 
-**主文档**：[TPR开发文档](TPR开发文档.md)
+**主文档**：[TPR开发文档](TPR开发文档.md)  
+**实验汇总**：[TPR实验结果](TPR实验结果.md)（正确性与性能历史快照，后续更新可替换）
 
 这是一份用于项目交付和代码评审的开发文档，基于 `main` 的 `93b24dff`（2026-10-19）。主要说明 TPR（Tree Prefix Reuse）实现了什么、原生 VERL/Megatron 的修改范围、各个源码文件职责、真实训练调用链、Tree/Segment/KV/Attention/PPO/TP/CP 的实现边界及当前验收范围。
 
