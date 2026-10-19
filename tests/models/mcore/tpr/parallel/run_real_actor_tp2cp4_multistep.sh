@@ -26,6 +26,7 @@ mkdir -p "$TPR_OFFLINE_OUTPUT_DIR"
 python -m pytest -q \
   tests/models/mcore/tpr/parallel/test_native_full_dynamic_microbatches_cpu.py \
   tests/models/mcore/tpr/parallel/test_multistep_artifact_recovery_cpu.py \
+  tests/models/mcore/tpr/parallel/test_cp4_multistep_replica_audit_cpu.py \
   | tee "$TPR_OFFLINE_OUTPUT_DIR/native_batch_preflight.log"
 
 case "${TPR_OFFLINE_RUN_MODES:-both}" in
