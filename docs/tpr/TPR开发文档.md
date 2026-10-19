@@ -68,7 +68,93 @@ RayPPOTrainer.fit()
 
 ## 3. TPR 新增组件与源码职责
 
-### 3.1 Engine 侧：`verl/workers/engine/megatron/tpr/`
+### 3.1 各模块之间的依赖图
+
+下面的图以**生产训练路径中的模块调用和代码依赖**为主，按仓库中的实际文件组织；箭头从**调用方/依赖方**指向**被调用方/依赖组件**。**实线**表示主线调用或代码依赖，**虚线**表示配置、模型构建注入或可选路径。该图是模块依赖关系，§2.3 则是一次完整训练步骤的执行顺序，两者不等价。
+
+```mermaid
+flowchart TB
+    subgraph Native["原生 VERL / Megatron"]
+        Trainer["ray_trainer.py<br/>RayPPOTrainer"]
+        Worker["engine_workers.py<br/>TrainingWorker"]
+        Base["engine/base.py<br/>train_batch / optimizer_step"]
+        Engine["transformer_impl.py<br/>MegatronEngine"]
+        Config["config/engine.py<br/>TPR 配置"]
+        PPO["workers/utils/losses.py<br/>原生 ppo_loss"]
+        Finalize["Megatron 原生<br/>梯度 finalize / TP / Optimizer"]
+    end
+
+    subgraph TPR["TPR Engine：workers/engine/megatron/tpr"]
+        Adapter["adapter.py<br/>入口 / Forest 协调"]
+        Tree["tree.py<br/>Turn Forest / SegmentPlan / Ref"]
+        Executor["executor.py<br/>DFS Push / Visit / Pop"]
+        State["state.py<br/>KV Stack / Prefix dKV"]
+        Objective["objective.py<br/>物理 logits → 逻辑 PPO"]
+        Ring["ring.py<br/>SequenceShard / Padding / Prefix Ring"]
+        Recompute["recompute.py<br/>可选实验性 checkpoint"]
+        Placement["placement.py<br/>DP 成本规划（未接生产分发）"]
+    end
+
+    subgraph Model["TPR 模型侧：models/mcore/tpr"]
+        Attention["attention.py<br/>TPRSelfAttention"]
+        Context["context.py<br/>每次 Forward 的 KV Context"]
+        Rect["rectangular_attention.py<br/>CP1 矩形因果 Attention"]
+    end
+
+    subgraph Reuse["复用的第三方实现"]
+        MindSpeed["MindSpeed<br/>RingP2P / Native Ring"]
+        CANN["torch-npu / CANN<br/>Fusion Attention"]
+    end
+
+    Trainer --> Worker
+    Worker --> Base
+    Base --> Engine
+    Config -.-> Engine
+    Base --> Finalize
+    Engine --> Adapter
+    Engine -.-> Recompute
+
+    Adapter --> Tree
+    Adapter --> Executor
+    Adapter --> Objective
+    Adapter --> Ring
+    Adapter -. "安装 SelfAttention ModuleSpec" .-> Attention
+    Adapter -. "梯度 finalize" .-> Finalize
+
+    Executor --> Tree
+    Executor --> State
+    Executor --> Ring
+    Executor --> Context
+    Executor -. "模型 forward" .-> Attention
+    State --> Tree
+    State --> Context
+    State --> Ring
+    Objective --> Tree
+    Objective --> Ring
+    Objective --> PPO
+
+    Attention --> Context
+    Attention --> Rect
+    Context -. "注入 CP>1 Attention backend" .-> Ring
+    Recompute --> Attention
+    Recompute --> Context
+    Ring --> Rect
+    Ring --> MindSpeed
+    Ring --> CANN
+    Rect --> CANN
+
+    style Placement stroke-dasharray: 5 5
+```
+
+**关键边界和阅读方式：**
+
+- **框架接入**：`transformer_impl.py` 仅在模型构建与训练前反向两个位置接入 TPR；`adapter.py` 统一构树、创建单树 Executor、收集指标与触发原生梯度 finalize。原生 `BaseEngine.train_batch()` 仍负责 optimizer zero-grad/step。
+- **树调度**：`tree.py` 生成 Forest/Tree/Segment 和 ObjectiveRef；**`executor.py` 只负责 Tree 内 DFS**；`adapter.run_forest()` 负责 Tree 间顺序执行和整个 mini-batch 的梯度收尾。
+- **Prefix KV**：`executor.py` 操作 `state.py` 的长期 KV/dKV；`context.py` 仅管理一次模型 forward；`attention.py` 从 Context 读取外部 Prefix KV。CP1 经 `rectangular_attention.py`，CP>1 由 Context 注入 Ring backend。
+- **PPO 适配**：`objective.py` 依赖 `tree.py` 的逻辑 Ref 和 `ring.py` 的 CP 位置映射，但**最终调用的是原生 `ppo_loss()`**，不依赖实验数据采集脚本。
+- **并行与非生产路径**：`ring.py` 中同时维护 SequenceShard、Padding、逻辑/物理索引及 Ring；它复用 MindSpeed 传输而不是自建 CP 通信框架。`recompute.py` 是显式开启的实验性路径；`placement.py` 当前与生产 Trainer dispatch **没有调用边**。TP 一致性验证位于 `tree.py`，没有单独的 TPR TP 算法模块。
+
+### 3.2 Engine 侧：`verl/workers/engine/megatron/tpr/`
 
 | 文件 | 主要职责 | 关键接口 |
 | --- | --- | --- |
@@ -82,7 +168,7 @@ RayPPOTrainer.fit()
 | [`recompute.py`](../../verl/workers/engine/megatron/tpr/recompute.py) | 可选 TPR-aware TransformerBlock checkpoint，保留外部 KV graph roots；**实验性** | `install_tpr_full_recompute()`、`assert_tpr_full_recompute_installed()` |
 | [`__init__.py`](../../verl/workers/engine/megatron/tpr/__init__.py) | 子包入口 | — |
 
-### 3.2 模型侧：`verl/models/mcore/tpr/`
+### 3.3 模型侧：`verl/models/mcore/tpr/`
 
 | 文件 | 主要职责 |
 | --- | --- |
@@ -93,7 +179,7 @@ RayPPOTrainer.fit()
 
 `context.py` 是**一次 forward 的上下文**，`state.py` 是**多 Segment 间持久的 KV/dKV 状态**，职责不同。当前 Ring/Padding/Sharding 的唯一维护实现位于 Engine `ring.py`，不是另一套模型侧 Shard 文件。
 
-### 3.3 实验代码与生产代码的区分
+### 3.4 实验代码与生产代码的区分
 
 `verl/experimental/tpr/` 中的 `actor_capture.py`、AllGather/Ulysses/Hybrid CP、GDN/Linear、offload 与 `legacy/` 实现，分别用于数据留存、对照、探索和历史回归；**不等于默认生产 Dense PPO 执行路径**。现有生产 Ring 维护入口是 `tpr/ring.py`，而不是历史实验实现。
 
