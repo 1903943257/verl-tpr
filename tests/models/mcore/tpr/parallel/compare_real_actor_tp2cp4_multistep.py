@@ -30,7 +30,10 @@ def _rank_replica_audit(items, label: str, step: int) -> dict:
     """
     records = sorted((
         {
-            "world_rank": int(x["rank"]) if x.get("rank") == x.get("tp_rank") else int(idx),
+            # Offline snapshots' "rank" field is TP rank, not WORLD rank.
+            # File list is ordered full_step<step>_rank0..7.pt.
+            "world_rank": idx,
+            "recorded_rank_field": int(x["rank"]),
             "snapshot_index": idx,
             "tp": int(x["tp_rank"]), "cp": int(x["cp_rank"]),
             "loss": float(x["loss"]),
