@@ -74,6 +74,7 @@ def test_done_missing_full_gradient_witness_fails_closed(tmp_path):
 def test_manifest_requires_all_real_step_snapshots(tmp_path):
     assert expected_snapshots(5, has_manifest=True) == (1, 2, 3, 4, 5)
     assert expected_snapshots(5, has_manifest=False) == (1, 2, 5)
+    assert expected_snapshots(3, has_manifest=False) == (1, 2, 3)
     _snapshots(tmp_path, "full", steps=(1, 2, 5))
     result = reconcile(tmp_path, mode="full", steps=5, has_manifest=True,
                        full_grad_steps=set())
