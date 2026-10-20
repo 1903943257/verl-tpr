@@ -77,6 +77,32 @@ def test_n8_capture_preserves_real_ppo_labels_and_actual_turn_root(tmp_path: Pat
         derive_capture(source, target)
 
 
+def test_n8_qwen_turn_root_rounding_at_short_prompt_tail(tmp_path: Path):
+    # The identical prompt ends 64 tokens after the preceding ChatML turn.
+    # With production turn_min_segment_tokens=128, this short final piece
+    # is merged with a response-dependent turn: true reusable Root=P-64.
+    source, batch = _original_source(tmp_path)
+    from verl.workers.engine.megatron.tpr.tree import QWEN3_IM_END_TOKEN_ID
+    original = torch.load(source, map_location="cpu", weights_only=False)
+    prompt = batch["prompts"][0].clone()
+    prompt[-65] = QWEN3_IM_END_TOKEN_ID
+    data = batch.clone(recurse=False)
+    prompts = [prompt.clone() for _ in range(BRANCHES)]
+    responses = [batch["responses"][i] for i in range(BRANCHES)]
+    data.set("prompts", _nested(prompts))
+    data.set("input_ids", _nested([
+        torch.cat((prompts[i], responses[i])) for i in range(BRANCHES)
+    ]))
+    original["tensordict"] = data
+    torch.save(original, source)
+    audit = derive_capture(source, tmp_path/"rounded.pt")
+    assert audit["actual_shared_root_tokens"] == PREFIX - 64
+    assert audit["nominal_prefix_minus_actual_root"] == 64
+    assert audit["effective_root_to_suffix_ratio"] == (PREFIX - 64) / SUFFIX
+    assert audit["forest_trees"] == 1
+    assert audit["forest_segments"] == 9
+
+
 def test_n8_capture_rejects_missing_common_prefix(tmp_path: Path):
     source, _ = _original_source(tmp_path, divergent_prompt=True)
     with pytest.raises(ValueError, match="identical"):
@@ -121,6 +147,7 @@ def test_cpu_comparison_has_strict_same_input_and_baseline_label(tmp_path: Path)
         "synthetic_shared_uid":True, "recompute":False, "optimizer_step":False,
         "warmups":1, "repeats":3,
         "forest_trees":8, "forest_segments":8,
+        "actual_shared_root_tokens":8192, "unique_tree_tokens":16384,
         "baseline_kind":"CONTROLLED_WHOLE_SQUARE_CANN_NO_TPR_CONTEXT",
         "median_fwd_bwd_s":4.,
         "worst_peak_allocated_gib":30.,
