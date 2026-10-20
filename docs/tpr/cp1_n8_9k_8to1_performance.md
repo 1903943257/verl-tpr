@@ -158,3 +158,47 @@ The script skips a case only if its `results/comparison.json` exists. All
 three are F/B-only: 1 warmup + 3 rank-max repeats, Recompute OFF, optimizer
 excluded. Because the CP1 and CP4 Full baselines differ, do not pool their
 speedup values as if they shared one production baseline.
+
+## CP2 N=8 controlled 18K P:S sweep
+
+After the CP4 36K attempts yielded only `prompt_shortfall` (360/360
+candidate sources), run **two CP2 shapes at identical total length**
+using native Megatron/MindSpeed Full vs production TPR Ring:
+
+| Case | P | S | Length | Topology | Ranks |
+|---|---:|---:|---:|---|---:|
+| CP2 8:1 | 16,384 | 2,048 | 18,432 | TP2 CP2 DP1 | 4 |
+| CP2 1:1 | 9,216 | 9,216 | 18,432 | TP2 CP2 DP1 | 4 |
+
+Both use Qwen3-4B BF16, N=8 captured Actor PPO rows, 1 warmup + 3
+F/B repetitions, recompute OFF, optimizer excluded and no Fixed Tile.
+The same real-source eligibility gates apply: token-identical trailing
+prompt, eight distinct real response branches and retained PPO labels.
+Searching the available Run2/Run3/Run5 data does **not** guarantee a
+capture will pass either gate. In particular Run2 has an original row
+with under 9,216 response tokens, so it is ineligible for CP2 1:1.
+
+Docker command:
+
+```bash
+cd /workspace/verl-tpr-ring-review
+set -o pipefail
+bash tests/models/mcore/tpr/parallel/run_tpr_cp2_n8_18k_sweep.sh \
+  2>&1 | tee /workspace/tpr_experiments/performance/cp2_n8_18k_sweep.log
+```
+
+Optional explicit real source files: `TPR_CP2_N8_SOURCE_16K_2K` and
+`TPR_CP2_N8_SOURCE_9K_9K`. The default source finder searches
+`/workspace/tpr_actor_capture_4b_n8_run{5,3,2}` without rewriting
+or fabricating source values.
+
+Isolated results:
+- `/workspace/tpr_experiments/performance/cp2_n8_18k_8to1_v1/results/comparison.json`
+- `/workspace/tpr_experiments/performance/cp2_n8_18k_1to1_v1/results/comparison.json`
+
+The prior CP1 9K 1:1 F/B result measured 9.818837s Controlled Full
+versus 6.694984s TPR (1.4666x), 41.47494 GiB vs 25.62606 GiB
+allocated memory (38.21% saving). CP2's native Full baseline is
+a different reference and should not be pooled with CP1's controlled
+Square-CANN baseline. New CP2 NPU code must still pass server
+preflight and benchmark execution before any measured speedup claim.
