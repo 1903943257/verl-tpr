@@ -45,12 +45,13 @@ def test_fixed_shape_40k_one_mode():
         # the original 40K/20-step manifest path untouched for production
         # historical regression tests.
         if step != 0:
-            raise ValueError("The independent CP4 27K shape benchmark uses step=0")
+            raise ValueError("The independent CP4 controlled shape benchmark uses step=0")
         controlled = json.loads(Path(controlled_path).read_text())
         p, s = int(controlled["prefix"]), int(controlled["suffix"])
         if (
-            (p, s) not in ((13824, 13824), (24576, 3072))
-            or controlled["n"] != 8 or controlled["length"] != 27648
+            (p, s) not in ((13824, 13824), (24576, 3072),
+                           (18432, 18432), (32768, 4096))
+            or controlled["n"] != 8 or controlled["length"] != p + s
             or controlled["forest_trees"] != 1
             or controlled["forest_segments"] < 9
             or not p - 127 <= controlled.get("actual_shared_root_tokens", -1) < p + s
@@ -58,11 +59,11 @@ def test_fixed_shape_40k_one_mode():
             or not controlled["changed_conditioning"]
             or not controlled["synthetic_shared_uid"]
         ):
-            raise AssertionError("CP4 27K benchmark needs an audited eight-leaf 1:1 or 8:1 tree")
+            raise AssertionError("CP4 controlled benchmark needs an audited eight-leaf 1:1 or 8:1 tree")
         item = {
             "capture": controlled["capture"],
             "ppo_tokens": controlled["ppo_tokens"],
-            "effective_sequence_cap": 27648,
+            "effective_sequence_cap": p + s,
         }
     else:
         manifest_path = Path(os.environ["TPR_OFFLINE_CAPTURE_MANIFEST"])
@@ -140,8 +141,8 @@ def test_fixed_shape_40k_one_mode():
         if controlled:
             if data_sha != controlled["input_sha256"]:
                 raise AssertionError("CP4 controlled Full/TPR input SHA differs from audited capture")
-            if any(int(row.numel()) != 27648 for row in batch["input_ids"].unbind(0)):
-                raise AssertionError("CP4 controlled replay must have eight exact 27648-token rows")
+            if any(int(row.numel()) != controlled["length"] for row in batch["input_ids"].unbind(0)):
+                raise AssertionError("CP4 controlled replay must have eight exact audited-length rows")
         if max(int(x.numel()) for x in batch["input_ids"].unbind(0)) > int(
                 item.get("effective_sequence_cap", 40960)):
             raise AssertionError("Capture exceeds its declared experimental sequence cap")
