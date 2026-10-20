@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
-# Qwen3-4B, 2 NPU TP2 CP1 DP1, N8, P8192 S1024. F/B+finalize only.
+# Qwen3-4B, 2 NPU TP2 CP1 DP1, N8, supported 9K shapes. F/B+finalize only.
 # Full is a controlled whole-sequence square-CANN reference, NOT
 # production Native Megatron/MindSpeed Full F/B.
 # Offline performance-only capture retains original historical PPO labels.
 set -euo pipefail
 cd "$(dirname "$0")/../../../../.."
 
+P="${TPR_CP1_N8_P:-8192}"
+S="${TPR_CP1_N8_S:-1024}"
+if [[ "$P:$S" != "8192:1024" && "$P:$S" != "4608:4608" ]]; then
+  echo "Supported CP1 shapes: 8192/1024 or 4608/4608" >&2
+  exit 2
+fi
 SOURCE="${TPR_CP1_N8_SOURCE:-/workspace/tpr_actor_capture_4b_n8_run2/actor_update_step000003_rank2_capture000002_batch0.pt}"
-ROOT="${TPR_CP1_N8_ROOT:-/workspace/tpr_experiments/performance/cp1_n8_9k_8to1_v1}"
+if [[ "$P:$S" == "8192:1024" ]]; then
+  DEFAULT_ROOT="/workspace/tpr_experiments/performance/cp1_n8_9k_8to1_v1"
+else
+  DEFAULT_ROOT="/workspace/tpr_experiments/performance/cp1_n8_9k_1to1_v1"
+fi
+ROOT="${TPR_CP1_N8_ROOT:-$DEFAULT_ROOT}"
 DATA_DIR="$ROOT/data"
 RESULT_DIR="$ROOT/results"
 LOG_DIR="$ROOT/logs"
-CAPTURE="$DATA_DIR/cp1_n8_p8192_s1024.pt"
+CAPTURE="$DATA_DIR/cp1_n8_p${P}_s${S}.pt"
 export TPR_QWEN_4B_PATH="${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}"
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-8,9}"
 if [[ "$ASCEND_RT_VISIBLE_DEVICES" != "8,9" ]]; then
@@ -31,6 +42,8 @@ export TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS=0
 export TPR_BENCH_WARMUPS="${TPR_BENCH_WARMUPS:-1}"
 export TPR_BENCH_REPEATS="${TPR_BENCH_REPEATS:-3}"
 export TPR_RUN_CP1_N8_PERF=1
+export TPR_CP1_N8_P="$P"
+export TPR_CP1_N8_S="$S"
 export TPR_CP1_N8_CAPTURE="$CAPTURE"
 export TPR_CP1_N8_OUTPUT_DIR="$RESULT_DIR"
 unset TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
@@ -50,16 +63,16 @@ python tests/models/mcore/tpr/run_cpu_regressions.py --only-cp1-n8-perf \
 
 if [[ ! -f "$CAPTURE" ]]; then
   python -m tests.models.mcore.tpr.parallel.prepare_tpr_cp1_n8_perf_capture \
-    "$SOURCE" "$CAPTURE" 2>&1 | tee "$LOG_DIR/prepare.log"
+    "$SOURCE" "$CAPTURE" --prefix "$P" --suffix "$S" 2>&1 | tee "$LOG_DIR/prepare.log"
 fi
 [[ -f "${CAPTURE%.pt}.audit.json" ]] || {
-  echo "Missing 8:1 capture audit; refusing an unverified benchmark" >&2
+  echo "Missing capture audit; refusing an unverified benchmark" >&2
   exit 2
 }
 fail=0
 for mode in full tpr; do
   export TPR_CP1_N8_MODE="$mode"
-  echo "TPR_CP1_N8_RUN mode=$mode topology=TP2CP1 N=8 P8192 S1024"
+  echo "TPR_CP1_N8_RUN mode=$mode topology=TP2CP1 N=8 P=$P S=$S"
   if ! torchrun --nproc_per_node=2 --master_port=29831 \
        -m pytest \
        tests/models/mcore/tpr/parallel/test_tpr_cp1_n8_9k_perf_npu.py \
@@ -70,6 +83,7 @@ for mode in full tpr; do
 done
 if [[ "$fail" == 0 ]]; then
   python -m tests.models.mcore.tpr.parallel.compare_tpr_cp1_n8_perf "$RESULT_DIR" \
+    --prefix "$P" --suffix "$S" \
     2>&1 | tee "$LOG_DIR/compare.log"
 else
   exit 1
