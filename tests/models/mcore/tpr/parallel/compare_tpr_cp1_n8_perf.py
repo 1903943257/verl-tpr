@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 
 
-def compare(root: Path) -> dict:
-    full = json.loads((root / "full.json").read_text())
-    tpr = json.loads((root / "tpr.json").read_text())
+def compare(output_dir: Path) -> dict:
+    full = json.loads((output_dir / "full.json").read_text())
+    tpr = json.loads((output_dir / "tpr.json").read_text())
     common = (
         "model", "checkpoint", "topology", "branches", "prefix", "suffix",
         "length", "source_capture", "source_input_sha256", "ppo_tokens",
@@ -30,9 +30,9 @@ def compare(root: Path) -> dict:
         raise AssertionError("Unshared control did not execute eight whole sequences")
     if tpr["forest_trees"] != 1 or tpr["forest_segments"] < 9:
         raise AssertionError("TPR did not share one root across eight leaves")
-    root = tpr["actual_shared_root_tokens"]
-    if (not 8192 - 127 <= root < 9216
-            or full["actual_shared_root_tokens"] != root
+    shared_root_tokens = tpr["actual_shared_root_tokens"]
+    if (not 8192 - 127 <= shared_root_tokens < 9216
+            or full["actual_shared_root_tokens"] != shared_root_tokens
             or full["unique_tree_tokens"] != tpr["unique_tree_tokens"]):
         raise AssertionError("Actual physical qwen_turn prefix differs across modes")
     if full["recompute"] or full["optimizer_step"]:
@@ -61,8 +61,8 @@ def compare(root: Path) -> dict:
         ),
         "ppo_tokens": full["ppo_tokens"],
         "nominal_prefix_tokens": 8192,
-        "actual_shared_root_tokens": root,
-        "effective_root_to_suffix_ratio": root / 1024,
+        "actual_shared_root_tokens": shared_root_tokens,
+        "effective_root_to_suffix_ratio": shared_root_tokens / 1024,
         "unique_tree_tokens": tpr["unique_tree_tokens"],
         "source_input_sha256": full["source_input_sha256"],
         "notes": (
@@ -72,7 +72,7 @@ def compare(root: Path) -> dict:
             "not Megatron native F/B schedule."
         ),
     }
-    target = root / "comparison.json"
+    target = output_dir / "comparison.json"
     if target.exists():
         raise FileExistsError(f"Refuse overwrite of benchmark comparison: {target}")
     target.write_text(json.dumps(report, indent=2))
