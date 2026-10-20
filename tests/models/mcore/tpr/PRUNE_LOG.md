@@ -5,16 +5,15 @@ production runtime changes, regression thresholds, Attention implementation or
 PPO math are included. Each removed file can be recovered from the main
 history with `git show <old-commit>:<path>`.
 
-## 18 retired files (10 pytest files)
+## 16 retired files (10 pytest files)
 
-- 10-file Qwen3-1.7B weak-E2E experiment island:
-  `correctness/_qwen17_weak_e2e_{sampling,token_capture,trace}.py`,
+- 9 retired files from the Qwen3-1.7B weak-E2E experiment island:
+  `correctness/_qwen17_weak_e2e_{token_capture,trace}.py`,
   `correctness/{analyze_qwen17_weak_e2e_samples.py,run_qwen17_real_tq_weak_e2e.sh,test_qwen3_1_7b_real_tq_weak_e2e_npu.py}`,
   and `unit/test_qwen17_weak_e2e_{analysis,sampling,token_capture,trace}.py`.
   These investigate an earlier Qwen3-1.7B weak-E2E path rather than the
   current Qwen3-4B production PPO acceptance.
-- Fixed Tile experiment:
-  `correctness/_qwen17_fixed_tile_probe.py` and
+- Fixed Tile CPU experiment:
   `unit/test_qwen17_fixed_tile_probe.py`. The earlier equal-M workaround
   must not be re-enabled; it changes the physical GEMM and was rejected as a
   correctness control.
@@ -28,6 +27,13 @@ history with `git show <old-commit>:<path>`.
   `parallel/test_native_attention_qkv_replay_npu.py`,
   `parallel/run_native_attention_qkv_replay.sh`.
   The original native CP drift and live Ring/TP/DP gates are retained.
+
+**Retained dependency helpers:** `correctness/_qwen17_weak_e2e_sampling.py`
+remains because the native CP drift probe imports `exact_sample_indices`.
+`correctness/_qwen17_fixed_tile_probe.py` remains because a separate
+historical Qwen3-1.7B PPO control imports it conditionally. Neither helper is
+part of a maintained production acceptance suite. Do not silently remove
+these imports or enable Fixed Tile in the production path.
 
 ## Acceptance requirements before merge
 
