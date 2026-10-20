@@ -45,8 +45,11 @@ p, s = int(sys.argv[3]), int(sys.argv[4])
 assert pathlib.Path(audit["source"]).resolve() == source
 assert (audit["prefix"], audit["suffix"], audit["length"], audit["n"]) == (p, s, p+s, 8)
 assert audit["forest_trees"] == 1 and audit["forest_segments"] >= 9
+assert p-127 <= audit["actual_shared_root_tokens"] < p+s
+assert audit["min_turn_segment_tokens"] == 128
 assert audit["synthetic_shared_uid"] and audit["changed_conditioning"]
-print("TPR_CP4_N8_CAPTURE_AUDIT_PASS", audit["input_sha256"], flush=True)
+print("TPR_CP4_N8_CAPTURE_AUDIT_PASS", audit["input_sha256"],
+      "actual_shared_root_tokens=", audit["actual_shared_root_tokens"], flush=True)
 PY
 
 if [[ "${TPR_SHAPE_PREFLIGHT_ONLY:-0}" == "1" ]]; then
@@ -120,6 +123,8 @@ report = {
     "baseline": "NATIVE_MEGATRON_MINDSPEED_FULL",
     "tpr": "TPR_RING_QWEN_TURN",
     "input_sha256": full["input_sha256"],
+    "actual_shared_root_tokens": full["controlled_performance_shape"]["actual_shared_root_tokens"],
+    "unique_tree_tokens": full["controlled_performance_shape"]["unique_tree_tokens"],
     "full_median_fwd_bwd_s": f, "tpr_median_fwd_bwd_s": t,
     "speedup": f/t,
     "full_peak_allocated_gib": max(v["peak_allocated_gib"] for v in full["runs"] if not v["warmup"]),
