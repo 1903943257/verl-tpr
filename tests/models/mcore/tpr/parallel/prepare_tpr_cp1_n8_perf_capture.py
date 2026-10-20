@@ -47,10 +47,48 @@ def derive_capture(source: Path, target: Path) -> dict:
     prompts = [batch["prompts"][i] for i in range(BRANCHES)]
     responses = [batch["responses"][i] for i in range(BRANCHES)]
     ids = [batch["input_ids"][i] for i in range(BRANCHES)]
+    length_audit = []
     for i in range(BRANCHES):
-        if (prompts[i].numel() < PREFIX or responses[i].numel() < SUFFIX
-                or ids[i].numel() != prompts[i].numel() + responses[i].numel()):
-            raise ValueError(f"row {i} cannot supply {PREFIX}+{SUFFIX} real tokens")
+        p_len = int(prompts[i].numel())
+        r_len = int(responses[i].numel())
+        input_len = int(ids[i].numel())
+        length_audit.append({
+            "row": i,
+            "prompt_tokens": p_len,
+            "response_tokens": r_len,
+            "input_tokens": input_len,
+            "prompt_shortfall": max(0, PREFIX - p_len),
+            "response_shortfall": max(0, SUFFIX - r_len),
+            "input_length_aligned": input_len == p_len + r_len,
+            "supervised_in_first_1024": int(
+                batch["response_mask"][i][:SUFFIX].bool().sum().item()
+            ),
+        })
+    # Always report all eight original lengths *before* the first rejection;
+    # truncated captures must never silently masquerade as a P:S=8:1 case.
+    print(
+        "TPR_CP1_N8_SOURCE_LENGTHS "
+        + json.dumps({"source": str(source), "rows": length_audit},
+                     sort_keys=True),
+        flush=True,
+    )
+    for i, stat in enumerate(length_audit):
+        reasons = []
+        if stat["prompt_shortfall"]:
+            reasons.append(f"prompt_shortfall={stat['prompt_shortfall']}")
+        if stat["response_shortfall"]:
+            reasons.append(f"response_shortfall={stat['response_shortfall']}")
+        if not stat["input_length_aligned"]:
+            reasons.append("input_length_not_prompt_plus_response")
+        if reasons:
+            raise ValueError(
+                f"row {i} cannot supply exact P={PREFIX}, S={SUFFIX}: "
+                f"prompt={stat['prompt_tokens']}, "
+                f"response={stat['response_tokens']}, "
+                f"input={stat['input_tokens']}, reasons={','.join(reasons)}. "
+                "See TPR_CP1_N8_SOURCE_LENGTHS for all 8 rows. "
+                "Choose a different real capture; no padding or fabricated PPO labels."
+            )
         if not torch.equal(ids[i], torch.cat((prompts[i], responses[i]))):
             raise AssertionError(f"Capture row {i} input_ids != prompts+responses")
         if any(batch[k][i].numel() != responses[i].numel()
