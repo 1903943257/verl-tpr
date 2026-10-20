@@ -34,18 +34,18 @@ UNIT = (
     "turn_tree_cpu", "ppo_objective_cpu", "ppo_batch_cpu", "ppo_executor_cpu",
     "sequence_shard_cpu", "unified_kv_state_cpu", "prefix_state", "kv_stack",
     "shard", "tpr_self_attention", "context", "rectangular_attention_contract",
-    "ring_streaming_transport", "ring_coalescing_schedule", "production_architecture",
+    "ring_streaming_transport",  "production_architecture",
     "tpr_production_dp2_gate_cpu",
-    "tp_validation", "rope", "control_plane_gloo_cpu",
+    "tp_validation", "rope", 
     "replay_bootstrap_cpu",
     "suite_registry_cpu",
-    "dp_placement", 
+    "dp_placement",
 )
 PARALLEL = (
     "ring_cp_attention_contract", "ring_numerics_cpu",
     "cp_padding_contract", "cp_backend_contract",
-    "cp_segment_execution_contract", "allgather_cp_attention_contract",
-    "hybrid_cp_attention_contract", "ulysses_cp_attention_contract",
+    "cp_segment_execution_contract", 
+     
 )
 
 

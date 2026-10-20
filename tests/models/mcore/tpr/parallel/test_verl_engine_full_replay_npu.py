@@ -232,7 +232,7 @@ def _native_witness(engine, *, grads: bool):
     param.grad; using the latter would silently report missing gradients.
     """
     from verl.utils.megatron_utils import unwrap_model
-    from ..correctness._qwen17_weak_e2e_sampling import exact_sample_indices
+    from ._sample_indices import exact_sample_indices
 
     unwrapped = unwrap_model(engine.module[0])
     result = {}
