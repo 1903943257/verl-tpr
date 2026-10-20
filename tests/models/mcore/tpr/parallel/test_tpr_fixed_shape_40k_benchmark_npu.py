@@ -58,6 +58,7 @@ def test_fixed_shape_40k_one_mode():
                 (4, 13824, 13824), (4, 24576, 3072),
                 (4, 18432, 18432), (4, 32768, 4096),
                 (2, 16384, 2048), (2, 9216, 9216),
+                (2, 6016, 6016), (2, 12416, 6016),
             )
             or controlled["n"] != 8 or controlled["length"] != p + s
             or controlled["forest_trees"] != 1
