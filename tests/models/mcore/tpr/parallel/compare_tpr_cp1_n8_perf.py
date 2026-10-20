@@ -1,4 +1,4 @@
-"""Compare two immutable TP2 CP1 N8 P8192/S1024 CPU-side performance JSONs."""
+"""Compare controlled CP1 N8 9K performance JSONs at audited P/S shapes."""
 from __future__ import annotations
 
 import argparse
