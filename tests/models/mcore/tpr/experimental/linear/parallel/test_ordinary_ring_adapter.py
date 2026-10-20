@@ -83,7 +83,7 @@ def test_native_whole_ring_opt_in_virtual_right_padding(monkeypatch):
 def test_offline_native_ring_adapter_flattens_heads_for_projection(monkeypatch):
     """Regression: a four-dimensional Q must produce [S,1,H*D] for TP row GEMM."""
     import os
-    from .test_real_actor_tp2cp4_offline_ppo_npu import _install_offline_full_ring_backend
+    from ....parallel.test_real_actor_tp2cp4_offline_ppo_npu import _install_offline_full_ring_backend
 
     monkeypatch.setenv("TPR_OFFLINE_FULL_RING_BACKEND", "native")
     seen = []
