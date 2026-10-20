@@ -26,6 +26,7 @@ from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 from .native_full_megatron_schedule import run_native_full_step
 from .test_real_actor_tp2cp4_multistep_npu import _make_engine
 from .test_real_actor_tp2cp4_offline_ppo_npu import _PPO, _runtime, _load_real_pair
+from .test_tpr_10k_parallel_parity_npu import _runtime as _parallel_runtime, _engine as _parallel_engine
 
 pytestmark = pytest.mark.skipif(
     os.getenv("TPR_RUN_FIXED_SHAPE_40K_BENCH") != "1",
@@ -39,6 +40,10 @@ def test_fixed_shape_40k_one_mode():
         raise ValueError("TPR_OFFLINE_MODE must be full or tpr")
     step = int(os.environ["TPR_BENCH_SOURCE_STEP"])
     controlled_path = os.getenv("TPR_BENCH_CONTROLLED_N8_AUDIT")
+    cp = int(os.getenv("TPR_BENCH_CP_SIZE", "4"))
+    if cp not in (2, 4) or (cp == 2 and not controlled_path):
+        raise ValueError("CP2 is only supported for audited controlled N8 shapes")
+    world = 2 * cp
     controlled = None
     if controlled_path:
         # Direct, explicitly marked performance-only derived capture. Keep
@@ -49,8 +54,11 @@ def test_fixed_shape_40k_one_mode():
         controlled = json.loads(Path(controlled_path).read_text())
         p, s = int(controlled["prefix"]), int(controlled["suffix"])
         if (
-            (p, s) not in ((13824, 13824), (24576, 3072),
-                           (18432, 18432), (32768, 4096))
+            (cp, p, s) not in (
+                (4, 13824, 13824), (4, 24576, 3072),
+                (4, 18432, 18432), (4, 32768, 4096),
+                (2, 16384, 2048), (2, 9216, 9216),
+            )
             or controlled["n"] != 8 or controlled["length"] != p + s
             or controlled["forest_trees"] != 1
             or controlled["forest_segments"] < 9
@@ -59,7 +67,7 @@ def test_fixed_shape_40k_one_mode():
             or not controlled["changed_conditioning"]
             or not controlled["synthetic_shared_uid"]
         ):
-            raise AssertionError("CP4 controlled benchmark needs an audited eight-leaf 1:1 or 8:1 tree")
+            raise AssertionError(f"CP{cp} controlled benchmark needs an audited eight-leaf 1:1 or 8:1 tree")
         item = {
             "capture": controlled["capture"],
             "ppo_tokens": controlled["ppo_tokens"],
@@ -114,7 +122,7 @@ def test_fixed_shape_40k_one_mode():
     )
     output_dir = Path(os.environ["TPR_BENCH_OUTPUT_DIR"])
     checkpoint = Path(os.environ.get("TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"))
-    runtime = _runtime()
+    runtime = _runtime() if cp == 4 else _parallel_runtime(2, cp, 1)
     # The Full reference needs the same supported FP32 collective gate as
     # the TPR DP2 benchmark; FP64 HCCL reductions cannot be trusted on 910B.
     probe = torch.tensor(
@@ -122,13 +130,14 @@ def test_fixed_shape_40k_one_mode():
     )
     dist.all_reduce(probe, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
     torch.npu.synchronize()
-    if float(probe.item()) != 36.0:
+    expected_sum = float(world * (world + 1) // 2)
+    if float(probe.item()) != expected_sum:
         raise AssertionError(
             f"Full WORLD FP32 AllReduce failed on rank {dist.get_rank()}: "
-            f"rank_sum={probe.item()} expected=36"
+            f"rank_sum={probe.item()} expected={expected_sum}"
         )
     if dist.get_rank() == 0:
-        print("TPR_FULL_WORLD_FP32_REDUCE_PASS rank_sum=36", flush=True)
+        print(f"TPR_FULL_WORLD_FP32_REDUCE_PASS rank_sum={expected_sum:g}", flush=True)
     try:
         from verl.workers.utils.losses import ppo_loss
         # Reuse existing original PPO-capture loader. Its original source_keys
@@ -140,9 +149,9 @@ def test_fixed_shape_40k_one_mode():
             raise AssertionError("Capture/manifest PPO token count mismatch")
         if controlled:
             if data_sha != controlled["input_sha256"]:
-                raise AssertionError("CP4 controlled Full/TPR input SHA differs from audited capture")
+                raise AssertionError(f"CP{cp} controlled Full/TPR input SHA differs from audited capture")
             if any(int(row.numel()) != controlled["length"] for row in batch["input_ids"].unbind(0)):
-                raise AssertionError("CP4 controlled replay must have eight exact audited-length rows")
+                raise AssertionError(f"CP{cp} controlled replay must have eight exact audited-length rows")
         if max(int(x.numel()) for x in batch["input_ids"].unbind(0)) > int(
                 item.get("effective_sequence_cap", 40960)):
             raise AssertionError("Capture exceeds its declared experimental sequence cap")
@@ -152,12 +161,16 @@ def test_fixed_shape_40k_one_mode():
             raise AssertionError("Expected eight selected Sessions")
         tu.assign_non_tensor(batch, tpr_capture_log_probs=capture_logprobs)
         model, hf = make_real_qwen3_tp_model(
-            runtime, model_path=checkpoint, tp_size=2, cp_size=4,
+            runtime, model_path=checkpoint, tp_size=2, cp_size=cp,
             sequence_parallel=False, profile="4b", native_attention=(mode == "full"),
         )
         assert hf.num_hidden_layers == 36
         finalize_time = [0.0]
-        engine = _make_engine(model, runtime, finalize_time) if mode == "tpr" else None
+        engine = (
+            (_make_engine(model, runtime, finalize_time) if cp == 4
+             else _parallel_engine(model, runtime, 2, cp, 1))
+            if mode == "tpr" else None
+        )
         installed_blocks = 0
         if mode == "tpr" and recompute_enabled:
             from megatron.core.transformer.transformer_block import TransformerBlock
@@ -378,7 +391,7 @@ def test_fixed_shape_40k_one_mode():
                 "recompute_method": model.config.recompute_method,
                 "recompute_num_layers": model.config.recompute_num_layers,
                 "recompute_installed_tpr_blocks": installed_blocks,
-                "topology": {"tp": 2, "cp": 4, "dp": 1, "world": 8},
+                "topology": {"tp": 2, "cp": cp, "dp": 1, "world": world},
                 "effective_sequence_cap": int(item.get("effective_sequence_cap", 40960)),
                 "input_sha256": data_sha, "source_capture": str(capture),
                 "checkpoint": str(checkpoint), "warmups": warmups,
