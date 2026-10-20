@@ -385,6 +385,8 @@ def test_fixed_shape_40k_one_mode():
                      "unique_tree_tokens": controlled["unique_tree_tokens"],
                      "synthetic_shared_uid": controlled["synthetic_shared_uid"],
                      "changed_conditioning": controlled["changed_conditioning"],
+                     "synthetic_response_windows": controlled.get("synthetic_response_windows", False),
+                     "original_actor_capture": controlled.get("original_actor_capture"),
                      "original_capture": controlled["source"]}
                     if controlled else None
                 ),
