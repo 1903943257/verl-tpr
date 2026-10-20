@@ -81,6 +81,19 @@ def _check_relative_imports() -> list[str]:
     return errors
 
 
+
+def _check_shell_references() -> list[str]:
+    """Catch shell launchers referring to Python/tests removed by pruning."""
+    errors: list[str] = []
+    pattern = r"tests/models/mcore/tpr/[A-Za-z0-9_./-]+\.(?:py|sh)"
+    for path in sorted(TEST_ROOT.rglob("*.sh")):
+        source = path.relative_to(TEST_ROOT)
+        for reference in set(re.findall(pattern, path.read_text(encoding="utf-8"))):
+            if not (ROOT / reference).is_file():
+                errors.append(f"{source}: missing shell target {reference}")
+    return errors
+
+
 def check() -> list[str]:
     errors: list[str] = []
     if set(SUITES) != set(SUITE_DESCRIPTIONS):
@@ -108,6 +121,7 @@ def check() -> list[str]:
             if identifier not in GATES:
                 errors.append(f"{suite}: unknown gate {identifier}")
     errors.extend(_check_relative_imports())
+    errors.extend(_check_shell_references())
     return errors
 
 
@@ -209,7 +223,7 @@ def main(argv: list[str] | None = None) -> int:
         counts = inventory()
         for name, number in counts.items():
             print(f"{name:18s} {number:4d}")
-        print(f"total pytest files: {sum(counts.values())}; curated gates: {len(GATES)}")
+        print(f"total pytest files: {sum(counts.values())}; core: {sum(counts.values()) - counts.get('experimental', 0)}; experimental: {counts.get('experimental', 0)}; curated gates: {len(GATES)}")
         return 0
     if args.action == "check":
         errors = check()

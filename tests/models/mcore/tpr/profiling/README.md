@@ -1,19 +1,7 @@
-# TPR profiling is not a correctness suite
+# TPR profiling
 
-This folder contains capacity probes, memory lifecycle studies, GEMM
-diagnostics, Ring CP profiles and activation offload experiments.
-Run these only with a fixed model, capture, topology, flags, number of
-warmups/repetitions, and a comparable baseline.
+Active NPU profiling entry: `test_tpr_qwen3_ring_cp_profile_npu.py`, invoked by `../run_performance.sh ring`. The shared real-Qwen profile helpers live in `_qwen3_profile_target.py` and `_engine_profile_fixture.py`.
 
-A `profiling/test_*.py` file being named as a pytest does not mean its
-output certifies forward/backward parity. In particular:
-- `test_tpr_qwen3_ring_cp_profile_npu.py` requires the opt-in
-  `TPR_RUN_QWEN_RING_CP_PROFILE=1`.
-- `NATIVE_RECOMPUTE_AUDIT.md` is a historical analysis of the
-  *config-only* native checkpoint contract, not a negative statement about
-  the later KV-aware prototype.
-- All-gather/native and custom Ring reference paths must be identified
-  precisely in result tables.
+For reproducible real Actor performance, prefer `../parallel/run_tpr_fixed_shape_40k_benchmark.sh` or explicit 30K scripts rather than a standalone synthetic benchmark. Results must distinguish F/B-only timing from optimizer/online E2E.
 
-See `../TEST_MATRIX.md` for the acceptance order. Numerical correctness
-and full parameter gradients precede any claimed memory/speedup result.
+Existing `*.md` files describing older Qwen3-1.7B GEMM, activation-offload and Ring probe results are historical research notes; their removed launchers are **not** maintained commands.
