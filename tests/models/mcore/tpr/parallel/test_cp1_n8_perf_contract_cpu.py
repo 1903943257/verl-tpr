@@ -168,6 +168,10 @@ def test_cpu_comparison_has_strict_same_input_and_baseline_label(tmp_path: Path)
     report = compare(tmp_path)
     assert report["speedup_full_over_tpr"] == 2
     assert report["memory_saving_fraction"] == pytest.approx(1/3)
+    assert report["actual_shared_root_tokens"] == 8192
+    comparison_path = tmp_path / "comparison.json"
+    assert comparison_path.is_file()
+    assert json.loads(comparison_path.read_text()) == report
     with pytest.raises(FileExistsError):
         compare(tmp_path)
     (tmp_path/"comparison.json").unlink()
