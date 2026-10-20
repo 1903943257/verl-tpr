@@ -6,6 +6,38 @@ lives in `verl/workers/engine/megatron/tpr/` and
 `verl/models/mcore/tpr/`; the tests also include frozen historical and
 experimental references.
 
+## Four maintained commands
+
+These are the **only recommended user-facing entry scripts**. The existing
+smaller pytest modules and historical comparison utilities are their
+implementation details; more of those will be retired after cross-backend
+numerical acceptance.
+
+```bash
+bash tests/models/mcore/tpr/run_unit.sh core
+bash tests/models/mcore/tpr/run_correctness.sh cp1
+bash tests/models/mcore/tpr/run_recompute.sh cpu
+bash tests/models/mcore/tpr/run_performance.sh ring
+```
+
+NPU modes require a populated model and capture directory in the NPU-enabled
+VERL runtime (for example the configured Docker mount). On a plain host these
+are **commands to inspect**, not an assertion that Ascend libraries are installed.
+Use `run_unit.sh all` only when the full Python environment includes Megatron.
+Use `run_recompute.sh actor-cp4 CAPTURE.pt NEW_OUTPUT_ROOT` or
+`run_recompute.sh dp2 MANIFEST NEW_OUTPUT_ROOT [STEP]` for real OFF/ON.
+Use `run_performance.sh fixed40k MANIFEST NEW_OUTPUT_ROOT` for measured
+forward/backward. The performance case deliberately does not claim an
+optimizer-step or online E2E speedup.
+
+The catalog `run_suite.py` remains the **internal** dispatcher and can
+display the precise gated commands. It rejects all-skipped selected tests
+rather than treating their exit code as an acceptance result.
+
+The 2026-10-20 cleanup removes 18 dated weak-E2E / Fixed Tile / clamp /
+Native GEMM-QKV diagnostic files. See [PRUNE_LOG.md](PRUNE_LOG.md).
+This is the first deletion batch, not the final 30–50-file target.
+
 ## Start here
 
 ```bash
