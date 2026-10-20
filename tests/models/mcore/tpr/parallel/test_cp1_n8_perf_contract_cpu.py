@@ -17,16 +17,17 @@ def _nested(parts):
     return tu.nested_tensor_from_tensor_list(parts, ragged_idx=1)
 
 
-def _original_source(root: Path, *, divergent_prompt: bool = False):
-    prompt = torch.arange(PREFIX + 32, dtype=torch.long) + 100
+def _original_source(root: Path, *, divergent_prompt: bool = False,
+                     prefix: int = PREFIX, suffix: int = SUFFIX):
+    prompt = torch.arange(prefix + 32, dtype=torch.long) + 100
     prompts = [prompt.clone() for _ in range(BRANCHES)]
     if divergent_prompt:
         prompts[7][-1] = 55555
     responses = [
-        torch.arange(SUFFIX + 20, dtype=torch.long) + 25000 + i * 2000
+        torch.arange(suffix + 20, dtype=torch.long) + 25000 + i * 2000
         for i in range(BRANCHES)
     ]
-    masks = [torch.ones(SUFFIX + 20, dtype=torch.bool) for _ in range(BRANCHES)]
+    masks = [torch.ones(suffix + 20, dtype=torch.bool) for _ in range(BRANCHES)]
     data = TensorDict({
         "input_ids": _nested([torch.cat((p, r)) for p, r in zip(prompts, responses)]),
         "prompts": _nested(prompts),
@@ -34,11 +35,11 @@ def _original_source(root: Path, *, divergent_prompt: bool = False):
         "response_mask": _nested(masks),
         "loss_mask": _nested([x.clone() for x in masks]),
         "old_log_probs": _nested([
-            torch.arange(SUFFIX+20, dtype=torch.float32) * (-0.01)
+            torch.arange(suffix+20, dtype=torch.float32) * (-0.01)
             for _ in range(BRANCHES)
         ]),
         "advantages": _nested([
-            torch.arange(SUFFIX+20, dtype=torch.float32) * 0.01
+            torch.arange(suffix+20, dtype=torch.float32) * 0.01
             for _ in range(BRANCHES)
         ]),
         "temperature": torch.full((BRANCHES,), 0.6),
@@ -80,6 +81,34 @@ def test_n8_capture_rejects_missing_common_prefix(tmp_path: Path):
     source, _ = _original_source(tmp_path, divergent_prompt=True)
     with pytest.raises(ValueError, match="identical"):
         derive_capture(source, tmp_path/"invalid.pt")
+
+
+@pytest.mark.parametrize("p,s", [(13824, 13824), (24576, 3072)])
+def test_cp4_27k_capture_exact_real_label_contract(tmp_path: Path, p: int, s: int):
+    source, original = _original_source(tmp_path, prefix=p, suffix=s)
+    target = tmp_path/"cp4_27k.pt"
+    audit = derive_capture(source, target, prefix=p, suffix=s)
+    assert (audit["prefix"], audit["suffix"], audit["length"], audit["n"]) == (
+        p, s, 27648, 8
+    )
+    assert audit["forest_trees"] == 1
+    assert audit["forest_segments"] >= 9
+    assert audit["ppo_tokens"] == 8*s
+    data = torch.load(target, map_location="cpu", weights_only=False)["tensordict"]
+    for i in range(BRANCHES):
+        assert data["input_ids"][i].numel() == 27648
+        assert data["prompts"][i].numel() == p
+        assert data["responses"][i].numel() == s
+        for key in ("responses", "response_mask", "loss_mask",
+                    "old_log_probs", "advantages"):
+            assert torch.equal(data[key][i], original[key][i][:s])
+
+
+def test_cp4_27k_rejects_short_response_without_padding(tmp_path: Path):
+    source, original = _original_source(tmp_path, prefix=13824, suffix=10000)
+    with pytest.raises(ValueError, match="response_shortfall"):
+        derive_capture(source, tmp_path/"invalid.pt",
+                       prefix=13824, suffix=13824)
 
 
 def test_cpu_comparison_has_strict_same_input_and_baseline_label(tmp_path: Path):
