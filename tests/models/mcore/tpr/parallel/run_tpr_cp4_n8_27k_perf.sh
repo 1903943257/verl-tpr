@@ -79,6 +79,7 @@ export TPR_BENCH_WARMUPS="${TPR_BENCH_WARMUPS:-1}"
 export TPR_BENCH_REPEATS="${TPR_BENCH_REPEATS:-3}"
 unset TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
 
+failed=0
 for mode in full tpr; do
   export TPR_OFFLINE_MODE="$mode"
   echo "TPR_CP4_N8_START ratio=$RATIO mode=$mode p=$P s=$S"
@@ -87,9 +88,13 @@ for mode in full tpr; do
       tests/models/mcore/tpr/parallel/test_tpr_fixed_shape_40k_benchmark_npu.py \
       2>&1 | tee "$LOGS/${mode}.log"; then
     echo "TPR_CP4_N8_FAILED ratio=$RATIO mode=$mode. Inspect OOM/errors in $LOGS." >&2
-    exit 1
+    failed=1
   fi
 done
+if ((failed)); then
+  echo "At least one mode failed; preserve individual results and logs, do not report speedup." >&2
+  exit 1
+fi
 
 python - "$RESULTS" "$RATIO" "$P" "$S" <<'PY' 2>&1 | tee "$LOGS/compare.log"
 import json, pathlib, sys
