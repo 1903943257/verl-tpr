@@ -11,10 +11,10 @@ from .test_full_qwen35_tree_cp_npu import (
     runtime, make_qwen35_model, broadcast_module_state, assert_hybrid_architecture,
     allreduce_parameter_gradients, gather_native_zigzag, _boundary, _cpu,
 )
-from ....parallel.test_fa_transport_matrix_npu import metric
-from ....parallel._whole_fa_allgather import install_whole_fa_allgather
-from ....parallel._ordinary_ring_control import install_ordinary_ring
-from ....parallel._trajectory_fa_trace import trace_l4
+from .test_fa_transport_matrix_npu import metric
+from ._whole_fa_allgather import install_whole_fa_allgather
+from ._ordinary_ring_control import install_ordinary_ring
+from ._trajectory_fa_trace import trace_l4
 from .test_small_hybrid_tree_cp_npu import _communication_probe
 
 

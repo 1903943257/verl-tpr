@@ -134,7 +134,7 @@ def _run(model, plan, runtime, monkeypatch, *, cp, tree, trace=False, fa_replay=
     drift = None
     fa_capture = None
     if fa_replay:
-        from ....parallel._fa_core_replay import FACoreReplay
+        from ._fa_core_replay import FACoreReplay
         fa_capture = FACoreReplay(cp)
     if trace:
         from ._full_hybrid_drift_diagnostic import LayerDriftProbe
@@ -371,7 +371,7 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
     assert fa_backend in ("ring", "allgather_whole")
     fa_transport = None
     if fa_backend == "allgather_whole":
-        from ....parallel._whole_fa_allgather import install_whole_fa_allgather
+        from ._whole_fa_allgather import install_whole_fa_allgather
         for flag in ("STAGE44_FA_REPLAY", "STAGE44_GDN_REPLAY", "STAGE44_PROPAGATION_CLOSURE"):
             assert os.getenv(flag, "0") == "0", f"disable {flag} for the transport A/B"
         fa_transport = install_whole_fa_allgather(monkeypatch)
@@ -426,7 +426,7 @@ def test_full_qwen35_cp2_engine_tree(runtime, monkeypatch):
         closure_capture = None
         closure_enabled = os.getenv("STAGE44_PROPAGATION_CLOSURE", "0") == "1" and label in ("CP1-connected", "CP2-connected")
         if closure_enabled:
-            from ....parallel._propagation_closure import ClosureCapture, propagation_closure
+            from ._propagation_closure import ClosureCapture, propagation_closure
             if cp == 1:
                 closure_capture = ClosureCapture()
         if os.getenv("STAGE44_GDN_REPLAY", "0") == "1" and label in ("CP1-connected", "CP2-connected"):

@@ -19,8 +19,8 @@ import torch.distributed as dist
 
 from verl.utils.device import is_torch_npu_available
 from baseline import _qwen35_baseline_utils as baseline
-from ....parallel._prefix_reuse_metrics import benchmark_cases, summarize_case
-from ....parallel._whole_fa_allgather import install_whole_fa_allgather
+from ._prefix_reuse_metrics import benchmark_cases, summarize_case
+from ._whole_fa_allgather import install_whole_fa_allgather
 from ._stage45_sync_trace import SyncTrace
 
 if not is_torch_npu_available(check_device=True):
