@@ -24,7 +24,7 @@ not a completed physical migration of every historical file.
 The repository now uses `run_unit.sh`, `run_correctness.sh`,
 `run_recompute.sh` and `run_performance.sh` as the four user-facing
 entry points. The `run_suite.py` registry is a dispatcher, not another
-mainline testing workflow. The first batch **removed 18 historical files,
+mainline testing workflow. The first batch **removed 16 historical files,
 including 10 pytest files** (see [PRUNE_LOG.md](PRUNE_LOG.md)). The original
 189-test count above is a *pre-cleanup baseline*, not a current count.
 
