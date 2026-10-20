@@ -30,4 +30,4 @@ The CPU-only MindSpeed `''` parser regression remains in `unit/test_replay_boots
 4. Performance results must identify model/checkpoint, input SHA, P:S/N, TP/CP/DP, recompute, precision flags, trial counts, memory definition and measurement scope.
 5. Never activate the retired Fixed Tile or FC2 fixed-M interventions to artificially align backends.
 
-**Historical status:** User's 2026-10-20 CPU gate (642 passed) belonged to the preceding 143-test checkout. After this cleanup, a fresh CPU and NPU verification is required. A prior 30K DP2 result is historical evidence, not a substitute for running the new checkout.
+**Historical status:** User's 2026-10-20 CPU gate (642 passed) belonged to the preceding 143-test checkout. The maintained core now contains **52** test modules after eight test files were merged without deleting their 28 test functions. After this cleanup, a fresh CPU and NPU verification is required. A prior 30K DP2 result is historical evidence, not a substitute for running the new checkout.

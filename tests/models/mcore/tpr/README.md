@@ -2,7 +2,7 @@
 
 The test folder is intentionally limited to maintained **Dense Full Attention / Ring CP / real Qwen3 Actor PPO** contracts. Older Qwen3-1.7B/AReaL-DTA numerical investigations, Tiny GPT synthetic model suites, alternative CP research backends, and historical one-off diagnostic launchers were retired from this branch. Their previous implementations remain in git history.
 
-As of 2026-10-20: **60 mainline `test_*.py` files + 32 optional `experimental/linear` test files**. The latter are GDN/Qwen3.5 research, never a production Dense FA gate. Mainline tests are grouped in `unit/`, `equivalence/`, `parallel/`, `correctness/`, `integration/`, and `profiling/`.
+As of 2026-10-20: **52 mainline `test_*.py` files + 32 optional `experimental/linear` test files**. The latter are GDN/Qwen3.5 research, never a production Dense FA gate. Mainline tests are grouped in `unit/`, `equivalence/`, `parallel/`, `correctness/`, `integration/`, and `profiling/`.
 
 ## Four supported entry points
 
@@ -43,6 +43,12 @@ Use the launchers below only when the corresponding comparison is needed:
 The `integration/` scripts run Uni-Agent capture/online experiments; do not confuse these with standalone training-side F/B performance.
 
 **No Fixed Tile workaround** is allowed. Numerical claims require the same input hash, checkpoint, PPO labels, precision flags, parallel topology, optimizer scope and recompute configuration; do not label forward/backward-only measurements as online end-to-end speedups.
+
+## Second-pass consolidation (2026-10-20)
+
+Eight small CPU test files were consolidated into seven existing test modules. Their **28 test functions remain**; the CPU entry list and CP4 offline preflight were updated to point to the retained files. No production implementation was modified. The core suite now has **52** test files; `experimental/linear` remains **32**. The eight `parallel/run_*.sh` launchers are retained because each owns a distinct maintained real-Actor/DP2/recompute/30K/40K/Full replay workflow; the two `integration/` launchers remain paired for online Native capture.
+
+These are **source-level changes, not CPU/NPU acceptance evidence**. Re-run `run_suite.py check`, `run_unit.sh core`, and the hardware-specific NPU gates on the new checkout before claiming numerical or performance validation.
 
 ## Cleanup policy
 
