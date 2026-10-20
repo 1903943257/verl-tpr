@@ -639,6 +639,10 @@ def test_empty_objective_does_not_convert_whole_logits_to_float():
         backward_loss = executor._prepare_backward_loss(
             loss, logits=x, has_owned_loss=False
         )
-    assert loss.dtype == backward_loss.dtype == torch.float32
+    # A connected zero may retain the BF16 logits dtype; only a scalar
+    # conversion is permitted, not a full-vocabulary FP32 allocation.
+    assert loss.shape == backward_loss.shape == ()
+    assert loss.requires_grad and backward_loss.requires_grad
+    assert loss.is_floating_point() and backward_loss.is_floating_point()
     backward_loss.backward()
     torch.testing.assert_close(x.grad, torch.zeros_like(x))
