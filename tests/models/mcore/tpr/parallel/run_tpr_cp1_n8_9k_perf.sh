@@ -7,8 +7,11 @@ set -euo pipefail
 cd "$(dirname "$0")/../../../../.."
 
 SOURCE="${TPR_CP1_N8_SOURCE:-/workspace/tpr_actor_capture_4b_n8_run1/actor_update_rank0_batch0.pt}"
-ROOT="${TPR_CP1_N8_ROOT:-/workspace/tpr_experiments/cp1_n8_9k_8to1_v1}"
-CAPTURE="$ROOT/cp1_n8_p8192_s1024.pt"
+ROOT="${TPR_CP1_N8_ROOT:-/workspace/tpr_experiments/performance/cp1_n8_9k_8to1_v1}"
+DATA_DIR="$ROOT/data"
+RESULT_DIR="$ROOT/results"
+LOG_DIR="$ROOT/logs"
+CAPTURE="$DATA_DIR/cp1_n8_p8192_s1024.pt"
 export TPR_QWEN_4B_PATH="${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}"
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-8,9}"
 if [[ "$ASCEND_RT_VISIBLE_DEVICES" != "8,9" ]]; then
@@ -29,19 +32,21 @@ export TPR_BENCH_WARMUPS="${TPR_BENCH_WARMUPS:-1}"
 export TPR_BENCH_REPEATS="${TPR_BENCH_REPEATS:-3}"
 export TPR_RUN_CP1_N8_PERF=1
 export TPR_CP1_N8_CAPTURE="$CAPTURE"
-export TPR_CP1_N8_OUTPUT_DIR="$ROOT"
+export TPR_CP1_N8_OUTPUT_DIR="$RESULT_DIR"
 unset TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
 
-mkdir -p "$ROOT"
-python -m py_compile \
-  tests/models/mcore/tpr/parallel/prepare_tpr_cp1_n8_perf_capture.py \
-  tests/models/mcore/tpr/parallel/test_tpr_cp1_n8_9k_perf_npu.py
-# Fail fast on data/metric regression before allocating 4B model weights.
-python -m pytest -q   tests/models/mcore/tpr/parallel/test_cp1_n8_perf_contract_cpu.py
+# Runtime files stay below ONE versioned experiment directory, never the repo.
+# Do not create Python __pycache__ files in the source checkout.
+export PYTHONDONTWRITEBYTECODE=1
+mkdir -p "$DATA_DIR" "$RESULT_DIR" "$LOG_DIR"
+# Fail fast on CPU data/comparison contracts, preserving diagnostic logs.
+python -m pytest -q \
+  tests/models/mcore/tpr/parallel/test_cp1_n8_perf_contract_cpu.py \
+  2>&1 | tee "$LOG_DIR/preflight.log"
 
 if [[ ! -f "$CAPTURE" ]]; then
   python -m tests.models.mcore.tpr.parallel.prepare_tpr_cp1_n8_perf_capture \
-    "$SOURCE" "$CAPTURE"
+    "$SOURCE" "$CAPTURE" 2>&1 | tee "$LOG_DIR/prepare.log"
 fi
 [[ -f "${CAPTURE%.pt}.audit.json" ]] || {
   echo "Missing 8:1 capture audit; refusing an unverified benchmark" >&2
@@ -54,13 +59,14 @@ for mode in full tpr; do
   if ! torchrun --nproc_per_node=2 --master_port=29831 \
        -m pytest -q -s -x \
        tests/models/mcore/tpr/parallel/test_tpr_cp1_n8_9k_perf_npu.py \
-       2>&1 | tee "$ROOT/${mode}.log"; then
+       2>&1 | tee "$LOG_DIR/${mode}.log"; then
     echo "TPR_CP1_N8_FAILED mode=$mode; do not interpret missing results as speedup" >&2
     fail=1
   fi
 done
 if [[ "$fail" == 0 ]]; then
-  python -m tests.models.mcore.tpr.parallel.compare_tpr_cp1_n8_perf "$ROOT"
+  python -m tests.models.mcore.tpr.parallel.compare_tpr_cp1_n8_perf "$RESULT_DIR" \
+    2>&1 | tee "$LOG_DIR/compare.log"
 else
   exit 1
 fi
