@@ -21,6 +21,7 @@ import pytest
 import torch
 
 import verl.workers.engine.megatron.tpr.ring as ring
+from verl.workers.engine.megatron.tpr import ring_layout as ring_layout
 from verl.models.mcore.tpr import (
     RingBlockKind,
     classify_ring_block,
@@ -306,8 +307,8 @@ def test_prepared_ring_layout_matches_full_validation_without_rechecking_placeme
             torch.randn(prefix_shard.local_length, 1, 2, 8),
         ),
     )
-    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
-    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    monkeypatch.setattr(ring_layout, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring_layout, "_process_group_global_ranks", lambda _: (0, 1))
     context = ring.RingCPAttentionBackend(
         global_prefix_length=127, current_shard=current_shard,
         prefix_blocks_by_layer={1: blocks, 2: blocks},
@@ -323,9 +324,9 @@ def test_prepared_ring_layout_matches_full_validation_without_rechecking_placeme
     def forbidden(*args, **kwargs):
         raise AssertionError("static Ring placement was recomputed per layer")
 
-    monkeypatch.setattr(ring, "_group_world_size_and_rank", forbidden)
-    monkeypatch.setattr(ring, "_validate_ring_shard", forbidden)
-    monkeypatch.setattr(ring, "_process_group_global_ranks", forbidden)
+    monkeypatch.setattr(ring_layout, "_group_world_size_and_rank", forbidden)
+    monkeypatch.setattr(ring_layout, "_validate_ring_shard", forbidden)
+    monkeypatch.setattr(ring_layout, "_process_group_global_ranks", forbidden)
     _, optimized = ring._normalize_inputs(
         q, k, v, prefix_blocks=blocks, current_shard=current_shard,
         cp_group=group, softmax_scale=None, _layout=prepared,
@@ -360,8 +361,8 @@ def test_prepared_ring_layout_matches_full_validation_without_rechecking_placeme
 def test_unified_ring_prefix_builder_keeps_anchored_autograd_leaves(monkeypatch):
     """Cached and anchored Prefix KV have identical placement, different graph ownership."""
     group = object()
-    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
-    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    monkeypatch.setattr(ring_layout, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring_layout, "_process_group_global_ranks", lambda _: (0, 1))
     shard = make_ring_sequence_shard(64, cp_rank=0, cp_size=2)
     current = make_ring_sequence_shard(32, cp_rank=0, cp_size=2)
     kv = (
@@ -396,8 +397,8 @@ def test_unified_ring_prefix_builder_keeps_anchored_autograd_leaves(monkeypatch)
 
 def test_prepared_ring_layout_rejects_cross_layer_shard_mismatch(monkeypatch):
     group = object()
-    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
-    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    monkeypatch.setattr(ring_layout, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring_layout, "_process_group_global_ranks", lambda _: (0, 1))
     regular = make_ring_sequence_shard(64, cp_rank=0, cp_size=2)
     padded = make_ring_sequence_shard(64, cp_rank=0, cp_size=2, padded_length=96)
     current = make_ring_sequence_shard(32, cp_rank=0, cp_size=2)
@@ -616,8 +617,8 @@ def test_native_root_route_is_explicit_and_never_selected_by_empty_prefix_alone(
 ):
     """A Root flag, not zero Prefix length, chooses ordinary MindSpeed Ring."""
     group = object()
-    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
-    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    monkeypatch.setattr(ring_layout, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring_layout, "_process_group_global_ranks", lambda _: (0, 1))
     policy = ring.RingCPBackend(group, parallel_size=2, parallel_rank=0)
     shard = make_ring_sequence_shard(63, cp_rank=0, cp_size=2)
     empty_stack = SimpleNamespace(prefix_length=0, segment_ids=())
@@ -663,8 +664,8 @@ def test_native_root_route_is_explicit_and_never_selected_by_empty_prefix_alone(
 def test_native_root_masks_trailing_padding_output_and_upstream_gradient(monkeypatch):
     """A virtual physical Query must not produce output or a graph gradient."""
     group = object()
-    monkeypatch.setattr(ring, "_group_world_size_and_rank", lambda _: (2, 0))
-    monkeypatch.setattr(ring, "_process_group_global_ranks", lambda _: (0, 1))
+    monkeypatch.setattr(ring_layout, "_group_world_size_and_rank", lambda _: (2, 0))
+    monkeypatch.setattr(ring_layout, "_process_group_global_ranks", lambda _: (0, 1))
     monkeypatch.setattr(ring.dist, "get_rank", lambda: 0)
     shard = make_ring_sequence_shard(63, cp_rank=0, cp_size=2)
     query = torch.randn(shard.local_length, 1, 4, 8, requires_grad=True)

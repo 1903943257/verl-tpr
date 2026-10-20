@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -98,9 +99,10 @@ def run(suite: str, *, ack_npu: bool, ack_negative: bool) -> int:
     if any(g.kind == "torchrun" for _, g in gates) and not ack_npu:
         print("NPU/distributed execution requires --ack-npu.", file=sys.stderr)
         return 2
-    if any(g.expected_failure for _, g in gates) and not ack_negative:
-        print("Negative controls require --ack-negative; they are not passing gates.",
-              file=sys.stderr)
+    if any(g.expected_failure for _, g in gates):
+        print("Negative controls are intentionally failing diagnostics. "
+              "Use 'show' and run the underlying pytest manually; "
+              "never report them as a green suite.", file=sys.stderr)
         return 2
     for name, gate in gates:
         missing = [var for var in gate.required_env if not os.environ.get(var)]
@@ -113,16 +115,29 @@ def run(suite: str, *, ack_npu: bool, ack_negative: bool) -> int:
         for key, value in gate.opt_in:
             env[key] = value
         print(f"=== {name}: {shlex.join(command(gate))} ===", flush=True)
-        completed = subprocess.run(command(gate), cwd=ROOT, env=env, check=False)
-        if completed.returncode:
-            print(f"{name}: exit={completed.returncode}", file=sys.stderr)
-            return completed.returncode
-        if gate.expected_failure:
-            print(f"{name}: unexpectedly exited 0; inspect skips and probe assertions.",
+        # Stream output while ensuring an all-skipped pytest never looks green.
+        passed = 0
+        with subprocess.Popen(
+            command(gate), cwd=ROOT, env=env, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, bufsize=1,
+        ) as proc:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                print(line, end="", flush=True)
+                match = re.search(r"(?<!\w)(\d+) passed\b", line)
+                if match:
+                    passed += int(match.group(1))
+            rc = proc.wait()
+        if rc:
+            print(f"{name}: exit={rc}", file=sys.stderr)
+            return rc
+        if passed < gate.ranks:
+            print(f"{name}: no passing test summary from every rank "
+                  f"(saw {passed}, require >= {gate.ranks}); skips are not PASS.",
                   file=sys.stderr)
             return 1
-    print("Commands exited 0. Inspect pytest skip counts and numerical assertions;"
-          " this does not certify unselected tests.")
+    print("PASS: every selected gate reported passing pytest cases. "
+          "Device gates still require numerical witness review.")
     return 0
 
 

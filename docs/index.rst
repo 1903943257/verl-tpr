@@ -206,6 +206,7 @@ verl is fast with:
    tpr_audit_fixes_20261016.md
    tpr/performance_plan_20261017.md
    tpr/contract_fixes_20261018.md
+   tpr/production_dp2_ring_three_files_20261019.md
 
 Contribution
 -------------
