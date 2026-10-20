@@ -256,3 +256,58 @@ Neither should be relabeled as an exact 18K 1:1 result. If a full N6 18K
 1:1 comparison is needed, derive six-row captures consistently from source
 rows (0,1,3,4,5,6) and benchmark **both** N6 8:1 and N6 1:1 cases rather
 than comparing N6 to the existing N8 baseline.
+
+## Controlled synthetic-response-window sweep: CP2 9K/9K and CP4 17,440/17,440
+
+For **performance only**, retaining true *token window contents* is enough;
+the PPO labels are historical, so this benchmark is explicitly **not
+on-policy or PPO correctness evidence**.
+
+A Run2 eight-row Actor update includes 17,483-token identical prompts and
+responses of lengths [48538, 17444, 7560, 51885, 30929, 57442, 25058,
+6026]. Keep six original long-response rows (0,1,3,4,5,6); replace the
+two insufficient rows with **distinct later response windows** from
+original long rows 0 and 3. Source responses, masks, old log-probs, advantages
+and temperature are copied/sliced from their actual donor rows, never
+filled with fake zeros or duplicated identical Response streams. The
+result is a *synthetic N8 performance workload* with identical full/TPR
+inputs, not eight authentic sampled trajectories. Donor indices and
+response offsets are preserved in `*.windows.json`, and downstream
+capture audit/benchmark report includes
+`synthetic_response_windows=true`.
+
+| Mode | P | S | Whole sequence | NPU | Baseline |
+|---|---:|---:|---:|---:|---|
+| CP2 1:1 | 9216 | 9216 | 18432 | 4 | Native Megatron/MindSpeed Full |
+| CP4 1:1 | 17440 | 17440 | 34880 | 8 | Native Megatron/MindSpeed Full |
+
+Choose 17,440 rather than 17,483 for CP4: the shorter original row1 has
+17,444 response tokens, and 34,880 is divisible by TP2/CP4's 16-token
+zigzag alignment. This differs by just 43 tokens per segment from the
+nominal 17,483/17,483 target.
+
+Run within the Docker checkout after syncing PR12:
+
+```bash
+cd /workspace/verl-tpr-ring-review
+set -o pipefail
+bash tests/models/mcore/tpr/parallel/run_tpr_n8_synthetic_window_perf.sh both \
+  2>&1 | tee /workspace/tpr_experiments/performance/n8_synthetic_window_sweep.log
+```
+
+Modes `cp2` and `cp4` can be run separately instead of `both`.
+The original Run2 path can be overridden by
+`TPR_SYNTHETIC_WINDOW_SOURCE`. Every mode has separate immutable staged
+source, derived capture, audit, Full/TPR performance JSON and comparison
+report below its own versioned folder. Nonempty PPO supervision in each
+window and distinct final responses remain mandatory. If the 17K native
+Full run OOMs with Recompute OFF, report this as an OOM, not an infinite
+speedup or a production-size parity result.
+
+Results:
+- `/workspace/tpr_experiments/performance/cp2_n8_18k_1to1_synthetic_windows_v1/results/comparison.json`
+- `/workspace/tpr_experiments/performance/cp4_n8_34k_1to1_synthetic_windows_v1/results/comparison.json`
+
+Cross-ratio comparisons to *authentic-window* CP2 16K/2K must clearly
+mark that branch-source provenance changes; these are system-performance
+stress comparisons, not a controlled on-policy PPO ablation.
