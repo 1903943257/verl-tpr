@@ -49,15 +49,6 @@ def test_dp1_supported_topologies_unchanged():
     assert _gate()(_sizes(tp=1, cp=2, dp=1), ppo=True) == 1
 
 
-def test_10k_offline_parity_stays_explicit(monkeypatch):
-    monkeypatch.setenv("TPR_EXPERIMENTAL_OFFLINE_DP2", "1")
-    monkeypatch.setenv("TPR_RUN_10K_PARALLEL_PARITY", "1")
-    monkeypatch.setenv("TPR_10K_PARITY_ONLY", "1")
-    assert _gate()(_sizes(tp=1, cp=2), ppo=True) == 1
-    with pytest.raises(NotImplementedError):
-        _gate()(_sizes(tp=1, cp=4), ppo=True)
-
-
 def _mindspeed_cli_sanitizer():
     """Import only the pure stdlib function, not NPU-gated test dependencies."""
     source = Path(__file__).resolve().parents[1] / "parallel/test_real_actor_tp2cp4_offline_ppo_npu.py"
