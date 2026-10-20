@@ -291,6 +291,70 @@ def _install_offline_full_ring_backend(mode: str) -> str:
     return "mindspeed_native_whole_ring_virtual_right_padding"
 
 
+
+def _make_unshared_split(shared_forest, batch):
+    """Clone the exact shared Root/Leaf boundary for each logical sibling.
+
+    No KV is shared between rows. Objectives keep identical target tokens,
+    global predicting-query positions, logical row IDs and PPO denominator.
+    The ONLY physical difference from shared is that the Root is recomputed
+    for each row rather than reused across two siblings.
+    """
+    from verl.workers.engine.megatron.tpr.tree import (
+        ForestExecutionPlan, SegmentObjectiveRef, SegmentPlan, SegmentSpec,
+        TreeExecutionPlan,
+    )
+
+    if len(shared_forest.trees) != 1:
+        raise AssertionError("Need exactly one original shared tree")
+    original = shared_forest.trees[0]
+    plan = original.segment_plan
+    root = plan.get(plan.root_id)
+    children = plan.children_of(plan.root_id)
+    if len(children) != 2 or any(plan.children_of(child.segment_id) for child in children):
+        raise AssertionError("Expected one Root and exactly two sibling Leaves")
+    boundary = root.length
+    rows = tuple(original.member_rows)
+    if set(rows) != {0, 1}:
+        raise AssertionError(f"Expected two local sibling rows (0,1), got {rows}")
+    independent = []
+    for row in sorted(rows):
+        tokens = batch["input_ids"][row].detach().cpu().long()
+        if not 0 < boundary < tokens.numel():
+            raise AssertionError("Invalid shared Root boundary for split-no-share")
+        if not torch.equal(tokens[:boundary], root.token_ids):
+            raise AssertionError("Shared root is not an exact token prefix of both rows")
+        local_plan = SegmentPlan(
+            (
+                SegmentSpec(0, None, tokens[:boundary], 0, 0),
+                SegmentSpec(1, 0, tokens[boundary:], boundary, boundary),
+            ),
+            root_id=0,
+        )
+        refs = []
+        for ref in original.objective_refs:
+            if ref.sample_row != row:
+                continue
+            parent = plan.get(ref.segment_id)
+            global_query = parent.position_start + ref.query_offset
+            target_global = global_query + 1
+            if target_global >= tokens.numel() or int(tokens[target_global]) != ref.target_token_id:
+                raise AssertionError(f"Split ref target mismatch row={row}, query={global_query}")
+            new_id = 0 if global_query < boundary else 1
+            refs.append(SegmentObjectiveRef(
+                new_id, global_query if new_id == 0 else global_query - boundary,
+                ref.target_token_id, ref.sample_row, ref.response_offset,
+            ))
+        if not refs:
+            raise AssertionError(f"Split tree row {row} has no supervised targets")
+        independent.append(TreeExecutionPlan(
+            uid=f"{original.uid}_split_no_share_{row}",
+            tree_index=row, member_rows=(row,),
+            segment_plan=local_plan, objective_refs=tuple(refs),
+        ))
+    return ForestExecutionPlan(tuple(independent), shared_forest.logical_loss_tokens)
+
+
 def test_recorded_full_vs_tpr_one_step():
     mode = os.environ.get("TPR_OFFLINE_MODE")
     if mode not in ("full", "tpr", "split_no_share"):
@@ -354,7 +418,6 @@ def test_recorded_full_vs_tpr_one_step():
             raise AssertionError("Full control accidentally reused tokens across rows")
         if mode == "split_no_share":
             # Experimental isolation only: preserve Main's replay/recompute path.
-            from .test_real_actor_cp1_short_full_tpr_npu import _make_unshared_split
             if len(forest.trees) != 1 or forest.segment_count != 3:
                 raise AssertionError("Split-no-share needs one Root and two Leaves")
             forest = _make_unshared_split(forest, batch)
