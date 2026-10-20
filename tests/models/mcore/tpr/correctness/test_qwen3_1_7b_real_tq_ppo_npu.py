@@ -1115,68 +1115,6 @@ def _native_core_square_vs_rectangular_oracle(
 
 
 
-from contextlib import contextmanager
-
-
-@contextmanager
-def _diagnostic_fixed_m_fc2(model, *, physical_m: int):
-    """Test-only, autograd-preserving FC2 GEMM-M padding hypothesis.
-
-    Never used in training code. All true token/hidden values and logical
-    objectives stay unchanged; only physical FC2 GEMM batch rows are padded
-    with zeros before the real Megatron module and sliced after its return.
-    """
-    from types import MethodType
-
-    originals = []
-    calls = {"padded": 0, "unmodified": 0}
-    try:
-        for layer in model.decoder.layers:
-            fc2 = layer.mlp.linear_fc2
-            original = fc2.forward
-
-            def patched(self, hidden_states, *args, _original=original, **kwargs):
-                if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
-                    raise AssertionError(
-                        "diagnostic fixed-M FC2 only supports CP=TP=PP=1"
-                    )
-                s = hidden_states.shape[0]
-                if s > physical_m:
-                    raise AssertionError(
-                        f"diagnostic FC2 physical M={physical_m} < segment S={s}"
-                    )
-                if s == physical_m:
-                    calls["unmodified"] += 1
-                    return _original(hidden_states, *args, **kwargs)
-                padded = torch.cat((
-                    hidden_states,
-                    hidden_states.new_zeros((physical_m - s, *hidden_states.shape[1:])),
-                ), dim=0)
-                output = _original(padded, *args, **kwargs)
-                calls["padded"] += 1
-                def trim(value):
-                    if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.shape[0] == physical_m:
-                        return value[:s]
-                    return value
-                if isinstance(output, tuple):
-                    return tuple(trim(item) for item in output)
-                return trim(output)
-
-            originals.append((fc2, original))
-            fc2.forward = MethodType(patched, fc2)
-        yield
-    finally:
-        for fc2, original in originals:
-            fc2.forward = original
-        if originals:
-            print(
-                f"TPR TEST-ONLY FC2 FIXED-M={physical_m} "
-                f"padded_calls={calls['padded']} "
-                f"unmodified_calls={calls['unmodified']}"
-            )
-
-
-
 def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients(monkeypatch):
     """Real-weight native row-wise PPO vs TPR Forest (CP=TP=PP=DP=1)."""
     # Sanitize before importing Qwen fixtures: some MindSpeed revisions
@@ -1216,38 +1154,11 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients(monkeypatch):
     device = torch.device("npu")
     _initialize_single_rank_megatron()
     longest_row = max(len(row) for row in _rows(batch, "input_ids"))
-    tile_spec = os.getenv("TPR_QWEN17_PPO_TILE_GEMM", "").strip()
-    tile_size = int(tile_spec) if tile_spec else 0
-    tile_groups = tuple(
-        item.strip() for item in os.getenv(
-            "TPR_QWEN17_PPO_TILE_GEMM_GROUPS", "qkv,proj,fc1,fc2"
-        ).split(",")
-    )
-    if tile_size and longest_row > 256:
-        pytest.fail(
-            "Symmetric fixed-tile PPO oracle is for cropped real-TQ "
-            "rows with max token length <= 256 only; it is too costly "
-            "for long-sequence production training"
-        )
-    if tile_size and os.getenv("TPR_QWEN17_PPO_FC2_FIXED_M") is not None:
-        pytest.fail(
-            "Do not combine TPR_QWEN17_PPO_TILE_GEMM with "
-            "TPR_QWEN17_PPO_FC2_FIXED_M"
-        )
-    if tile_size:
-        from ._qwen17_fixed_tile_probe import install_test_only_fixed_tile_gemm
-        print(
-            f"QWEN17 PPO TEST-ONLY SYMMETRIC FIXED GEMM M={tile_size} "
-            f"groups={sorted(tile_groups)} max_row={longest_row}",
-            flush=True,
-        )
+    if os.getenv("TPR_QWEN17_PPO_TILE_GEMM") or os.getenv("TPR_QWEN17_PPO_FC2_FIXED_M"):
+        pytest.fail("Fixed Tile / fixed-M GEMM experiments were retired: run unmodified native/TPR kernels")
     print(f"PHASE5 max real sequence length={longest_row}; initializing Native reference")
     ref = _make_qwen_model(device, tpr=False, max_sequence_length=longest_row)
     ref_params = target.assert_model_scale(ref)
-    if tile_size:
-        install_test_only_fixed_tile_gemm(
-            ref, monkeypatch, tile_size=tile_size, groups=tile_groups,
-        )
 
     # The OLD policy is the real frozen Qwen checkpoint prior to this update,
     # not invented log-probabilities. Recompute once on the actual TQ tokens.
@@ -1393,10 +1304,6 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients(monkeypatch):
     print("PHASE5: Native loss and gradients collected; initializing TPR reference")
     tpr = _make_qwen_model(device, tpr=True, max_sequence_length=longest_row)
     assert target.assert_model_scale(tpr) == ref_params
-    if tile_size:
-        install_test_only_fixed_tile_gemm(
-            tpr, monkeypatch, tile_size=tile_size, groups=tile_groups,
-        )
     tpr.config.no_sync_func = None
     tpr.config.grad_scale_func = lambda value: value
     tpr.config.finalize_model_grads_func = lambda *args, **kwargs: None
@@ -1424,30 +1331,11 @@ def test_real_qwen3_1_7b_tq_ppo_loss_and_gradients(monkeypatch):
             tpr, monitored_positions=tuple(sorted(trace_owners)),
             owner_segments=trace_owners,
         )
-    # Controlled intervention only, never silently applied to training.
-    # Reproduce full-S FC2 GEMM tiling for each shorter physical segment.
-    from contextlib import nullcontext
-    fixed_m_setting = os.getenv("TPR_QWEN17_PPO_FC2_FIXED_M")
-    if fixed_m_setting is not None:
-        physical_m = int(fixed_m_setting)
-        if longest_row > 256 or physical_m < longest_row:
-            pytest.fail(
-                "TPR_QWEN17_PPO_FC2_FIXED_M diagnostic is only for "
-                "short real-TQ windows and M >= maximum logical row length"
-            )
-        fc2_context = _diagnostic_fixed_m_fc2(tpr, physical_m=physical_m)
-        print(
-            f"PHASE5 TEST-ONLY INTERVENTION: padding each TPR "
-            f"FC2 physical GEMM to M={physical_m}"
-        )
-    else:
-        fc2_context = nullcontext()
     try:
-        with fc2_context:
-            output = engine.forward_backward_batch(
-                batch, loss_function=partial(ppo_loss, config=_VanillaPPOConfig()),
-                forward_only=False,
-            )
+        output = engine.forward_backward_batch(
+            batch, loss_function=partial(ppo_loss, config=_VanillaPPOConfig()),
+            forward_only=False,
+        )
     finally:
         for handle in tpr_hooks:
             handle.remove()
