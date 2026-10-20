@@ -34,7 +34,7 @@ The catalog `run_suite.py` remains the **internal** dispatcher and can
 display the precise gated commands. It rejects all-skipped selected tests
 rather than treating their exit code as an acceptance result.
 
-The 2026-10-20 cleanup removes 18 dated weak-E2E / Fixed Tile / clamp /
+The 2026-10-20 cleanup removes 16 dated weak-E2E / Fixed Tile / clamp /
 Native GEMM-QKV diagnostic files. See [PRUNE_LOG.md](PRUNE_LOG.md).
 This is the first deletion batch, not the final 30–50-file target.
 
