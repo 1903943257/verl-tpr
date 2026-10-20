@@ -29,7 +29,12 @@ def compare(root: Path) -> dict:
     if (full["forest_trees"], full["forest_segments"]) != (8, 8):
         raise AssertionError("Unshared control did not execute eight whole sequences")
     if tpr["forest_trees"] != 1 or tpr["forest_segments"] < 9:
-        raise AssertionError("TPR did not share one 8192-token root across eight leaves")
+        raise AssertionError("TPR did not share one root across eight leaves")
+    root = tpr["actual_shared_root_tokens"]
+    if (not 8192 - 127 <= root < 9216
+            or full["actual_shared_root_tokens"] != root
+            or full["unique_tree_tokens"] != tpr["unique_tree_tokens"]):
+        raise AssertionError("Actual physical qwen_turn prefix differs across modes")
     if full["recompute"] or full["optimizer_step"]:
         raise AssertionError("Wrong timed phase")
     if not full["condition_changed"] or not full["synthetic_shared_uid"]:
@@ -55,6 +60,10 @@ def compare(root: Path) -> dict:
             1-tpr["worst_peak_allocated_gib"]/full["worst_peak_allocated_gib"]
         ),
         "ppo_tokens": full["ppo_tokens"],
+        "nominal_prefix_tokens": 8192,
+        "actual_shared_root_tokens": root,
+        "effective_root_to_suffix_ratio": root / 1024,
+        "unique_tree_tokens": tpr["unique_tree_tokens"],
         "source_input_sha256": full["source_input_sha256"],
         "notes": (
             "Performance-only derived old-PPO data with changed conditioning "
