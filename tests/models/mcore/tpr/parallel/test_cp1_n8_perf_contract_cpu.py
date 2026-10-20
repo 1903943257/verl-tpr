@@ -109,20 +109,21 @@ def test_n8_capture_rejects_missing_common_prefix(tmp_path: Path):
         derive_capture(source, tmp_path/"invalid.pt")
 
 
-@pytest.mark.parametrize("p,s", [(13824, 13824), (24576, 3072)])
-def test_cp4_27k_capture_exact_real_label_contract(tmp_path: Path, p: int, s: int):
+@pytest.mark.parametrize("p,s", [(4608, 4608), (13824, 13824),
+                                 (24576, 3072), (18432, 18432), (32768, 4096)])
+def test_extra_n8_shapes_preserve_real_ppo_labels(tmp_path: Path, p: int, s: int):
     source, original = _original_source(tmp_path, prefix=p, suffix=s)
-    target = tmp_path/"cp4_27k.pt"
+    target = tmp_path/f"p{p}_s{s}.pt"
     audit = derive_capture(source, target, prefix=p, suffix=s)
     assert (audit["prefix"], audit["suffix"], audit["length"], audit["n"]) == (
-        p, s, 27648, 8
+        p, s, p+s, 8
     )
     assert audit["forest_trees"] == 1
     assert audit["forest_segments"] >= 9
     assert audit["ppo_tokens"] == 8*s
     data = torch.load(target, map_location="cpu", weights_only=False)["tensordict"]
     for i in range(BRANCHES):
-        assert data["input_ids"][i].numel() == 27648
+        assert data["input_ids"][i].numel() == p+s
         assert data["prompts"][i].numel() == p
         assert data["responses"][i].numel() == s
         for key in ("responses", "response_mask", "loss_mask",
@@ -137,17 +138,18 @@ def test_cp4_27k_rejects_short_response_without_padding(tmp_path: Path):
                        prefix=13824, suffix=13824)
 
 
-def test_cpu_comparison_has_strict_same_input_and_baseline_label(tmp_path: Path):
+@pytest.mark.parametrize("p,s", [(8192, 1024), (4608, 4608)])
+def test_cpu_comparison_has_strict_same_input_and_baseline_label(tmp_path: Path, p: int, s: int):
     base = {
         "model":"Qwen3-4B-128K", "checkpoint":"qwen",
         "topology":{"tp":2,"cp":1,"dp":1,"world":2},
-        "branches":8, "prefix":8192, "suffix":1024, "length":9216,
+        "branches":8, "prefix":p, "suffix":s, "length":p+s,
         "source_capture":"source.pt", "source_input_sha256":"a"*64,
         "ppo_tokens":8192, "condition_changed":True,
         "synthetic_shared_uid":True, "recompute":False, "optimizer_step":False,
         "warmups":1, "repeats":3,
         "forest_trees":8, "forest_segments":8,
-        "actual_shared_root_tokens":8192, "unique_tree_tokens":16384,
+        "actual_shared_root_tokens":p, "unique_tree_tokens":p+8*s,
         "baseline_kind":"CONTROLLED_WHOLE_SQUARE_CANN_NO_TPR_CONTEXT",
         "median_fwd_bwd_s":4.,
         "worst_peak_allocated_gib":30.,
@@ -165,17 +167,17 @@ def test_cpu_comparison_has_strict_same_input_and_baseline_label(tmp_path: Path)
            "worst_peak_allocated_gib":20.}
     (tmp_path/"full.json").write_text(json.dumps(full))
     (tmp_path/"tpr.json").write_text(json.dumps(tpr))
-    report = compare(tmp_path)
+    report = compare(tmp_path, prefix=p, suffix=s)
     assert report["speedup_full_over_tpr"] == 2
     assert report["memory_saving_fraction"] == pytest.approx(1/3)
-    assert report["actual_shared_root_tokens"] == 8192
+    assert report["actual_shared_root_tokens"] == p
     comparison_path = tmp_path / "comparison.json"
     assert comparison_path.is_file()
     assert json.loads(comparison_path.read_text()) == report
     with pytest.raises(FileExistsError):
-        compare(tmp_path)
+        compare(tmp_path, prefix=p, suffix=s)
     (tmp_path/"comparison.json").unlink()
     tpr["source_input_sha256"] = "b"*64
     (tmp_path/"tpr.json").write_text(json.dumps(tpr))
     with pytest.raises(AssertionError, match="mismatch"):
-        compare(tmp_path)
+        compare(tmp_path, prefix=p, suffix=s)
