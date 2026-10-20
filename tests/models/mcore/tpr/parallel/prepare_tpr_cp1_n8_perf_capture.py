@@ -30,7 +30,17 @@ REQUIRED = (
 )
 
 
-def derive_capture(source: Path, target: Path) -> dict:
+def derive_capture(
+    source: Path, target: Path, *, prefix: int = PREFIX, suffix: int = SUFFIX,
+) -> dict:
+    """Build a strictly token-exact eight-branch PPO performance shape."""
+    allowed = ((8192, 1024), (13824, 13824), (24576, 3072))
+    if (prefix, suffix) not in allowed:
+        raise ValueError(f"Unsupported measured workload {(prefix, suffix)}; allowed={allowed}")
+    keys = (
+        SYNTHETIC_KEYS if (prefix, suffix) == (PREFIX, SUFFIX)
+        else tuple(f"cp4_p{prefix}_s{suffix}_tpr_{i}" for i in range(BRANCHES))
+    )
     if target.exists():
         raise FileExistsError(f"Never overwrite a derived performance capture: {target}")
     raw = torch.load(source, map_location="cpu", weights_only=False)
@@ -57,17 +67,17 @@ def derive_capture(source: Path, target: Path) -> dict:
             "prompt_tokens": p_len,
             "response_tokens": r_len,
             "input_tokens": input_len,
-            "prompt_shortfall": max(0, PREFIX - p_len),
-            "response_shortfall": max(0, SUFFIX - r_len),
+            "prompt_shortfall": max(0, prefix - p_len),
+            "response_shortfall": max(0, suffix - r_len),
             "input_length_aligned": input_len == p_len + r_len,
-            "supervised_in_first_1024": int(
-                batch["response_mask"][i][:SUFFIX].bool().sum().item()
+            "supervised_in_suffix": int(
+                batch["response_mask"][i][:suffix].bool().sum().item()
             ),
         })
     # Always report all eight original lengths *before* the first rejection;
     # truncated captures must never silently masquerade as a P:S=8:1 case.
     print(
-        "TPR_CP1_N8_SOURCE_LENGTHS "
+        "TPR_N8_SOURCE_LENGTHS "
         + json.dumps({"source": str(source), "rows": length_audit},
                      sort_keys=True),
         flush=True,
@@ -82,11 +92,11 @@ def derive_capture(source: Path, target: Path) -> dict:
             reasons.append("input_length_not_prompt_plus_response")
         if reasons:
             raise ValueError(
-                f"row {i} cannot supply exact P={PREFIX}, S={SUFFIX}: "
+                f"row {i} cannot supply exact P={prefix}, S={suffix}: "
                 f"prompt={stat['prompt_tokens']}, "
                 f"response={stat['response_tokens']}, "
                 f"input={stat['input_tokens']}, reasons={','.join(reasons)}. "
-                "See TPR_CP1_N8_SOURCE_LENGTHS for all 8 rows. "
+                "See TPR_N8_SOURCE_LENGTHS for all 8 rows. "
                 "Choose a different real capture; no padding or fabricated PPO labels."
             )
         if not torch.equal(ids[i], torch.cat((prompts[i], responses[i]))):
@@ -94,22 +104,22 @@ def derive_capture(source: Path, target: Path) -> dict:
         if any(batch[k][i].numel() != responses[i].numel()
                for k in ("response_mask", "loss_mask", "old_log_probs", "advantages")):
             raise AssertionError(f"Original PPO response fields misaligned on row {i}")
-        if not bool(batch["response_mask"][i][:SUFFIX].bool().any()):
-            raise ValueError(f"Row {i} has no supervised PPO tokens in the first {SUFFIX}")
-    common = prompts[0][-PREFIX:]
-    if any(not torch.equal(common, p[-PREFIX:]) for p in prompts[1:]):
+        if not bool(batch["response_mask"][i][:suffix].bool().any()):
+            raise ValueError(f"Row {i} has no supervised PPO tokens in the first {suffix}")
+    common = prompts[0][-prefix:]
+    if any(not torch.equal(common, p[-prefix:]) for p in prompts[1:]):
         raise ValueError(
-            "Original eight prompts lack a token-identical 8192-token suffix. "
+            f"Original eight prompts lack a token-identical {prefix}-token suffix. "
             "Choose another true Actor capture: do not synthesize shared tokens."
         )
     # Diverse branches are essential: eight copies of one response are not N=8.
-    distinct = {x[:SUFFIX].contiguous().numpy().tobytes() for x in responses}
+    distinct = {x[:suffix].contiguous().numpy().tobytes() for x in responses}
     if len(distinct) != BRANCHES:
         raise ValueError("Need eight distinct original response suffixes")
 
     windows = [
         (int(prompts[i].numel()), int(responses[i].numel()),
-         int(prompts[i].numel()) - PREFIX, 0, PREFIX, SUFFIX)
+         int(prompts[i].numel()) - prefix, 0, prefix, suffix)
         for i in range(BRANCHES)
     ]
     # Only change the genuine sequence-aligned fields, preserving metadata and
@@ -138,12 +148,12 @@ def derive_capture(source: Path, target: Path) -> dict:
     supervised = []
     for i in range(BRANCHES):
         p, s, full = derived["prompts"][i], derived["responses"][i], derived["input_ids"][i]
-        if p.numel() != PREFIX or s.numel() != SUFFIX or full.numel() != PREFIX+SUFFIX:
+        if p.numel() != prefix or s.numel() != suffix or full.numel() != prefix+suffix:
             raise AssertionError(f"Unexpected physical benchmark shape row={i}")
         if not torch.equal(full, torch.cat((p, s))):
             raise AssertionError(f"Derived prompt/response corruption row={i}")
         for field in ("response_mask", "loss_mask", "old_log_probs", "advantages"):
-            if not torch.equal(derived[field][i], batch[field][i][:SUFFIX]):
+            if not torch.equal(derived[field][i], batch[field][i][:suffix]):
                 raise AssertionError(f"Historical PPO labels changed: {field} row={i}")
         count = int(derived["response_mask"][i].bool().sum())
         if count == 0:
@@ -156,13 +166,13 @@ def derive_capture(source: Path, target: Path) -> dict:
     # Verify the *actual* production turn-only tree, rather than reporting
     # nominal 8:1 when the builder did not share all eight roots.
     forest = build_tree_execution_plans(
-        SYNTHETIC_KEYS, derived, tree_policy="qwen_turn", turn_min_segment_tokens=128,
+        keys, derived, tree_policy="qwen_turn", turn_min_segment_tokens=128,
     )
     if (len(forest.trees) != 1
             or set(forest.trees[0].member_rows) != set(range(BRANCHES))
-            or forest.trees[0].segment_plan.get(0).length != PREFIX):
+            or forest.trees[0].segment_plan.get(0).length != prefix):
         raise AssertionError(
-            "Actual qwen_turn tree is not exactly one shared 8192-token root"
+            f"Actual qwen_turn tree is not exactly one shared {prefix}-token root"
         )
     if forest.segment_count < 1 + BRANCHES:
         raise AssertionError("Production tree failed to retain distinct branches")
@@ -171,7 +181,7 @@ def derive_capture(source: Path, target: Path) -> dict:
 
     payload = dict(raw)
     payload["tensordict"] = derived
-    payload["keys"] = SYNTHETIC_KEYS
+    payload["keys"] = keys
     payload["performance_original_keys"] = tuple(raw["keys"])
     payload["performance_derived_from"] = str(source.resolve())
     payload["performance_changed_conditioning"] = True
@@ -186,10 +196,10 @@ def derive_capture(source: Path, target: Path) -> dict:
         "capture": str(target.resolve()),
         "source": str(source.resolve()),
         "source_original_keys": list(raw["keys"]),
-        "new_keys": list(SYNTHETIC_KEYS),
+        "new_keys": list(keys),
         "n": BRANCHES,
-        "prefix": PREFIX, "suffix": SUFFIX, "length": PREFIX+SUFFIX,
-        "ratio": "8:1", "ppo_tokens": sum(supervised),
+        "prefix": prefix, "suffix": suffix, "length": prefix+suffix,
+        "ratio": f"{prefix//suffix}:1", "ppo_tokens": sum(supervised),
         "ppo_tokens_per_row": supervised,
         "forest_trees": len(forest.trees),
         "forest_segments": forest.segment_count,
@@ -200,15 +210,17 @@ def derive_capture(source: Path, target: Path) -> dict:
         "input_sha256": digest.hexdigest(),
         "changed_conditioning": True,
         "synthetic_shared_uid": True,
-        "note": ("Real original response tokens and PPO labels; last prompt 8192 "
-                 "and first response 1024 retained, but original conditioning "
-                 "has changed and different sessions may share a synthetic UID. "
-                 "PERFORMANCE ONLY, not on-policy PPO correctness."),
+        "note": (
+            f"Original real PPO response tokens and labels; last {prefix} prompt "
+            f"tokens and first {suffix} response tokens retained. Historical "
+            "conditioning changed and sessions share synthetic UID. "
+            "PERFORMANCE ONLY, not on-policy PPO correctness."
+        ),
     }
     target.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, target)
     target.with_suffix(".audit.json").write_text(json.dumps(audit, indent=2))
-    print("TPR_CP1_N8_CAPTURE "+json.dumps(audit, sort_keys=True), flush=True)
+    print("TPR_N8_CAPTURE "+json.dumps(audit, sort_keys=True), flush=True)
     return audit
 
 
@@ -216,8 +228,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path)
     parser.add_argument("target", type=Path)
+    parser.add_argument("--prefix", type=int, default=PREFIX)
+    parser.add_argument("--suffix", type=int, default=SUFFIX)
     args = parser.parse_args()
-    derive_capture(args.source, args.target)
+    derive_capture(args.source, args.target, prefix=args.prefix, suffix=args.suffix)
 
 
 if __name__ == "__main__":
