@@ -4,7 +4,7 @@ Status: experimental runner on a branch from main; **no Ascend measurements yet*
 
 - Real Qwen3-4B-128K BF16 checkpoint, TP=2, CP=1, DP=1, **2 Ascend NPUs**.
 - Fixed **N=8**, retained original actor PPO response tokens and historical old_log_probs, advantages, response_mask, loss_mask, temperature.
-- Each trajectory: common **P=8,192 tokens** (last prompt tokens), distinct **S=1,024 tokens** (first response tokens); L=9,216. All eight prompts must share the exact 8,192-token suffix. Actual qwen_turn Root must cover eight leaves. Incompatible sources are rejected, not repaired.
+- Each trajectory: nominal **P=8,192 tokens** (last prompt tokens), distinct **S=1,024 tokens** (first response tokens); L=9,216. All eight prompts must be token-identical for 8,192 tokens. Actual qwen_turn Root must cover eight leaves and share **at least 8,065 tokens**. With production turn_min_segment_tokens=128, the prompt boundary may be merged with a response turn if the preceding Turn boundary is fewer than 128 tokens away; therefore Root need not equal 8,192. Record **actual_shared_root_tokens** separately from the nominal P:S ratio. Incompatible sources are rejected, not repaired.
 - Original session identifiers are saved in metadata. A synthetic shared UID is used for this *performance-only* comparison to allow different sessions with identical prompt tokens to share Prefix KV. Left-truncation and shortened responses **change original conditioning**; stored PPO labels are not recomputed. Do not use for on-policy correctness claims.
 - Full: eight independent complete 9,216-token model F/B calls without TPR context. Uses **controlled CP1 square-CANN Full**, not the native Megatron/MindSpeed schedule. Do not mix this baseline with Native Full CP4.
 - TPR: same TP2 model and PPO fields, one Root / eight distinct Leaves through the production SegmentExecutor. Recompute OFF. No optimizer step.
@@ -46,9 +46,10 @@ The original input remains read-only at
 `/workspace/tpr_actor_capture_4b_n8_run2/actor_update_step000003_rank2_capture000002_batch0.pt`
 unless overridden with TPR_CP1_N8_SOURCE.
 
-**Failure diagnostics:** Data preparation logs `TPR_CP1_N8_SOURCE_LENGTHS`
+**Failure diagnostics:** Data preparation logs `TPR_N8_SOURCE_LENGTHS`
 for every original row (Prompt length, Response length, PPO supervision, and
-exact shortfall), before rejecting an ineligible capture. Even if the
+exact shortfall) and `TPR_N8_ACTUAL_TREE` for the actual compressed segment
+topology, before rejecting an ineligible capture. Even if the
 preparation fails, its log stays at `logs/prepare.log`; no derived input or
 F/B result is created. A row with Response shorter than 1024 is *not*
 automatically padded or replaced. Pick another eight-row source whose actual
