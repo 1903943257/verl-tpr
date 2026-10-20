@@ -6,7 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../../../../.."
 
-SOURCE="${TPR_CP1_N8_SOURCE:-/workspace/tpr_actor_capture_4b_n8_run1/actor_update_rank0_batch0.pt}"
+SOURCE="${TPR_CP1_N8_SOURCE:-/workspace/tpr_actor_capture_4b_n8_run2/actor_update_step000003_rank2_capture000002_batch0.pt}"
 ROOT="${TPR_CP1_N8_ROOT:-/workspace/tpr_experiments/performance/cp1_n8_9k_8to1_v1}"
 DATA_DIR="$ROOT/data"
 RESULT_DIR="$ROOT/results"
