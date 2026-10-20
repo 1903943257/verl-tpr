@@ -37,7 +37,7 @@ def derive_capture(
     allowed = ((8192, 1024), (4608, 4608), (16384, 2048),
                (9216, 9216), (6016, 6016), (12416, 6016),
                (13824, 13824), (24576, 3072),
-               (18432, 18432), (32768, 4096))
+               (18432, 18432), (32768, 4096), (17440, 17440))
     if (prefix, suffix) not in allowed:
         raise ValueError(f"Unsupported measured workload {(prefix, suffix)}; allowed={allowed}")
     cp = (1 if (prefix, suffix) in ((8192, 1024), (4608, 4608))
