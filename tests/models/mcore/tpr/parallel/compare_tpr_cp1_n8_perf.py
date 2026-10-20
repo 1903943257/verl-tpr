@@ -6,7 +6,9 @@ import json
 from pathlib import Path
 
 
-def compare(output_dir: Path) -> dict:
+def compare(output_dir: Path, *, prefix: int = 8192, suffix: int = 1024) -> dict:
+    if (prefix, suffix) not in ((8192, 1024), (4608, 4608)):
+        raise ValueError(f"Unsupported CP1 workload P={prefix} S={suffix}")
     full = json.loads((output_dir / "full.json").read_text())
     tpr = json.loads((output_dir / "tpr.json").read_text())
     common = (
@@ -24,14 +26,14 @@ def compare(output_dir: Path) -> dict:
         raise AssertionError("Missing TPR CP1 SegmentExecutor mode")
     if ((full["topology"]["tp"], full["topology"]["cp"], full["topology"]["dp"])
             != (2, 1, 1) or full["branches"] != 8
-            or (full["prefix"], full["suffix"], full["length"]) != (8192, 1024, 9216)):
+            or (full["prefix"], full["suffix"], full["length"]) != (prefix, suffix, prefix+suffix)):
         raise AssertionError("Unexpected TP2 CP1 8-way shape")
     if (full["forest_trees"], full["forest_segments"]) != (8, 8):
         raise AssertionError("Unshared control did not execute eight whole sequences")
     if tpr["forest_trees"] != 1 or tpr["forest_segments"] < 9:
         raise AssertionError("TPR did not share one root across eight leaves")
     shared_root_tokens = tpr["actual_shared_root_tokens"]
-    if (not 8192 - 127 <= shared_root_tokens < 9216
+    if (not prefix - 127 <= shared_root_tokens < prefix + suffix
             or full["actual_shared_root_tokens"] != shared_root_tokens
             or full["unique_tree_tokens"] != tpr["unique_tree_tokens"]):
         raise AssertionError("Actual physical qwen_turn prefix differs across modes")
@@ -49,7 +51,7 @@ def compare(output_dir: Path) -> dict:
     if min(f, t) <= 0:
         raise AssertionError("Cannot compute speedup from nonpositive durations")
     report = {
-        "experiment": "QWEN3_4B_CP1_N8_P8192_S1024_PPO_FWD_BWD",
+        "experiment": f"QWEN3_4B_CP1_N8_P{prefix}_S{suffix}_PPO_FWD_BWD",
         "baseline": "CONTROLLED_SQUARE_CANN_NOT_NATIVE_MEGATRON",
         "full_median_fwd_bwd_s": f,
         "tpr_median_fwd_bwd_s": t,
@@ -60,9 +62,9 @@ def compare(output_dir: Path) -> dict:
             1-tpr["worst_peak_allocated_gib"]/full["worst_peak_allocated_gib"]
         ),
         "ppo_tokens": full["ppo_tokens"],
-        "nominal_prefix_tokens": 8192,
+        "nominal_prefix_tokens": prefix,
         "actual_shared_root_tokens": shared_root_tokens,
-        "effective_root_to_suffix_ratio": shared_root_tokens / 1024,
+        "effective_root_to_suffix_ratio": shared_root_tokens / suffix,
         "unique_tree_tokens": tpr["unique_tree_tokens"],
         "source_input_sha256": full["source_input_sha256"],
         "notes": (
@@ -83,8 +85,10 @@ def compare(output_dir: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("output_dir", type=Path)
+    parser.add_argument("--prefix", type=int, default=8192)
+    parser.add_argument("--suffix", type=int, default=1024)
     args = parser.parse_args()
-    compare(args.output_dir)
+    compare(args.output_dir, prefix=args.prefix, suffix=args.suffix)
 
 
 if __name__ == "__main__":
