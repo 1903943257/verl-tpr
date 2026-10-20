@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../../../../.."
 
 if [[ "$#" != 2 ]]; then
-  echo "Usage: bash $0 {1to1|8to1|18k_18k|32k_4k|16k_2k|9k_9k|6k_6k|12k_6k} SOURCE_ACTOR_CAPTURE.pt" >&2
+  echo "Usage: bash $0 {1to1|8to1|18k_18k|32k_4k|17k_17k|16k_2k|9k_9k|6k_6k|12k_6k} SOURCE_ACTOR_CAPTURE.pt" >&2
   exit 2
 fi
 RATIO="$1"
