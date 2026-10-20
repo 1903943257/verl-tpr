@@ -19,6 +19,19 @@ they remain discoverable through `run_suite.py inventory` and the original
 paths. The initial reorganization is a **non-breaking test governance pass**,
 not a completed physical migration of every historical file.
 
+## Physical cleanup and four main entries
+
+The repository now uses `run_unit.sh`, `run_correctness.sh`,
+`run_recompute.sh` and `run_performance.sh` as the four user-facing
+entry points. The `run_suite.py` registry is a dispatcher, not another
+mainline testing workflow. The first batch **removed 18 historical files,
+including 10 pytest files** (see [PRUNE_LOG.md](PRUNE_LOG.md)). The original
+189-test count above is a *pre-cleanup baseline*, not a current count.
+
+A green acceptance requires actual executed, passing tests: all-skipped
+pytest output fails the dispatcher. A performance report additionally
+requires numerical validation and consistent input/hash/topology conditions.
+
 ## Acceptance ladder
 
 | Stage | Core question | Primary command/test | Required evidence |
@@ -118,7 +131,6 @@ prerequisites and source hashes, then migrate a whole dependency island in
 one commit with compatibility checks. Do not create duplicate copies of tests
 or delete previous numerical references merely to reduce the file count.
 
-The first cleanup step therefore introduces one maintained gate registry,
-a zero-dependency path check, regression tests of the registry and an
-accurate README. Subsequent moves should occur only after their dependency
-islands and runtime owners are verified.
+The first cleanup added one maintained gate registry, zero-dependency path
+checks, and removed a verified historical-only batch. Further deletion must
+preserve surviving module imports, CLI callers and numerical coverage.
