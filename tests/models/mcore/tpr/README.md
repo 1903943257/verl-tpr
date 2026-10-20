@@ -81,7 +81,7 @@ tests were executed merely by reorganizing this directory.
 | `integration/` | Uni-Agent actor integration and real-TQ preparation contracts | Requires external capture or application environment |
 | `parallel/` | CP/Ring/TP/DP parity **plus legacy launchers and analysis scripts** | Mixed historical folder; do not run blindly |
 | `profiling/` | Latency, memory, capacity, offload and backend probes | Not correctness acceptance |
-| `linear/` | Experimental GDN/Hybrid-linear model coverage | Outside production Dense FA gate |
+| `experimental/linear/` | 隔离的 GDN/Qwen3.5 Hybrid-Linear 及原 Stage 3/4 CP 诊断 | 不参与 Dense Full Attention 默认门禁 |
 
 Do not move a helper in `parallel/` simply because its name looks like a
 diagnostic: many comparison tools import sibling files by filename and shell
@@ -130,3 +130,16 @@ Legacy host/docker instructions previously embedded in this README are
 historical only; current commands should use the active `verl-tpr` checkout.
 See `docs/tpr/architecture.md` and `docs/tpr/recompute_prototype.md` for
 runtime ownership and the recompute feature gates.
+
+
+## 2026-10-20 Linear/历史清理
+
+所有 58 个 Linear/GDN/Qwen3.5 Hybrid 相关实验、helper 和旧 CP/FA
+控制脚本已经从 `linear/`、`unit/`、`parallel/` 归并至
+`experimental/linear/`，旧相对导入同步调整。默认 CPU isolated 白名单
+已移除 GDN。额外删除旧 10K TP/CP/DP 对比链和不再支持的
+Fixed Tile/FC2 fixed-M PPO 干预路径。
+
+当前 `test_*.py` = **180**，其中 experimental=34，
+主目录=146。每个现存文件的保留/删减建议见
+[FILE_AUDIT_20261020.md](FILE_AUDIT_20261020.md)。
