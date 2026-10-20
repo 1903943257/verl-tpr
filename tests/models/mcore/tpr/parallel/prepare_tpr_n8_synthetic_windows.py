@@ -23,6 +23,37 @@ NEEDED = ("input_ids", "prompts", "responses", "response_mask",
           "loss_mask", "old_log_probs", "advantages", "temperature")
 
 
+def _choose_later_supervised_window(mask: torch.Tensor, suffix: int) -> tuple[int, int]:
+    """Choose a nonoverlapping later window with actual supervised PPO tokens.
+
+    Preserve the old [S:2S] behavior when it is already supervised (CP4).
+    Otherwise maximize the supervised-token count among aligned later windows.
+    The source offset may change; the output sequence shape never changes.
+    """
+    supervised = mask.bool().reshape(-1).to(dtype=torch.int64)
+    size = supervised.numel()
+    latest = size - suffix
+    if latest < suffix:
+        raise ValueError(f"No second nonoverlapping window: response={size} suffix={suffix}")
+    original_count = int(supervised[suffix:2*suffix].sum().item())
+    if original_count:
+        return suffix, original_count
+    # Prefix-sum scores are O(response_length), not O(length * candidate_count).
+    prefix = torch.cat((supervised.new_zeros(1), supervised.cumsum(0)))
+    starts = torch.arange(suffix, latest + 1, 16, dtype=torch.long)
+    if starts.numel() == 0 or starts[-1].item() != latest:
+        starts = torch.cat((starts, starts.new_tensor([latest])))
+    scores = prefix[starts + suffix] - prefix[starts]
+    best = int(scores.argmax().item())
+    count = int(scores[best].item())
+    if count == 0:
+        raise ValueError(
+            f"No later nonoverlapping window with supervised tokens: "
+            f"response={size} suffix={suffix}"
+        )
+    return int(starts[best].item()), count
+
+
 def prepare_window_source(source: Path, target: Path, *, prefix: int, suffix: int) -> dict:
     if (prefix, suffix) not in SUPPORTED:
         raise ValueError(f"Unsupported synthetic window shape {(prefix, suffix)}")
@@ -48,13 +79,22 @@ def prepare_window_source(source: Path, target: Path, *, prefix: int, suffix: in
     # the two additional branches use non-overlapping later response windows.
     row_windows = []
     for output_row, donor in enumerate(DONOR_ROWS):
-        start = suffix if output_row >= 6 else 0
         rlen = int(responses[donor].numel())
         plen = int(prompts[donor].numel())
-        if rlen < start + suffix:
+        if rlen < suffix * (2 if output_row >= 6 else 1):
             raise ValueError(
-                f"Donor row {donor} insufficient for window "
-                f"[{start}:{start+suffix}]: response={rlen}"
+                f"Donor row {donor} insufficient for "
+                f"{'later' if output_row >= 6 else 'first'} "
+                f"{suffix}-token window: response={rlen}"
+            )
+        if output_row >= 6:
+            start, supervised_tokens = _choose_later_supervised_window(
+                original["response_mask"][donor], suffix,
+            )
+        else:
+            start = 0
+            supervised_tokens = int(
+                original["response_mask"][donor][:suffix].bool().sum().item()
             )
         full = original["input_ids"][donor]
         if not torch.equal(full, torch.cat((prompts[donor], responses[donor]))):
@@ -62,12 +102,15 @@ def prepare_window_source(source: Path, target: Path, *, prefix: int, suffix: in
         for name in ("response_mask", "loss_mask", "old_log_probs", "advantages"):
             if original[name][donor].numel() != rlen:
                 raise AssertionError(f"{name} misaligned in donor {donor}")
-        if not original["response_mask"][donor][start:start+suffix].bool().any().item():
+        if supervised_tokens == 0:
             raise ValueError(f"Donor {donor} window has no supervised tokens")
         row_windows.append({
             "output_row": output_row, "donor_source_row": donor,
             "prompt_start": plen-prefix, "prompt_tokens": prefix,
             "response_start": start, "response_tokens": suffix,
+            "supervised_tokens": supervised_tokens,
+            "window_selection": ("adaptive_later_supervised" if output_row >= 6
+                                 and start != suffix else "fixed_window"),
             "donor_response_tokens": rlen,
             "donor_original_key": str(raw["keys"][donor]),
         })
