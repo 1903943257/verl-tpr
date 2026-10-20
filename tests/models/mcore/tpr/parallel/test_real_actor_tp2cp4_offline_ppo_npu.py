@@ -66,9 +66,18 @@ def _sanitize_mindspeed_repatch_args(args):
     full_args = vars(args)
     # MindSpeed parser_unknown_args() does key[2:] on unknown options.
     # Pytest -q/-s/-x therefore becomes the invalid dataclass field name "".
-    # Its value can be True, a string, or a list depending on flag order.
-    # Only the invalid EMPTY key is discarded, never another argument.
-    full_args.pop("", None)
+    # Values from pytest's short flags may be bool, str, None or a list of
+    # strings. Do not silently discard unexpected values (e.g. int=12).
+    if "" in full_args:
+        value = full_args[""]
+        expected = (
+            value is None
+            or isinstance(value, (bool, str))
+            or (isinstance(value, list) and all(isinstance(v, str) for v in value))
+        )
+        if not expected:
+            raise RuntimeError(f"Unexpected MindSpeed empty argument value type: {type(value).__name__}")
+        del full_args[""]
     malformed = [repr(key) for key in full_args if not isinstance(key, str) or not key.isidentifier()]
     if malformed:
         raise RuntimeError(f"Invalid MindSpeed argument names after repatch: {malformed}")
