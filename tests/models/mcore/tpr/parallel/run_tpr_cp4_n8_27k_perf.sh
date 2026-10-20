@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Controlled Qwen3-4B N8 P:S sweep at 27,648 tokens, TP2 CP4 DP1.
+# Controlled Qwen3-4B N8 P:S sweep at 27K or 36K tokens, TP2 CP4 DP1.
 # Reuses existing native Megatron Full vs production TPR Ring benchmark.
 # Original PPO labels retained; reject any source unable to supply real tokens.
 set -euo pipefail
 cd "$(dirname "$0")/../../../../.."
 
-if [[ "$#" != 2 || ("$1" != "1to1" && "$1" != "8to1") ]]; then
-  echo "Usage: bash $0 {1to1|8to1} SOURCE_ACTOR_CAPTURE.pt" >&2
+if [[ "$#" != 2 ]]; then
+  echo "Usage: bash $0 {1to1|8to1|18k_18k|32k_4k} SOURCE_ACTOR_CAPTURE.pt" >&2
   exit 2
 fi
 RATIO="$1"
 SOURCE="$(realpath "$2")"
-if [[ "$RATIO" == "1to1" ]]; then
-  P=13824
-  S=13824
-else
-  P=24576
-  S=3072
-fi
-ROOT="${TPR_CP4_N8_ROOT:-/workspace/tpr_experiments/performance/cp4_n8_27k_${RATIO}_v1}"
+case "$RATIO" in
+  1to1)    P=13824; S=13824; SHAPE="27k_1to1" ;;
+  8to1)    P=24576; S=3072;  SHAPE="27k_8to1" ;;
+  18k_18k) P=18432; S=18432; SHAPE="36k_1to1" ;;
+  32k_4k)  P=32768; S=4096;  SHAPE="36k_8to1" ;;
+  *) echo "Unsupported shape: $RATIO" >&2; exit 2 ;;
+esac
+ROOT="${TPR_CP4_N8_ROOT:-/workspace/tpr_experiments/performance/cp4_n8_${SHAPE}_v1}"
 DATA="$ROOT/data"
 LOGS="$ROOT/logs"
 RESULTS="$ROOT/results"
