@@ -50,7 +50,7 @@ def test_fixed_shape_40k_one_mode():
         # the original 40K/20-step manifest path untouched for production
         # historical regression tests.
         if step != 0:
-            raise ValueError("The independent CP4 controlled shape benchmark uses step=0")
+            raise ValueError("The independent controlled shape benchmark uses step=0")
         controlled = json.loads(Path(controlled_path).read_text())
         p, s = int(controlled["prefix"]), int(controlled["suffix"])
         if (
@@ -220,7 +220,7 @@ def test_fixed_shape_40k_one_mode():
         if dist.get_rank() == 0:
             print(
                 f"TPR_FIXED_SHAPE_GRAD_REDUCE_MODE mode={mode} "
-                f"dtype={grad_sync_dtype} cp_group_size=4",
+                f"dtype={grad_sync_dtype} cp_group_size={cp}",
                 flush=True,
             )
         runs = []
