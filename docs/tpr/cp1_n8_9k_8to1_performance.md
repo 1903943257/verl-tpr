@@ -43,7 +43,7 @@ All NEW runtime artifacts are below this one directory, not the Git checkout:
 ```
 
 The original input remains read-only at
-`/workspace/tpr_actor_capture_4b_n8_run1/actor_update_rank0_batch0.pt`
+`/workspace/tpr_actor_capture_4b_n8_run2/actor_update_step000003_rank2_capture000002_batch0.pt`
 unless overridden with TPR_CP1_N8_SOURCE.
 
 **Failure diagnostics:** Data preparation logs `TPR_CP1_N8_SOURCE_LENGTHS`
@@ -62,3 +62,43 @@ an empty folder from a failed run; inspect it before manually removing it.
 **OOM policy:** report failure; do not automatically reduce P, S or N, and do not enable Recompute mid-comparison. Any shortened case must be separately labeled.
 
 **Baseline limitation:** Final production Native Full vs TPR comparisons still require a separate validated CP1 native Megatron schedule, since the current native Full PPO helper hardcodes CP4. This controlled CP1 square-CANN result measures physical whole-sequence versus reuse, not production Native Full throughput.
+
+## 27K CP4 P:S comparison (Native Full vs TPR)
+
+Use the same audited N8 capture derivation and original fixed-shape CP4
+native Megatron/MindSpeed Full-vs-TPR F/B runner. Two independent workloads:
+
+| Ratio | P | S | L | TP x CP x DP |
+|---|---:|---:|---:|---|
+| 1:1 | 13824 | 13824 | 27648 | 2 x 4 x 1 |
+| 8:1 | 24576 | 3072 | 27648 | 2 x 4 x 1 |
+
+Each ratio requires **eight real captured response rows** with at least S
+original response tokens each and a **token-identical trailing prompt**
+of length P. All eight must have positive original PPO supervision in their
+retained response window; no label synthesis or automatic ratio adjustment.
+
+Run for each ratio with its own source capture:
+
+```bash
+bash tests/models/mcore/tpr/parallel/run_tpr_cp4_n8_27k_perf.sh 1to1 /path/to/eligible_capture.pt
+bash tests/models/mcore/tpr/parallel/run_tpr_cp4_n8_27k_perf.sh 8to1 /path/to/eligible_capture.pt
+```
+
+Set TPR_SHAPE_PREFLIGHT_ONLY=1 to prepare/validate *without starting NPUs*.
+Default output directories:
+
+- /workspace/tpr_experiments/performance/cp4_n8_27k_1to1_v1/{data,logs,results}
+- /workspace/tpr_experiments/performance/cp4_n8_27k_8to1_v1/{data,logs,results}
+
+The original Run2 capture used for the CP1 test has Prompt=17483 for all
+rows but responses of 48538,17444,7560,51885,30929,57442,25058,6026.
+It **cannot** serve as 27K 1:1: rows 2 and 7 are too short. It also
+**cannot** serve as 27K 8:1: 24576-token common prompt is unavailable.
+These CP4 benchmarks must remain PENDING until eligible captures are found
+or a separately disclosed synthetic-shape workload is explicitly approved.
+They are not to be silently replaced with unrelated test cases.
+
+For all three benchmark pairs, use 1 warmup + 3 rank-max timed F/B runs,
+Recompute OFF, profiler OFF and no AdamW. NPU OOM is retained as a separate
+capacity result; do not infer a speedup from a failed mode.
