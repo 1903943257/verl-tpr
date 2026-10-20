@@ -132,7 +132,7 @@ f,t=full["median_fwd_bwd_s"],tpr["median_fwd_bwd_s"]
 assert f>0 and t>0
 report = {
     "ratio": ratio, "prefix": p, "suffix": s, "length": p+s, "n": 8,
-    "world": 8, "topology": full["topology"], "recompute": False,
+    "world": 2*cp, "topology": full["topology"], "recompute": False,
     "optimizer_included": False,
     "baseline": "NATIVE_MEGATRON_MINDSPEED_FULL",
     "tpr": "TPR_RING_QWEN_TURN",
