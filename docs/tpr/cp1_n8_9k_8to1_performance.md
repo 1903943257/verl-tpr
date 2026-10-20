@@ -21,7 +21,43 @@ bash tests/models/mcore/tpr/parallel/run_tpr_cp1_n8_9k_perf.sh
 
 Set TPR_CP1_N8_SOURCE for another source if the default capture lacks a valid eight-way common 8K prompt suffix. Use TPR_CP1_N8_ROOT for a fresh output directory.
 
-Outputs: cp1_n8_p8192_s1024.pt, its .audit.json, full.json, tpr.json, comparison.json, and both mode logs.
+## Experiment artifact layout
+
+All NEW runtime artifacts are below this one directory, not the Git checkout:
+
+```text
+/workspace/tpr_experiments/performance/cp1_n8_9k_8to1_v1/
+├── data/
+│   ├── cp1_n8_p8192_s1024.pt
+│   └── cp1_n8_p8192_s1024.audit.json
+├── logs/
+│   ├── preflight.log
+│   ├── prepare.log
+│   ├── full.log
+│   ├── tpr.log
+│   └── compare.log
+└── results/
+    ├── full.json
+    ├── tpr.json
+    └── comparison.json
+```
+
+The original input remains read-only at
+`/workspace/tpr_actor_capture_4b_n8_run1/actor_update_rank0_batch0.pt`
+unless overridden with TPR_CP1_N8_SOURCE.
+
+**Failure diagnostics:** Data preparation logs `TPR_CP1_N8_SOURCE_LENGTHS`
+for every original row (Prompt length, Response length, PPO supervision, and
+exact shortfall), before rejecting an ineligible capture. Even if the
+preparation fails, its log stays at `logs/prepare.log`; no derived input or
+F/B result is created. A row with Response shorter than 1024 is *not*
+automatically padded or replaced. Pick another eight-row source whose actual
+shared prompt and response lengths meet the defined workload.
+
+Existing older experiments under `/workspace/tpr_experiments/` and
+original captures are deliberately NOT moved or deleted by this script. The
+former default `/workspace/tpr_experiments/cp1_n8_9k_8to1_v1/` may contain
+an empty folder from a failed run; inspect it before manually removing it.
 
 **OOM policy:** report failure; do not automatically reduce P, S or N, and do not enable Recompute mid-comparison. Any shortened case must be separately labeled.
 
