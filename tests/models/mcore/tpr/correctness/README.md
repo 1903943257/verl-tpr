@@ -34,6 +34,6 @@ training, and never silently relax tolerance to claim regression success.
 The `*_twenty_step*_npu.py` scripts use fixed data in their own protocols;
 they must not be described as online GRPO Reward-convergence validation.
 
-The early Qwen3-1.7B weak-E2E experiment and Fixed Tile diagnostic helpers
+The early Qwen3-1.7B weak-E2E test drivers and Fixed Tile CPU test
 were deleted as a dependency island on 2026-10-20. Historical commits remain
 available for reproduction; do not enable Fixed Tile as a correctness fix.
