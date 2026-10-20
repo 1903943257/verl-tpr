@@ -141,5 +141,5 @@ preserve surviving module imports, CLI callers and numerical coverage.
 - 30K TP2×CP2×DP2 PPO 单步已由用户在 NPU 环境验收通过；此前的 MindSpeed 参数空键问题已做 CPU 回归。
 - 旧版 10K parity 专项和仅适用于 legacy Megatron DP 的旧门禁已删除。
 - Linear/GDN/Qwen3.5 Hybrid 被集中到 `experimental/linear/`（58 个原有文件），不作为 Dense TPR 主线门禁。
-- 现存 `test_*.py` 180 个，其中 experimental 34，主线目录 146。
+- 现存 `test_*.py` 177 个，其中 experimental 32，主线目录 145。
 - 后续删减以 [FILE_AUDIT_20261020.md](FILE_AUDIT_20261020.md) 的逐文件表为依据。

@@ -4,7 +4,7 @@
 
 ## 本轮清理数据
 
-- 现存 TPR 文件：**308**；其中 `test_*.py`：**180**。
+- 现存 TPR 文件：**308**；其中 `test_*.py`：**177**。
 - Linear/GDN/Qwen3.5 Hybrid 已隔离：**34 个测试文件**，共 58 个原有文件移入 `experimental/linear/`，另增 3 个 package initializer。
 - 默认 CPU 引导保持明确的 **38 个选定测试文件**，移动 GDN 后无悬挂路径（静态校验）。
 - 本次新增删除：历史 10K TP/CP/DP 链 6 个、实验性旧 DP 门禁 1 个、失效 Fixed Tile helper 1 个；同时移除 112 行 Fix Tile/FC2 fixed-M 诊断干预。

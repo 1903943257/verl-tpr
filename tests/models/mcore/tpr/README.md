@@ -140,6 +140,6 @@ runtime ownership and the recompute feature gates.
 已移除 GDN。额外删除旧 10K TP/CP/DP 对比链和不再支持的
 Fixed Tile/FC2 fixed-M PPO 干预路径。
 
-当前 `test_*.py` = **180**，其中 experimental=34，
-主目录=146。每个现存文件的保留/删减建议见
+当前 `test_*.py` = **177**，其中 experimental=32，
+主目录=145。每个现存文件的保留/删减建议见
 [FILE_AUDIT_20261020.md](FILE_AUDIT_20261020.md)。
