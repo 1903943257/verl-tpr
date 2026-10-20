@@ -21,6 +21,20 @@ bash tests/models/mcore/tpr/parallel/run_tpr_cp1_n8_9k_perf.sh
 
 Set TPR_CP1_N8_SOURCE for another source if the default capture lacks a valid eight-way common 8K prompt suffix. Use TPR_CP1_N8_ROOT for a fresh output directory.
 
+### CPU preflight on the Ascend server
+
+Use the repository's isolated CPU harness instead of importing the full
+Megatron/MindSpeed stack with direct `python -m pytest`:
+
+```bash
+python tests/models/mcore/tpr/run_cpu_regressions.py --only-cp1-n8-perf
+```
+
+If both `results/full.json` and `results/tpr.json` already exist, the
+performance measurement has already finished. After a comparator-only fix,
+do not rerun the NPU benchmark; simply regenerate the missing
+`results/comparison.json` via the compare module.
+
 ## Experiment artifact layout
 
 All NEW runtime artifacts are below this one directory, not the Git checkout:
