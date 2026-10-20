@@ -10,6 +10,19 @@ mkdir -p "$BASE"
 echo "=== CP2 N8 18K CPU contract preflight ==="
 python tests/models/mcore/tpr/run_cpu_regressions.py --only-cp1-n8-perf
 
+# Prefer the same eight original trajectories for both ratios when possible.
+# Require a source covering the maximum P and maximum S across both cases.
+if [[ -z "${TPR_CP2_N8_SOURCE:-}" && -z "${TPR_CP2_N8_SOURCE_16K_2K:-}" \
+      && -z "${TPR_CP2_N8_SOURCE_9K_9K:-}" ]]; then
+  if shared_source="$(python -m tests.models.mcore.tpr.parallel.select_tpr_n8_perf_source \
+      --prefix 16384 --suffix 9216)"; then
+    export TPR_CP2_N8_SOURCE="$shared_source"
+    echo "TPR_CP2_COMMON_SOURCE $shared_source"
+  else
+    echo "TPR_CP2_NO_COMMON_SOURCE: use independent eligible captures; ratios then differ in source data" >&2
+  fi
+fi
+
 status=0
 for shape in 16k_2k 9k_9k; do
   if [[ "$shape" == "16k_2k" ]]; then
