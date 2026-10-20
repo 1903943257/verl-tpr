@@ -1,7 +1,7 @@
 """Controlled CP1 N=8 long-P/short-S Qwen3-4B Actor PPO performance capture.
 
-Preserve real response tokens and their historical PPO labels, but retain only
-the last 8192 prompt tokens and first 1024 response tokens. This deliberately
+Preserve real response tokens and their historical PPO labels. Retain the last
+P prompt tokens and first S response tokens for an explicit shape. This deliberately
 changes conditioning: it is a PERFORMANCE SHAPE TEST, not on-policy PPO parity.
 A synthetic shared UID allows identical original prompts from distinct sessions
 to share physical KV; original source identifiers remain in audit metadata.
@@ -34,12 +34,14 @@ def derive_capture(
     source: Path, target: Path, *, prefix: int = PREFIX, suffix: int = SUFFIX,
 ) -> dict:
     """Build a strictly token-exact eight-branch PPO performance shape."""
-    allowed = ((8192, 1024), (13824, 13824), (24576, 3072))
+    allowed = ((8192, 1024), (4608, 4608), (13824, 13824), (24576, 3072),
+               (18432, 18432), (32768, 4096))
     if (prefix, suffix) not in allowed:
         raise ValueError(f"Unsupported measured workload {(prefix, suffix)}; allowed={allowed}")
     keys = (
         SYNTHETIC_KEYS if (prefix, suffix) == (PREFIX, SUFFIX)
-        else tuple(f"cp4_p{prefix}_s{suffix}_tpr_{i}" for i in range(BRANCHES))
+        else tuple(f"cp{1 if (prefix, suffix) == (4608, 4608) else 4}_p{prefix}_s{suffix}_tpr_{i}"
+                   for i in range(BRANCHES))
     )
     if target.exists():
         raise FileExistsError(f"Never overwrite a derived performance capture: {target}")
@@ -172,7 +174,7 @@ def derive_capture(
     # boundary which survived min_segment_tokens=128). If the new prompt end
     # falls <128 tokens after the previous turn boundary, that boundary is
     # merged with a subsequent response turn and the actual shared root can
-    # end UP TO 127 tokens before the nominal 8192/13824/24576-token prompt.
+    # end UP TO 127 tokens before the nominal prefix boundary.
     # Do not change production tree policy or require a non-existent split.
     root_tokens = (
         forest.trees[0].segment_plan.get(0).length if len(forest.trees) == 1
