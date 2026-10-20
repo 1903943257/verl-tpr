@@ -117,3 +117,44 @@ They are not to be silently replaced with unrelated test cases.
 For all three benchmark pairs, use 1 warmup + 3 rank-max timed F/B runs,
 Recompute OFF, profiler OFF and no AdamW. NPU OOM is retained as a separate
 capacity result; do not infer a speedup from a failed mode.
+
+## Additional 9K/36K N8 shape sweep (October 2026)
+
+The original 9K 8:1 and 27K controls remain unchanged. Three additional,
+**independent** workloads are supported; 1 Ki token = 1024 tokens.
+
+| Case | P | S | Length | Parallelism | Full baseline |
+|---|---:|---:|---:|---|---|
+| CP1 9K 1:1 | 4608 | 4608 | 9216 | TP2 CP1 DP1 | controlled whole-sequence Square-CANN |
+| CP4 36K 1:1 | 18432 | 18432 | 36864 | TP2 CP4 DP1 | native Megatron/MindSpeed |
+| CP4 36K 8:1 | 32768 | 4096 | 36864 | TP2 CP4 DP1 | native Megatron/MindSpeed |
+
+A single sequential command from the Docker repository is:
+
+```bash
+cd /workspace/verl-tpr-ring-review
+set -o pipefail
+bash tests/models/mcore/tpr/parallel/run_tpr_n8_9k_36k_sweep.sh \
+  2>&1 | tee /workspace/tpr_experiments/performance/n8_9k_36k_sweep.log
+```
+
+CP1 defaults to the original Run2 8-row capture. CP4 searches read-only under
+`/workspace/tpr_actor_capture_4b_n8_run{5,3,2}` for the first eligible original
+Actor PPO mini-batch capture; it checks eight distinct response branches, a
+token-identical P-token prompt suffix, retained response masks and genuine PPO
+labels. Override with `TPR_CP4_N8_SOURCE_18K_18K` and
+`TPR_CP4_N8_SOURCE_32K_4K` (or one `TPR_CP4_N8_SOURCE` for both).
+Missing eligible source is a **PENDING** case, never a synthetic shape or a
+benchmark speedup. The older Run2 source is **ineligible for both new CP4 shapes**.
+A CP4 36K Full with recompute OFF may OOM; failure must remain a capacity result.
+
+Outputs are separated under `/workspace/tpr_experiments/performance/`:
+
+- `cp1_n8_9k_1to1_v1/{data,logs,results}`
+- `cp4_n8_36k_1to1_v1/{data,logs,results}`
+- `cp4_n8_36k_8to1_v1/{data,logs,results}`
+
+The script skips a case only if its `results/comparison.json` exists. All
+three are F/B-only: 1 warmup + 3 rank-max repeats, Recompute OFF, optimizer
+excluded. Because the CP1 and CP4 Full baselines differ, do not pool their
+speedup values as if they shared one production baseline.
