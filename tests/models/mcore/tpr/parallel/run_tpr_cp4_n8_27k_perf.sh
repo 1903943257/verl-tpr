@@ -16,6 +16,7 @@ case "$RATIO" in
   8to1)    CP=4; P=24576; S=3072;  SHAPE="27k_8to1" ;;
   18k_18k) CP=4; P=18432; S=18432; SHAPE="36k_1to1" ;;
   32k_4k)  CP=4; P=32768; S=4096;  SHAPE="36k_8to1" ;;
+  17k_17k) CP=4; P=17440; S=17440; SHAPE="34k_1to1_synthetic_windows" ;;
   16k_2k)  CP=2; P=16384; S=2048;  SHAPE="18k_8to1" ;;
   9k_9k)   CP=2; P=9216;  S=9216;  SHAPE="18k_1to1" ;;
   6k_6k)   CP=2; P=6016;  S=6016;  SHAPE="12k_1to1" ;;
