@@ -51,7 +51,7 @@ for shape in 16k_2k 9k_9k; do
     status=1
     continue
   fi
-  if ! TPR_CP_N8_ROOT="$ROOT" \
+  if ! ASCEND_RT_VISIBLE_DEVICES=8,9,10,11 TPR_CP_N8_ROOT="$ROOT" \
       bash tests/models/mcore/tpr/parallel/run_tpr_cp4_n8_27k_perf.sh \
       "$shape" "$SOURCE"; then
     echo "TPR_CP2_N8_FAILED P=$P S=$S source=$SOURCE" >&2
