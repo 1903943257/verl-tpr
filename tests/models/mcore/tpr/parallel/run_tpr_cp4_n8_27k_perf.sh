@@ -81,13 +81,17 @@ export TPR_EXEC_PROFILE=0
 export TPR_BENCH_WARMUPS="${TPR_BENCH_WARMUPS:-1}"
 export TPR_BENCH_REPEATS="${TPR_BENCH_REPEATS:-3}"
 unset TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
+# Keep pytest short flags out of sys.argv: MindSpeed parses unknown -q/-s/-x
+# as empty config field names and make_dataclass(TransformerConfig) then fails.
+# PYTEST_ADDOPTS is consumed by pytest, not by MindSpeed argv parsing.
+export PYTEST_ADDOPTS="-q -s -x"
 
 failed=0
 for mode in full tpr; do
   export TPR_OFFLINE_MODE="$mode"
   echo "TPR_CP4_N8_START ratio=$RATIO mode=$mode p=$P s=$S"
   if ! torchrun --nproc_per_node=8 --master_port="${TPR_CP4_N8_PORT:-29832}" \
-      -m pytest -q -s -x \
+      -m pytest \
       tests/models/mcore/tpr/parallel/test_tpr_fixed_shape_40k_benchmark_npu.py \
       2>&1 | tee "$LOGS/${mode}.log"; then
     echo "TPR_CP4_N8_FAILED ratio=$RATIO mode=$mode. Inspect OOM/errors in $LOGS." >&2
