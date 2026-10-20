@@ -112,7 +112,8 @@ def test_n8_capture_rejects_missing_common_prefix(tmp_path: Path):
 @pytest.mark.parametrize("p,s", [(4608, 4608), (16384, 2048),
                                  (9216, 9216), (6016, 6016),
                                  (12416, 6016), (13824, 13824),
-                                 (24576, 3072), (18432, 18432), (32768, 4096)])
+                                 (24576, 3072), (18432, 18432),
+                                 (32768, 4096), (17440, 17440)])
 def test_extra_n8_shapes_preserve_real_ppo_labels(tmp_path: Path, p: int, s: int):
     source, original = _original_source(tmp_path, prefix=p, suffix=s)
     target = tmp_path/f"p{p}_s{s}.pt"
