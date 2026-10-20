@@ -17,7 +17,7 @@
 Run from the verl repository root on one NPU::
 
     pytest -s -v \
-        tests/models/mcore/tpr/linear/test_linear_prefix_state_forward_npu.py
+        tests/models/mcore/tpr/experimental/linear/test_linear_prefix_state_forward_npu.py
 
 The test first proves that the state-aware test runner matches the unchanged
 MindSpeed GDN forward. It then splits the same hidden sequence into prefix and
@@ -40,7 +40,7 @@ from torch import Tensor, nn
 
 from verl.utils.device import is_torch_npu_available
 
-from ..parallel._cp_gdn_test_utils import TensorComparison, tensor_comparison
+from .parallel._cp_gdn_test_utils import TensorComparison, tensor_comparison
 from ._gdn_state_test_utils import LinearPrefixState, run_stateful_gdn_segment
 
 

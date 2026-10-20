@@ -38,11 +38,11 @@ UNIT = (
     "tpr_production_dp2_gate_cpu",
     "segment_plan", "tree_plan_builder", "trajectory_tree_turn", "trajectory_tree",
     "segment_executor", "fixed_topology_scheduler", "segment_external_objective",
-    "tp_validation", "rope", "gdn_prefix_state", "tpr_batch_runner",
+    "tp_validation", "rope", "tpr_batch_runner",
     "control_plane_gloo_cpu",
     "replay_bootstrap_cpu",
     "suite_registry_cpu",
-    "dp_placement", "gdn_context",
+    "dp_placement", 
 )
 PARALLEL = (
     "ring_cp_attention_contract", "ring_numerics_cpu",

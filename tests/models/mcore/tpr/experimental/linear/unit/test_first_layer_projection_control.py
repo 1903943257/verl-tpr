@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from ..linear._first_layer_projection_control import first_layer_projection_control
+from .._first_layer_projection_control import first_layer_projection_control
 
 
 class _Projection(torch.nn.Module):
