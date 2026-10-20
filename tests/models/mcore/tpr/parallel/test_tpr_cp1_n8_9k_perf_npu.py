@@ -1,4 +1,4 @@
-"""Qwen3-4B TP2×CP1 N8 P8192/S1024 controlled Full-vs-TPR PPO F/B.
+"""Qwen3-4B TP2×CP1 N8 9K controlled Full-vs-TPR PPO F/B.
 
 Exactly 2 Ascend NPU ranks. Both modes use the SAME checkpoint, captured PPO
 labels, model's TP2 weights, CANN CP1 attention and common minibatch. "full"
@@ -66,7 +66,7 @@ def test_cp1_n8_p8192_s1024_perf():
     if (audit.get("prefix"), audit.get("suffix"), audit.get("n")) != (
         p, s, BRANCHES
     ):
-        raise AssertionError("Data manifest does not describe N8 P8192/S1024")
+        raise AssertionError(f"Data manifest does not describe N8 P{p}/S{s}")
 
     runtime = _runtime(2, 1, 1)
     try:
