@@ -39,9 +39,9 @@ unset TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
 # Do not create Python __pycache__ files in the source checkout.
 export PYTHONDONTWRITEBYTECODE=1
 mkdir -p "$DATA_DIR" "$RESULT_DIR" "$LOG_DIR"
-# Fail fast on CPU data/comparison contracts, preserving diagnostic logs.
-python -m pytest -q \
-  tests/models/mcore/tpr/parallel/test_cp1_n8_perf_contract_cpu.py \
+# CPU-only contract preflight uses the repository's isolated Megatron
+# interface stubs: bare pytest imports MindSpeed/Megatron unnecessarily.
+python tests/models/mcore/tpr/run_cpu_regressions.py --only-cp1-n8-perf \
   2>&1 | tee "$LOG_DIR/preflight.log"
 
 if [[ ! -f "$CAPTURE" ]]; then
