@@ -147,6 +147,18 @@ def test_n8_synthetic_window_source_keeps_aligned_original_ppo_labels(tmp_path: 
     # The source has long enough responses; the two extra branches are
     # shifted windows of rows 0 and 3, not exact copied response duplicates.
     source, original = _original_source(tmp_path, prefix=p, suffix=2*s)
+    # Mimic the production actor capture containing critic-only nested
+    # returns/values: once P == S these become alignment-ambiguous.
+    recorded = torch.load(source, map_location="cpu", weights_only=False)
+    recorded["tensordict"].set("returns", _nested([
+        torch.arange(original["responses"][i].numel(), dtype=torch.float32)
+        for i in range(BRANCHES)
+    ]))
+    recorded["tensordict"].set("values", _nested([
+        torch.ones(original["responses"][i].numel(), dtype=torch.float32)
+        for i in range(BRANCHES)
+    ]))
+    torch.save(recorded, source)
     stage = tmp_path / "window_source.pt"
     provenance = prepare_window_source(source, stage, prefix=p, suffix=s)
     assert provenance["synthetic_response_windows"] is True
@@ -159,6 +171,7 @@ def test_n8_synthetic_window_source_keeps_aligned_original_ppo_labels(tmp_path: 
     ]
     staged = torch.load(stage, map_location="cpu", weights_only=False)
     batch = staged["tensordict"]
+    assert "returns" in batch and "values" in batch
     for i, entry in enumerate(provenance["source_rows"]):
         donor, offset = entry["donor_source_row"], entry["response_start"]
         assert batch["input_ids"][i].numel() == p+s
@@ -174,6 +187,13 @@ def test_n8_synthetic_window_source_keeps_aligned_original_ppo_labels(tmp_path: 
     audit = derive_capture(stage, derived, prefix=p, suffix=s)
     assert audit["synthetic_response_windows"] is True
     assert audit["original_actor_capture"] == str(source.resolve())
+    assert set(("returns", "values")).issubset(audit["dropped_actor_unused_fields"])
+    derived_batch = torch.load(derived, map_location="cpu", weights_only=False)["tensordict"]
+    assert "returns" not in derived_batch and "values" not in derived_batch
+    assert all(key in derived_batch for key in (
+        "input_ids", "prompts", "responses", "response_mask",
+        "loss_mask", "old_log_probs", "advantages", "temperature"
+    ))
     assert audit["forest_trees"] == 1 and audit["forest_segments"] >= 9
     assert audit["prefix"] == p and audit["suffix"] == s
 
