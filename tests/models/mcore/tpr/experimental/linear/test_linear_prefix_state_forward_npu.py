@@ -40,7 +40,7 @@ from torch import Tensor, nn
 
 from verl.utils.device import is_torch_npu_available
 
-from .parallel._cp_gdn_test_utils import TensorComparison, tensor_comparison
+from ...parallel._cp_gdn_test_utils import TensorComparison, tensor_comparison
 from ._gdn_state_test_utils import LinearPrefixState, run_stateful_gdn_segment
 
 

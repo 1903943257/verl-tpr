@@ -39,7 +39,7 @@ from torch import Tensor, nn
 
 from verl.utils.device import is_torch_npu_available
 
-from ._cp_gdn_test_utils import (
+from ....parallel._cp_gdn_test_utils import (
     AllToAllProbe,
     TensorComparison,
     assert_named_tensors_finite,
