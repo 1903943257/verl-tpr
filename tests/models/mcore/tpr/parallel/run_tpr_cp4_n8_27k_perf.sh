@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../../../../.."
 
 if [[ "$#" != 2 ]]; then
-  echo "Usage: bash $0 {1to1|8to1|18k_18k|32k_4k|16k_2k|9k_9k} SOURCE_ACTOR_CAPTURE.pt" >&2
+  echo "Usage: bash $0 {1to1|8to1|18k_18k|32k_4k|16k_2k|9k_9k|6k_6k|12k_6k} SOURCE_ACTOR_CAPTURE.pt" >&2
   exit 2
 fi
 RATIO="$1"
@@ -18,6 +18,8 @@ case "$RATIO" in
   32k_4k)  CP=4; P=32768; S=4096;  SHAPE="36k_8to1" ;;
   16k_2k)  CP=2; P=16384; S=2048;  SHAPE="18k_8to1" ;;
   9k_9k)   CP=2; P=9216;  S=9216;  SHAPE="18k_1to1" ;;
+  6k_6k)   CP=2; P=6016;  S=6016;  SHAPE="12k_1to1" ;;
+  12k_6k)  CP=2; P=12416; S=6016;  SHAPE="18k_2to1" ;;
   *) echo "Unsupported shape: $RATIO" >&2; exit 2 ;;
 esac
 ROOT="${TPR_CP_N8_ROOT:-${TPR_CP4_N8_ROOT:-/workspace/tpr_experiments/performance/cp${CP}_n8_${SHAPE}_v1}}"
