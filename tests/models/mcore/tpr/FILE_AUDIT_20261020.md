@@ -4,8 +4,8 @@
 
 ## 本轮清理数据
 
-- 现存 TPR 文件：**308**；其中 `test_*.py`：**177**。
-- Linear/GDN/Qwen3.5 Hybrid 已隔离：**34 个测试文件**，共 58 个原有文件移入 `experimental/linear/`，另增 3 个 package initializer。
+- 现存 TPR 文件：**309**；其中 `test_*.py`：**177**。
+- Linear/GDN/Qwen3.5 Hybrid 已隔离：**32 个测试文件**，共 58 个原有文件移入 `experimental/linear/`，另增 3 个 package initializer。
 - 默认 CPU 引导保持明确的 **38 个选定测试文件**，移动 GDN 后无悬挂路径（静态校验）。
 - 本次新增删除：历史 10K TP/CP/DP 链 6 个、实验性旧 DP 门禁 1 个、失效 Fixed Tile helper 1 个；同时移除 112 行 Fix Tile/FC2 fixed-M 诊断干预。
 - 测试整理分支没有改动 `verl/` 生产代码；NPU 数值复测仍须在用户 Docker 执行。
@@ -22,6 +22,7 @@
 
 | 相对路径 | 建议 | 具体职责 / 保留理由 |
 | --- | --- | --- |
+| `FILE_AUDIT_20261020.md` | KEEP-DOC | 本次逐文件静态清理台账 | 
 | `PRUNE_LOG.md` | KEEP-DOC | 组件边界、测试工具或历史断言 |
 | `README.md` | KEEP-DOC | 组件边界、测试工具或历史断言 |
 | `TEST_MATRIX.md` | KEEP-DOC | 组件边界、测试工具或历史断言 |
