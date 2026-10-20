@@ -202,3 +202,57 @@ allocated memory (38.21% saving). CP2's native Full baseline is
 a different reference and should not be pooled with CP1's controlled
 Square-CANN baseline. New CP2 NPU code must still pass server
 preflight and benchmark execution before any measured speedup claim.
+
+## N8 CP2 alternatives when P9216/S9216 source is unavailable
+
+Existing source preflight checked 360 Run2/Run3/Run5 Actor PPO files, with
+200 eight-row response shortfalls and 160 eight-row prompt shortfalls for
+exact P9216/S9216. The original Run2 sample has eight prompts of 17,483
+tokens; per-row response lengths are
+[48538, 17444, 7560, 51885, 30929, 57442, 25058, 6026].
+It supports **N8 P6016/S6016** (strict 1:1, 12,032 tokens) and
+**N8 P12416/S6016** (about 2.06:1, 18,432 tokens) by cropping existing
+tokens only. Both require the strict source/PPO/audited-Root preflight and
+produce independent Full/TPR NPU comparisons.
+
+Use read-only inventory first:
+
+```bash
+cd /workspace/verl-tpr-ring-review
+python -m tests.models.mcore.tpr.parallel.scan_tpr_n8_capture_lengths \
+  --top 10 \
+  --json /workspace/tpr_experiments/performance/n8_capture_lengths.json \
+  2>&1 | tee /workspace/tpr_experiments/performance/n8_capture_lengths.log
+```
+
+It reports the globally shortest/longest captured response, each capture's
+minimum and maximum responses, its length-only maximal balanced N8 shape,
+fixed-18K N8 shape, and which rows could support two *N6* controlled
+ratios (N6 is a proposed separate experiment, **not** implemented by these
+N8 benchmark scripts). Length-only shortlisting cannot replace token
+identity and supervision checks.
+
+To execute both implemented fallback modes on the same original Run2 source:
+
+```bash
+bash tests/models/mcore/tpr/parallel/run_tpr_cp2_n8_fallback_ratios.sh both
+```
+
+Output paths:
+- `/workspace/tpr_experiments/performance/cp2_n8_12k_1to1_v1/results/comparison.json`
+- `/workspace/tpr_experiments/performance/cp2_n8_18k_2to1_v1/results/comparison.json`
+
+Optional run of matched-source CP2 16K/2K into an independent output path:
+
+```bash
+bash tests/models/mcore/tpr/parallel/run_tpr_cp2_n8_fallback_ratios.sh 16k_2k
+```
+
+This writes to `cp2_n8_18k_8to1_run2matched_v1`, without overwriting
+the prior CP2 16K/2K result. The same-source, fixed-total-length 2.06:1
+vs 8:1 comparison isolates the prefix ratio better than comparing 12K vs
+18K; the 12K 1:1 case tests the desired exact ratio but changes length.
+Neither should be relabeled as an exact 18K 1:1 result. If a full N6 18K
+1:1 comparison is needed, derive six-row captures consistently from source
+rows (0,1,3,4,5,6) and benchmark **both** N6 8:1 and N6 1:1 cases rather
+than comparing N6 to the existing N8 baseline.
