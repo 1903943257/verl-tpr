@@ -2,8 +2,9 @@
 
 This folder is **not one pytest suite**. It combines primary CP/TP/DP
 correctness, native baselines, offline actor capture comparators, launchers,
-and research diagnostics. Start with [the TPR test matrix](../TEST_MATRIX.md)
-and the curated [suite launcher](../run_suite.py). Do not run
+and research diagnostics. Start with [the TPR test matrix](../TEST_MATRIX.md) and the maintained
+`../run_correctness.sh` / `../run_recompute.sh` / `../run_performance.sh`
+entry scripts (internally using [the suite launcher](../run_suite.py)). Do not run
 `pytest parallel/` as a single acceptance gate.
 
 | Prefix | Role | Execution |
@@ -42,3 +43,7 @@ Record: source capture SHA, model checkpoint and precision, recompute OFF/ON,
 TP/CP/DP, Ring backend, logical PPO tokens, all-rank loss/gradients and
 peak allocated/reserved. Comparisons involving an unshared SegmentExecutor
 baseline must not be relabelled native Megatron Full.
+
+The 2026-10-20 pruning batch retired native GEMM/QKV replay diagnostic
+pairs and six-FA value-clamp tests; they were not production correctness
+entrances. See `../PRUNE_LOG.md` for restore paths.
