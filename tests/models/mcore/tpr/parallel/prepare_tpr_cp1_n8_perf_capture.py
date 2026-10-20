@@ -268,6 +268,15 @@ def derive_capture(
             "PERFORMANCE ONLY, not on-policy PPO correctness."
         ),
     }
+    if raw.get("performance_synthetic_response_windows", False):
+        audit["synthetic_response_windows"] = True
+        audit["original_actor_capture"] = raw["performance_window_original_capture"]
+        audit["response_window_sources"] = raw["performance_row_windows"]
+        audit["note"] += (
+            " Synthetic N8 workload: two short source rows replaced by "
+            "distinct later windows from original long replies, preserving "
+            "aligned original token slices and PPO labels; NOT on-policy."
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, target)
     target.with_suffix(".audit.json").write_text(json.dumps(audit, indent=2))
