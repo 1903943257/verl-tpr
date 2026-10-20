@@ -34,14 +34,16 @@ def derive_capture(
     source: Path, target: Path, *, prefix: int = PREFIX, suffix: int = SUFFIX,
 ) -> dict:
     """Build a strictly token-exact eight-branch PPO performance shape."""
-    allowed = ((8192, 1024), (4608, 4608), (13824, 13824), (24576, 3072),
+    allowed = ((8192, 1024), (4608, 4608), (16384, 2048),
+               (9216, 9216), (13824, 13824), (24576, 3072),
                (18432, 18432), (32768, 4096))
     if (prefix, suffix) not in allowed:
         raise ValueError(f"Unsupported measured workload {(prefix, suffix)}; allowed={allowed}")
+    cp = (1 if (prefix, suffix) in ((8192, 1024), (4608, 4608))
+          else 2 if (prefix, suffix) in ((16384, 2048), (9216, 9216)) else 4)
     keys = (
         SYNTHETIC_KEYS if (prefix, suffix) == (PREFIX, SUFFIX)
-        else tuple(f"cp{1 if (prefix, suffix) == (4608, 4608) else 4}_p{prefix}_s{suffix}_tpr_{i}"
-                   for i in range(BRANCHES))
+        else tuple(f"cp{cp}_p{prefix}_s{suffix}_tpr_{i}" for i in range(BRANCHES))
     )
     if target.exists():
         raise FileExistsError(f"Never overwrite a derived performance capture: {target}")
