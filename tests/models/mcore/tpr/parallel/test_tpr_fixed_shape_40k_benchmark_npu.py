@@ -53,6 +53,8 @@ def test_fixed_shape_40k_one_mode():
             or controlled["n"] != 8 or controlled["length"] != 27648
             or controlled["forest_trees"] != 1
             or controlled["forest_segments"] < 9
+            or not p - 127 <= controlled.get("actual_shared_root_tokens", -1) < p + s
+            or controlled.get("min_turn_segment_tokens") != 128
             or not controlled["changed_conditioning"]
             or not controlled["synthetic_shared_uid"]
         ):
@@ -363,6 +365,8 @@ def test_fixed_shape_40k_one_mode():
                 "controlled_performance_shape": (
                     {"prefix": controlled["prefix"], "suffix": controlled["suffix"],
                      "length": controlled["length"],
+                     "actual_shared_root_tokens": controlled["actual_shared_root_tokens"],
+                     "unique_tree_tokens": controlled["unique_tree_tokens"],
                      "synthetic_shared_uid": controlled["synthetic_shared_uid"],
                      "changed_conditioning": controlled["changed_conditioning"],
                      "original_capture": controlled["source"]}
