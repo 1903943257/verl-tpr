@@ -14,6 +14,7 @@ No heavy test runs merely because a suite was listed or checked.
 from __future__ import annotations
 
 import argparse
+import ast
 import os
 import re
 from pathlib import Path
@@ -34,6 +35,50 @@ def inventory() -> dict[str, int]:
         folder = path.relative_to(TEST_ROOT).parts[0]
         result[folder] = result.get(folder, 0) + 1
     return dict(sorted(result.items()))
+
+
+
+def _check_relative_imports() -> list[str]:
+    """Check local Python module paths without importing NPU/Megatron.
+
+    This catches historical test dependencies accidentally stranded by file
+    deletion or experimental/ relocation; it does not validate dynamic
+    importlib calls or shell script paths.
+    """
+    errors: list[str] = []
+    for path in sorted(TEST_ROOT.rglob("*.py")):
+        relative = path.relative_to(TEST_ROOT)
+        try:
+            syntax = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (SyntaxError, UnicodeDecodeError) as exc:
+            errors.append(f"{relative}: unparseable module: {exc}")
+            continue
+        for node in ast.walk(syntax):
+            if not isinstance(node, ast.ImportFrom) or not node.level:
+                continue
+            target = path.parent
+            for _ in range(node.level - 1):
+                target = target.parent
+            if node.module:
+                target = target.joinpath(*node.module.split("."))
+            if not target.is_relative_to(TEST_ROOT):
+                continue
+            exists = target.with_suffix(".py").is_file() or (target / "__init__.py").is_file()
+            if not exists:
+                errors.append(
+                    f"{relative}:{node.lineno}: missing relative module "
+                    f"{'.' * node.level}{node.module or ''}"
+                )
+                continue
+            # 'from . import test_fixture_module' imports a sibling module;
+            # check it even though ImportFrom.module is None.
+            if node.module is None:
+                for alias in node.names:
+                    if alias.name.startswith("test_") and not (target / (alias.name + ".py")).is_file():
+                        errors.append(
+                            f"{relative}:{node.lineno}: missing sibling test module {alias.name}"
+                        )
+    return errors
 
 
 def check() -> list[str]:
@@ -62,6 +107,7 @@ def check() -> list[str]:
         for identifier in identifiers:
             if identifier not in GATES:
                 errors.append(f"{suite}: unknown gate {identifier}")
+    errors.extend(_check_relative_imports())
     return errors
 
 
@@ -146,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="action", required=True)
     sub.add_parser("list", help="List supported suites and purpose")
     sub.add_parser("inventory", help="Count discovered pytest files by physical folder")
-    sub.add_parser("check", help="Validate registry paths and descriptions (no imports)")
+    sub.add_parser("check", help="Validate registry and local Python import paths (no imports)")
     show = sub.add_parser("show", help="Print exact commands for a suite")
     show.add_argument("suite", choices=sorted(SUITES))
     execute = sub.add_parser("run", help="Execute a curated suite, not every test")
@@ -171,7 +217,7 @@ def main(argv: list[str] | None = None) -> int:
             for issue in errors:
                 print(f"ERROR: {issue}", file=sys.stderr)
             return 1
-        print(f"PASS: {len(SUITES)} suites / {len(GATES)} gates; paths and metadata valid.")
+        print(f"PASS: {len(SUITES)} suites / {len(GATES)} gates; registry and local import paths valid.")
         return 0
     if args.action == "show":
         describe(args.suite)
