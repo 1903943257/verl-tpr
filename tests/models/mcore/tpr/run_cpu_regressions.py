@@ -32,7 +32,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[4]
 UNIT = (
     "turn_tree_cpu", "ppo_objective_cpu", "ppo_batch_cpu", "ppo_executor_cpu",
-    "sequence_shard_cpu", "unified_kv_state_cpu", "prefix_state", "kv_stack",
+    "unified_kv_state_cpu", "prefix_state", "kv_stack",
     "shard", "tpr_self_attention", "context", "rectangular_attention_contract",
     "ring_streaming_transport",  "production_architecture",
     "tpr_production_dp2_gate_cpu",
