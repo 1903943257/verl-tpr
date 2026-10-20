@@ -36,7 +36,7 @@ from tensordict import TensorDict
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
-from ..equivalence.test_tpr_engine_reference_equivalence_npu import (
+from ..equivalence._engine_reference_fixture import (
     _configure_model_runtime,
     _install_reference_forward,
     _make_engine,
