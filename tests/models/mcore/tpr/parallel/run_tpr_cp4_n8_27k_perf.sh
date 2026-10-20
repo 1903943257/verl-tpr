@@ -147,6 +147,8 @@ report = {
     "full_peak_allocated_gib": max(v["peak_allocated_gib"] for v in full["runs"] if not v["warmup"]),
     "tpr_peak_allocated_gib": max(v["peak_allocated_gib"] for v in tpr["runs"] if not v["warmup"]),
     "performance_only_changed_conditioning": True,
+    "synthetic_response_windows": bool(full["controlled_performance_shape"].get("synthetic_response_windows", False)),
+    "original_actor_capture": full["controlled_performance_shape"].get("original_actor_capture"),
 }
 target = root/"comparison.json"
 if target.exists(): raise FileExistsError(f"Refuse to overwrite: {target}")
