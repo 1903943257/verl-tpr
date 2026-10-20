@@ -11,6 +11,7 @@ from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 from .prepare_tpr_cp1_n8_perf_capture import derive_capture, PREFIX, SUFFIX, BRANCHES
 from .compare_tpr_cp1_n8_perf import compare
+from .prepare_tpr_n8_synthetic_windows import prepare_window_source
 
 
 def _nested(parts):
@@ -139,6 +140,42 @@ def test_cp4_27k_rejects_short_response_without_padding(tmp_path: Path):
     with pytest.raises(ValueError, match="response_shortfall"):
         derive_capture(source, tmp_path/"invalid.pt",
                        prefix=13824, suffix=13824)
+
+
+@pytest.mark.parametrize("p,s", [(9216, 9216), (17440, 17440)])
+def test_n8_synthetic_window_source_keeps_aligned_original_ppo_labels(tmp_path: Path, p: int, s: int):
+    # The source has long enough responses; the two extra branches are
+    # shifted windows of rows 0 and 3, not exact copied response duplicates.
+    source, original = _original_source(tmp_path, prefix=p, suffix=2*s)
+    stage = tmp_path / "window_source.pt"
+    provenance = prepare_window_source(source, stage, prefix=p, suffix=s)
+    assert provenance["synthetic_response_windows"] is True
+    assert provenance["on_policy_valid"] is False
+    assert [entry["donor_source_row"] for entry in provenance["source_rows"]] == [
+        0, 1, 3, 4, 5, 6, 0, 3,
+    ]
+    assert [entry["response_start"] for entry in provenance["source_rows"]] == [
+        0, 0, 0, 0, 0, 0, s, s,
+    ]
+    staged = torch.load(stage, map_location="cpu", weights_only=False)
+    batch = staged["tensordict"]
+    for i, entry in enumerate(provenance["source_rows"]):
+        donor, offset = entry["donor_source_row"], entry["response_start"]
+        assert batch["input_ids"][i].numel() == p+s
+        assert torch.equal(batch["prompts"][i], original["prompts"][donor][-p:])
+        for key in ("responses", "response_mask", "loss_mask",
+                    "old_log_probs", "advantages"):
+            assert torch.equal(batch[key][i],
+                               original[key][donor][offset:offset+s])
+    with pytest.raises(FileExistsError):
+        prepare_window_source(source, stage, prefix=p, suffix=s)
+
+    derived = tmp_path / "derived.pt"
+    audit = derive_capture(stage, derived, prefix=p, suffix=s)
+    assert audit["synthetic_response_windows"] is True
+    assert audit["original_actor_capture"] == str(source.resolve())
+    assert audit["forest_trees"] == 1 and audit["forest_segments"] >= 9
+    assert audit["prefix"] == p and audit["suffix"] == s
 
 
 @pytest.mark.parametrize("p,s", [(8192, 1024), (4608, 4608)])
