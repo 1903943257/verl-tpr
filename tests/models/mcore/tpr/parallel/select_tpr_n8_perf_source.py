@@ -79,8 +79,9 @@ def main() -> None:
     print(f"TPR_N8_NO_ELIGIBLE_SOURCE P={args.prefix} S={args.suffix} "
           f"examined={len(candidates)} reasons={dict(failures)} "
           f"roots={[str(r) for r in args.roots]}. "
-          "Supply TPR_CP4_N8_SOURCE_18K_18K or TPR_CP4_N8_SOURCE_32K_4K "
-          "pointing to an eligible original actor_update_mini_batch capture.",
+          "Supply TPR_CP2_N8_SOURCE_16K_2K / TPR_CP2_N8_SOURCE_9K_9K "
+          "(or the CP4 equivalents) pointing to an eligible original "
+          "actor_update_mini_batch capture.",
           file=sys.stderr)
     raise SystemExit(2)
 
