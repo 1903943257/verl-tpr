@@ -11,7 +11,7 @@ from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 from .prepare_tpr_cp1_n8_perf_capture import derive_capture, PREFIX, SUFFIX, BRANCHES
 from .compare_tpr_cp1_n8_perf import compare
-from .prepare_tpr_n8_synthetic_windows import prepare_window_source
+from .prepare_tpr_n8_synthetic_windows import (prepare_window_source, _choose_later_supervised_window)
 
 
 def _nested(parts):
@@ -196,6 +196,53 @@ def test_n8_synthetic_window_source_keeps_aligned_original_ppo_labels(tmp_path: 
     ))
     assert audit["forest_trees"] == 1 and audit["forest_segments"] >= 9
     assert audit["prefix"] == p and audit["suffix"] == s
+
+
+@pytest.mark.parametrize("suffix", [9216, 17440])
+def test_synthetic_later_window_falls_back_to_supervised_span(suffix: int):
+    mask = torch.ones(2*suffix + 20, dtype=torch.bool)
+    mask[suffix:2*suffix] = False
+    start, count = _choose_later_supervised_window(mask, suffix)
+    assert start > suffix
+    assert start + suffix <= len(mask)
+    assert count == int(mask[start:start+suffix].sum()) > 0
+    with pytest.raises(ValueError, match="No later nonoverlapping window"):
+        _choose_later_supervised_window(torch.cat((
+            torch.ones(suffix, dtype=torch.bool),
+            torch.zeros(suffix + 20, dtype=torch.bool),
+        )), suffix)
+
+
+def test_cp2_synthetic_window_adapts_to_sparse_supervision(tmp_path: Path):
+    p = s = 9216
+    source, original = _original_source(tmp_path, prefix=p, suffix=2*s)
+    raw = torch.load(source, map_location="cpu", weights_only=False)
+    masks = [raw["tensordict"]["response_mask"][i].clone()
+             for i in range(BRANCHES)]
+    for donor in (0, 3):
+        masks[donor][s:2*s] = False
+    raw["tensordict"].set("response_mask", _nested(masks))
+    torch.save(raw, source)
+    stage = tmp_path / "sparse_window_source.pt"
+    provenance = prepare_window_source(source, stage, prefix=p, suffix=s)
+    shifted = provenance["source_rows"][6:]
+    assert [item["donor_source_row"] for item in shifted] == [0, 3]
+    assert all(item["response_start"] > s for item in shifted)
+    assert all(item["supervised_tokens"] > 0 for item in shifted)
+    assert all(item["window_selection"] == "adaptive_later_supervised"
+               for item in shifted)
+    prepared = torch.load(stage, map_location="cpu", weights_only=False)["tensordict"]
+    for i, window in enumerate(provenance["source_rows"]):
+        donor, start = window["donor_source_row"], window["response_start"]
+        for name in ("responses", "response_mask", "loss_mask",
+                     "old_log_probs", "advantages"):
+            assert torch.equal(
+                prepared[name][i],
+                raw["tensordict"][name][donor][start:start+s],
+            )
+    audit = derive_capture(stage, tmp_path / "adapted.pt", prefix=p, suffix=s)
+    assert audit["synthetic_response_windows"] is True
+    assert audit["forest_segments"] >= 9
 
 
 @pytest.mark.parametrize("p,s", [(8192, 1024), (4608, 4608)])
