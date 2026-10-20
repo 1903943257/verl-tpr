@@ -128,8 +128,19 @@ def derive_capture(
          int(prompts[i].numel()) - prefix, 0, prefix, suffix)
         for i in range(BRANCHES)
     ]
-    # Only change the genuine sequence-aligned fields, preserving metadata and
-    # scalar/batched TensorDict fields without reconstructing their semantics.
+    # The synthetic window source is Actor F/B-only. Its original PPO capture
+    # may also include critic fields such as 'returns'/'values'. When P == S,
+    # these unknown ragged fields are ambiguous to the generic shape-inference
+    # cropper, and none are consumed by the actor PPO objective. Retain only
+    # the actual actor inputs, masks/labels and optional actor loss inputs.
+    # Keep the strict unfiltered behavior for every real-capture experiment.
+    dropped_auxiliary_fields = []
+    if raw.get("performance_synthetic_response_windows", False):
+        actor_fields = set(REQUIRED) | {"ref_log_prob", "rollout_is_weights"}
+        dropped_auxiliary_fields = [
+            name for name in batch.keys() if name not in actor_fields
+        ]
+        batch = batch.select(*[name for name in batch.keys() if name in actor_fields])
     derived = batch.clone(recurse=False)
     for name in batch.keys():
         value = batch[name]
@@ -269,6 +280,7 @@ def derive_capture(
         ),
     }
     if raw.get("performance_synthetic_response_windows", False):
+        audit["dropped_actor_unused_fields"] = dropped_auxiliary_fields
         audit["synthetic_response_windows"] = True
         audit["original_actor_capture"] = raw["performance_window_original_capture"]
         audit["response_window_sources"] = raw["performance_row_windows"]
