@@ -35,12 +35,14 @@ def derive_capture(
 ) -> dict:
     """Build a strictly token-exact eight-branch PPO performance shape."""
     allowed = ((8192, 1024), (4608, 4608), (16384, 2048),
-               (9216, 9216), (13824, 13824), (24576, 3072),
+               (9216, 9216), (6016, 6016), (12416, 6016),
+               (13824, 13824), (24576, 3072),
                (18432, 18432), (32768, 4096))
     if (prefix, suffix) not in allowed:
         raise ValueError(f"Unsupported measured workload {(prefix, suffix)}; allowed={allowed}")
     cp = (1 if (prefix, suffix) in ((8192, 1024), (4608, 4608))
-          else 2 if (prefix, suffix) in ((16384, 2048), (9216, 9216)) else 4)
+          else 2 if (prefix, suffix) in ((16384, 2048), (9216, 9216),
+                                         (6016, 6016), (12416, 6016)) else 4)
     keys = (
         SYNTHETIC_KEYS if (prefix, suffix) == (PREFIX, SUFFIX)
         else tuple(f"cp{cp}_p{prefix}_s{suffix}_tpr_{i}" for i in range(BRANCHES))
