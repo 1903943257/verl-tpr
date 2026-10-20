@@ -35,6 +35,10 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_cp1_n8_p8192_s1024_perf():
+    p = int(os.getenv("TPR_CP1_N8_P", str(PREFIX)))
+    s = int(os.getenv("TPR_CP1_N8_S", str(SUFFIX)))
+    if (p, s) not in ((8192, 1024), (4608, 4608)):
+        raise ValueError(f"Unsupported CP1 workload P={p} S={s}")
     mode = os.getenv("TPR_CP1_N8_MODE")
     if mode not in ("full", "tpr"):
         raise ValueError("TPR_CP1_N8_MODE=full or tpr")
@@ -60,7 +64,7 @@ def test_cp1_n8_p8192_s1024_perf():
         raise FileNotFoundError("Missing derived capture or its provenance audit")
     audit = json.loads(capture.with_suffix(".audit.json").read_text())
     if (audit.get("prefix"), audit.get("suffix"), audit.get("n")) != (
-        PREFIX, SUFFIX, BRANCHES
+        p, s, BRANCHES
     ):
         raise AssertionError("Data manifest does not describe N8 P8192/S1024")
 
@@ -79,8 +83,8 @@ def test_cp1_n8_p8192_s1024_perf():
         if tokens != audit["ppo_tokens"]:
             raise AssertionError("Captured supervised PPO token count mismatch")
         for row in batch["input_ids"].unbind(0):
-            if int(row.numel()) != PREFIX + SUFFIX:
-                raise AssertionError("Physical length differs from 9216")
+            if int(row.numel()) != p + s:
+                raise AssertionError(f"Physical length differs from {p+s}")
 
         tu.assign_non_tensor(
             batch, dp_size=1, global_batch_size=BRANCHES,
@@ -100,10 +104,10 @@ def test_cp1_n8_p8192_s1024_perf():
             if (len(forest.trees) != 1 or forest.segment_count < BRANCHES+1):
                 raise AssertionError("TPR did not build one eight-way shared tree")
             actual_root = forest.trees[0].segment_plan.get(0).length
-            if not PREFIX - 127 <= actual_root < PREFIX + SUFFIX:
+            if not p - 127 <= actual_root < p + s:
                 raise AssertionError(
                     f"Actual qwen_turn root {actual_root} is too far from nominal "
-                    f"P={PREFIX}; check turn-boundary rounding and source capture"
+                    f"P={p}; check turn-boundary rounding and source capture"
                 )
             if actual_root != audit["actual_shared_root_tokens"]:
                 raise AssertionError(
@@ -189,8 +193,8 @@ def test_cp1_n8_p8192_s1024_perf():
                                   if mode == "full" else "PRODUCTION_TPR_SEGMENT_EXECUTOR_CP1"),
                 "model": "Qwen3-4B-128K", "checkpoint": str(checkpoint),
                 "topology": {"tp": 2, "cp": 1, "dp": 1, "world": 2},
-                "branches": BRANCHES, "prefix": PREFIX, "suffix": SUFFIX,
-                "length": PREFIX+SUFFIX, "source_capture": str(capture),
+                "branches": BRANCHES, "prefix": p, "suffix": s,
+                "length": p+s, "source_capture": str(capture),
                 "source_input_sha256": input_sha,
                 "ppo_tokens": tokens,
                 "forest_trees": len(forest.trees),
