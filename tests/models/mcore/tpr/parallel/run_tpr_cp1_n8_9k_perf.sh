@@ -34,6 +34,10 @@ export TPR_RUN_CP1_N8_PERF=1
 export TPR_CP1_N8_CAPTURE="$CAPTURE"
 export TPR_CP1_N8_OUTPUT_DIR="$RESULT_DIR"
 unset TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
+# Keep pytest short flags out of sys.argv: MindSpeed parses unknown -q/-s/-x
+# as empty config field names and make_dataclass(TransformerConfig) then fails.
+# PYTEST_ADDOPTS is consumed by pytest, not by MindSpeed argv parsing.
+export PYTEST_ADDOPTS="-q -s -x"
 
 # Runtime files stay below ONE versioned experiment directory, never the repo.
 # Do not create Python __pycache__ files in the source checkout.
@@ -57,7 +61,7 @@ for mode in full tpr; do
   export TPR_CP1_N8_MODE="$mode"
   echo "TPR_CP1_N8_RUN mode=$mode topology=TP2CP1 N=8 P8192 S1024"
   if ! torchrun --nproc_per_node=2 --master_port=29831 \
-       -m pytest -q -s -x \
+       -m pytest \
        tests/models/mcore/tpr/parallel/test_tpr_cp1_n8_9k_perf_npu.py \
        2>&1 | tee "$LOG_DIR/${mode}.log"; then
     echo "TPR_CP1_N8_FAILED mode=$mode; do not interpret missing results as speedup" >&2
