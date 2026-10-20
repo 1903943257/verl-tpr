@@ -38,23 +38,48 @@ def test_fixed_shape_40k_one_mode():
     if mode not in ("full", "tpr"):
         raise ValueError("TPR_OFFLINE_MODE must be full or tpr")
     step = int(os.environ["TPR_BENCH_SOURCE_STEP"])
-    manifest_path = Path(os.environ["TPR_OFFLINE_CAPTURE_MANIFEST"])
-    manifest = json.loads(manifest_path.read_text())
-    if (manifest.get("protocol") != "real_actor_session_first_8merged_v3"
-            or manifest.get("steps") != 20
-            or manifest.get("expected_sessions") != 8
-            or manifest.get("max_seq_len") != 40960
-            or not 1 <= step <= 20):
-        raise ValueError("Requires existing, already truncated, session-first 40K/20-step manifest")
-    if (manifest.get("only_step_derived") not in (None, step)
-            or manifest.get("experimental_sequence_cap", 40960) !=
-                manifest["items"][step - 1].get("effective_sequence_cap", 40960)):
-        raise ValueError("Refuse to replay an unrelated or mismatched 30K derived step")
-    item = manifest["items"][step - 1]
-    if (item["step"] != step or item["source_global_step"] != step
-            or item["rows"] != list(range(8)) or item.get("session_count") != 8
-            or item["max_sequence_length"] > 40960):
-        raise AssertionError("Source step or original eight-session selection changed")
+    controlled_path = os.getenv("TPR_BENCH_CONTROLLED_N8_AUDIT")
+    controlled = None
+    if controlled_path:
+        # Direct, explicitly marked performance-only derived capture. Keep
+        # the original 40K/20-step manifest path untouched for production
+        # historical regression tests.
+        if step != 0:
+            raise ValueError("The independent CP4 27K shape benchmark uses step=0")
+        controlled = json.loads(Path(controlled_path).read_text())
+        p, s = int(controlled["prefix"]), int(controlled["suffix"])
+        if (
+            (p, s) not in ((13824, 13824), (24576, 3072))
+            or controlled["n"] != 8 or controlled["length"] != 27648
+            or controlled["forest_trees"] != 1
+            or controlled["forest_segments"] < 9
+            or not controlled["changed_conditioning"]
+            or not controlled["synthetic_shared_uid"]
+        ):
+            raise AssertionError("CP4 27K benchmark needs an audited eight-leaf 1:1 or 8:1 tree")
+        item = {
+            "capture": controlled["capture"],
+            "ppo_tokens": controlled["ppo_tokens"],
+            "effective_sequence_cap": 27648,
+        }
+    else:
+        manifest_path = Path(os.environ["TPR_OFFLINE_CAPTURE_MANIFEST"])
+        manifest = json.loads(manifest_path.read_text())
+        if (manifest.get("protocol") != "real_actor_session_first_8merged_v3"
+                or manifest.get("steps") != 20
+                or manifest.get("expected_sessions") != 8
+                or manifest.get("max_seq_len") != 40960
+                or not 1 <= step <= 20):
+            raise ValueError("Requires existing, already truncated, session-first 40K/20-step manifest")
+        if (manifest.get("only_step_derived") not in (None, step)
+                or manifest.get("experimental_sequence_cap", 40960) !=
+                    manifest["items"][step - 1].get("effective_sequence_cap", 40960)):
+            raise ValueError("Refuse to replay an unrelated or mismatched 30K derived step")
+        item = manifest["items"][step - 1]
+        if (item["step"] != step or item["source_global_step"] != step
+                or item["rows"] != list(range(8)) or item.get("session_count") != 8
+                or item["max_sequence_length"] > 40960):
+            raise AssertionError("Source step or original eight-session selection changed")
     capture = Path(item["capture"])
     if not capture.is_file():
         raise FileNotFoundError(capture)
@@ -110,6 +135,11 @@ def test_fixed_shape_40k_one_mode():
         )
         if tokens != item["ppo_tokens"]:
             raise AssertionError("Capture/manifest PPO token count mismatch")
+        if controlled:
+            if data_sha != controlled["input_sha256"]:
+                raise AssertionError("CP4 controlled Full/TPR input SHA differs from audited capture")
+            if any(int(row.numel()) != 27648 for row in batch["input_ids"].unbind(0)):
+                raise AssertionError("CP4 controlled replay must have eight exact 27648-token rows")
         if max(int(x.numel()) for x in batch["input_ids"].unbind(0)) > int(
                 item.get("effective_sequence_cap", 40960)):
             raise AssertionError("Capture exceeds its declared experimental sequence cap")
@@ -330,6 +360,14 @@ def test_fixed_shape_40k_one_mode():
             measured = [r["critical_fwd_bwd_s"] for r in runs if not r["warmup"]]
             target.write_text(json.dumps({
                 "source_step": step, "mode": mode,
+                "controlled_performance_shape": (
+                    {"prefix": controlled["prefix"], "suffix": controlled["suffix"],
+                     "length": controlled["length"],
+                     "synthetic_shared_uid": controlled["synthetic_shared_uid"],
+                     "changed_conditioning": controlled["changed_conditioning"],
+                     "original_capture": controlled["source"]}
+                    if controlled else None
+                ),
                 "recompute": recompute_enabled,
                 "recompute_granularity": model.config.recompute_granularity,
                 "recompute_method": model.config.recompute_method,
