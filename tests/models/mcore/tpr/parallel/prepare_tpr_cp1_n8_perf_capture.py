@@ -168,12 +168,53 @@ def derive_capture(
     forest = build_tree_execution_plans(
         keys, derived, tree_policy="qwen_turn", turn_min_segment_tokens=128,
     )
+    # qwen_turn only splits at complete message boundaries (or a prompt
+    # boundary which survived min_segment_tokens=128). If the new prompt end
+    # falls <128 tokens after the previous turn boundary, that boundary is
+    # merged with a subsequent response turn and the actual shared root can
+    # end UP TO 127 tokens before the nominal 8192/13824/24576-token prompt.
+    # Do not change production tree policy or require a non-existent split.
+    root_tokens = (
+        forest.trees[0].segment_plan.get(0).length if len(forest.trees) == 1
+        else None
+    )
+    leaf_shapes = (
+        [(seg.segment_id, seg.parent_id, seg.length)
+         for seg in forest.trees[0].segment_plan.segments.values()]
+        if len(forest.trees) == 1 else []
+    )
+    minimum_shared = prefix - 127
+    print(
+        "TPR_N8_ACTUAL_TREE "
+        + json.dumps({
+            "nominal_prefix": prefix,
+            "actual_shared_root": root_tokens,
+            "minimum_acceptable_shared_root": minimum_shared,
+            "forest_trees": len(forest.trees),
+            "forest_segments": forest.segment_count,
+            "member_rows": [list(t.member_rows) for t in forest.trees],
+            "segment_layout": leaf_shapes,
+        }, sort_keys=True),
+        flush=True,
+    )
     if (len(forest.trees) != 1
             or set(forest.trees[0].member_rows) != set(range(BRANCHES))
-            or forest.trees[0].segment_plan.get(0).length != prefix):
+            or root_tokens is None
+            or not minimum_shared <= root_tokens < prefix + suffix):
         raise AssertionError(
-            f"Actual qwen_turn tree is not exactly one shared {prefix}-token root"
+            f"Invalid real qwen_turn eight-way reuse: nominal_prefix={prefix}, "
+            f"actual_root={root_tokens}, minimum={minimum_shared}, "
+            f"trees={len(forest.trees)}; inspect TPR_N8_ACTUAL_TREE"
         )
+    if not torch.equal(forest.trees[0].segment_plan.get(0).token_ids,
+                       derived["input_ids"][0][:root_tokens]):
+        raise AssertionError("Shared root is not the exact source tokens")
+    if any(
+        not torch.equal(derived["input_ids"][i][:root_tokens],
+                        derived["input_ids"][0][:root_tokens])
+        for i in range(1, BRANCHES)
+    ):
+        raise AssertionError("Shared root would reuse mismatched token sequences")
     if forest.segment_count < 1 + BRANCHES:
         raise AssertionError("Production tree failed to retain distinct branches")
     if forest.logical_loss_tokens != sum(supervised):
@@ -203,6 +244,10 @@ def derive_capture(
         "ppo_tokens_per_row": supervised,
         "forest_trees": len(forest.trees),
         "forest_segments": forest.segment_count,
+        "actual_shared_root_tokens": root_tokens,
+        "effective_root_to_suffix_ratio": root_tokens / suffix,
+        "nominal_prefix_minus_actual_root": prefix - root_tokens,
+        "min_turn_segment_tokens": 128,
         "unique_tree_tokens": sum(
             segment.length for tree in forest.trees
             for segment in tree.segment_plan.segments.values()
