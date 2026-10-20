@@ -97,9 +97,19 @@ def test_cp1_n8_p8192_s1024_perf():
             if forest.segment_count != BRANCHES:
                 raise AssertionError("Full must execute eight whole sequences")
         else:
-            if (len(forest.trees) != 1 or forest.segment_count < BRANCHES+1
-                    or forest.trees[0].segment_plan.get(0).length != PREFIX):
-                raise AssertionError("TPR did not build one N8 shared 8192-token Root")
+            if (len(forest.trees) != 1 or forest.segment_count < BRANCHES+1):
+                raise AssertionError("TPR did not build one eight-way shared tree")
+            actual_root = forest.trees[0].segment_plan.get(0).length
+            if not PREFIX - 127 <= actual_root < PREFIX + SUFFIX:
+                raise AssertionError(
+                    f"Actual qwen_turn root {actual_root} is too far from nominal "
+                    f"P={PREFIX}; check turn-boundary rounding and source capture"
+                )
+            if actual_root != audit["actual_shared_root_tokens"]:
+                raise AssertionError(
+                    f"NPU tree root={actual_root} disagrees with audited "
+                    f"CPU root={audit['actual_shared_root_tokens']}"
+                )
         if forest.logical_loss_tokens != tokens:
             raise AssertionError("Forest PPO token count differs from capture")
 
@@ -185,6 +195,8 @@ def test_cp1_n8_p8192_s1024_perf():
                 "ppo_tokens": tokens,
                 "forest_trees": len(forest.trees),
                 "forest_segments": forest.segment_count,
+                "actual_shared_root_tokens": audit["actual_shared_root_tokens"],
+                "unique_tree_tokens": audit["unique_tree_tokens"],
                 "condition_changed": audit["changed_conditioning"],
                 "synthetic_shared_uid": audit["synthetic_shared_uid"],
                 "recompute": False, "optimizer_step": False,
