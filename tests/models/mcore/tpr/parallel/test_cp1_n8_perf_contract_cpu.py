@@ -288,3 +288,63 @@ def test_cpu_comparison_has_strict_same_input_and_baseline_label(tmp_path: Path,
     (tmp_path/"tpr.json").write_text(json.dumps(tpr))
     with pytest.raises(AssertionError, match="mismatch"):
         compare(tmp_path, prefix=p, suffix=s)
+
+
+def test_phase_trace_classifies_only_npu_kernel_and_hccl_lanes(tmp_path: Path):
+    from .tpr_phase_diagnostics import trace_kernel_summary, segment_event_summary
+    trace = tmp_path / "trace.json"
+    trace.write_text(json.dumps({"traceEvents": [
+        {"ph": "X", "cat": "NPU Kernel", "name": "FlashAttentionScore", "dur": 2800},
+        {"ph": "X", "cat": "HCCL Communication", "name": "HCCL_AllReduce", "dur": 1200},
+        {"ph": "X", "cat": "CPU", "name": "HCCL_AllReduce", "dur": 700000},
+        {"ph": "X", "cat": "CPU", "name": "aten::matmul", "dur": 8000},
+    ]}))
+    metrics = trace_kernel_summary(trace)
+    assert metrics["attention_kernel_sum_ms"] == pytest.approx(2.8)
+    assert metrics["hccl_kernel_sum_ms"] == pytest.approx(1.2)
+    assert metrics["attention_events"] == 1 and metrics["hccl_events"] == 1
+    assert trace_kernel_summary(None)["attention_kernel_sum_ms"] is None
+    segment = segment_event_summary([
+        {"kind": "push", "npu_event_ms": 1.5},
+        {"kind": "visit_leaf", "npu_event_ms": 2.0},
+        {"kind": "visit_leaf", "npu_event_ms": 3.0},
+        {"kind": "pop", "npu_event_ms": 0.7},
+    ])
+    assert segment["visit_leaf"] == {"npu_event_sum_ms": 5.0, "segments": 2}
+
+
+def test_phase_comparison_requires_matching_unprofiled_sha(tmp_path: Path):
+    from .compare_tpr_cp1_cp4_phase_diagnostics import collect_diagnostic
+    base = {
+        "mode": "tpr", "checkpoint": "/model/qwen",
+        "topology": {"tp": 2, "cp": 4, "dp": 1, "world": 8},
+        "input_sha256": "a" * 64, "median_fwd_bwd_s": 5.,
+    }
+    current = dict(base, phase_diagnostic=True, median_fwd_bwd_s=6.,
+                   runs=[{"warmup": False, "phase_diagnostics": [
+                       {"rank": 0, "stages": {
+                           "forward": {"npu_event_sum_ms": 2500., "events": 9},
+                           "backward": {"npu_event_sum_ms": 1800., "events": 9},
+                       }, "kernels": {
+                           "attention_kernel_sum_ms": 800.,
+                           "hccl_kernel_sum_ms": 200.,
+                       }},
+                   ], "profiles": [{"rank": 0, "stage_ms": {
+                       "tree_build_cpu_ms": 20., "tp_plan_collective_ms": 4.,
+                       "executor_setup_cpu_ms": 6.,
+                   }, "events": [{"kind": "push", "npu_event_ms": 100.}]}]}])
+    ref, phase = tmp_path / "ref.json", tmp_path / "phase.json"
+    ref.write_text(json.dumps(base))
+    phase.write_text(json.dumps(current))
+    result = collect_diagnostic(phase, ref, topology="TP2CP4")
+    assert result["stages_ms"]["forward"] == 2500.
+    assert result["stages_ms"]["attention"] == 800.
+    assert result["stages_ms"]["hccl"] == 200.
+    assert result["stages_ms"]["setup"] == 30.
+    assert result["stages_ms"]["profiled"] == 6000.
+    assert result["stages_ms"]["unprofiled"] == 5000.
+    assert result["stages_ms"]["ppo_loss"] is None
+    current["input_sha256"] = "b" * 64
+    phase.write_text(json.dumps(current))
+    with pytest.raises(AssertionError, match="inputs differ"):
+        collect_diagnostic(phase, ref, topology="TP2CP4")
