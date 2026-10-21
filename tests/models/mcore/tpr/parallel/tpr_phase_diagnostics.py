@@ -119,8 +119,16 @@ class PhaseSampler:
         by_name = defaultdict(list)
         for name, start, end in self._pending:
             by_name[name].append(float(start.elapsed_time(end)))
+        # Opt-in individual entries: CP4 native Full invokes forward/backward
+        # per Session; TPR invokes forward for Push/Leaf/Pop and backward for
+        # Leaf/Pop. Keep the existing aggregate schema unchanged otherwise.
+        per_call = os.getenv("TPR_LEAF_SESSION_DIAG", "0") == "1"
         return {
-            key: {"npu_event_sum_ms": sum(vals), "events": len(vals)}
+            key: {
+                "npu_event_sum_ms": sum(vals),
+                "events": len(vals),
+                **({"per_call_npu_event_ms": vals} if per_call else {}),
+            }
             for key, vals in by_name.items()
         }
 
