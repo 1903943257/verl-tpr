@@ -38,6 +38,7 @@ export TPR_TURN_MIN_SEGMENT_TOKENS=128
 export TPR_PPO_LOGPROB_CHUNK_TOKENS=256
 export TPR_ROOT_NATIVE_RING=0
 export TPR_EXEC_PROFILE=0
+export TPR_PHASE_DIAG="${TPR_PHASE_DIAG:-0}"
 export TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS=0
 export TPR_BENCH_WARMUPS="${TPR_BENCH_WARMUPS:-1}"
 export TPR_BENCH_REPEATS="${TPR_BENCH_REPEATS:-3}"
@@ -72,6 +73,11 @@ fi
 fail=0
 for mode in full tpr; do
   export TPR_CP1_N8_MODE="$mode"
+  if [[ "$TPR_PHASE_DIAG" == "1" && "$mode" == "tpr" ]]; then
+    export TPR_EXEC_PROFILE=1
+  else
+    export TPR_EXEC_PROFILE=0
+  fi
   echo "TPR_CP1_N8_RUN mode=$mode topology=TP2CP1 N=8 P=$P S=$S"
   if ! torchrun --nproc_per_node=2 --master_port=29831 \
        -m pytest \
@@ -81,10 +87,12 @@ for mode in full tpr; do
     fail=1
   fi
 done
-if [[ "$fail" == 0 ]]; then
+if [[ "$fail" == 0 && "$TPR_PHASE_DIAG" != "1" ]]; then
   python -m tests.models.mcore.tpr.parallel.compare_tpr_cp1_n8_perf "$RESULT_DIR" \
     --prefix "$P" --suffix "$S" \
     2>&1 | tee "$LOG_DIR/compare.log"
-else
+elif [[ "$fail" != "0" ]]; then
   exit 1
+else
+  echo "TPR_CP1_PHASE_DIAG_COMPLETE output=$RESULT_DIR (not a benchmark speedup)"
 fi
