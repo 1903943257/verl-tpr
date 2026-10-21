@@ -180,8 +180,25 @@ def trace_kernel_summary(path: Path | None):
         return {"attention_kernel_sum_ms": None, "hccl_kernel_sum_ms": None,
                 "reason": "trace_missing"}
     import re
-    raw = json.loads(path.read_text())
-    events = raw.get("traceEvents", []) if isinstance(raw, dict) else raw
+    try:
+        raw = json.loads(path.read_text())
+    except (json.JSONDecodeError, UnicodeError, OSError) as exc:
+        # An incomplete CANN export must not invalidate a completed F/B.
+        # Never report kernel timings from a partial trace as complete.
+        print(f"TPR_TRACE_PARSE_FAILED path={path} error={type(exc).__name__}: {exc}", flush=True)
+        return {
+            "attention_kernel_sum_ms": None, "hccl_kernel_sum_ms": None,
+            "attention_events": 0, "hccl_events": 0,
+            "reason": "trace_invalid_json",
+            "trace_error": f"{type(exc).__name__}: {exc}"[:240],
+        }
+    events = raw.get("traceEvents") if isinstance(raw, dict) else raw
+    if not isinstance(events, list):
+        return {
+            "attention_kernel_sum_ms": None, "hccl_kernel_sum_ms": None,
+            "attention_events": 0, "hccl_events": 0,
+            "reason": "trace_events_missing",
+        }
     totals = defaultdict(float)
     counts = defaultdict(int)
     for item in events:
