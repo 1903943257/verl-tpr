@@ -72,6 +72,10 @@ fi
 }
 fail=0
 for mode in full tpr; do
+  if [[ "$TPR_PHASE_DIAG" == "1" && -f "$RESULT_DIR/$mode.json" ]]; then
+    echo "TPR_CP1_PHASE_MODE_ALREADY_COMPLETE $mode"
+    continue
+  fi
   export TPR_CP1_N8_MODE="$mode"
   if [[ "$TPR_PHASE_DIAG" == "1" && "$mode" == "tpr" ]]; then
     export TPR_EXEC_PROFILE=1
