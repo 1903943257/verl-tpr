@@ -321,6 +321,32 @@ def test_phase_trace_classifies_only_npu_kernel_and_hccl_lanes(tmp_path: Path):
 
 
 
+
+def test_phase_sampler_optional_per_call_values_without_npu(monkeypatch):
+    from .tpr_phase_diagnostics import PhaseSampler
+
+    class FakeEvent:
+        def __init__(self, elapsed=0.0):
+            self.elapsed = elapsed
+
+        def elapsed_time(self, _):
+            return self.elapsed
+
+    sampler = PhaseSampler(None, mode="full")
+    sampler._pending.extend([
+        ("forward", FakeEvent(2.0), FakeEvent()),
+        ("forward", FakeEvent(3.0), FakeEvent()),
+        ("backward", FakeEvent(4.0), FakeEvent()),
+    ])
+    monkeypatch.delenv("TPR_LEAF_SESSION_DIAG", raising=False)
+    summary = sampler.materialize()
+    assert summary["forward"] == {"npu_event_sum_ms": 5.0, "events": 2}
+    monkeypatch.setenv("TPR_LEAF_SESSION_DIAG", "1")
+    summary = sampler.materialize()
+    assert summary["forward"]["per_call_npu_event_ms"] == [2.0, 3.0]
+    assert summary["backward"]["per_call_npu_event_ms"] == [4.0]
+
+
 def test_phase_trace_invalid_json_keeps_npu_kernel_timings_null(tmp_path: Path):
     from .tpr_phase_diagnostics import trace_kernel_summary
     trace = tmp_path / "incomplete_trace.json"
