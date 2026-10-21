@@ -7,13 +7,14 @@ cd "$(dirname "$0")/../../../../.."
 
 BASE=/workspace/tpr_experiments/performance
 CP1_REF="$BASE/cp1_n8_9k_1to1_v1/results"
+CP1_SOURCE="/workspace/tpr_actor_capture_4b_n8_run2/actor_update_step000003_rank2_capture000002_batch0.pt"
 CP4_REF="$BASE/cp4_n8_34k_1to1_synthetic_windows_v1/results"
 CP1_ROOT="$BASE/cp1_n8_9k_1to1_phase_v1"
 CP4_ROOT="$BASE/cp4_n8_34k_1to1_phase_v1"
 SOURCE_CP4="$BASE/cp4_n8_34k_1to1_synthetic_windows_v1/data/window_source_p17440_s17440.pt"
 SUMMARY="$BASE/cp1_cp4_phase_comparison_v1.json"
 
-for file in "$CP1_REF/full.json" "$CP1_REF/tpr.json" \
+for file in "$CP1_SOURCE" "$CP1_REF/full.json" "$CP1_REF/tpr.json" \
             "$CP4_REF/step0_full_fixed_shape.json" \
             "$CP4_REF/step0_tpr_fixed_shape.json" "$SOURCE_CP4"; do
   [[ -f "$file" ]] || { echo "Missing reference $file" >&2; exit 2; }
@@ -39,6 +40,7 @@ if [[ "$selection" == "cp1" || "$selection" == "both" ]]; then
   else
     echo "=== CP1 4608/4608 controlled Full vs TPR stage profile ==="
     ASCEND_RT_VISIBLE_DEVICES=8,9 \
+      TPR_CP1_N8_SOURCE="$CP1_SOURCE" \
       TPR_CP1_N8_P=4608 TPR_CP1_N8_S=4608 TPR_CP1_N8_ROOT="$CP1_ROOT" \
       bash tests/models/mcore/tpr/parallel/run_tpr_cp1_n8_9k_perf.sh \
       2>&1 | tee "$BASE/cp1_1to1_phase_v1.log"
