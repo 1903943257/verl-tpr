@@ -90,6 +90,7 @@ export TPR_BENCH_MEM_AUDIT=0
 export TPR_BENCH_GRAD_WITNESS=0
 export TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS=0
 export TPR_EXEC_PROFILE=0
+export TPR_PHASE_DIAG="${TPR_PHASE_DIAG:-0}"
 export TPR_BENCH_WARMUPS="${TPR_BENCH_WARMUPS:-1}"
 export TPR_BENCH_REPEATS="${TPR_BENCH_REPEATS:-3}"
 unset TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
@@ -101,6 +102,11 @@ export PYTEST_ADDOPTS="-q -s -x"
 failed=0
 for mode in full tpr; do
   export TPR_OFFLINE_MODE="$mode"
+  if [[ "$TPR_PHASE_DIAG" == "1" && "$mode" == "tpr" ]]; then
+    export TPR_EXEC_PROFILE=1
+  else
+    export TPR_EXEC_PROFILE=0
+  fi
   echo "TPR_CP_N8_START cp=$CP ratio=$RATIO mode=$mode p=$P s=$S"
   if ! torchrun --nproc_per_node="$WORLD" --master_port="${TPR_CP_N8_PORT:-${TPR_CP4_N8_PORT:-29832}}" \
       -m pytest \
@@ -113,6 +119,11 @@ done
 if ((failed)); then
   echo "At least one mode failed; preserve individual results and logs, do not report speedup." >&2
   exit 1
+fi
+
+if [[ "$TPR_PHASE_DIAG" == "1" ]]; then
+  echo "TPR_CP_N8_PHASE_DIAG_COMPLETE results=$RESULTS (not a benchmark speedup)"
+  exit 0
 fi
 
 python - "$RESULTS" "$RATIO" "$P" "$S" "$CP" <<'PY' 2>&1 | tee "$LOGS/compare.log"
