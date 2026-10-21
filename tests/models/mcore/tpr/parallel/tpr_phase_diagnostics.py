@@ -182,3 +182,23 @@ def trace_kernel_summary(path: Path | None):
         "hccl_events": counts["hccl"],
         "semantics": "SUM of matching NPU trace events on one rank; overlaps possible; not wall time",
     }
+
+
+def segment_event_summary(events: list[dict]) -> dict:
+    """Sum executor segment event latencies by operation, per single rank.
+
+    push = graph-free Root forward; visit_leaf includes forward + PPO +
+    backward; pop includes Root recompute + gradient relay + backward.
+    These NPU stream timings can overlap separate comm streams and cannot
+    be equated with end-to-end elapsed or an isolated Attention/BWD total.
+    """
+    totals = defaultdict(float)
+    counts = defaultdict(int)
+    for event in events:
+        kind = event["kind"]
+        totals[kind] += float(event["npu_event_ms"])
+        counts[kind] += 1
+    return {
+        key: {"npu_event_sum_ms": round(totals[key], 4), "segments": counts[key]}
+        for key in ("push", "visit_leaf", "pop")
+    }
