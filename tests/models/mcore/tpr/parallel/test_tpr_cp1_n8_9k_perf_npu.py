@@ -9,6 +9,7 @@ MindSpeed/Megatron F/B schedule, nor an optimizer/online training benchmark.
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 import os
 import statistics
 import time
@@ -26,6 +27,7 @@ from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 from .prepare_tpr_cp1_n8_perf_capture import BRANCHES, PREFIX, SUFFIX
 from .test_real_actor_tp2cp4_offline_ppo_npu import _PPO, _load_real_pair
 from .test_real_actor_cp1_short_full_tpr_npu import _run_controlled_full
+from .tpr_phase_diagnostics import PhaseSampler, OperatorTrace, trace_path, trace_kernel_summary
 from .test_tpr_10k_parallel_parity_npu import _runtime, _engine
 
 pytestmark = pytest.mark.skipif(
@@ -49,8 +51,9 @@ def test_cp1_n8_p8192_s1024_perf():
     repeats = int(os.getenv("TPR_BENCH_REPEATS", "3"))
     if not 0 <= warmups <= 5 or not 1 <= repeats <= 10:
         raise ValueError("Warmups must be 0..5; repeats must be 1..10")
-    if os.getenv("TPR_EXEC_PROFILE", "0") != "0":
-        raise ValueError("Disable segment profiler for timed measurements")
+    phase_diagnostic = os.getenv("TPR_PHASE_DIAG", "0") == "1"
+    if os.getenv("TPR_EXEC_PROFILE", "0") != "0" and not phase_diagnostic:
+        raise ValueError("Disable segment profiler for normal timed measurements")
     if os.getenv("TPR_CP1_SAVE_FULL_GRADS", "0") != "0":
         raise ValueError("Full gradient snapshots cannot be enabled in performance runs")
     if os.getenv("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "0") != "0":
@@ -134,26 +137,32 @@ def test_cp1_n8_p8192_s1024_perf():
             dist.barrier()
             torch.npu.synchronize()
             torch.npu.reset_peak_memory_stats()
+            stage_active = phase_diagnostic and iteration >= warmups
+            sampler = PhaseSampler(model, mode=mode) if stage_active else nullcontext(None)
+            trace = trace_path(output, mode, iteration, dist.get_rank()) if stage_active else None
             start = time.perf_counter()
-            if mode == "full":
-                result = _run_controlled_full(
-                    model, batch, loss_fn=partial(ppo_loss, config=_PPO()),
-                    forest=forest,
-                )
-                # The CP1, DP1 grad finalize is intentionally empty. Do
-                # NOT all-reduce the TP parameter shards.
-                model.config.finalize_model_grads_func(
-                    [model], None, force_all_reduce=True,
-                )
-                loss = float(result["loss"])
-            else:
-                tpr_result = run_tpr_forward_backward_batch(
-                    engine, batch, partial(ppo_loss, config=_PPO()),
-                    forward_only=False,
-                )
-                loss = float(tpr_result["loss"][0])
-            torch.npu.synchronize()
+            with sampler as stages:
+                with OperatorTrace(trace):
+                    if mode == "full":
+                        result = _run_controlled_full(
+                            model, batch, loss_fn=partial(ppo_loss, config=_PPO()),
+                            forest=forest,
+                        )
+                        # TP shards must NOT be AllReduced for CP1, DP1.
+                        model.config.finalize_model_grads_func(
+                            [model], None, force_all_reduce=True,
+                        )
+                        loss = float(result["loss"])
+                    else:
+                        tpr_result = run_tpr_forward_backward_batch(
+                            engine, batch, partial(ppo_loss, config=_PPO()),
+                            forward_only=False,
+                        )
+                        loss = float(tpr_result["loss"][0])
+                    torch.npu.synchronize()
             elapsed = time.perf_counter()-start
+            stage_timings = stages.materialize() if stage_active else None
+            kernel_summary = trace_kernel_summary(trace) if stage_active else None
             # Report per-iteration rank-max, never rank0 alone.
             metrics = torch.tensor(
                 [elapsed, float(torch.npu.max_memory_allocated()),
@@ -161,16 +170,40 @@ def test_cp1_n8_p8192_s1024_perf():
                 device=runtime.device, dtype=torch.float32,
             )
             dist.all_reduce(metrics, op=dist.ReduceOp.MAX)
+            stage_by_rank = []
+            if stage_active:
+                stage_by_rank = [None] * dist.get_world_size()
+                dist.all_gather_object(stage_by_rank, {
+                    "rank": dist.get_rank(),
+                    "stages": stage_timings,
+                    "kernels": kernel_summary,
+                    "trace": str(trace) if trace else None,
+                    "method": "asynchronous NPU events + optional CANN operator trace",
+                })
             rec = {
                 "iteration": iteration, "warmup": iteration < warmups,
                 "critical_fwd_bwd_finalize_s": float(metrics[0]),
                 "peak_allocated_gib": float(metrics[1])/2**30,
                 "peak_reserved_gib": float(metrics[2])/2**30,
                 "loss": loss,
+                "phase_diagnostics": stage_by_rank,
             }
             if not all(map(lambda key: torch.isfinite(torch.tensor(rec[key])).item(),
                            ("critical_fwd_bwd_finalize_s", "loss"))):
                 raise FloatingPointError("Nonfinite forward/backward performance result")
+            if mode == "tpr" and os.getenv("TPR_EXEC_PROFILE", "0") == "1":
+                from .tpr_phase_diagnostics import segment_event_summary
+                stage_raw = engine._tpr_stage_profile
+                segment_events = engine._tpr_segment_event_profiler.materialize()
+                seg_loc = {
+                    "rank": dist.get_rank(),
+                    "stage_ms": dict(stage_raw),
+                    "segments": segment_event_summary(segment_events),
+                }
+                details = [None] * dist.get_world_size()
+                dist.all_gather_object(details, seg_loc)
+                if dist.get_rank() == 0:
+                    rec["segment_profiles"] = details
             if dist.get_rank() == 0:
                 print(
                     f"TPR_CP1_N8_STEP mode={mode} iteration={iteration} "
@@ -205,6 +238,7 @@ def test_cp1_n8_p8192_s1024_perf():
                 "synthetic_shared_uid": audit["synthetic_shared_uid"],
                 "recompute": False, "optimizer_step": False,
                 "warmups": warmups, "repeats": repeats,
+                "phase_diagnostic": phase_diagnostic,
                 "median_fwd_bwd_s": statistics.median(
                     r["critical_fwd_bwd_finalize_s"] for r in measured
                 ),
