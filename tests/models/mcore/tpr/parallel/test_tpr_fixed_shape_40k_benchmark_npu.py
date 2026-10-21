@@ -239,9 +239,10 @@ def test_fixed_shape_40k_one_mode():
             stage_active = phase_diagnostic and iteration >= warmups
             sampler = PhaseSampler(model, mode=mode) if stage_active else nullcontext(None)
             trace = trace_path(output_dir, mode, iteration, dist.get_rank()) if stage_active else None
-            start = time.perf_counter()
             with sampler as stages:
                 with OperatorTrace(trace):
+                    # Exclude profiler start/stop/export from the F/B timer.
+                    start = time.perf_counter()
                     if mode == "full":
                         out_full = run_native_full_step(
                             model, batch, runtime, partial(ppo_loss, config=_PPO()),
@@ -256,7 +257,7 @@ def test_fixed_shape_40k_one_mode():
                         )
                         loss = float(out["loss"][0])
                     torch.npu.synchronize()
-            own_seconds = time.perf_counter() - start
+                    own_seconds = time.perf_counter() - start
             stage_timings = stages.materialize() if stage_active else None
             kernel_summary = trace_kernel_summary(trace) if stage_active else None
             # FP64 HCCL AllReduce is unsupported on Ascend 910B.
