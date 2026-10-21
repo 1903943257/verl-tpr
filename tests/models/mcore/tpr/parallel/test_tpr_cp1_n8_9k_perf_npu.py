@@ -140,9 +140,10 @@ def test_cp1_n8_p8192_s1024_perf():
             stage_active = phase_diagnostic and iteration >= warmups
             sampler = PhaseSampler(model, mode=mode) if stage_active else nullcontext(None)
             trace = trace_path(output, mode, iteration, dist.get_rank()) if stage_active else None
-            start = time.perf_counter()
             with sampler as stages:
                 with OperatorTrace(trace):
+                    # Exclude profiler start/stop/export from the F/B timer.
+                    start = time.perf_counter()
                     if mode == "full":
                         result = _run_controlled_full(
                             model, batch, loss_fn=partial(ppo_loss, config=_PPO()),
@@ -160,7 +161,7 @@ def test_cp1_n8_p8192_s1024_perf():
                         )
                         loss = float(tpr_result["loss"][0])
                     torch.npu.synchronize()
-            elapsed = time.perf_counter()-start
+                    elapsed = time.perf_counter()-start
             stage_timings = stages.materialize() if stage_active else None
             kernel_summary = trace_kernel_summary(trace) if stage_active else None
             # Report per-iteration rank-max, never rank0 alone.
