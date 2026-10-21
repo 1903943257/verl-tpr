@@ -101,6 +101,10 @@ export PYTEST_ADDOPTS="-q -s -x"
 
 failed=0
 for mode in full tpr; do
+  if [[ "$TPR_PHASE_DIAG" == "1" && -f "$RESULTS/step0_${mode}_fixed_shape.json" ]]; then
+    echo "TPR_CP_N8_PHASE_MODE_ALREADY_COMPLETE $mode"
+    continue
+  fi
   export TPR_OFFLINE_MODE="$mode"
   if [[ "$TPR_PHASE_DIAG" == "1" && "$mode" == "tpr" ]]; then
     export TPR_EXEC_PROFILE=1
