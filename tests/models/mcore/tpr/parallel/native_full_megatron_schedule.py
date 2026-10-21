@@ -15,6 +15,7 @@ grads over CP replicas once, as in the existing offline experiment.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 import time
 
 import torch
@@ -117,7 +118,7 @@ def _compact_native_ppo(loss_function, logprobs, response_offsets, batch, row,
 
 
 def run_native_full_step(model, batch, runtime, loss_function, *,
-                         capture_logprobs: bool) -> NativeFullResult:
+                         capture_logprobs: bool, phase_sampler=None) -> NativeFullResult:
     """Execute the real no-PP Megatron F/B schedule over CP-sharded rows.
 
     Deliberately fails rather than silently falling back to SegmentExecutor.
@@ -317,11 +318,16 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
     )
     grad_dtype = offline_grad_sync_dtype()
     t0 = time.perf_counter()
-    for name, param in model.named_parameters():
-        reduce_average_weight_grad(
-            param, runtime.cp_group, name=name, reduce_dtype=grad_dtype,
-        )
-    torch.npu.synchronize()
+    finalize_scope = (
+        phase_sampler.phase("gradient_finalize")
+        if phase_sampler is not None else nullcontext()
+    )
+    with finalize_scope:
+        for name, param in model.named_parameters():
+            reduce_average_weight_grad(
+                param, runtime.cp_group, name=name, reduce_dtype=grad_dtype,
+            )
+        torch.npu.synchronize()
     finalize_seconds = time.perf_counter() - t0
 
     # Reporting-only reduction: all CP participants MUST pass the same dtype
