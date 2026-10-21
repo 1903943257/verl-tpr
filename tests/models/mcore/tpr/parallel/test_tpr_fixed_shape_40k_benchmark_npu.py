@@ -8,6 +8,7 @@ Never use these as sequential PPO training steps or online reward evidence.
 from __future__ import annotations
 
 import gc
+from contextlib import nullcontext
 import json
 import os
 import statistics
@@ -24,6 +25,7 @@ from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_ba
 from verl.utils import tensordict_utils as tu
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 from .native_full_megatron_schedule import run_native_full_step
+from .tpr_phase_diagnostics import PhaseSampler, OperatorTrace, trace_path, trace_kernel_summary
 from .test_real_actor_tp2cp4_multistep_npu import _make_engine
 from .test_real_actor_tp2cp4_offline_ppo_npu import _PPO, _runtime, _load_real_pair
 from .test_tpr_10k_parallel_parity_npu import _runtime as _parallel_runtime, _engine as _parallel_engine
@@ -225,6 +227,7 @@ def test_fixed_shape_40k_one_mode():
                 f"dtype={grad_sync_dtype} cp_group_size={cp}",
                 flush=True,
             )
+        phase_diagnostic = os.getenv("TPR_PHASE_DIAG", "0") == "1"
         runs = []
         for iteration in range(warmups + repeats):
             model.zero_grad(set_to_none=True)
@@ -233,21 +236,29 @@ def test_fixed_shape_40k_one_mode():
             dist.barrier()
             torch.npu.synchronize()
             torch.npu.reset_peak_memory_stats()
+            stage_active = phase_diagnostic and iteration >= warmups
+            sampler = PhaseSampler(model, mode=mode) if stage_active else nullcontext(None)
+            trace = trace_path(output_dir, mode, iteration, dist.get_rank()) if stage_active else None
             start = time.perf_counter()
-            if mode == "full":
-                out_full = run_native_full_step(
-                    model, batch, runtime, partial(ppo_loss, config=_PPO()),
-                    capture_logprobs=capture_logprobs,
-                )
-                loss = float(out_full.loss)
-            else:
-                out = run_tpr_forward_backward_batch(
-                    engine, batch, partial(ppo_loss, config=_PPO()),
-                    forward_only=False,
-                )
-                loss = float(out["loss"][0])
-            torch.npu.synchronize()
+            with sampler as stages:
+                with OperatorTrace(trace):
+                    if mode == "full":
+                        out_full = run_native_full_step(
+                            model, batch, runtime, partial(ppo_loss, config=_PPO()),
+                            capture_logprobs=capture_logprobs,
+                            phase_sampler=stages,
+                        )
+                        loss = float(out_full.loss)
+                    else:
+                        out = run_tpr_forward_backward_batch(
+                            engine, batch, partial(ppo_loss, config=_PPO()),
+                            forward_only=False,
+                        )
+                        loss = float(out["loss"][0])
+                    torch.npu.synchronize()
             own_seconds = time.perf_counter() - start
+            stage_timings = stages.materialize() if stage_active else None
+            kernel_summary = trace_kernel_summary(trace) if stage_active else None
             # FP64 HCCL AllReduce is unsupported on Ascend 910B.
             # Use FP32 for world MAX time and memory statistics.
             critical = torch.tensor(
@@ -287,6 +298,16 @@ def test_fixed_shape_40k_one_mode():
                 dist.all_gather_object(profiles, profile)
             else:
                 profiles = []
+            phase_profiles = []
+            if stage_active:
+                phase_profiles = [None] * dist.get_world_size()
+                dist.all_gather_object(phase_profiles, {
+                    "rank": dist.get_rank(),
+                    "stages": stage_timings,
+                    "kernels": kernel_summary,
+                    "trace": str(trace) if trace else None,
+                    "method": "asynchronous NPU events + optional CANN operator trace",
+                })
             record = {
                 "source_step": step,
                 "mode": mode,
@@ -306,6 +327,7 @@ def test_fixed_shape_40k_one_mode():
                 "mem_audit": mem_audit,
                 "capture_logprobs": capture_logprobs,
                 "profiles": profiles,
+                "phase_diagnostics": phase_profiles,
             }
             if dist.get_rank() == 0:
                 print(
@@ -405,6 +427,7 @@ def test_fixed_shape_40k_one_mode():
                 "hccl_stats_reduce_dtype": "float32",
                 "capture_logprobs": capture_logprobs,
                 "profiler_enabled": os.getenv("TPR_EXEC_PROFILE", "0") == "1",
+                "phase_diagnostic": phase_diagnostic,
                 "median_fwd_bwd_s": statistics.median(measured),
                 "gradient_witness": gradient_witness,
                 "runs": runs,
