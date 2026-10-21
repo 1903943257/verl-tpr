@@ -313,6 +313,26 @@ def test_phase_trace_classifies_only_npu_kernel_and_hccl_lanes(tmp_path: Path):
     assert segment["visit_leaf"] == {"npu_event_sum_ms": 5.0, "segments": 2}
 
 
+
+def test_phase_trace_invalid_json_keeps_npu_kernel_timings_null(tmp_path: Path):
+    from .tpr_phase_diagnostics import trace_kernel_summary
+    trace = tmp_path / "incomplete_trace.json"
+    # Mirrors a truncated CANN Chrome trace: events exported, closing ']' absent.
+    invalid = '[{"ph": "X", "cat": "NPU Kernel", "name": "FlashAttentionScore", "dur": 2000}'
+    trace.write_text(invalid)
+    result = trace_kernel_summary(trace)
+    assert result["attention_kernel_sum_ms"] is None
+    assert result["hccl_kernel_sum_ms"] is None
+    assert result["reason"] == "trace_invalid_json"
+    assert "JSONDecodeError" in result["trace_error"]
+    assert trace.read_text() == invalid  # original trace left untouched
+
+    trace.write_text('{"unexpected": []}')
+    result = trace_kernel_summary(trace)
+    assert result["reason"] == "trace_events_missing"
+    assert result["attention_kernel_sum_ms"] is None
+
+
 def test_phase_comparison_requires_matching_unprofiled_sha(tmp_path: Path):
     from .compare_tpr_cp1_cp4_phase_diagnostics import collect_diagnostic
     base = {
