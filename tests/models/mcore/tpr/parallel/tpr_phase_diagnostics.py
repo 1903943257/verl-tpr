@@ -172,9 +172,9 @@ def trace_path(output_dir: Path, mode: str, iteration: int, rank: int) -> Path |
 def trace_kernel_summary(path: Path | None):
     """Conservative keyword inventory, NOT an additive wall-clock breakdown.
 
-    Event formats differ across CANN versions. Only categories that explicitly
-    say NPU/kernel/Ascend are eligible; absent names produce null values.
-    Inspect raw trace before interpreting these diagnostics as device time.
+    Event formats differ across CANN versions: on-device tasks may omit
+    `cat` but carry CANN Task Type / physical stream metadata in `args`.
+    Never classify CPU API latency as device HCCL/kernel time.
     """
     if path is None or not path.exists():
         return {"attention_kernel_sum_ms": None, "hccl_kernel_sum_ms": None,
@@ -206,8 +206,24 @@ def trace_kernel_summary(path: Path | None):
             continue
         category = str(item.get("cat", "")).lower()
         name = str(item.get("name", ""))
-        # Do not count host-side HCCL API latency as on-device communication.
-        if not any(key in category for key in ("npu", "kernel", "ascend", "hardware", "cann", "hccl", "communication")):
+        args = item.get("args")
+        args = args if isinstance(args, dict) else {}
+        # CANN Chrome Trace device events can omit `cat`. Identify them
+        # by device task metadata instead of treating them as host callbacks.
+        has_device_task = (
+            "Physic Stream Id" in args and "Task Id" in args
+        ) or (
+            str(args.get("Task Type", "")).upper().startswith("KERNEL_")
+        )
+        has_device_category = any(
+            key in category
+            for key in ("npu", "kernel", "ascend", "hardware", "cann", "communication")
+        )
+        # Explicit host CPU records are never hardware operators without
+        # supporting CANN device task metadata.
+        if not has_device_task and not (
+            has_device_category and "cpu" not in category
+        ):
             continue
         duration = item.get("dur")
         if not isinstance(duration, (int, float)) or duration <= 0:
