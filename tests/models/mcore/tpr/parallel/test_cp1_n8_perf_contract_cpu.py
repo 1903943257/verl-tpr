@@ -296,13 +296,20 @@ def test_phase_trace_classifies_only_npu_kernel_and_hccl_lanes(tmp_path: Path):
     trace.write_text(json.dumps({"traceEvents": [
         {"ph": "X", "cat": "NPU Kernel", "name": "FlashAttentionScore", "dur": 2800},
         {"ph": "X", "cat": "HCCL Communication", "name": "HCCL_AllReduce", "dur": 1200},
+        # Current CANN Chrome export sometimes omits `cat` for device events.
+        {"ph": "X", "name": "FlashAttentionScoreGrad", "dur": 3100,
+         "args": {"Task Type": "KERNEL_AICORE", "Physic Stream Id": 46, "Task Id": 3}},
+        {"ph": "X", "name": "HcclAllReduce", "dur": 600,
+         "args": {"Task Type": "KERNEL_AIVEC", "Physic Stream Id": 47, "Task Id": 4}},
         {"ph": "X", "cat": "CPU", "name": "HCCL_AllReduce", "dur": 700000},
         {"ph": "X", "cat": "CPU", "name": "aten::matmul", "dur": 8000},
+        {"ph": "X", "cat": "CPU", "name": "FlashAttentionScore", "dur": 8000},
+        {"ph": "X", "cat": "HCCL API", "name": "HcclAllReduce", "dur": 100000},
     ]}))
     metrics = trace_kernel_summary(trace)
-    assert metrics["attention_kernel_sum_ms"] == pytest.approx(2.8)
-    assert metrics["hccl_kernel_sum_ms"] == pytest.approx(1.2)
-    assert metrics["attention_events"] == 1 and metrics["hccl_events"] == 1
+    assert metrics["attention_kernel_sum_ms"] == pytest.approx(5.9)
+    assert metrics["hccl_kernel_sum_ms"] == pytest.approx(1.8)
+    assert metrics["attention_events"] == 2 and metrics["hccl_events"] == 2
     assert trace_kernel_summary(None)["attention_kernel_sum_ms"] is None
     segment = segment_event_summary([
         {"kind": "push", "npu_event_ms": 1.5},
