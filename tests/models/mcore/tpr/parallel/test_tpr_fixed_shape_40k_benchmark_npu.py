@@ -101,6 +101,9 @@ def test_fixed_shape_40k_one_mode():
     warmups = int(os.environ.get("TPR_BENCH_WARMUPS", "1"))
     repeats = int(os.environ.get("TPR_BENCH_REPEATS", "3"))
     capture_logprobs = os.environ.get("TPR_BENCH_CAPTURE_LOGPROBS", "1") == "1"
+    merge_token_diagnostic = os.getenv("TPR_MERGE_TOKEN_DIAG", "0") == "1"
+    if merge_token_diagnostic and not capture_logprobs:
+        raise ValueError("TPR_MERGE_TOKEN_DIAG=1 requires TPR_BENCH_CAPTURE_LOGPROBS=1")
     recompute_setting = os.getenv("TPR_BENCH_RECOMPUTE", "0")
     if recompute_setting not in ("0", "1"):
         raise ValueError("TPR_BENCH_RECOMPUTE must be 0 or 1")
@@ -309,6 +312,41 @@ def test_fixed_shape_40k_one_mode():
                     "trace": str(trace) if trace else None,
                     "method": "asynchronous NPU events + optional CANN operator trace",
                 })
+            # Opt-in correctness probe: collect original-row/response-offset logprobs
+            # after the timed F/B, never for production or performance comparisons.
+            token_logprobs = None
+            if merge_token_diagnostic and iteration >= warmups:
+                source_lp = (
+                    out_full.logprobs if mode == "full"
+                    else engine._tpr_captured_log_probs
+                )
+                local_lp = {
+                    "tp_rank": int(runtime.tp_rank),
+                    "entries": [
+                        [int(row), int(offset), float(value)]
+                        for (row, offset), value in source_lp.items()
+                    ],
+                }
+                gathered = [None] * dist.get_world_size()
+                dist.all_gather_object(gathered, local_lp)
+                if dist.get_rank() == 0:
+                    combined = {}
+                    for shard in gathered:
+                        if shard["tp_rank"] != 0:
+                            continue  # TP replicas refer to the same logical PPO tokens.
+                        for row, offset, value in shard["entries"]:
+                            key = (row, offset)
+                            if key in combined:
+                                raise AssertionError(f"Duplicate PPO token: {key}")
+                            combined[key] = value
+                    if len(combined) != tokens:
+                        raise AssertionError(
+                            f"Missing PPO tokens: got {len(combined)}, expected {tokens}"
+                        )
+                    token_logprobs = [
+                        [row, offset, combined[row, offset]]
+                        for row, offset in sorted(combined)
+                    ]
             record = {
                 "source_step": step,
                 "mode": mode,
@@ -329,6 +367,7 @@ def test_fixed_shape_40k_one_mode():
                 "capture_logprobs": capture_logprobs,
                 "profiles": profiles,
                 "phase_diagnostics": phase_profiles,
+                **({"token_logprobs": token_logprobs} if merge_token_diagnostic else {}),
             }
             if dist.get_rank() == 0:
                 print(
