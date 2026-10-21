@@ -48,12 +48,27 @@ class PhaseSampler:
                     return original_forward(*args, **kwargs)
             self._stack.enter_context(patch.object(self.model, "forward", forward))
 
-            original_backward = torch.autograd.backward
-            @wraps(original_backward)
-            def backward(*args, **kwargs):
-                with self.phase("backward"):
-                    return original_backward(*args, **kwargs)
-            self._stack.enter_context(patch.object(torch.autograd, "backward", backward))
+            native_cp = int(getattr(self.model.config, "context_parallel_size", 1))
+            # Native Megatron does not necessarily call Python's
+            # torch.autograd.backward; mark the actual schedule backward_step.
+            # The CP1 controlled Full and TPR Executor use autograd.backward.
+            if self.mode == "full" and native_cp > 1:
+                import megatron.core.pipeline_parallel.schedules as schedule
+                if not hasattr(schedule, "backward_step"):
+                    raise RuntimeError("Native schedule missing backward_step profiling hook")
+                original_backward = schedule.backward_step
+                @wraps(original_backward)
+                def backward(*args, **kwargs):
+                    with self.phase("backward"):
+                        return original_backward(*args, **kwargs)
+                self._stack.enter_context(patch.object(schedule, "backward_step", backward))
+            else:
+                original_backward = torch.autograd.backward
+                @wraps(original_backward)
+                def backward(*args, **kwargs):
+                    with self.phase("backward"):
+                        return original_backward(*args, **kwargs)
+                self._stack.enter_context(patch.object(torch.autograd, "backward", backward))
 
             from verl.workers.engine.megatron.tpr.objective import SegmentPPOObjectiveAdapter
             original_ppo = SegmentPPOObjectiveAdapter.compute_loss
@@ -70,6 +85,17 @@ class PhaseSampler:
                 with self.phase("ppo_loss"):
                     return original_native_ppo(*args, **kwargs)
             self._stack.enter_context(patch.object(native, "_compact_native_ppo", compact_ppo))
+            # Native Full computes TP-sharded log-probs outside the compact
+            # PPO loss; capture this as the same non-overlapping loss category.
+            from verl.utils.megatron import tensor_parallel as tp_logprobs
+            original_logprobs = tp_logprobs.vocab_parallel_log_probs_from_logits
+            @wraps(original_logprobs)
+            def logprobs(*args, **kwargs):
+                with self.phase("ppo_loss"):
+                    return original_logprobs(*args, **kwargs)
+            self._stack.enter_context(patch.object(
+                tp_logprobs, "vocab_parallel_log_probs_from_logits", logprobs,
+            ))
 
             finalize = getattr(self.model.config, "finalize_model_grads_func", None)
             if callable(finalize):
