@@ -190,7 +190,7 @@ def trace_kernel_summary(path: Path | None):
         category = str(item.get("cat", "")).lower()
         name = str(item.get("name", ""))
         # Do not count host-side HCCL API latency as on-device communication.
-        if not any(key in category for key in ("npu", "kernel", "ascend", "hardware", "cann")):
+        if not any(key in category for key in ("npu", "kernel", "ascend", "hardware", "cann", "hccl", "communication")):
             continue
         duration = item.get("dur")
         if not isinstance(duration, (int, float)) or duration <= 0:
