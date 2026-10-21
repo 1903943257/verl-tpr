@@ -62,6 +62,10 @@ fi
 if [[ -f "$CP1_ROOT/results/full.json" && -f "$CP1_ROOT/results/tpr.json" && \
       -f "$CP4_ROOT/results/step0_full_fixed_shape.json" && \
       -f "$CP4_ROOT/results/step0_tpr_fixed_shape.json" ]]; then
+  if [[ -f "$SUMMARY" ]]; then
+    echo "PHASE_SUMMARY_ALREADY_COMPLETE $SUMMARY"
+    exit 0
+  fi
   python -m tests.models.mcore.tpr.parallel.compare_tpr_cp1_cp4_phase_diagnostics \
     --cp1 "$CP1_ROOT/results" --cp4 "$CP4_ROOT/results" \
     --cp1-reference "$CP1_REF" --cp4-reference "$CP4_REF" \
