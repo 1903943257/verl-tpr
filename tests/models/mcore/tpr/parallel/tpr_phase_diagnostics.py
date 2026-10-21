@@ -1,0 +1,184 @@
+"""Test-only, opt-in stage sampling for CP1/CP4 Full versus TPR.
+
+NPU events are enqueued on the current stream (no internal synchronize);
+these timings are diagnostic, NOT production F/B speedups. Hardware kernel
+durations/communication overlap are read separately from optional CANN trace.
+No production Executor/Attention/PPO implementation is modified.
+"""
+from __future__ import annotations
+
+from collections import defaultdict
+from contextlib import ExitStack, contextmanager
+from functools import wraps
+import json
+import os
+from pathlib import Path
+from unittest.mock import patch
+
+import torch
+
+
+class PhaseSampler:
+    def __init__(self, model, *, mode: str):
+        self.model, self.mode = model, mode
+        self._stack = ExitStack()
+        self._pending = []
+
+    @contextmanager
+    def phase(self, name: str):
+        # Event timings use the host's current NPU stream; they do not measure
+        # simultaneous non-default HCCL streams or every host dispatch cost.
+        start, end = (torch.npu.Event(enable_timing=True),
+                      torch.npu.Event(enable_timing=True))
+        with torch.autograd.profiler.record_function("TPR_PHASE/" + name):
+            start.record()
+            try:
+                yield
+            finally:
+                end.record()
+                self._pending.append((name, start, end))
+
+    def __enter__(self):
+        self._stack.__enter__()
+        try:
+            original_forward = self.model.forward
+            @wraps(original_forward)
+            def forward(*args, **kwargs):
+                with self.phase("forward"):
+                    return original_forward(*args, **kwargs)
+            self._stack.enter_context(patch.object(self.model, "forward", forward))
+
+            original_backward = torch.autograd.backward
+            @wraps(original_backward)
+            def backward(*args, **kwargs):
+                with self.phase("backward"):
+                    return original_backward(*args, **kwargs)
+            self._stack.enter_context(patch.object(torch.autograd, "backward", backward))
+
+            from verl.workers.engine.megatron.tpr.objective import SegmentPPOObjectiveAdapter
+            original_ppo = SegmentPPOObjectiveAdapter.compute_loss
+            @wraps(original_ppo)
+            def ppo(adapter, *args, **kwargs):
+                with self.phase("ppo_loss"):
+                    return original_ppo(adapter, *args, **kwargs)
+            self._stack.enter_context(patch.object(SegmentPPOObjectiveAdapter, "compute_loss", ppo))
+
+            from . import native_full_megatron_schedule as native
+            original_native_ppo = native._compact_native_ppo
+            @wraps(original_native_ppo)
+            def compact_ppo(*args, **kwargs):
+                with self.phase("ppo_loss"):
+                    return original_native_ppo(*args, **kwargs)
+            self._stack.enter_context(patch.object(native, "_compact_native_ppo", compact_ppo))
+
+            finalize = getattr(self.model.config, "finalize_model_grads_func", None)
+            if callable(finalize):
+                @wraps(finalize)
+                def wrapped_finalize(*args, **kwargs):
+                    with self.phase("gradient_finalize"):
+                        return finalize(*args, **kwargs)
+                self._stack.enter_context(
+                    patch.object(self.model.config, "finalize_model_grads_func", wrapped_finalize)
+                )
+            return self
+        except BaseException:
+            self._stack.__exit__(*__import__("sys").exc_info())
+            raise
+
+    def __exit__(self, *exc):
+        return self._stack.__exit__(*exc)
+
+    def materialize(self):
+        """Call only AFTER caller synchronizes the NPU at F/B completion."""
+        by_name = defaultdict(list)
+        for name, start, end in self._pending:
+            by_name[name].append(float(start.elapsed_time(end)))
+        return {
+            key: {"npu_event_sum_ms": sum(vals), "events": len(vals)}
+            for key, vals in by_name.items()
+        }
+
+
+class OperatorTrace:
+    """Optional per-rank CANN kernel trace for one measured iteration only."""
+
+    def __init__(self, path: Path | None):
+        self.path = path
+        self.profiler = None
+
+    def __enter__(self):
+        if self.path is None:
+            return self
+        import torch_npu
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.profiler = torch_npu.profiler._KinetoProfile(
+            activities=[
+                torch_npu.profiler.ProfilerActivity.CPU,
+                torch_npu.profiler.ProfilerActivity.NPU,
+            ],
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        self.profiler.start()
+        return self
+
+    def __exit__(self, *exc):
+        if self.profiler is None:
+            return False
+        self.profiler.stop()
+        if exc[0] is None:
+            self.profiler.export_chrome_trace(str(self.path))
+            if not self.path.exists():
+                raise RuntimeError(f"Profiler did not export NPU trace: {self.path}")
+        return False
+
+
+def trace_path(output_dir: Path, mode: str, iteration: int, rank: int) -> Path | None:
+    if os.getenv("TPR_OPERATOR_TRACE", "0") != "1":
+        return None
+    ranks = tuple(int(x) for x in os.getenv("TPR_TRACE_RANKS", "0").split(","))
+    if rank not in ranks:
+        return None
+    return output_dir / "trace" / f"{mode}_iter{iteration}_rank{rank}.json"
+
+
+def trace_kernel_summary(path: Path | None):
+    """Conservative keyword inventory, NOT an additive wall-clock breakdown.
+
+    Event formats differ across CANN versions. Only categories that explicitly
+    say NPU/kernel/Ascend are eligible; absent names produce null values.
+    Inspect raw trace before interpreting these diagnostics as device time.
+    """
+    if path is None or not path.exists():
+        return {"attention_kernel_sum_ms": None, "hccl_kernel_sum_ms": None,
+                "reason": "trace_missing"}
+    import re
+    raw = json.loads(path.read_text())
+    events = raw.get("traceEvents", []) if isinstance(raw, dict) else raw
+    totals = defaultdict(float)
+    counts = defaultdict(int)
+    for item in events:
+        if not isinstance(item, dict) or item.get("ph") != "X":
+            continue
+        category = str(item.get("cat", "")).lower()
+        name = str(item.get("name", ""))
+        # Do not count host-side HCCL API latency as on-device communication.
+        if not any(key in category for key in ("npu", "kernel", "ascend", "hardware", "cann")):
+            continue
+        duration = item.get("dur")
+        if not isinstance(duration, (int, float)) or duration <= 0:
+            continue
+        label = "hccl" if re.search(r"hccl|allreduce|allgather|reducescatter|sendrecv|hcom", name, re.I) else (
+            "attention" if re.search(r"flashattention|fusionattention|npu_fusion_attention|\battention\b", name, re.I) else None
+        )
+        if label:
+            totals[label] += duration / 1000
+            counts[label] += 1
+    return {
+        "attention_kernel_sum_ms": round(totals["attention"], 3) if counts["attention"] else None,
+        "hccl_kernel_sum_ms": round(totals["hccl"], 3) if counts["hccl"] else None,
+        "attention_events": counts["attention"],
+        "hccl_events": counts["hccl"],
+        "semantics": "SUM of matching NPU trace events on one rank; overlaps possible; not wall time",
+    }
