@@ -311,3 +311,60 @@ Results:
 Cross-ratio comparisons to *authentic-window* CP2 16K/2K must clearly
 mark that branch-source provenance changes; these are system-performance
 stress comparisons, not a controlled on-policy PPO ablation.
+
+## Isolated CP1 / CP4 diagnostic phase traces
+
+The two **already successful** 1:1 workloads are re-executed without
+replacing their historical no-profiler timing measurements:
+
+| Experiment | Shape | Ranks | Full reference |
+|---|---|---:|---|
+| CP1 | N8 P4608/S4608 | TP2 CP1 DP1 (2 NPU) | Controlled Square-CANN |
+| CP4 | N8 P17440/S17440 | TP2 CP4 DP1 (8 NPU) | Native Megatron/MindSpeed |
+
+The CP4 source is the existing synthetic-window source whose provenance
+and original actor capture were audited in the preceding section.
+The suite uses 1 warmup and 1 measured diagnostic iteration per mode.
+No optimizer or recompute, TP2 and Qwen3-4B BF16 unchanged.
+It only changes test-side temporary instrumentation and adds an optional
+trace / output summary; **production TPR / Ring code is not modified**.
+
+```bash
+cd /workspace/verl-tpr-ring-review
+bash tests/models/mcore/tpr/parallel/run_tpr_cp1_cp4_phase_diagnostics.sh both \
+  2>&1 | tee /workspace/tpr_experiments/performance/cp1_cp4_phase_driver.log
+```
+
+Selections `cp1`, `cp4`, `both`, `summary` are supported. A second
+invocation resumes missing modes only; existing valid phase result files
+are not overwritten.
+
+Artifacts:
+- CP1 profiled: `cp1_n8_9k_1to1_phase_v1/results/{full,tpr}.json`
+- CP4 profiled: `cp4_n8_34k_1to1_phase_v1/results/step0_{full,tpr}_fixed_shape.json`
+- Per-rank CANN raw traces (rank 0 by default): `results/trace/*.json`
+- Cross-case matrix: `cp1_cp4_phase_comparison_v1.json`, with printable
+  `cp1_cp4_phase_comparison_v1.log`
+
+By default `TPR_OPERATOR_TRACE=1` and `TPR_TRACE_RANKS=0`: only physical
+global rank0 records potentially large device traces. All ranks contribute
+cheap event stage timings, aggregated with per-rank maxima. If the 34.9K
+native run OOMs or the profiler is unavailable, run once with
+`TPR_OPERATOR_TRACE=0` in a **new** versioned diagnostic directory or
+preserve completed mode output; Attention and HCCL fields will be null
+until CANN Trace is available. Never relabel null as zero.
+
+The output table includes Forward, Attention NPU-kernel sum, Ring/HCCL
+NPU-kernel sum, PPO callback, Backward, Gradient Finalize,
+Host tree/setup, historical unprofiled F/B and instrumented F/B.
+The `SegmentEventProfiler` also emits TPR Root Push, Leaf Visit, Root Pop
+statistics. Native Full uses a temporary wrapper around the Megatron
+`backward_step` schedule; all temporary wrappers are removed automatically.
+
+**Measurement caveats:** sums of asynchronous NPU events, host CPU stage
+latency and single-rank CANN kernel totals are heterogeneous metrics;
+communication and computation overlap. They must NOT be added together,
+nor should the instrumented F/B be used as an end-to-end speedup. CP1's
+controlled Full is not CP4's Native Full, and CP1/CP4 sequence lengths
+differ, so between-topology attribution remains conditional. CP1 still
+includes TP communication despite having no CP Ring.
