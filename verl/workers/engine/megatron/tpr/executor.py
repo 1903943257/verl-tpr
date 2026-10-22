@@ -340,6 +340,9 @@ class SegmentExecutor:
             raise ValueError("TPR leaf batch size and token budget must be positive")
         if self.leaf_batch_size > 1 and self.cp_enabled:
             raise NotImplementedError("TPR leaf batching MVP supports CP=1 only")
+        self.model_forward_calls = 0
+        self.grouped_leaf_calls = 0
+        self.grouped_leaf_segments = 0
         self._failed = False
         self._ran = False
         self._operation_depth = 0
@@ -523,6 +526,8 @@ class SegmentExecutor:
             # Keep one backward root and one Prefix-anchor accumulation.
             torch.autograd.backward(torch.stack(owned_losses).sum())
             self.kv_stack.accumulate_anchor_gradients(anchors, consume=True)
+            self.grouped_leaf_calls += 1
+            self.grouped_leaf_segments += len(segments)
             # Report the unscaled objective, just like _backward_segment.
             return torch.stack(normalized_losses).sum()
 
@@ -623,6 +628,7 @@ class SegmentExecutor:
         )
         with torch.set_grad_enabled(not no_grad), rope_context, use_tpr_attention_context(context):
             logits = self.model(input_ids=input_ids, position_ids=position_ids, attention_mask=None)
+        self.model_forward_calls += 1
         if os.getenv("TPR_MEM_TRACE", "0") == "1":
             print(f"TPR_MEM FORWARD_END segment={segment.segment_id} no_grad={no_grad} alloc_gib={torch.npu.memory_allocated() / (1024 ** 3):.3f} reserved_gib={torch.npu.memory_reserved() / (1024 ** 3):.3f}", flush=True)
         if not isinstance(logits, Tensor) or logits.ndim != 3:
