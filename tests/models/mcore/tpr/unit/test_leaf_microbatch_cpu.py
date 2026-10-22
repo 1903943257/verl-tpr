@@ -23,7 +23,7 @@ def _siblings():
     return SegmentPlan([root, *leaves], root_id=0)
 
 
-def _run(model, plan, monkeypatch, *, k, budget):
+def _run(model, plan, monkeypatch, *, k, budget, loss_scale):
     monkeypatch.setenv("TPR_LEAF_BATCH_SIZE", str(k))
     monkeypatch.setenv("TPR_LEAF_BATCH_MAX_TOKENS", str(budget))
     seen = []
@@ -36,6 +36,7 @@ def _run(model, plan, monkeypatch, *, k, budget):
         model, plan, expected_layer_numbers=(1,),
         segment_loss_fn=objective,
         segment_loss_term_counts={s: int(s != 0) for s in plan.segments},
+        loss_scale_func=lambda loss: loss * loss_scale,
     )
     class Events:
         def begin(self, segment, *, kind, **_):
@@ -51,14 +52,15 @@ def _run(model, plan, monkeypatch, *, k, budget):
     return loss, seen
 
 
-def test_grouped_leaves_match_sequential_loss_parameter_and_prefix_gradients(monkeypatch):
+@pytest.mark.parametrize("loss_scale", [1.0, 8.0])
+def test_grouped_leaves_match_sequential_loss_parameter_and_prefix_gradients(monkeypatch, loss_scale):
     torch.manual_seed(1234)
     plan = _siblings()
     baseline = _PrefixModel()
     grouped = copy.deepcopy(baseline)
 
-    baseline_loss, baseline_events = _run(baseline, plan, monkeypatch, k=1, budget=12)
-    grouped_loss, group_events = _run(grouped, plan, monkeypatch, k=4, budget=12)
+    baseline_loss, baseline_events = _run(baseline, plan, monkeypatch, k=1, budget=12, loss_scale=loss_scale)
+    grouped_loss, group_events = _run(grouped, plan, monkeypatch, k=4, budget=12, loss_scale=loss_scale)
 
     # The 4 equal-length siblings become one physical forward/backward.
     assert [kind for kind, _ in group_events].count("visit_leaf_group") == 1
