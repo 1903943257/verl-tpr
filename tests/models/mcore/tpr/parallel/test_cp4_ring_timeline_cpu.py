@@ -57,3 +57,23 @@ def test_csv_timeline_gemm_attention_hccl_and_gap(tmp_path):
 def test_missing_kernel_data_is_explicit_error(tmp_path):
     with pytest.raises(ValueError, match="No device time axis"):
         summarize(tmp_path, "us", 0, None, 0.1, no_trace=True)
+
+
+def test_level1_missing_communication_report_does_not_mask_kernel_error(tmp_path, capsys):
+    from unittest.mock import MagicMock
+    from tests.models.mcore.tpr.parallel.tpr_phase_diagnostics import OperatorTrace
+
+    prof = OperatorTrace(tmp_path / "rank0")
+    prof.path.mkdir()
+    prof.format = "ascend_level1"
+    prof.profiler = MagicMock()
+    assert prof.__exit__(None, None, None) is False
+    prof.profiler.step.assert_called_once_with()
+    assert "communication.json missing" in capsys.readouterr().out
+
+    # The original kernel exception must remain observable, not become
+    # a missing-export exception.
+    prof.profiler = MagicMock()
+    error = RuntimeError("device kernel failed")
+    assert prof.__exit__(RuntimeError, error, None) is False
+    prof.profiler.step.assert_not_called()
