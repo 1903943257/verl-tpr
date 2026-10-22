@@ -17,7 +17,6 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from ..correctness._qwen17_weak_e2e_sampling import exact_sample_indices
 from .test_real_actor_tp2cp4_offline_ppo_npu import _PPO
 from .test_verl_engine_full_replay_npu import (
     _construct_real_engine, _load_step, _cpu_metrics, _native_witness,
