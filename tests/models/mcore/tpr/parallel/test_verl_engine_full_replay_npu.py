@@ -55,7 +55,10 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
             if not self.vanilla_bridge or self.provider is not None:
                 raise RuntimeError("Replay Local Spec expects vanilla MBridge")
             install_replay_local_spec(self.bridge)
-            return super()._build_megatron_module()
+            model = super()._build_megatron_module()
+            # Verify checkpoint loading BEFORE allocating optimizer state.
+            assert_replay_local_qwen3_norms(model[0], self.bridge)
+            return model
 
     model_cfg = HFModelConfig(
         path=str(checkpoint),
@@ -160,10 +163,6 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
     finally:
         sys.argv[:] = old_argv
 
-    # Local Spec has independent pre-attention / pre-MLP RMSNorm modules.
-    # The old MBridge maps the TE-fused names instead. Fail closed if
-    # the test-only mapping or Qwen3 model structure is not as expected.
-    assert_replay_local_qwen3_norms(engine.module[0], engine.bridge)
     from megatron.core import parallel_state as mpu
     sizes = {
         "TP": mpu.get_tensor_model_parallel_world_size(),
