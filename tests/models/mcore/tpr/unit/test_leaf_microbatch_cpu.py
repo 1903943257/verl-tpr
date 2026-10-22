@@ -1,6 +1,7 @@
 """CPU correctness gates for opt-in CP1 leaf micro-batching."""
 
 import copy
+import json
 
 import pytest
 import torch
@@ -129,3 +130,42 @@ def test_rectangular_attention_contract_accepts_equal_length_batched_layout():
     query = torch.randn(3, 2, 4, 8)
     key = torch.randn(9, 2, 2, 8)
     assert _validate_inputs(query, key, torch.randn_like(key), 0.0) == (3, 9, 4, 8)
+
+
+def test_leaf_run_summary_includes_values_and_survives_missing_results(tmp_path):
+    from ..parallel.summarize_cp1_leaf_batch import summarize
+
+    partial = summarize(tmp_path, exit_code=1)
+    assert "runner_exit=1" in partial
+    assert "Comparison missing/incomplete" in partial
+    assert "k2 result missing" in partial
+
+    for k, calls, groups in ((1, 4, 0), (2, 3, 1)):
+        folder = tmp_path / f"k{k}"
+        folder.mkdir()
+        (folder / "result.json").write_text(json.dumps({
+            "leaf_batch_stats": {
+                "model_forward_calls": calls, "grouped_leaf_calls": groups,
+                "grouped_leaf_segments": groups * 2,
+            },
+            "fwd_bwd_seconds": 2.0 / k,
+            "peak_allocated_gib": 21.5 / k,
+            "peak_reserved_gib": 22.0 / k,
+            "loss": -0.8, "global_grad_norm": 7.8,
+        }))
+    (tmp_path / "k1_vs_k2.json").write_text(json.dumps({
+        "comparison": "identical_shared_tree_K1_vs_K2",
+        "speedup": 2.0, "loss_abs_gap": 0.0001,
+        "logprob": {"relative_l2": 0.03},
+        "sampled_gradient": {"relative_l2": 0.13},
+        "complete_norm_gradient": {"relative_l2": 0.18},
+        "full_parameter_gradient": None,
+        "layer_trace": None,
+    }))
+    summary = summarize(tmp_path, exit_code=0)
+    assert "runner_exit=0" in summary
+    assert "Forward calls" in summary
+    assert "Grouped leaf calls" in summary
+    assert "2.0000x" in summary
+    assert "0.130000" in summary
+    assert "NOT proof of matching gradients" in summary
