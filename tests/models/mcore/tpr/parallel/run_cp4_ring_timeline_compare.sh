@@ -36,9 +36,13 @@ fi
 python - "$FULL_RESULT" "$TPR_RESULT" <<'PY'
 import json, sys
 f, t = (json.load(open(path)) for path in sys.argv[1:])
-for key in ("checkpoint", "topology", "input_sha256", "ppo_tokens"):
+for key in ("checkpoint", "topology", "input_sha256",
+            "source_capture", "controlled_performance_shape",
+            "warmups", "repeats", "recompute"):
     if f.get(key) != t.get(key) or f.get(key) is None:
         raise SystemExit(f"CP4 profile mismatch {key}: {f.get(key)!r} != {t.get(key)!r}")
+if not f.get("runs") or not t.get("runs") or f["runs"][-1].get("ppo_tokens") != t["runs"][-1].get("ppo_tokens"):
+    raise SystemExit("CP4 profile PPO token counts differ or are missing")
 if f.get("mode") != "full" or t.get("mode") != "tpr":
     raise SystemExit("Mode mismatch between CP4 reference and TPR")
 print("CP4_TIMELINE_INPUTS_MATCH sha256=" + str(f["input_sha256"]))
