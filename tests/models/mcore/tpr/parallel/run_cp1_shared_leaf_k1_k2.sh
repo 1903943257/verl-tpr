@@ -107,6 +107,13 @@ PY
     echo "TPR_CP1_LEAF_RESUME_ARCHIVED K=$k archive=$archive"
   fi
   mkdir -p "$ROOT/k$k"
+  if [[ "${TPR_CP1_LEAF_TRACE:-0}" == "1" ]]; then
+    export TPR_CP1_TRACE=1
+    export TPR_CP1_TRACE_DIR="$ROOT/k$k/trace"
+    echo "TPR_CP1_LEAF_TRACE enabled dir=$TPR_CP1_TRACE_DIR"
+  else
+    unset TPR_CP1_TRACE TPR_CP1_TRACE_DIR || true
+  fi
   echo "TPR_CP1_LEAF_K_START K=$k capture=$TPR_CP1_CAPTURE output=$TPR_CP1_OUTPUT"
   _LAST_LOG="$ROOT/k$k.log"
   torchrun --master_addr=127.0.0.1 --master_port=29797 \
@@ -116,6 +123,10 @@ PY
 done
 
 _LAST_LOG="$ROOT/comparison.log"
+compare_args=()
+if [[ "${TPR_CP1_LEAF_TRACE:-0}" == "1" ]]; then
+  compare_args+=(--require-trace)
+fi
 python -m tests.models.mcore.tpr.parallel.compare_real_actor_cp1_leaf_batch \
   "$ROOT/k1/result.json" "$ROOT/k2/result.json" \
-  --output "$ROOT/k1_vs_k2.json" | tee "$ROOT/comparison.log"
+  --output "$ROOT/k1_vs_k2.json" "${compare_args[@]}" | tee "$ROOT/comparison.log"
