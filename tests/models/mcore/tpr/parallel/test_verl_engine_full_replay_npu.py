@@ -31,7 +31,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, steps: int):
+def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, steps: int,
+                           tpr_enabled: bool = False):
     # On NPU this class (not the generic CUDA MegatronEngine) owns the
     # MindSpeed repatch and parallel-state initialization.
     from verl.workers.engine.mindspeed.transformer_impl import MindspeedEngineWithLMHead
@@ -69,6 +70,8 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
         vanilla_mbridge=True,
         use_fused_kernels=False,
         forward_only=False,
+        tpr_enabled=tpr_enabled,
+        tpr_cp_backend="ring" if tpr_enabled else None,
         use_distributed_optimizer=True,
         param_offload=False,
         optimizer_offload=False,
@@ -112,8 +115,9 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
     finally:
         sys.argv[:] = old_argv
     if not engine.engine_config.vanilla_mbridge:
-        raise AssertionError("Offline Full must follow online E2E vanilla_mbridge=True")
-    print("VERL_FULL_BRIDGE_SELECTED backend=legacy_mbridge vanilla_mbridge=True", flush=True)
+        raise AssertionError("Offline Engine must follow online E2E vanilla_mbridge=True")
+    label = "TPR" if tpr_enabled else "FULL"
+    print(f"VERL_{label}_BRIDGE_SELECTED backend=legacy_mbridge vanilla_mbridge=True", flush=True)
     engine.initialize()
 
     from megatron.core import parallel_state as mpu
@@ -136,16 +140,43 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
             "TPR's PPO objective uses vanilla global-token-mean loss"
         )
     from verl.models.mcore.tpr import TPRSelfAttention
-    if any(isinstance(x, TPRSelfAttention) for module in engine.module for x in module.modules()):
+    attn_layers = [
+        x for module in engine.module for x in module.modules()
+        if isinstance(x, TPRSelfAttention)
+    ]
+    if tpr_enabled:
+        if len(attn_layers) != 36:
+            raise AssertionError(
+                f"Real TPR Engine requires all 36 Qwen3-4B attention layers, got {len(attn_layers)}"
+            )
+        from verl.utils.megatron_utils import unwrap_model
+        wrapped = engine.module[0]
+        if wrapped is unwrap_model(wrapped):
+            raise AssertionError("TPR experiment must use genuine Megatron DDP, not an unwrapped GPTModel")
+        if getattr(engine, "optimizer", None) is None:
+            raise AssertionError("TPR Engine requires actual VERL Megatron optimizer")
+        # No silent switch to FP32: match the original online precision-aware BF16 main grads.
+        if engine.optimizer_config.main_grads_dtype != "bf16":
+            raise AssertionError("TPR Replay changed the online BF16 main_grads_dtype")
+        print(
+            "VERL_TPR_DDP_SELECTED "
+            f"wrapper={type(wrapped).__name__} main_grads_dtype=bf16 "
+            f"tpr_cp_backend={engine.engine_config.tpr_cp_backend}",
+            flush=True,
+        )
+    elif attn_layers:
         raise AssertionError("Full Engine unexpectedly installed TPRSelfAttention")
-    # Verify entrypoint is the unmodified native VERL schedule, not any
-    # test-generated adapter.  This check is version-agnostic enough for bridge.
+    # Native Full remains on the unmodified VERL schedule. The TPR engine
+    # routes into run_tpr_forward_backward_batch before microbatch packing.
     import inspect
     source = inspect.getsource(engine.forward_backward_batch)
-    if "prepare_micro_batches" not in source or "get_forward_backward_func" not in source:
-        raise AssertionError("This Engine has no native VERL microbatch schedule")
+    if ("prepare_micro_batches" not in source
+            or "get_forward_backward_func" not in source):
+        raise AssertionError("This Engine lacks the tested native schedule")
+    if tpr_enabled and "run_tpr_forward_backward_batch" not in source:
+        raise AssertionError("This Engine cannot route TPR PPO updates")
     print(
-        "VERL_FULL_ENGINE_INIT_PASS "
+        f"VERL_{label}_ENGINE_INIT_PASS "
         f"engine={type(engine).__name__} mesh={sizes} "
         f"recompute={engine.tf_config.recompute_granularity} "
         f"per_token_loss={engine.tf_config.calculate_per_token_loss}",
@@ -154,13 +185,15 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
     return engine
 
 
-def _load_step(item: dict, *, row_count: int = 8):
+def _load_step(item: dict, *, row_count: int = 8, mode: str = "full"):
     capture = Path(item["capture"])
     rows = tuple(item["rows"])
     if len(rows) != row_count or len(set(rows)) != row_count:
         raise AssertionError("VERL Full requires the exact eight Session rows")
+    if mode not in ("full", "tpr"):
+        raise ValueError(f"unsupported Replay mode: {mode!r}")
     batch, original_keys, ppo_tokens, digest = _load_real_pair(
-        capture, rows, "full"
+        capture, rows, mode
     )
     # The native Engine denominator is computed from original loss_mask,
     # whereas the original TPR replay used response_mask.  Never silently
@@ -183,6 +216,8 @@ def _load_step(item: dict, *, row_count: int = 8):
         force_group_size=1,
         global_batch_size=row_count,
     )
+    if mode == "tpr":
+        tu.assign_non_tensor(batch, tpr_capture_log_probs=True)
     return batch, original_keys, ppo_tokens, digest, rows, capture
 
 
