@@ -421,6 +421,8 @@ def test_real_actor_cp1_short_full_vs_tpr():
             "full_gradient_scope": "ALL_PARAMETERS_BF16_TP1_CP1" if full_grad_dir else None,
             "fwd_bwd_seconds": seconds,
             "leaf_batch_stats": leaf_batch_stats,
+            "leaf_batch_configured_k": int(os.getenv("TPR_LEAF_BATCH_SIZE", "1")),
+            "leaf_batch_max_tokens": int(os.getenv("TPR_LEAF_BATCH_MAX_TOKENS", "8192")),
             "peak_allocated_gib": measured_alloc,
             "peak_reserved_gib": measured_reserved,
             "optimizer_step": False,
