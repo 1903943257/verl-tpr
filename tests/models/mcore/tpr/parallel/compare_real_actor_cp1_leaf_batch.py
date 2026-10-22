@@ -121,6 +121,37 @@ def _compare_leaf_traces(k1_result: Path, k2_result: Path, *, required: bool) ->
     first_grad_change = next((item for item in grad_metrics if not item["exact"]), None)
     first_grad_material = next((item for item in grad_metrics if item["relative_l2"] > 1e-6), None)
 
+    # The grouped run replays native L1 linear_qkv on its *own* captured
+    # input with physical B=1 and unchanged checkpoint weights. This isolates
+    # the GEMM-M effect without including Prefix segmentation differences.
+    grouped_qkv = right.get("grouped_qkv_replay", {})
+    qkv_replay = {}
+    if grouped_qkv:
+        for row in (0, 1):
+            item = grouped_qkv.get(row)
+            if item is None:
+                raise AssertionError(f"Missing isolated grouped QKV replay row={row}")
+            recorded = left_records[f"r{row}|leaf|L1|qkv_out"]
+            sample = item["sampled_single_output"]
+            if recorded["positions"] != sample["positions"]:
+                raise AssertionError(f"K1 vs native K2 single-GEMM replay coords differ on row={row}")
+            reference = recorded["values"].float()
+            replay = sample["values"].float()
+            if reference.shape != replay.shape:
+                raise AssertionError(f"K1 vs replay QKV values differ in shape row={row}")
+            delta = replay - reference
+            qkv_replay[row] = {
+                "k2_grouped_vs_same_input_single": item["same_input_grouped_vs_single"],
+                "k1_vs_k2_same_input_single": {
+                    "relative_l2": float(delta.norm().item() / max(reference.norm().item(), 1e-30)),
+                    "mean_abs": float(delta.abs().mean().item()),
+                    "max_abs": float(delta.abs().max().item()),
+                    "exact": bool(torch.equal(recorded["values"], sample["values"])),
+                    "count": delta.numel(),
+                },
+                "grouped_input_shape": item["grouped_input_shape"],
+            }
+
     attention = right.get("same_qkv_attention", {})
     attention_summary = sorted(
         (
@@ -149,6 +180,7 @@ def _compare_leaf_traces(k1_result: Path, k2_result: Path, *, required: bool) ->
         "largest_gradient_differences": sorted(
             grad_metrics, key=lambda item: item["relative_l2"], reverse=True,
         )[:12],
+        "k2_same_input_qkv_single_replay": qkv_replay,
         "k2_same_qkv_rectangular_attention": attention_summary,
     }
 
@@ -305,6 +337,10 @@ def main():
             else report["layer_trace"]["first_gradient_rel_l2_gt_1e-6"]
         ),
         "top_logprob_differences": report["top_logprob_differences"][:5],
+        "same_input_l1_qkv_replay": (
+            None if report["layer_trace"] is None
+            else report["layer_trace"]["k2_same_input_qkv_single_replay"]
+        ),
     }, sort_keys=True), flush=True)
     print(f"TPR_CP1_LEAF_K1_K2_REPORT saved={args.output}", flush=True)
 
