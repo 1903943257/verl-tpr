@@ -243,6 +243,8 @@ class CP1AttentionTrace:
     def _patched_rectangular(self, query, key, value, **kwargs):
         self.attention_call_index += 1
         layer = self.attention_call_index
+        if self.mode != "full" and layer in (1, 2, 8, 36):
+            self._snapshot(layer, "query_post_rope", query)
         out = self.original_rectangular(query, key, value, **kwargs)
         if self.mode == "full" or layer not in (1, 2, 8, 36):
             return out
