@@ -54,19 +54,36 @@ export TPR_RING_COALESCE_PREFIX_FULL=1
 export TPR_RING_COALESCE_PREFIX_QUERY=1
 export TPR_RING_COALESCE_PREFIX_PADDED=1
 
-# Profile ONLY the measured iteration, after warmup.
-export TPR_PHASE_DIAG=1
-export TPR_OPERATOR_TRACE=1
+# Isolate device faults with identical Full/TPR replay and progressively
+# enabled diagnostics. Choose a fresh TPR_COMM_LEVEL1_ROOT for each probe.
+PROBE="${TPR_COMM_PROBE:-level1}"
+case "$PROBE" in
+  off)
+    export TPR_PHASE_DIAG=0
+    export TPR_OPERATOR_TRACE=0
+    ;;
+  phase)
+    export TPR_PHASE_DIAG=1
+    export TPR_OPERATOR_TRACE=0
+    ;;
+  level1)
+    export TPR_PHASE_DIAG=1
+    export TPR_OPERATOR_TRACE=1
+    ;;
+  *) echo "TPR_COMM_PROBE must be off, phase, or level1" >&2; exit 2 ;;
+esac
 export TPR_OPERATOR_TRACE_FORMAT=ascend_level1
 export TPR_TRACE_RANKS="${TPR_TRACE_RANKS:-0,1,2,3,4,5,6,7}"
 export TPR_BENCH_OUTPUT_DIR="$OUT"
 
-echo "TPR_RING_COMM_LEVEL1_START mode=$TPR_OFFLINE_MODE out=$OUT trace_ranks=$TPR_TRACE_RANKS"
+echo "TPR_RING_COMM_LEVEL1_START mode=$TPR_OFFLINE_MODE probe=$PROBE out=$OUT trace_ranks=$TPR_TRACE_RANKS"
 torchrun --nproc_per_node=8 --master_port="${TPR_COMM_LEVEL1_PORT:-29847}" \
   -m pytest "$TEST" 2>&1 | tee "$OUT/run.log"
 echo "TPR_RING_COMM_LEVEL1_DONE out=$OUT"
-find "$OUT/ascend_profiler" -type f \
-  \( -name communication.json -o -name communication_matrix.json \
-     -o -name trace_view.json -o -name step_trace_time.csv \
-     -o -name kernel_details.csv -o -name op_summary.csv \) \
-  -printf '%p  %s bytes\n' | sort
+if [[ "$PROBE" == level1 && -d "$OUT/ascend_profiler" ]]; then
+  find "$OUT/ascend_profiler" -type f \
+    \( -name communication.json -o -name communication_matrix.json \
+       -o -name trace_view.json -o -name step_trace_time.csv \
+       -o -name kernel_details.csv -o -name op_summary.csv \) \
+    -printf '%p  %s bytes\n' | sort
+fi
