@@ -15,8 +15,8 @@ TEST=tests/models/mcore/tpr/parallel/test_tpr_fixed_shape_40k_benchmark_npu.py
 [[ -f "$CAP" && -f "${CAP%.pt}.audit.json" ]] || {
   echo "Missing controlled 17K:17K Capture/audit: $CAP" >&2; exit 2;
 }
-[[ ! -e "$OUT/step0_tpr_fixed_shape.json" ]] || {
-  echo "Refusing to overwrite existing output: $OUT/step0_tpr_fixed_shape.json" >&2; exit 2;
+[[ ! -e "$OUT/step0_${TPR_OFFLINE_MODE}_fixed_shape.json" ]] || {
+  echo "Refusing to overwrite existing output: $OUT/step0_${TPR_OFFLINE_MODE}_fixed_shape.json" >&2; exit 2;
 }
 mkdir -p "$OUT"
 
@@ -32,7 +32,8 @@ export TPR_OFFLINE_GRAD_SYNC_DTYPE=bf16
 export TPR_TREE_POLICY=qwen_turn
 export TPR_TURN_MIN_SEGMENT_TOKENS=128
 export TPR_RUN_FIXED_SHAPE_40K_BENCH=1
-export TPR_OFFLINE_MODE=tpr
+export TPR_OFFLINE_MODE="${TPR_COMM_MODE:-tpr}"
+case "$TPR_OFFLINE_MODE" in full|tpr) ;; *) echo "TPR_COMM_MODE must be full or tpr" >&2; exit 2;; esac
 export TPR_BENCH_CP_SIZE=4
 export TPR_BENCH_SOURCE_STEP=0
 export TPR_BENCH_CONTROLLED_N8_AUDIT="${CAP%.pt}.audit.json"
@@ -59,7 +60,7 @@ export TPR_OPERATOR_TRACE_FORMAT=ascend_level1
 export TPR_TRACE_RANKS="${TPR_TRACE_RANKS:-0,1,2,3,4,5,6,7}"
 export TPR_BENCH_OUTPUT_DIR="$OUT"
 
-echo "TPR_RING_COMM_LEVEL1_START out=$OUT trace_ranks=$TPR_TRACE_RANKS"
+echo "TPR_RING_COMM_LEVEL1_START mode=$TPR_OFFLINE_MODE out=$OUT trace_ranks=$TPR_TRACE_RANKS"
 torchrun --nproc_per_node=8 --master_port="${TPR_COMM_LEVEL1_PORT:-29847}" \
   -m pytest "$TEST" 2>&1 | tee "$OUT/run.log"
 echo "TPR_RING_COMM_LEVEL1_DONE out=$OUT"
