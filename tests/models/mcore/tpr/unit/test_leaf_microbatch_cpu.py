@@ -49,29 +49,53 @@ def _run(model, plan, monkeypatch, *, k, budget, loss_scale):
     loss = executor.run(event_profiler=Events())
     executor.kv_stack.assert_empty()
     assert not executor.failed
-    return loss, seen
+    return loss, seen, executor
 
 
 @pytest.mark.parametrize("loss_scale", [1.0, 8.0])
-def test_grouped_leaves_match_sequential_loss_parameter_and_prefix_gradients(monkeypatch, loss_scale):
+@pytest.mark.parametrize("group_size", [2, 4])
+def test_grouped_leaves_match_sequential_loss_parameter_and_prefix_gradients(
+    monkeypatch, loss_scale, group_size,
+):
     torch.manual_seed(1234)
     plan = _siblings()
     baseline = _PrefixModel()
     grouped = copy.deepcopy(baseline)
 
-    baseline_loss, baseline_events = _run(baseline, plan, monkeypatch, k=1, budget=12, loss_scale=loss_scale)
-    grouped_loss, group_events = _run(grouped, plan, monkeypatch, k=4, budget=12, loss_scale=loss_scale)
+    baseline_loss, baseline_events, baseline_executor = _run(
+        baseline, plan, monkeypatch, k=1, budget=12, loss_scale=loss_scale,
+    )
+    grouped_loss, group_events, grouped_executor = _run(
+        grouped, plan, monkeypatch, k=group_size, budget=12, loss_scale=loss_scale,
+    )
 
-    # The 4 equal-length siblings become one physical forward/backward.
-    assert [kind for kind, _ in group_events].count("visit_leaf_group") == 1
+    # K=2 executes two two-leaf groups; K=4 executes one four-leaf group.
+    assert [kind for kind, _ in group_events].count("visit_leaf_group") == 4 // group_size
     assert [kind for kind, _ in group_events].count("visit_leaf") == 1
+    assert grouped_executor.grouped_leaf_calls == 4 // group_size
+    assert grouped_executor.grouped_leaf_segments == 4
+    assert baseline_executor.model_forward_calls == 7  # 5 leaves + root Push/Pop
+    assert grouped_executor.model_forward_calls == 3 + 4 // group_size
     assert [kind for kind, _ in baseline_events].count("visit_leaf") == 5
     assert [kind for kind, _ in group_events].count("push") == 1
     assert [kind for kind, _ in group_events].count("pop") == 1
 
     torch.testing.assert_close(grouped_loss, baseline_loss, rtol=1e-12, atol=1e-12)
+    differences = []
     for left, right in zip(grouped.parameters(), baseline.parameters(), strict=True):
         torch.testing.assert_close(left.grad, right.grad, rtol=1e-11, atol=1e-11)
+        differences.append((left.grad.detach() - right.grad.detach()).float().square().sum())
+    grad_l2 = torch.sqrt(torch.stack(differences).sum()).item()
+    loss_gap = (grouped_loss - baseline_loss).abs().item()
+    print(
+        f"TPR_LEAF_CPU_RESULT K={group_size} scale={loss_scale:g} "
+        f"group_calls={grouped_executor.grouped_leaf_calls} "
+        f"grouped_leaves={grouped_executor.grouped_leaf_segments} "
+        f"forwards_k1={baseline_executor.model_forward_calls} "
+        f"forwards_grouped={grouped_executor.model_forward_calls} "
+        f"loss_abs={loss_gap:.6e} grad_abs_l2={grad_l2:.6e}",
+        flush=True,
+    )
 
 
 def test_grouping_respects_maximum_token_budget(monkeypatch):
