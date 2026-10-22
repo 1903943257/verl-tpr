@@ -511,9 +511,11 @@ class SegmentExecutor:
             )
             self._assert_collected_layers(context)
             owned_losses: list[Tensor] = []
+            normalized_losses: list[Tensor] = []
             for index, segment in enumerate(segments):
                 row_logits = logits[index : index + 1]
                 loss = self._compute_loss(segment, row_logits)
+                normalized_losses.append(loss.detach())
                 owned_losses.append(self._prepare_backward_loss(
                     loss, logits=row_logits,
                     has_owned_loss=self._owned_loss_count(segment) > 0,
@@ -521,7 +523,8 @@ class SegmentExecutor:
             # Keep one backward root and one Prefix-anchor accumulation.
             torch.autograd.backward(torch.stack(owned_losses).sum())
             self.kv_stack.accumulate_anchor_gradients(anchors, consume=True)
-            return torch.stack([value.detach() for value in owned_losses]).sum()
+            # Report the unscaled objective, just like _backward_segment.
+            return torch.stack(normalized_losses).sum()
 
     def _backward_segment(
         self, segment: SegmentSpec, relayed_gradients: Mapping[int, KVPair] | None = None,
