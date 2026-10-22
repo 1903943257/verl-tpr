@@ -4,6 +4,51 @@ This branch explores memory-constrained leaf grouping without replacing the
 existing DFS Prefix Push/Pop, PPO objective, KV anchors, or gradient finalizer.
 It is **not** an enabled production optimization.
 
+## Where commands run (host vs Docker)
+
+**Host only — Git / worktree synchronization.** The actual source of this
+experiment is the dedicated `verl-tpr-leaf-microbatch` worktree. Do not
+switch branches in the Ring review worktree or modify `main`.
+
+```bash
+# HOST: run inside your existing leaf-microbatch worktree
+cd /mnt/pipeline-data/j00972288/project/uniagent_linear/verl-tpr-leaf-microbatch
+git fetch tpr feat/tpr-leaf-microbatch-cp1-20261022
+git merge --ff-only FETCH_HEAD
+git status --short --branch
+```
+
+**Docker only — CPU/NPU Pytest and real Actor PPO Capture.** Confirm the
+Docker's VERL tree contains the updated commit before running; host Git
+changes are not necessarily visible inside the container. Use the existing
+host-to-Docker sync / mount arrangement. All `/workspace/tpr_experiments`
+paths below refer to the Docker's filesystem.
+
+```bash
+# DOCKER: after synchronizing the updated VERL source
+cd /workspace/uni-agent/verl  # adjust to your actual mounted/synced VERL directory
+export TPR_CP1_CAPTURE=/workspace/tpr_experiments/leaf_batch_k2_first_run/actor_pair_cap2048_p1024.pt
+export TPR_CP1_LEAF_ROOT=/workspace/tpr_experiments/leaf_k1k2_example
+export TPR_CP1_LEAF_TRACE=1
+mkdir -p "$TPR_CP1_LEAF_ROOT"
+set -o pipefail
+bash tests/models/mcore/tpr/parallel/run_cp1_shared_leaf_k1_k2.sh \
+  2>&1 | tee "$TPR_CP1_LEAF_ROOT/run.log"
+rc=${PIPESTATUS[0]}
+echo "===== LAST SAVED RESULTS / ERRORS exit=$rc ====="
+cat "$TPR_CP1_LEAF_ROOT/SUMMARY.txt" 2>/dev/null || {
+  tail -n 80 "$TPR_CP1_LEAF_ROOT/run.log"
+}
+exit "$rc"
+```
+
+The runner now always writes and prints **`SUMMARY.txt`** at exit. It shows
+an at-a-glance K=1/K=2 table with forward counts, grouping, F/B time, peak
+allocated/reserved, loss, gradient norm, and parity gaps. On OOM/exception
+it instead identifies missing result arms and prints the current failed log.
+It does not turn gradient mismatch into a "PASS", and preserves the original
+exit code. Detailed raw data remain in `k1_vs_k2.json`.
+
 ## Supported scope
 
 - **CP=1 only**, dense training, same-parent leaves, equal-length adjacent
