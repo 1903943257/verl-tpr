@@ -85,6 +85,25 @@ def _compare_leaf_traces(k1_result: Path, k2_result: Path, *, required: bool) ->
             "exact": exact, "count": diff.numel(),
         })
     metrics.sort(key=lambda item: (item["layer"], item["stage_order"], item["row"]))
+    layers = sorted({item["layer"] for item in metrics})
+    layer_progression = [
+        {
+            "layer": layer,
+            "max_diff": max(
+                (item for item in metrics if item["layer"] == layer),
+                key=lambda item: item["relative_l2"],
+            ),
+            "last_stage_by_row": [
+                next(
+                    (item for item in reversed(metrics)
+                     if item["layer"] == layer and item["row"] == row),
+                    None,
+                )
+                for row in (0, 1)
+            ],
+        }
+        for layer in layers
+    ]
     first_changed = next((item for item in metrics if not item["exact"]), None)
     first_material = next((item for item in metrics if item["relative_l2"] > 1e-6), None)
 
@@ -170,6 +189,8 @@ def _compare_leaf_traces(k1_result: Path, k2_result: Path, *, required: bool) ->
     return {
         "trace_paths": [str(path) for path in trace_paths],
         "leaf_forward_tensor_count": len(metrics),
+        "layer_progression": layer_progression,
+        "layer1_forward_stages": [item for item in metrics if item["layer"] == 1],
         "first_forward_value_change": first_changed,
         "first_forward_rel_l2_gt_1e-6": first_material,
         "largest_forward_differences": sorted(
@@ -335,6 +356,18 @@ def main():
         "first_gradient_mismatch": (
             None if report["layer_trace"] is None
             else report["layer_trace"]["first_gradient_rel_l2_gt_1e-6"]
+        ),
+        "layer_progression": (
+            None if report["layer_trace"] is None
+            else [
+                {
+                    "layer": item["layer"],
+                    "largest_rel_l2": item["max_diff"]["relative_l2"],
+                    "largest_stage": item["max_diff"]["stage"],
+                    "largest_row": item["max_diff"]["row"],
+                }
+                for item in report["layer_trace"]["layer_progression"]
+            ]
         ),
         "top_logprob_differences": report["top_logprob_differences"][:5],
         "same_input_l1_qkv_replay": (
