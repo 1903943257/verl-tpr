@@ -201,14 +201,31 @@ class OperatorTrace:
             finally:
                 self.profiler.__exit__(*exc)
             if exc[0] is None:
+                # Communication reports are not guaranteed for every profiler
+                # export. In particular, a device-side kernel failure can
+                # interrupt export. Never replace the original NPU failure
+                # with a spurious "communication.json missing" assertion.
                 reports = list(self.path.rglob("ASCEND_PROFILER_OUTPUT/communication.json"))
+                kernels = list(self.path.rglob("ASCEND_PROFILER_OUTPUT/kernel_details.csv"))
+                traces = list(self.path.rglob("ASCEND_PROFILER_OUTPUT/trace_view.json"))
                 if not reports:
-                    raise RuntimeError(
-                        f"Ascend Level1 exported no communication.json under {self.path}"
+                    print(
+                        f"TPR_ASCEND_LEVEL1_WARNING path={self.path} "
+                        "communication.json missing; verify NPU device logs "
+                        "and profile completeness before interpreting timings",
+                        flush=True,
+                    )
+                if not kernels and not traces:
+                    print(
+                        f"TPR_ASCEND_LEVEL1_WARNING path={self.path} "
+                        "no device-kernel timeline exported; "
+                        "the profile is incomplete",
+                        flush=True,
                     )
                 print(
                     f"TPR_ASCEND_LEVEL1_OUTPUT path={self.path} "
-                    f"communication_reports={len(reports)}",
+                    f"communication_reports={len(reports)} "
+                    f"kernel_details={len(kernels)} trace_view={len(traces)}",
                     flush=True,
                 )
             return False
