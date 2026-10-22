@@ -153,7 +153,7 @@ The comparator prints `first_forward_mismatch` and
 in `k1_vs_k2.json`. Interpret the first differing stage as follows:
 
 - `qkv_out`: physical-B GEMM / projection kernel behavior is the first sampled difference.
-- `post_rope_k` or `raw_v`: QKV/RoPE or KV construction.
+- `query_post_rope`, `post_rope_k` or `raw_v`: QKV/RoPE or KV construction.
 - `attn_out` plus nontrivial same-QKV Attention error: grouped CANN TND attention path.
 - `proj_out` / `fc*_out`: later GEMM/MLP stage.
 - Forward snapshots agree but PPO logprobs differ: inspect objective row selection and response-token mapping next.
