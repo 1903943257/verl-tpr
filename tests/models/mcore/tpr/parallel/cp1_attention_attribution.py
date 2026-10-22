@@ -83,6 +83,7 @@ class CP1AttentionTrace:
         self.first_layer_linear_inputs_root = {}
         self.root_queries = {}
         self.same_qkv_attention = {}
+        self.group_vs_single_rectangular = {}
         # Diagnostic only: collect full first-layer grouped QKV operands for
         # a controlled M=2S vs two M=S GEMM replay on identical inputs.
         self.grouped_qkv_operands = {}
@@ -268,10 +269,16 @@ class CP1AttentionTrace:
                 key_row = key[:, batch_index:batch_index + 1].detach()
                 value_row = value[:, batch_index:batch_index + 1].detach()
                 with torch.no_grad():
+                    independent_rectangle = self.original_rectangular(
+                        query_row.detach(), key_row, value_row, **kwargs,
+                    )
                     same_qkv_square = self.original_rectangular(
                         torch.cat((prefix_q, query_row.detach()), dim=0),
                         key_row, value_row, **kwargs,
                     )[-query.shape[0]:]
+                self.group_vs_single_rectangular[f"r{row}|L{layer}"] = _difference(
+                    out[:, batch_index:batch_index + 1].detach(), independent_rectangle,
+                )
                 self.same_qkv_attention[f"r{row}|L{layer}"] = _difference(
                     out[:, batch_index:batch_index + 1].detach(), same_qkv_square,
                 )
@@ -496,6 +503,9 @@ class CP1AttentionTrace:
             "row_lengths": [len(t) for t in self.tokens],
             "call_counts": self.call_counts,
             "records": self.records,
+            # Separate physical B=2 TND vs B=1 TND on the same exact Q/K/V.
+            "group_vs_single_rectangular": self.group_vs_single_rectangular,
+            # Existing square-causal oracle is a different numerical comparison.
             "same_qkv_attention": self.same_qkv_attention,
             "same_input_gemm_replay": self.replay,
             "kv_relay_roundoff": {
