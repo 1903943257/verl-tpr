@@ -57,9 +57,9 @@ def _compare_leaf_traces(k1_result: Path, k2_result: Path, *, required: bool) ->
         )
 
     stage_order = {
-        "attn_in": 0, "qkv_in": 1, "qkv_out": 2, "post_rope_k": 3,
-        "raw_v": 4, "attn_out": 5, "proj_in": 6, "proj_out": 7,
-        "fc1_in": 8, "fc1_out": 9, "fc2_in": 10, "fc2_out": 11,
+        "attn_in": 0, "qkv_in": 1, "qkv_out": 2, "query_post_rope": 3,
+        "post_rope_k": 4, "raw_v": 5, "attn_out": 6, "proj_in": 7, "proj_out": 8,
+        "fc1_in": 9, "fc1_out": 10, "fc2_in": 11, "fc2_out": 12,
     }
     metrics = []
     for key in left_keys:
