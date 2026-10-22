@@ -91,6 +91,34 @@ that the real model path was reached, not just that the CANN operator works.
 The test still uses a controlled cropped capture and does not constitute
 a whole production Actor optimizer-step or a CP4 result.
 
+## Isolate grouping errors from pre-existing Full/Shared differences
+
+The existing `run_real_actor_cp1_short_full_tpr.sh` compares Full,
+One-node, Split-no-share and Shared. Its `provisional_gates` are diagnostics,
+not acceptance assertions, and Shared-vs-Full gradient differences **cannot**
+be attributed specifically to leaf batching.
+
+Use the *same exact Shared tree* twice, changing **only** K=1 to K=2:
+
+```bash
+# The capture was already derived by run_real_actor_cp1_short_full_tpr.sh
+export TPR_CP1_CAPTURE=/workspace/tpr_experiments/leaf_batch_k2_first_run/actor_pair_cap2048_p1024.pt
+export TPR_CP1_LEAF_ROOT=/workspace/tpr_experiments/leaf_batch_k1k2_v1
+bash tests/models/mcore/tpr/parallel/run_cp1_shared_leaf_k1_k2.sh
+```
+
+This loads Qwen3-4B twice (one NPU) and does not rerun the two unrelated
+Full/One-node or Split-no-share cases. It compares exact input/weights,
+number of actual grouped model calls, logprobs, loss, sampled/Norm gradients,
+optional saved complete parameter gradients, elapsed F/B and peak memory.
+The K=2 run **fails** if no real-model grouping occurs, and the comparison
+requires the exact Push+2 Leaves+Pop count change `4 → 3`. Results are
+saved in `$TPR_CP1_LEAF_ROOT/k1_vs_k2.json`.
+
+This isolates any additional error due to K=2 independently from pre-existing
+differences between TPR and a Full no-context reference. No NPU outcome is
+claimed until this comparison is executed.
+
 Before accepting the feature, rerun the real Actor PPO capture on **CP1** with
 K=1/2/4 and compare identical model weights, tree, PPO masks and total
 denominator. Check loss, logprob, every parameter gradient, Prefix dK/dV,
