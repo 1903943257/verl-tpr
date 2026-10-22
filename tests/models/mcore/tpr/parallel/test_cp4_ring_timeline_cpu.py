@@ -55,7 +55,7 @@ def test_csv_timeline_gemm_attention_hccl_and_gap(tmp_path):
 
 
 def test_missing_kernel_data_is_explicit_error(tmp_path):
-    with pytest.raises(ValueError, match="No device time axis"):
+    with pytest.raises(ValueError, match="No usable device time axis"):
         summarize(tmp_path, "us", 0, None, 0.1, no_trace=True)
 
 
@@ -77,3 +77,12 @@ def test_level1_missing_communication_report_does_not_mask_kernel_error(tmp_path
     error = RuntimeError("device kernel failed")
     assert prof.__exit__(RuntimeError, error, None) is False
     prof.profiler.step.assert_not_called()
+
+
+def test_missing_tpr_csv_lists_existing_communication_report(tmp_path):
+    rank = tmp_path / "tpr_iter1_rank0"
+    report = rank / "run" / "ASCEND_PROFILER_OUTPUT"
+    report.mkdir(parents=True)
+    (report / "communication.json").write_text("{}")
+    with pytest.raises(ValueError, match="communication.json alone cannot"):
+        summarize(rank, "us", 0, None, 0.1, no_trace=True)
