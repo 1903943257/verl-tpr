@@ -8,6 +8,7 @@ Never use these as sequential PPO training steps or online reward evidence.
 from __future__ import annotations
 
 import gc
+from contextlib import nullcontext
 import json
 import os
 import statistics
@@ -24,8 +25,10 @@ from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_ba
 from verl.utils import tensordict_utils as tu
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 from .native_full_megatron_schedule import run_native_full_step
+from .tpr_phase_diagnostics import PhaseSampler, OperatorTrace, trace_path, trace_kernel_summary
 from .test_real_actor_tp2cp4_multistep_npu import _make_engine
 from .test_real_actor_tp2cp4_offline_ppo_npu import _PPO, _runtime, _load_real_pair
+from .test_tpr_10k_parallel_parity_npu import _runtime as _parallel_runtime, _engine as _parallel_engine
 
 pytestmark = pytest.mark.skipif(
     os.getenv("TPR_RUN_FIXED_SHAPE_40K_BENCH") != "1",
@@ -38,29 +41,69 @@ def test_fixed_shape_40k_one_mode():
     if mode not in ("full", "tpr"):
         raise ValueError("TPR_OFFLINE_MODE must be full or tpr")
     step = int(os.environ["TPR_BENCH_SOURCE_STEP"])
-    manifest_path = Path(os.environ["TPR_OFFLINE_CAPTURE_MANIFEST"])
-    manifest = json.loads(manifest_path.read_text())
-    if (manifest.get("protocol") != "real_actor_session_first_8merged_v3"
-            or manifest.get("steps") != 20
-            or manifest.get("expected_sessions") != 8
-            or manifest.get("max_seq_len") != 40960
-            or not 1 <= step <= 20):
-        raise ValueError("Requires existing, already truncated, session-first 40K/20-step manifest")
-    if (manifest.get("only_step_derived") not in (None, step)
-            or manifest.get("experimental_sequence_cap", 40960) !=
-                manifest["items"][step - 1].get("effective_sequence_cap", 40960)):
-        raise ValueError("Refuse to replay an unrelated or mismatched 30K derived step")
-    item = manifest["items"][step - 1]
-    if (item["step"] != step or item["source_global_step"] != step
-            or item["rows"] != list(range(8)) or item.get("session_count") != 8
-            or item["max_sequence_length"] > 40960):
-        raise AssertionError("Source step or original eight-session selection changed")
+    controlled_path = os.getenv("TPR_BENCH_CONTROLLED_N8_AUDIT")
+    cp = int(os.getenv("TPR_BENCH_CP_SIZE", "4"))
+    if cp not in (2, 4) or (cp == 2 and not controlled_path):
+        raise ValueError("CP2 is only supported for audited controlled N8 shapes")
+    world = 2 * cp
+    controlled = None
+    if controlled_path:
+        # Direct, explicitly marked performance-only derived capture. Keep
+        # the original 40K/20-step manifest path untouched for production
+        # historical regression tests.
+        if step != 0:
+            raise ValueError("The independent controlled shape benchmark uses step=0")
+        controlled = json.loads(Path(controlled_path).read_text())
+        p, s = int(controlled["prefix"]), int(controlled["suffix"])
+        if (
+            (cp, p, s) not in (
+                (4, 13824, 13824), (4, 24576, 3072),
+                (4, 18432, 18432), (4, 32768, 4096),
+                (4, 17440, 17440),
+                (2, 16384, 2048), (2, 9216, 9216),
+                (2, 6016, 6016), (2, 12416, 6016),
+            )
+            or controlled["n"] != 8 or controlled["length"] != p + s
+            or controlled["forest_trees"] != 1
+            or controlled["forest_segments"] < 9
+            or not p - 127 <= controlled.get("actual_shared_root_tokens", -1) < p + s
+            or controlled.get("min_turn_segment_tokens") != 128
+            or not controlled["changed_conditioning"]
+            or not controlled["synthetic_shared_uid"]
+        ):
+            raise AssertionError(f"CP{cp} controlled benchmark needs an audited eight-leaf 1:1 or 8:1 tree")
+        item = {
+            "capture": controlled["capture"],
+            "ppo_tokens": controlled["ppo_tokens"],
+            "effective_sequence_cap": p + s,
+        }
+    else:
+        manifest_path = Path(os.environ["TPR_OFFLINE_CAPTURE_MANIFEST"])
+        manifest = json.loads(manifest_path.read_text())
+        if (manifest.get("protocol") != "real_actor_session_first_8merged_v3"
+                or manifest.get("steps") != 20
+                or manifest.get("expected_sessions") != 8
+                or manifest.get("max_seq_len") != 40960
+                or not 1 <= step <= 20):
+            raise ValueError("Requires existing, already truncated, session-first 40K/20-step manifest")
+        if (manifest.get("only_step_derived") not in (None, step)
+                or manifest.get("experimental_sequence_cap", 40960) !=
+                    manifest["items"][step - 1].get("effective_sequence_cap", 40960)):
+            raise ValueError("Refuse to replay an unrelated or mismatched 30K derived step")
+        item = manifest["items"][step - 1]
+        if (item["step"] != step or item["source_global_step"] != step
+                or item["rows"] != list(range(8)) or item.get("session_count") != 8
+                or item["max_sequence_length"] > 40960):
+            raise AssertionError("Source step or original eight-session selection changed")
     capture = Path(item["capture"])
     if not capture.is_file():
         raise FileNotFoundError(capture)
     warmups = int(os.environ.get("TPR_BENCH_WARMUPS", "1"))
     repeats = int(os.environ.get("TPR_BENCH_REPEATS", "3"))
     capture_logprobs = os.environ.get("TPR_BENCH_CAPTURE_LOGPROBS", "1") == "1"
+    merge_token_diagnostic = os.getenv("TPR_MERGE_TOKEN_DIAG", "0") == "1"
+    if merge_token_diagnostic and not capture_logprobs:
+        raise ValueError("TPR_MERGE_TOKEN_DIAG=1 requires TPR_BENCH_CAPTURE_LOGPROBS=1")
     recompute_setting = os.getenv("TPR_BENCH_RECOMPUTE", "0")
     if recompute_setting not in ("0", "1"):
         raise ValueError("TPR_BENCH_RECOMPUTE must be 0 or 1")
@@ -86,7 +129,7 @@ def test_fixed_shape_40k_one_mode():
     )
     output_dir = Path(os.environ["TPR_BENCH_OUTPUT_DIR"])
     checkpoint = Path(os.environ.get("TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"))
-    runtime = _runtime()
+    runtime = _runtime() if cp == 4 else _parallel_runtime(2, cp, 1)
     # The Full reference needs the same supported FP32 collective gate as
     # the TPR DP2 benchmark; FP64 HCCL reductions cannot be trusted on 910B.
     probe = torch.tensor(
@@ -94,13 +137,14 @@ def test_fixed_shape_40k_one_mode():
     )
     dist.all_reduce(probe, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
     torch.npu.synchronize()
-    if float(probe.item()) != 36.0:
+    expected_sum = float(world * (world + 1) // 2)
+    if float(probe.item()) != expected_sum:
         raise AssertionError(
             f"Full WORLD FP32 AllReduce failed on rank {dist.get_rank()}: "
-            f"rank_sum={probe.item()} expected=36"
+            f"rank_sum={probe.item()} expected={expected_sum}"
         )
     if dist.get_rank() == 0:
-        print("TPR_FULL_WORLD_FP32_REDUCE_PASS rank_sum=36", flush=True)
+        print(f"TPR_FULL_WORLD_FP32_REDUCE_PASS rank_sum={expected_sum:g}", flush=True)
     try:
         from verl.workers.utils.losses import ppo_loss
         # Reuse existing original PPO-capture loader. Its original source_keys
@@ -110,6 +154,11 @@ def test_fixed_shape_40k_one_mode():
         )
         if tokens != item["ppo_tokens"]:
             raise AssertionError("Capture/manifest PPO token count mismatch")
+        if controlled:
+            if data_sha != controlled["input_sha256"]:
+                raise AssertionError(f"CP{cp} controlled Full/TPR input SHA differs from audited capture")
+            if any(int(row.numel()) != controlled["length"] for row in batch["input_ids"].unbind(0)):
+                raise AssertionError(f"CP{cp} controlled replay must have eight exact audited-length rows")
         if max(int(x.numel()) for x in batch["input_ids"].unbind(0)) > int(
                 item.get("effective_sequence_cap", 40960)):
             raise AssertionError("Capture exceeds its declared experimental sequence cap")
@@ -119,12 +168,16 @@ def test_fixed_shape_40k_one_mode():
             raise AssertionError("Expected eight selected Sessions")
         tu.assign_non_tensor(batch, tpr_capture_log_probs=capture_logprobs)
         model, hf = make_real_qwen3_tp_model(
-            runtime, model_path=checkpoint, tp_size=2, cp_size=4,
+            runtime, model_path=checkpoint, tp_size=2, cp_size=cp,
             sequence_parallel=False, profile="4b", native_attention=(mode == "full"),
         )
         assert hf.num_hidden_layers == 36
         finalize_time = [0.0]
-        engine = _make_engine(model, runtime, finalize_time) if mode == "tpr" else None
+        engine = (
+            (_make_engine(model, runtime, finalize_time) if cp == 4
+             else _parallel_engine(model, runtime, 2, cp, 1))
+            if mode == "tpr" else None
+        )
         installed_blocks = 0
         if mode == "tpr" and recompute_enabled:
             from megatron.core.transformer.transformer_block import TransformerBlock
@@ -174,9 +227,10 @@ def test_fixed_shape_40k_one_mode():
         if dist.get_rank() == 0:
             print(
                 f"TPR_FIXED_SHAPE_GRAD_REDUCE_MODE mode={mode} "
-                f"dtype={grad_sync_dtype} cp_group_size=4",
+                f"dtype={grad_sync_dtype} cp_group_size={cp}",
                 flush=True,
             )
+        phase_diagnostic = os.getenv("TPR_PHASE_DIAG", "0") == "1"
         runs = []
         for iteration in range(warmups + repeats):
             model.zero_grad(set_to_none=True)
@@ -185,21 +239,30 @@ def test_fixed_shape_40k_one_mode():
             dist.barrier()
             torch.npu.synchronize()
             torch.npu.reset_peak_memory_stats()
-            start = time.perf_counter()
-            if mode == "full":
-                out_full = run_native_full_step(
-                    model, batch, runtime, partial(ppo_loss, config=_PPO()),
-                    capture_logprobs=capture_logprobs,
-                )
-                loss = float(out_full.loss)
-            else:
-                out = run_tpr_forward_backward_batch(
-                    engine, batch, partial(ppo_loss, config=_PPO()),
-                    forward_only=False,
-                )
-                loss = float(out["loss"][0])
-            torch.npu.synchronize()
-            own_seconds = time.perf_counter() - start
+            stage_active = phase_diagnostic and iteration >= warmups
+            sampler = PhaseSampler(model, mode=mode) if stage_active else nullcontext(None)
+            trace = trace_path(output_dir, mode, iteration, dist.get_rank()) if stage_active else None
+            with sampler as stages:
+                with OperatorTrace(trace):
+                    # Exclude profiler start/stop/export from the F/B timer.
+                    start = time.perf_counter()
+                    if mode == "full":
+                        out_full = run_native_full_step(
+                            model, batch, runtime, partial(ppo_loss, config=_PPO()),
+                            capture_logprobs=capture_logprobs,
+                            phase_sampler=stages,
+                        )
+                        loss = float(out_full.loss)
+                    else:
+                        out = run_tpr_forward_backward_batch(
+                            engine, batch, partial(ppo_loss, config=_PPO()),
+                            forward_only=False,
+                        )
+                        loss = float(out["loss"][0])
+                    torch.npu.synchronize()
+                    own_seconds = time.perf_counter() - start
+            stage_timings = stages.materialize() if stage_active else None
+            kernel_summary = trace_kernel_summary(trace) if stage_active else None
             # FP64 HCCL AllReduce is unsupported on Ascend 910B.
             # Use FP32 for world MAX time and memory statistics.
             critical = torch.tensor(
@@ -239,6 +302,51 @@ def test_fixed_shape_40k_one_mode():
                 dist.all_gather_object(profiles, profile)
             else:
                 profiles = []
+            phase_profiles = []
+            if stage_active:
+                phase_profiles = [None] * dist.get_world_size()
+                dist.all_gather_object(phase_profiles, {
+                    "rank": dist.get_rank(),
+                    "stages": stage_timings,
+                    "kernels": kernel_summary,
+                    "trace": str(trace) if trace else None,
+                    "method": "asynchronous NPU events + optional CANN operator trace",
+                })
+            # Opt-in correctness probe: collect original-row/response-offset logprobs
+            # after the timed F/B, never for production or performance comparisons.
+            token_logprobs = None
+            if merge_token_diagnostic and iteration >= warmups:
+                source_lp = (
+                    out_full.logprobs if mode == "full"
+                    else engine._tpr_captured_log_probs
+                )
+                local_lp = {
+                    "tp_rank": int(runtime.tp_rank),
+                    "entries": [
+                        [int(row), int(offset), float(value)]
+                        for (row, offset), value in source_lp.items()
+                    ],
+                }
+                gathered = [None] * dist.get_world_size()
+                dist.all_gather_object(gathered, local_lp)
+                if dist.get_rank() == 0:
+                    combined = {}
+                    for shard in gathered:
+                        if shard["tp_rank"] != 0:
+                            continue  # TP replicas refer to the same logical PPO tokens.
+                        for row, offset, value in shard["entries"]:
+                            key = (row, offset)
+                            if key in combined:
+                                raise AssertionError(f"Duplicate PPO token: {key}")
+                            combined[key] = value
+                    if len(combined) != tokens:
+                        raise AssertionError(
+                            f"Missing PPO tokens: got {len(combined)}, expected {tokens}"
+                        )
+                    token_logprobs = [
+                        [row, offset, combined[row, offset]]
+                        for row, offset in sorted(combined)
+                    ]
             record = {
                 "source_step": step,
                 "mode": mode,
@@ -258,6 +366,8 @@ def test_fixed_shape_40k_one_mode():
                 "mem_audit": mem_audit,
                 "capture_logprobs": capture_logprobs,
                 "profiles": profiles,
+                "phase_diagnostics": phase_profiles,
+                **({"token_logprobs": token_logprobs} if merge_token_diagnostic else {}),
             }
             if dist.get_rank() == 0:
                 print(
@@ -330,12 +440,24 @@ def test_fixed_shape_40k_one_mode():
             measured = [r["critical_fwd_bwd_s"] for r in runs if not r["warmup"]]
             target.write_text(json.dumps({
                 "source_step": step, "mode": mode,
+                "controlled_performance_shape": (
+                    {"prefix": controlled["prefix"], "suffix": controlled["suffix"],
+                     "length": controlled["length"],
+                     "actual_shared_root_tokens": controlled["actual_shared_root_tokens"],
+                     "unique_tree_tokens": controlled["unique_tree_tokens"],
+                     "synthetic_shared_uid": controlled["synthetic_shared_uid"],
+                     "changed_conditioning": controlled["changed_conditioning"],
+                     "synthetic_response_windows": controlled.get("synthetic_response_windows", False),
+                     "original_actor_capture": controlled.get("original_actor_capture"),
+                     "original_capture": controlled["source"]}
+                    if controlled else None
+                ),
                 "recompute": recompute_enabled,
                 "recompute_granularity": model.config.recompute_granularity,
                 "recompute_method": model.config.recompute_method,
                 "recompute_num_layers": model.config.recompute_num_layers,
                 "recompute_installed_tpr_blocks": installed_blocks,
-                "topology": {"tp": 2, "cp": 4, "dp": 1, "world": 8},
+                "topology": {"tp": 2, "cp": cp, "dp": 1, "world": world},
                 "effective_sequence_cap": int(item.get("effective_sequence_cap", 40960)),
                 "input_sha256": data_sha, "source_capture": str(capture),
                 "checkpoint": str(checkpoint), "warmups": warmups,
@@ -345,6 +467,7 @@ def test_fixed_shape_40k_one_mode():
                 "hccl_stats_reduce_dtype": "float32",
                 "capture_logprobs": capture_logprobs,
                 "profiler_enabled": os.getenv("TPR_EXEC_PROFILE", "0") == "1",
+                "phase_diagnostic": phase_diagnostic,
                 "median_fwd_bwd_s": statistics.median(measured),
                 "gradient_witness": gradient_witness,
                 "runs": runs,
