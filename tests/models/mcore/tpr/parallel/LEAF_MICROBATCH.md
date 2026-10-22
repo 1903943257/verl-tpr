@@ -128,6 +128,36 @@ The K=2 run **fails** if no real-model grouping occurs, and the comparison
 requires the exact Push+2 Leaves+Pop count change `4 → 3`. Results are
 saved in `$TPR_CP1_LEAF_ROOT/k1_vs_k2.json`.
 
+To locate the **first forward-stage divergence**, rerun in a new directory
+with trace enabled. This records sampled activation and selected gradient
+snapshots at layers 1/2/3/4/8/16/36, then compares K1 and K2 by row and stage.
+It also checks grouped Attention against independent rectangular Attention
+using the exact same Q/K/V. Tracing adds overhead, so **do not use traced
+times as performance measurements**.
+
+```bash
+export TPR_CP1_CAPTURE=/workspace/tpr_experiments/leaf_batch_k2_first_run/actor_pair_cap2048_p1024.pt
+export TPR_CP1_LEAF_ROOT=/workspace/tpr_experiments/leaf_k1k2_trace_v1
+export TPR_CP1_LEAF_TRACE=1
+unset TPR_CP1_LEAF_RESUME
+set -o pipefail
+bash tests/models/mcore/tpr/parallel/run_cp1_shared_leaf_k1_k2.sh 2>&1 | tee "$TPR_CP1_LEAF_ROOT/run.log"
+rc=${PIPESTATUS[0]}
+echo "===== FINAL LAYER TRACE / ERRORS exit=$rc ====="
+grep -hE 'TPR_CP1_LEAF_K1_K2_COMPARISON|TPR_CP1_LEAF_K1_K2_REPORT|TPR_LEAF_BATCH_RUN|TPR_CP1_SHORT_RESULT|Traceback|NPU out of memory|FAILED|ERROR' "$TPR_CP1_LEAF_ROOT"/*.log 2>/dev/null | tail -n 80 || true
+exit "$rc"
+```
+
+The comparator prints `first_forward_mismatch` and
+`largest_same_qkv_attention_rel_l2`; the full ordered stage report is saved
+in `k1_vs_k2.json`. Interpret the first differing stage as follows:
+
+- `qkv_out`: physical-B GEMM / projection kernel behavior is the first sampled difference.
+- `post_rope_k` or `raw_v`: QKV/RoPE or KV construction.
+- `attn_out` plus nontrivial same-QKV Attention error: grouped CANN TND attention path.
+- `proj_out` / `fc*_out`: later GEMM/MLP stage.
+- Forward snapshots agree but PPO logprobs differ: inspect objective row selection and response-token mapping next.
+
 This isolates any additional error due to K=2 independently from pre-existing
 differences between TPR and a Full no-context reference. No NPU outcome is
 claimed until this comparison is executed.
