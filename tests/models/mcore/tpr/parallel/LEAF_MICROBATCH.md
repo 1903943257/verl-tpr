@@ -107,6 +107,19 @@ export TPR_CP1_LEAF_ROOT=/workspace/tpr_experiments/leaf_batch_k1k2_v1
 bash tests/models/mcore/tpr/parallel/run_cp1_shared_leaf_k1_k2.sh
 ```
 
+The runner installs an EXIT diagnostic handler that always prints key
+`TPR_*` results or failure lines after all executions. On failure it includes
+the last test log and, where supported, `npu-smi` process occupancy on the
+physical NPU (`TPR_NPU_SMI_ID`, default 8). An OOM with ~18 GiB reserved by
+the process but only a few MiB free on a 61 GiB card strongly suggests
+**other device occupants**, not necessarily a K=2-only regression.
+
+To resume after a K=1 success and K=2 OOM, keep the same
+`TPR_CP1_LEAF_ROOT`, free the target NPU's occupied capacity, and set
+`TPR_CP1_LEAF_RESUME=1`. The runner verifies/reuses the saved K1 result and
+archives the incomplete K2 directory and log before rerunning only K2. It
+never kills other NPU processes.
+
 This loads Qwen3-4B twice (one NPU) and does not rerun the two unrelated
 Full/One-node or Split-no-share cases. It compares exact input/weights,
 number of actual grouped model calls, logprobs, loss, sampled/Norm gradients,
