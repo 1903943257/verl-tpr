@@ -332,6 +332,14 @@ class SegmentExecutor:
                     ) from exc
         validate_replay_plan(plan, prepared_model, cp_size=self.cp_size,
                              active_segment_ids=active_segment_ids)
+        # Opt-in experiment: group equal-length siblings only. CP Ring still
+        # requires batch=1, so never silently enable grouping on CP>1.
+        self.leaf_batch_size = int(os.getenv("TPR_LEAF_BATCH_SIZE", "1"))
+        self.leaf_batch_max_tokens = int(os.getenv("TPR_LEAF_BATCH_MAX_TOKENS", "8192"))
+        if self.leaf_batch_size < 1 or self.leaf_batch_max_tokens < 1:
+            raise ValueError("TPR leaf batch size and token budget must be positive")
+        if self.leaf_batch_size > 1 and self.cp_enabled:
+            raise NotImplementedError("TPR leaf batching MVP supports CP=1 only")
         self._failed = False
         self._ran = False
         self._operation_depth = 0
@@ -358,18 +366,24 @@ class SegmentExecutor:
             pending = [(self.plan.root_id, False, 0)]
             while pending:
                 segment_id, exiting, depth = pending.pop()
-                segment = self.plan.get(segment_id)
-                children = self._children_of(segment_id)
-                kind = "pop" if exiting else "push" if children else "visit_leaf"
+                grouped = isinstance(segment_id, tuple)
+                segment = self.plan.get(segment_id[0] if grouped else segment_id)
+                children = () if grouped else self._children_of(segment_id)
+                kind = "visit_leaf_group" if grouped else "pop" if exiting else "push" if children else "visit_leaf"
                 profile = None if event_profiler is None else event_profiler.begin(
                     segment, kind=kind, tree_index=tree_index, depth=depth,
                 )
                 if exiting:
                     losses.append(self.pop(segment_id))
+                elif grouped:
+                    losses.append(self.visit_leaf_group(segment_id))
                 elif children:
                     self.push(segment_id)
                     pending.append((segment_id, True, depth))
-                    pending.extend((child.segment_id, False, depth + 1) for child in reversed(children))
+                    pending.extend(
+                        (item, False, depth + 1)
+                        for item in reversed(self._group_ready_children(children))
+                    )
                 else:
                     losses.append(self.visit_leaf(segment_id))
                 if event_profiler is not None:
@@ -379,6 +393,36 @@ class SegmentExecutor:
             for loss in losses[1:]:
                 total = total + loss
             return total
+
+    def _group_ready_children(self, children: tuple[SegmentSpec, ...]) -> list[SegmentId | tuple[SegmentId, ...]]:
+        """Preserve DFS order; group only adjacent equal-length leaves with one Prefix."""
+        if self.leaf_batch_size == 1:
+            return [child.segment_id for child in children]
+        scheduled: list[SegmentId | tuple[SegmentId, ...]] = []
+        group: list[SegmentSpec] = []
+
+        def flush() -> None:
+            if group:
+                ids = tuple(item.segment_id for item in group)
+                scheduled.append(ids if len(ids) > 1 else ids[0])
+                group.clear()
+
+        for child in children:
+            is_leaf = not self._children_of(child.segment_id)
+            fits = child.length <= self.leaf_batch_max_tokens
+            if not is_leaf or not fits:
+                flush()
+                scheduled.append(child.segment_id)
+                continue
+            if group and (
+                child.length != group[0].length
+                or len(group) == self.leaf_batch_size
+                or (len(group) + 1) * child.length > self.leaf_batch_max_tokens
+            ):
+                flush()
+            group.append(child)
+        flush()
+        return scheduled
 
     def push(self, segment_id: SegmentId) -> None:
         """Save graph-free per-layer Prefix KV without owning loss."""
@@ -442,6 +486,43 @@ class SegmentExecutor:
 
             return self._backward_segment(segment, leaf=True)
 
+    def visit_leaf_group(self, segment_ids: tuple[SegmentId, ...]) -> Tensor:
+        """One CP1 model forward/backward for same-parent, equal-length leaves."""
+        with self._operation():
+            if self.cp_enabled or len(segment_ids) < 2:
+                raise ValueError("leaf group needs at least two CP1 leaves")
+            segments = tuple(self.plan.get(segment_id) for segment_id in segment_ids)
+            parent_id = self.kv_stack.top().segment.segment_id if len(self.kv_stack) else None
+            if any(
+                segment.parent_id != parent_id
+                or segment.prefix_length != self.kv_stack.prefix_length
+                or segment.length != segments[0].length
+                or self._children_of(segment.segment_id)
+                for segment in segments
+            ):
+                raise ValueError("leaf group must contain equal-length siblings on the current KV path")
+            if len(segments) > self.leaf_batch_size or len(segments) * segments[0].length > self.leaf_batch_max_tokens:
+                raise ValueError("leaf group exceeds configured size/token budget")
+
+            anchors = self.kv_stack.build_past_anchors()
+            context, logits = self._forward(
+                segments[0], past_key_values=anchors.key_values,
+                no_grad=False, leaf_group=segments,
+            )
+            self._assert_collected_layers(context)
+            owned_losses: list[Tensor] = []
+            for index, segment in enumerate(segments):
+                row_logits = logits[index : index + 1]
+                loss = self._compute_loss(segment, row_logits)
+                owned_losses.append(self._prepare_backward_loss(
+                    loss, logits=row_logits,
+                    has_owned_loss=self._owned_loss_count(segment) > 0,
+                ))
+            # Keep one backward root and one Prefix-anchor accumulation.
+            torch.autograd.backward(torch.stack(owned_losses).sum())
+            self.kv_stack.accumulate_anchor_gradients(anchors, consume=True)
+            return torch.stack([value.detach() for value in owned_losses]).sum()
+
     def _backward_segment(
         self, segment: SegmentSpec, relayed_gradients: Mapping[int, KVPair] | None = None,
         *, leaf: bool = False,
@@ -484,14 +565,22 @@ class SegmentExecutor:
         past_key_values,
         no_grad: bool,
         sharded_past_anchors: PastKVAnchors | None = None,
+        leaf_group: tuple[SegmentSpec, ...] | None = None,
     ) -> tuple[TPRAttentionContext, Tensor]:
         device = self.prepared_model.device
         shard = self._segment_shard(segment)
+        if leaf_group is not None and self.cp_enabled:
+            raise NotImplementedError("grouped TPR model forward supports CP1 only")
         local_token_ids = shard.select(segment.token_ids)
         if os.getenv("TPR_MEM_TRACE", "0") == "1":
             print(f"TPR_MEM FORWARD_BEGIN segment={segment.segment_id} parent={segment.parent_id} prefix={segment.prefix_length} length={segment.length} local_length={shard.local_length} no_grad={no_grad} cp={self.cp_size} alloc_gib={torch.npu.memory_allocated() / (1024 ** 3):.3f} reserved_gib={torch.npu.memory_reserved() / (1024 ** 3):.3f}", flush=True)
-        input_ids = local_token_ids.to(device=device).unsqueeze(0)
+        if leaf_group is None:
+            input_ids = local_token_ids.to(device=device).unsqueeze(0)
+        else:
+            input_ids = torch.stack([shard.select(item.token_ids) for item in leaf_group]).to(device=device)
         position_ids = shard.global_indices(device=device).add(segment.position_start).unsqueeze(0)
+        if leaf_group is not None:
+            position_ids = position_ids.expand(len(leaf_group), -1)
         attention_backend = None
         if self.cp_enabled:
             if self.cp_backend is None:
@@ -514,6 +603,7 @@ class SegmentExecutor:
         context = TPRAttentionContext(
             prefix_length=segment.prefix_length,
             suffix_length=segment.length,
+            batch_size=len(leaf_group) if leaf_group is not None else 1,
             past_key_values=past_key_values,
             suffix_rotary_pos_emb=build_sharded_rotary_pos_emb(
                 self.model.rotary_pos_emb,
@@ -534,7 +624,7 @@ class SegmentExecutor:
             print(f"TPR_MEM FORWARD_END segment={segment.segment_id} no_grad={no_grad} alloc_gib={torch.npu.memory_allocated() / (1024 ** 3):.3f} reserved_gib={torch.npu.memory_reserved() / (1024 ** 3):.3f}", flush=True)
         if not isinstance(logits, Tensor) or logits.ndim != 3:
             raise ValueError(f"model must return logits [batch, sequence, vocab], got {type(logits).__name__}")
-        expected_shape = (1, shard.local_length)
+        expected_shape = (len(leaf_group) if leaf_group is not None else 1, shard.local_length)
         if tuple(logits.shape[:2]) != expected_shape:
             raise ValueError(f"model logits must start with shape {expected_shape}, got {tuple(logits.shape)}")
         return context, logits
