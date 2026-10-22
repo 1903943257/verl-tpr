@@ -37,6 +37,10 @@ report_on_exit() {
     fi
   fi
   echo "========== TPR LEAF K1/K2 END rc=$rc =========="
+  # Keep the experiment's *actual numbers* as the LAST user-visible output.
+  # This module handles partial runs (including OOM) and persists SUMMARY.txt.
+  python -m tests.models.mcore.tpr.parallel.summarize_cp1_leaf_batch \
+    "$ROOT" --exit-code "$rc" || echo "WARNING: Could not write $ROOT/SUMMARY.txt"
   exit "$rc"
 }
 trap report_on_exit EXIT
