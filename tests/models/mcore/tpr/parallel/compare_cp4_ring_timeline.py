@@ -224,7 +224,26 @@ def summarize(root, csv_unit, w_start_ms, w_end_ms, min_gap_ms, no_trace=False):
     if not device:
         device = trace_device
         if not device:
-            raise ValueError(f"No device time axis found under {root}. Need kernel_details.csv or trace_view.json")
+            if not root.exists():
+                raise FileNotFoundError(
+                    f"TPR/Full profile directory does not exist: {root}. "
+                    "Use the exact directory for the same measured iteration and rank."
+                )
+            available = sorted(
+                str(p.relative_to(root)) for p in root.rglob("*")
+                if p.is_file() and p.name in (
+                    "kernel_details.csv", "trace_view.json", "trace_view.json.gz",
+                    "communication.json", "op_summary.csv", "step_trace_time.csv",
+                )
+            )
+            raise ValueError(
+                f"No usable device time axis under {root}; --no-trace="
+                f"{no_trace}. Discovered profile reports: {available[:20]!r}. "
+                "A communication.json alone cannot provide GEMM/Attention/idle "
+                "time attribution. Locate the SAME-RANK kernel_details.csv "
+                "elsewhere or collect one TPR Level1 profile with a fresh output "
+                "directory; never silently substitute a different rank or capture."
+            )
         source = trace_path
     else:
         source = kernel_path
