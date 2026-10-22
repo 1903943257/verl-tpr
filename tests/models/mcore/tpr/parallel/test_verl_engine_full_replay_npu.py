@@ -104,21 +104,43 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
             "overlap_cpu_optimizer_d2h_h2d": True,
         },
     )
-    # MindSpeed may inspect sys.argv through repatch/get_full_args.  Do not
-    # parse the torchrun/pytest flags as Megatron launcher options.
+    # MindSpeed repatch is triggered by the real Engine constructor and
+    # keeps its parsed args globally. Under `torchrun -m pytest` that object
+    # can contain the empty-string key ("") from pytest's launcher flags.
+    # Later TransformerConfig dataclass generation rejects it as a field
+    # name. The existing offline TP2CP4 runner already handles this artifact;
+    # apply precisely that same fix to the GENUINE Engine path, before
+    # initialize() builds TransformerConfig. Keep argv scrubbed during both
+    # constructor and initialize to avoid repatch observing pytest options.
+    from mindspeed.args_utils import get_full_args
+    from .test_real_actor_tp2cp4_offline_ppo_npu import (
+        _sanitize_mindspeed_repatch_args,
+    )
+
     old_argv = sys.argv[:]
     try:
         sys.argv[:] = [sys.argv[0]]
         engine = MindspeedEngineWithLMHead(
             model_cfg, engine_cfg, opt_cfg, CheckpointConfig(strict=False)
         )
+        if not engine.engine_config.vanilla_mbridge:
+            raise AssertionError("Offline Engine must follow online E2E vanilla_mbridge=True")
+        label = "TPR" if tpr_enabled else "FULL"
+        print(
+            f"VERL_{label}_BRIDGE_SELECTED backend=legacy_mbridge vanilla_mbridge=True",
+            flush=True,
+        )
+        full_args = get_full_args()
+        had_empty_key = "" in vars(full_args)
+        _sanitize_mindspeed_repatch_args(full_args)
+        print(
+            f"VERL_{label}_MINDSPEED_ARGS_SANITIZED "
+            f"empty_key_removed={had_empty_key}",
+            flush=True,
+        )
+        engine.initialize()
     finally:
         sys.argv[:] = old_argv
-    if not engine.engine_config.vanilla_mbridge:
-        raise AssertionError("Offline Engine must follow online E2E vanilla_mbridge=True")
-    label = "TPR" if tpr_enabled else "FULL"
-    print(f"VERL_{label}_BRIDGE_SELECTED backend=legacy_mbridge vanilla_mbridge=True", flush=True)
-    engine.initialize()
 
     from megatron.core import parallel_state as mpu
     sizes = {
