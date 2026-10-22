@@ -166,6 +166,15 @@ grep -E 'TPR_CP1_LEAF_K1_K2_COMPARISON|TPR_CP1_LEAF_K1_K2_REPORT|Traceback|ERROR
 exit "$rc"
 ```
 
+**Interpretation correction:** the historical `same_qkv_attention`
+probe compares rectangular causal Attention with a square-causal replay
+using the same K/V and reconstructed Prefix Q. It is *not* the isolated
+B=2 vs B=1 rectangular Attention test. New trace runs additionally save
+`group_vs_single_rectangular`, and print
+`largest_group_vs_single_rectangle_rel_l2`: identical Q/K/V, grouped
+TND against independent per-leaf TND. Old trace.pt files lack this new
+measurement, so reanalysis can only summarize existing data.
+
 The new summary includes `layer_progression`, with the largest relative L2
 among sampled stages in each checked layer. The complete layer-1 sampled
 stage ordering is in `layer_trace.layer1_forward_stages` in the output JSON.
