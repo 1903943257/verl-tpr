@@ -16,17 +16,18 @@ case "$MODE" in both|full|tpr|compare) ;; *) echo "MODE must be both|full|tpr|co
 if ! [[ "$STEPS" =~ ^([1-9]|1[0-9]|20)$ ]]; then
   echo "STEPS must be 1..20" >&2; exit 2
 fi
-# The original online prompt+response 49152 setting is NOT a verified hard
-# cap on the captured full agent session. Run2 contains a genuine 50435-token
-# trajectory. Do not crop PPO inputs/targets or silently replace a session.
-# Limit is a data-validity guard, NOT a guarantee Full fits NPU HBM.
+# The old online prompt+response 49152 setting is NOT a verified hard
+# limit on captured full sessions (Run2 includes >70K tokens). This bound
+# validates the SELECTED replay input, after optional controlled 10K/30K
+# derivation. Never mutate original captures or silently replace sessions.
+# A bound does NOT guarantee Native Full will fit NPU HBM.
 TPR_REPLAY_MAX_SEQ_LEN="${TPR_REPLAY_MAX_SEQ_LEN:-65536}"
 if ! [[ "$TPR_REPLAY_MAX_SEQ_LEN" =~ ^[1-9][0-9]*$ ]] ||
   (( 10#$TPR_REPLAY_MAX_SEQ_LEN > 131072 )); then
   echo "TPR_REPLAY_MAX_SEQ_LEN must be an integer between 1 and 131072" >&2
   exit 2
 fi
-echo "REAL_ENGINE_CAPTURE_LENGTH_GUARD max_seq_len=$TPR_REPLAY_MAX_SEQ_LEN no_truncation=1"
+echo "REAL_ENGINE_CAPTURE_LENGTH_GUARD max_selected_seq_len=$TPR_REPLAY_MAX_SEQ_LEN"
 # Prefer existing merged manifests. For a historical raw rank0 directory
 # or already-derived eight-row capture .pt, use the validated controlled
 # 10K / 30K source-data transforms, NOT an OOM-prone 71K full session.
