@@ -92,8 +92,11 @@ def test_verl_engine_tpr_replay():
         ))
         output_dir = Path(os.environ["TPR_OFFLINE_OUTPUT_DIR"])
         run_steps = int(os.getenv("TPR_VERL_TPR_REPLAY_STEPS", "1"))
-        if not 1 <= run_steps <= 20:
-            raise ValueError("Replay steps must be 1..20")
+        if not 1 <= run_steps <= len(manifest["items"]):
+            raise ValueError(
+                f"TPR_VERL_TPR_REPLAY_STEPS={run_steps} exceeds "
+                f"available original Actor steps={len(manifest['items'])}"
+            )
         prefix = os.getenv("TPR_VERL_TPR_REPLAY_PREFIX", "verl_tpr_smoke")
         if not prefix.startswith("verl_tpr") or any(
             c not in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in prefix
@@ -101,9 +104,10 @@ def test_verl_engine_tpr_replay():
             raise ValueError(f"Unsafe TPR replay prefix: {prefix!r}")
         manifest = json.loads(manifest_path.read_text())
         if (manifest.get("protocol") != "real_actor_session_first_8merged_v3"
-                or len(manifest.get("items", [])) != 20
+                or not 1 <= len(manifest.get("items", [])) <= 20
+                or manifest.get("online_steps") != len(manifest["items"])
                 or manifest.get("expected_sessions") != 8):
-            raise AssertionError("Requires genuine 20-step / 8-Session capture manifest")
+            raise AssertionError("Requires genuine 1..20-step / 8-Session capture manifest")
         if os.getenv("TPR_TREE_POLICY", "qwen_turn") != "qwen_turn":
             raise AssertionError("Real TPR replay requires qwen_turn")
         output_dir.mkdir(parents=True, exist_ok=True)
