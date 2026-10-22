@@ -111,12 +111,12 @@ class TPRAttentionContext:
 
     prefix_length: int
     suffix_length: int
-    batch_size: int = 1
     past_key_values: Mapping[int, KVPair] = field(default_factory=dict)
     suffix_rotary_pos_emb: RotaryPosEmb | None = None
     attention_backend: TPRAttentionBackend | None = None
 
     compact_new_kv: bool = False
+    batch_size: int = 1
     _new_key_values: dict[int, KVPair] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
