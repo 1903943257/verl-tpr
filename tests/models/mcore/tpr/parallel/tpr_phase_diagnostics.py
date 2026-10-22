@@ -134,31 +134,83 @@ class PhaseSampler:
 
 
 class OperatorTrace:
-    """Optional per-rank CANN kernel trace for one measured iteration only."""
+    """Opt-in per-rank profiler for one measured iteration; no production changes.
+
+    Default: legacy Kineto Chrome trace (preserved for existing tests).
+    TPR_OPERATOR_TRACE_FORMAT=ascend_level1: native Ascend Level1 profiler,
+    with device kernels and per-rank communication reports. This deliberately
+    avoids interpreting CPU HCCL launch events as device communication time.
+    """
 
     def __init__(self, path: Path | None):
         self.path = path
         self.profiler = None
+        self.format = os.getenv("TPR_OPERATOR_TRACE_FORMAT", "kineto")
 
     def __enter__(self):
         if self.path is None:
             return self
         import torch_npu
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.profiler = torch_npu.profiler._KinetoProfile(
-            activities=[
-                torch_npu.profiler.ProfilerActivity.CPU,
-                torch_npu.profiler.ProfilerActivity.NPU,
-            ],
-            record_shapes=False,
-            profile_memory=False,
-            with_stack=False,
-        )
-        self.profiler.start()
+        activities = [
+            torch_npu.profiler.ProfilerActivity.CPU,
+            torch_npu.profiler.ProfilerActivity.NPU,
+        ]
+        if self.format == "ascend_level1":
+            self.path.mkdir(parents=True, exist_ok=True)
+            self.profiler = torch_npu.profiler.profile(
+                activities=activities,
+                schedule=torch_npu.profiler.schedule(
+                    wait=0, warmup=0, active=1, repeat=1,
+                ),
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
+                    str(self.path),
+                ),
+                experimental_config=torch_npu.profiler._ExperimentalConfig(
+                    profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                ),
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            self.profiler.__enter__()
+        elif self.format == "kineto":
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.profiler = torch_npu.profiler._KinetoProfile(
+                activities=activities,
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+            )
+            self.profiler.start()
+        else:
+            raise ValueError(
+                f"TPR_OPERATOR_TRACE_FORMAT must be kineto or ascend_level1, "
+                f"got {self.format!r}"
+            )
         return self
 
     def __exit__(self, *exc):
         if self.profiler is None:
+            return False
+        if self.format == "ascend_level1":
+            try:
+                if exc[0] is None:
+                    # A single active step mirrors the previously validated
+                    # two-rank Ascend Level1 smoke test.
+                    self.profiler.step()
+            finally:
+                self.profiler.__exit__(*exc)
+            if exc[0] is None:
+                reports = list(self.path.rglob("ASCEND_PROFILER_OUTPUT/communication.json"))
+                if not reports:
+                    raise RuntimeError(
+                        f"Ascend Level1 exported no communication.json under {self.path}"
+                    )
+                print(
+                    f"TPR_ASCEND_LEVEL1_OUTPUT path={self.path} "
+                    f"communication_reports={len(reports)}",
+                    flush=True,
+                )
             return False
         self.profiler.stop()
         if exc[0] is None:
@@ -174,6 +226,8 @@ def trace_path(output_dir: Path, mode: str, iteration: int, rank: int) -> Path |
     ranks = tuple(int(x) for x in os.getenv("TPR_TRACE_RANKS", "0").split(","))
     if rank not in ranks:
         return None
+    if os.getenv("TPR_OPERATOR_TRACE_FORMAT", "kineto") == "ascend_level1":
+        return output_dir / "ascend_profiler" / f"{mode}_iter{iteration}_rank{rank}"
     return output_dir / "trace" / f"{mode}_iter{iteration}_rank{rank}.json"
 
 
@@ -187,6 +241,16 @@ def trace_kernel_summary(path: Path | None):
     if path is None or not path.exists():
         return {"attention_kernel_sum_ms": None, "hccl_kernel_sum_ms": None,
                 "reason": "trace_missing"}
+    if path.is_dir():
+        # Level1 materializes its own reports. A kernel-sum inventory of a
+        # Python/CPU trace is not a substitute for the device communication CSV.
+        files = list(path.rglob("ASCEND_PROFILER_OUTPUT/communication.json"))
+        return {
+            "attention_kernel_sum_ms": None,
+            "hccl_kernel_sum_ms": None,
+            "reason": "ascend_level1_raw_reports",
+            "communication_reports": [str(file) for file in files],
+        }
     import re
     try:
         raw = json.loads(path.read_text())
