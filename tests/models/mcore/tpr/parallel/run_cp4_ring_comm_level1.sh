@@ -10,13 +10,15 @@ BASE="${TPR_VALIDATE_BASE:-/workspace/tpr_experiments/performance}"
 CAP="${TPR_VALIDATE_CAPTURE:-$BASE/cp4_n8_merge_perf_none_v1/data/cp4_n8_p17440_s17440.pt}"
 ROOT="${TPR_COMM_LEVEL1_ROOT:-$BASE/cp4_ring_comm_level1_v1}"
 OUT="$ROOT/kv_query"
+MODE="${TPR_COMM_MODE:-tpr}"
+case "$MODE" in full|tpr) ;; *) echo "TPR_COMM_MODE must be full or tpr" >&2; exit 2;; esac
 TEST=tests/models/mcore/tpr/parallel/test_tpr_fixed_shape_40k_benchmark_npu.py
 
 [[ -f "$CAP" && -f "${CAP%.pt}.audit.json" ]] || {
   echo "Missing controlled 17K:17K Capture/audit: $CAP" >&2; exit 2;
 }
-[[ ! -e "$OUT/step0_${TPR_OFFLINE_MODE}_fixed_shape.json" ]] || {
-  echo "Refusing to overwrite existing output: $OUT/step0_${TPR_OFFLINE_MODE}_fixed_shape.json" >&2; exit 2;
+[[ ! -e "$OUT/step0_${MODE}_fixed_shape.json" ]] || {
+  echo "Refusing to overwrite existing output: $OUT/step0_${MODE}_fixed_shape.json" >&2; exit 2;
 }
 mkdir -p "$OUT"
 
@@ -32,8 +34,7 @@ export TPR_OFFLINE_GRAD_SYNC_DTYPE=bf16
 export TPR_TREE_POLICY=qwen_turn
 export TPR_TURN_MIN_SEGMENT_TOKENS=128
 export TPR_RUN_FIXED_SHAPE_40K_BENCH=1
-export TPR_OFFLINE_MODE="${TPR_COMM_MODE:-tpr}"
-case "$TPR_OFFLINE_MODE" in full|tpr) ;; *) echo "TPR_COMM_MODE must be full or tpr" >&2; exit 2;; esac
+export TPR_OFFLINE_MODE="$MODE"
 export TPR_BENCH_CP_SIZE=4
 export TPR_BENCH_SOURCE_STEP=0
 export TPR_BENCH_CONTROLLED_N8_AUDIT="${CAP%.pt}.audit.json"
