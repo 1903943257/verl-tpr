@@ -104,14 +104,20 @@ def _compare_leaf_traces(k1_result: Path, k2_result: Path, *, required: bool) ->
             raise AssertionError(f"Gradient trace tensor shape mismatch for {key}: {a.shape} vs {b.shape}")
         diff = b - a
         norm_a = float(a.norm().item())
+        fields = key.split("|")
+        row = int(fields[0][1:])
+        layer = int(fields[2][1:])
+        stage = fields[3].removesuffix("_grad_out")
         grad_metrics.append({
-            "key": key, "relative_l2": float(diff.norm().item() / max(norm_a, 1e-30)),
+            "key": key, "row": row, "layer": layer, "stage": stage,
+            "stage_order": stage_order.get(stage, 99),
+            "relative_l2": float(diff.norm().item() / max(norm_a, 1e-30)),
             "mean_abs": float(diff.abs().mean().item()),
             "max_abs": float(diff.abs().max().item()),
             "exact": bool(torch.equal(left_records[key]["values"], right_records[key]["values"])),
             "count": diff.numel(),
         })
-    grad_metrics.sort(key=lambda item: item["key"])
+    grad_metrics.sort(key=lambda item: (item["layer"], item["stage_order"], item["row"]))
     first_grad_change = next((item for item in grad_metrics if not item["exact"]), None)
     first_grad_material = next((item for item in grad_metrics if item["relative_l2"] > 1e-6), None)
 
