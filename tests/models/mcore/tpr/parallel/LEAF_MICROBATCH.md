@@ -148,6 +148,46 @@ grep -hE 'TPR_CP1_LEAF_K1_K2_COMPARISON|TPR_CP1_LEAF_K1_K2_REPORT|TPR_LEAF_BATCH
 exit "$rc"
 ```
 
+If the two traced `trace.pt` files already exist, inspect amplification
+across sampled layers **without another NPU run**. This never changes a
+saved PPO result or calls the model:
+
+```bash
+ROOT=/workspace/tpr_experiments/leaf_k1k2_trace_v1
+set -o pipefail
+python -m tests.models.mcore.tpr.parallel.compare_real_actor_cp1_leaf_batch \
+  "$ROOT/k1/result.json" "$ROOT/k2/result.json" \
+  --output "$ROOT/k1_vs_k2_stage_reanalysis.json" --require-trace \
+  2>&1 | tee "$ROOT/stage_reanalysis.log"
+rc=${PIPESTATUS[0]}
+echo "===== FINAL RESULTS / ERRORS exit=$rc ====="
+grep -E 'TPR_CP1_LEAF_K1_K2_COMPARISON|TPR_CP1_LEAF_K1_K2_REPORT|Traceback|ERROR' \
+  "$ROOT/stage_reanalysis.log" | tail -n 30 || true
+exit "$rc"
+```
+
+The new summary includes `layer_progression`, with the largest relative L2
+among sampled stages in each checked layer. The complete layer-1 sampled
+stage ordering is in `layer_trace.layer1_forward_stages` in the output JSON.
+A recorded early 1e-5 BF16 QKV difference can propagate through later
+layers, but this must be demonstrated by the progression rather than assumed.
+
+To isolate **physical GEMM-M shape**, run K1/K2 again in a fresh trace
+root after updating this branch. New K2 trace captures first-layer
+`linear_qkv` full inputs/outputs, then after training replays the *same*
+K2 inputs with the original QKV module at B=1. The summary includes
+`same_input_l1_qkv_replay` per leaf:
+
+- `k2_grouped_vs_same_input_single`: native grouped GEMM vs native
+  independent GEMM, with exactly the same input/weights.
+- `k1_vs_k2_same_input_single`: K1 original output vs native B1
+  replay on K2's input. Near-zero here and nonzero in the first
+  comparison would implicate GEMM-M shape directly.
+
+Diagnostic replays happen after the measured model update (no optimizer
+step) and are excluded from the timed F/B metrics, but the trace hooks
+themselves have overhead. Do not interpret trace timings as benchmarks.
+
 The comparator prints `first_forward_mismatch` and
 `largest_same_qkv_attention_rel_l2`; the full ordered stage report is saved
 in `k1_vs_k2.json`. Interpret the first differing stage as follows:
