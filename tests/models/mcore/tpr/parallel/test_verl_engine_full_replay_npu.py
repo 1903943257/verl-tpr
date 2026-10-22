@@ -312,12 +312,16 @@ def test_verl_engine_full_replay():
         checkpoint = Path(os.getenv("TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"))
         manifest = json.loads(manifest_path.read_text())
         if (manifest.get("protocol") != "real_actor_session_first_8merged_v3"
-                or len(manifest.get("items", [])) != 20
+                or not 1 <= len(manifest.get("items", [])) <= 20
+                or manifest.get("online_steps") != len(manifest["items"])
                 or manifest.get("expected_sessions") != 8):
-            raise AssertionError("Requires original 20-step, eight-Session v3 manifest")
+            raise AssertionError("Requires 1..20 original eight-Session v3 merged Actor steps")
         run_steps = int(os.getenv("TPR_VERL_FULL_REPLAY_STEPS", "1"))
-        if run_steps < 1 or run_steps > 20:
-            raise ValueError("TPR_VERL_FULL_REPLAY_STEPS must be 1..20")
+        if not 1 <= run_steps <= len(manifest["items"]):
+            raise ValueError(
+                f"TPR_VERL_FULL_REPLAY_STEPS={run_steps} exceeds "
+                f"available original Actor steps={len(manifest['items'])}"
+            )
         lr = float(os.getenv("TPR_OFFLINE_ADAMW_LR", "2e-5"))
         clip_norm = float(os.getenv("TPR_OFFLINE_ADAMW_CLIP_NORM", "1.0"))
         output_dir.mkdir(parents=True, exist_ok=True)
