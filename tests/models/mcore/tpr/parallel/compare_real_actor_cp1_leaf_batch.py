@@ -16,7 +16,106 @@ from .compare_real_actor_cp1_short_full_tpr import (
 )
 
 
-def compare(k1_result: Path, k2_result: Path) -> dict:
+def _compare_leaf_traces(k1_result: Path, k2_result: Path, *, required: bool) -> dict | None:
+    import torch
+
+    trace_paths = [
+        result.parent / "trace" / "shared" / "trace.pt"
+        for result in (k1_result, k2_result)
+    ]
+    present = [path.is_file() for path in trace_paths]
+    if not all(present):
+        if required:
+            raise FileNotFoundError(f"Required K1/K2 layer traces missing: {trace_paths}")
+        return None
+
+    left, right = [
+        torch.load(path, map_location="cpu", weights_only=False)
+        for path in trace_paths
+    ]
+    if left.get("mode") != "shared" or right.get("mode") != "shared":
+        raise AssertionError("K1/K2 trace modes must both be shared")
+
+    def normalize(key: str) -> str:
+        return key.replace("|leaf_group|", "|leaf|")
+
+    left_records = {normalize(key): value for key, value in left["records"].items()}
+    right_records = {normalize(key): value for key, value in right["records"].items()}
+    left_keys = {
+        key for key in left_records
+        if "|leaf|" in key and not key.endswith("_grad_out")
+    }
+    right_keys = {
+        key for key in right_records
+        if "|leaf|" in key and not key.endswith("_grad_out")
+    }
+    if left_keys != right_keys:
+        raise AssertionError(
+            "K1/K2 layer trace coordinate mismatch: "
+            f"missing_k1={sorted(right_keys-left_keys)[:8]}, "
+            f"missing_k2={sorted(left_keys-right_keys)[:8]}"
+        )
+
+    stage_order = {
+        "attn_in": 0, "qkv_in": 1, "qkv_out": 2, "post_rope_k": 3,
+        "raw_v": 4, "attn_out": 5, "proj_in": 6, "proj_out": 7,
+        "fc1_in": 8, "fc1_out": 9, "fc2_in": 10, "fc2_out": 11,
+    }
+    metrics = []
+    for key in left_keys:
+        a = left_records[key]["values"].float()
+        b = right_records[key]["values"].float()
+        if a.shape != b.shape:
+            raise AssertionError(f"Trace tensor shape mismatch for {key}: {a.shape} vs {b.shape}")
+        diff = b - a
+        norm_a = float(a.norm().item())
+        norm_b = float(b.norm().item())
+        max_abs = float(diff.abs().max().item())
+        mean_abs = float(diff.abs().mean().item())
+        rel_l2 = float(diff.norm().item() / max(norm_a, 1e-30))
+        exact = bool(torch.equal(left_records[key]["values"], right_records[key]["values"]))
+        fields = key.split("|")
+        row = int(fields[0][1:])
+        layer = int(fields[2][1:])
+        stage = fields[3]
+        metrics.append({
+            "key": key, "row": row, "layer": layer, "stage": stage,
+            "stage_order": stage_order.get(stage, 99),
+            "relative_l2": rel_l2, "mean_abs": mean_abs, "max_abs": max_abs,
+            "exact": exact, "count": diff.numel(),
+        })
+    metrics.sort(key=lambda item: (item["layer"], item["stage_order"], item["row"]))
+    first_changed = next((item for item in metrics if not item["exact"]), None)
+    first_material = next((item for item in metrics if item["relative_l2"] > 1e-6), None)
+
+    attention = right.get("same_qkv_attention", {})
+    attention_summary = sorted(
+        (
+            {
+                "key": key,
+                "relative_l2": value["rel_l2"],
+                "mean_abs": value["mean_abs"],
+                "max_abs": value["max_abs"],
+                "exact": value["exact"],
+            }
+            for key, value in attention.items()
+        ),
+        key=lambda item: item["relative_l2"],
+        reverse=True,
+    )
+    return {
+        "trace_paths": [str(path) for path in trace_paths],
+        "leaf_forward_tensor_count": len(metrics),
+        "first_forward_value_change": first_changed,
+        "first_forward_rel_l2_gt_1e-6": first_material,
+        "largest_forward_differences": sorted(
+            metrics, key=lambda item: item["relative_l2"], reverse=True,
+        )[:12],
+        "k2_same_qkv_rectangular_attention": attention_summary,
+    }
+
+
+def compare(k1_result: Path, k2_result: Path, *, require_trace: bool = False) -> dict:
     a = json.loads(k1_result.read_text())
     b = json.loads(k2_result.read_text())
     required_same = (
@@ -74,7 +173,9 @@ def compare(k1_result: Path, k2_result: Path) -> dict:
         bool(a.get("full_grad_dir")) != bool(b.get("full_grad_dir"))
     ):
         raise AssertionError("Only one run saved full parameter gradients")
+    layer_trace = _compare_leaf_traces(k1_result, k2_result, required=require_trace)
     result = {
+        "layer_trace": layer_trace,
         "comparison": "identical_shared_tree_K1_vs_K2",
         "input_sha256": a["input_sha256"],
         "initial_weights_witness_sha256": a["initial_weights_witness_sha256"],
@@ -115,8 +216,9 @@ def main():
     parser.add_argument("k1_result", type=Path)
     parser.add_argument("k2_result", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--require-trace", action="store_true")
     args = parser.parse_args()
-    report = compare(args.k1_result, args.k2_result)
+    report = compare(args.k1_result, args.k2_result, require_trace=args.require_trace)
     if args.output.exists():
         raise FileExistsError(args.output)
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -139,6 +241,15 @@ def main():
         "peak_alloc_gib": [
             report["k1_peak_allocated_gib"], report["k2_peak_allocated_gib"],
         ],
+        "first_forward_mismatch": (
+            None if report["layer_trace"] is None
+            else report["layer_trace"]["first_forward_rel_l2_gt_1e-6"]
+        ),
+        "largest_same_qkv_attention_rel_l2": (
+            None if not report["layer_trace"]
+            or not report["layer_trace"]["k2_same_qkv_rectangular_attention"]
+            else report["layer_trace"]["k2_same_qkv_rectangular_attention"][0]["relative_l2"]
+        ),
     }, sort_keys=True), flush=True)
     print(f"TPR_CP1_LEAF_K1_K2_REPORT saved={args.output}", flush=True)
 
