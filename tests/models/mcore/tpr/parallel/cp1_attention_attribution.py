@@ -88,6 +88,7 @@ class CP1AttentionTrace:
         # a controlled M=2S vs two M=S GEMM replay on identical inputs.
         self.grouped_qkv_operands = {}
         self.grouped_qkv_replay = {}
+        self.grouped_leaf_seen = False
         self.original_rectangular = None
         self.replay = {}
         self.relay_accumulation = {}
@@ -135,6 +136,8 @@ class CP1AttentionTrace:
             else:
                 start = context.prefix_length
                 phase = "leaf_group" if len(token_rows) > 1 else "leaf"
+                if phase == "leaf_group":
+                    self.grouped_leaf_seen = True
                 for batch_index, tokens in enumerate(token_rows):
                     matches = [
                         i for i, row_tokens in enumerate(self.tokens)
@@ -184,7 +187,7 @@ class CP1AttentionTrace:
                 selected = selected[:, batch_index:batch_index + 1]
             with torch.no_grad():
                 subset = selected.contiguous().cpu()
-                if layer == 1 and phase == "leaf_group" and stage in ("qkv_in", "qkv_out") and not backward:
+                if layer == 1 and phase in ("leaf", "leaf_group") and stage in ("qkv_in", "qkv_out") and not backward:
                     self.grouped_qkv_operands[(row, stage)] = (
                         t.detach()[:, batch_index:batch_index + 1].contiguous().cpu()
                     )
@@ -444,7 +447,7 @@ class CP1AttentionTrace:
         Run after close() so instrumentation hooks cannot recursively intercept
         these diagnostic GEMMs. The model has not performed any optimizer step.
         """
-        if self.mode != "shared" or not self.grouped_qkv_operands:
+        if self.mode != "shared" or not self.grouped_leaf_seen:
             return
         expected = {(row, stage) for row in (0, 1) for stage in ("qkv_in", "qkv_out")}
         if set(self.grouped_qkv_operands) != expected:
@@ -478,9 +481,8 @@ class CP1AttentionTrace:
                 },
                 "grouped_input_shape": tuple(operand.shape),
                 "single_output_shape": tuple(replay_output.shape),
+                "single_output": replay_output.contiguous(),
             }
-        self.grouped_qkv_operands.clear()
-
     def save(self, destination: Path):
         if destination.exists():
             raise FileExistsError(destination)
@@ -498,6 +500,7 @@ class CP1AttentionTrace:
         destination.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             "grouped_qkv_replay": self.grouped_qkv_replay,
+            "first_layer_leaf_qkv_operands": self.grouped_qkv_operands,
             "mode": self.mode,
             "root_length": self.root_len,
             "row_lengths": [len(t) for t in self.tokens],
