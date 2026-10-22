@@ -446,6 +446,20 @@ def run_tpr_forward_backward_batch(
         no_sync_func,
     )
     record_stage("tree_run_and_finalize_host_ms", run_start)
+    if os.getenv("TPR_LEAF_BATCH_TRACE", "0") == "1":
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        print(
+            f"TPR_LEAF_BATCH_RUN rank={rank} "
+            f"configured_k={os.getenv('TPR_LEAF_BATCH_SIZE', '1')} "
+            f"max_leaf_tokens={os.getenv('TPR_LEAF_BATCH_MAX_TOKENS', '8192')} "
+            f"cp={cp_runtime.size} "
+            f"trees={tree_number} "
+            f"model_forward_calls={leaf_batch_stats['model_forward_calls']} "
+            f"grouped_leaf_calls={leaf_batch_stats['grouped_leaf_calls']} "
+            f"grouped_leaf_segments={leaf_batch_stats['grouped_leaf_segments']} "
+            f"activated={int(leaf_batch_stats['grouped_leaf_calls'] > 0)}",
+            flush=True,
+        )
     if not bool(torch.isfinite(loss).item()):
         raise FloatingPointError("non-finite TPR PPO mini-batch loss")
     if objective.capture_log_probs:
