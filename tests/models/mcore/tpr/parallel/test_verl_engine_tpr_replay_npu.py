@@ -92,11 +92,6 @@ def test_verl_engine_tpr_replay():
         ))
         output_dir = Path(os.environ["TPR_OFFLINE_OUTPUT_DIR"])
         run_steps = int(os.getenv("TPR_VERL_TPR_REPLAY_STEPS", "1"))
-        if not 1 <= run_steps <= len(manifest["items"]):
-            raise ValueError(
-                f"TPR_VERL_TPR_REPLAY_STEPS={run_steps} exceeds "
-                f"available original Actor steps={len(manifest['items'])}"
-            )
         prefix = os.getenv("TPR_VERL_TPR_REPLAY_PREFIX", "verl_tpr_smoke")
         if not prefix.startswith("verl_tpr") or any(
             c not in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in prefix
@@ -108,6 +103,11 @@ def test_verl_engine_tpr_replay():
                 or manifest.get("online_steps") != len(manifest["items"])
                 or manifest.get("expected_sessions") != 8):
             raise AssertionError("Requires genuine 1..20-step / 8-Session capture manifest")
+        if not 1 <= run_steps <= len(manifest["items"]):
+            raise ValueError(
+                f"TPR_VERL_TPR_REPLAY_STEPS={run_steps} exceeds "
+                f"available original Actor steps={len(manifest['items'])}"
+            )
         if os.getenv("TPR_TREE_POLICY", "qwen_turn") != "qwen_turn":
             raise AssertionError("Real TPR replay requires qwen_turn")
         output_dir.mkdir(parents=True, exist_ok=True)
