@@ -186,7 +186,21 @@ def _compare_leaf_traces(k1_result: Path, k2_result: Path, *, required: bool) ->
         key=lambda item: item["relative_l2"],
         reverse=True,
     )
+    independent_rect = right.get("group_vs_single_rectangular", {})
+    independent_rect_summary = sorted(
+        (
+            {
+                "key": key,
+                "relative_l2": value["rel_l2"],
+                "max_abs": value["max_abs"],
+                "exact": value["exact"],
+            }
+            for key, value in independent_rect.items()
+        ),
+        key=lambda item: item["relative_l2"], reverse=True,
+    )
     return {
+        "k2_grouped_vs_single_rectangular": independent_rect_summary,
         "trace_paths": [str(path) for path in trace_paths],
         "leaf_forward_tensor_count": len(metrics),
         "layer_progression": layer_progression,
@@ -352,6 +366,11 @@ def main():
             None if not report["layer_trace"]
             or not report["layer_trace"]["k2_same_qkv_rectangular_attention"]
             else report["layer_trace"]["k2_same_qkv_rectangular_attention"][0]["relative_l2"]
+        ),
+        "largest_group_vs_single_rectangle_rel_l2": (
+            None if not report["layer_trace"]
+            or not report["layer_trace"]["k2_grouped_vs_single_rectangular"]
+            else report["layer_trace"]["k2_grouped_vs_single_rectangular"][0]["relative_l2"]
         ),
         "first_gradient_mismatch": (
             None if report["layer_trace"] is None
