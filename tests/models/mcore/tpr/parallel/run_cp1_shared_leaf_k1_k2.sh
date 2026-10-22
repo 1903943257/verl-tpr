@@ -75,10 +75,36 @@ fi
 for k in 1 2; do
   export TPR_LEAF_BATCH_SIZE="$k"
   export TPR_CP1_OUTPUT="$ROOT/k$k/result.json"
-  # Never silently reuse an old comparison produced by a different branch.
+  # Default is strict-new-run. With explicit resume, a verified successful
+  # arm may be reused, while a failed arm is archived instead of overwritten.
+  if [[ "${TPR_CP1_LEAF_RESUME:-0}" == "1" && -f "$TPR_CP1_OUTPUT" ]]; then
+    python - "$TPR_CP1_OUTPUT" "$k" "$TPR_CP1_CAPTURE" <<'PY'
+import json, sys
+from pathlib import Path
+record = json.loads(Path(sys.argv[1]).read_text())
+assert record["mode"] == "shared"
+assert record["leaf_batch_configured_k"] == int(sys.argv[2])
+assert Path(record["source_capture"]).resolve() == Path(sys.argv[3]).resolve()
+assert record["leaf_batch_stats"] is not None
+PY
+    echo "TPR_CP1_LEAF_RESUME_REUSE K=$k result=$TPR_CP1_OUTPUT"
+    continue
+  fi
   if [[ -e "$ROOT/k$k" ]]; then
-    echo "Refusing existing result directory: $ROOT/k$k; select a fresh TPR_CP1_LEAF_ROOT" >&2
-    exit 2
+    if [[ "${TPR_CP1_LEAF_RESUME:-0}" != "1" ]]; then
+      echo "Refusing existing directory: $ROOT/k$k; set RESUME=1 or select fresh ROOT" >&2
+      exit 2
+    fi
+    archive="$ROOT/k$k.failed.$(date +%Y%m%d_%H%M%S)"
+    if [[ -e "$archive" ]]; then
+      echo "Archive already exists: $archive" >&2
+      exit 2
+    fi
+    mv "$ROOT/k$k" "$archive"
+    if [[ -f "$ROOT/k$k.log" ]]; then
+      mv "$ROOT/k$k.log" "$archive.log"
+    fi
+    echo "TPR_CP1_LEAF_RESUME_ARCHIVED K=$k archive=$archive"
   fi
   mkdir -p "$ROOT/k$k"
   echo "TPR_CP1_LEAF_K_START K=$k capture=$TPR_CP1_CAPTURE output=$TPR_CP1_OUTPUT"
