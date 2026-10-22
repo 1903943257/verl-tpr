@@ -144,6 +144,8 @@ def _compare_leaf_traces(k1_result: Path, k2_result: Path, *, required: bool) ->
     # input with physical B=1 and unchanged checkpoint weights. This isolates
     # the GEMM-M effect without including Prefix segmentation differences.
     grouped_qkv = right.get("grouped_qkv_replay", {})
+    k1_qkv = left.get("first_layer_leaf_qkv_operands", {})
+    k2_qkv = right.get("first_layer_leaf_qkv_operands", {})
     qkv_replay = {}
     if grouped_qkv:
         for row in (0, 1):
@@ -159,7 +161,38 @@ def _compare_leaf_traces(k1_result: Path, k2_result: Path, *, required: bool) ->
             if reference.shape != replay.shape:
                 raise AssertionError(f"K1 vs replay QKV values differ in shape row={row}")
             delta = replay - reference
+            full_first_layer = {}
+            if k1_qkv and k2_qkv:
+                for stage in ("qkv_in", "qkv_out"):
+                    key = (row, stage)
+                    if key not in k1_qkv or key not in k2_qkv:
+                        raise AssertionError(f"Missing full first-layer operands {key}")
+                    x = k1_qkv[key].float()
+                    y = k2_qkv[key].float()
+                    if x.shape != y.shape:
+                        raise AssertionError(f"K1/K2 full first-layer shape mismatch {key}")
+                    difference = y - x
+                    full_first_layer[stage] = {
+                        "relative_l2": float(difference.norm().item() / max(x.norm().item(), 1e-30)),
+                        "max_abs": float(difference.abs().max().item()),
+                        "mean_abs": float(difference.abs().mean().item()),
+                        "exact": bool(torch.equal(k1_qkv[key], k2_qkv[key])),
+                        "count": difference.numel(),
+                    }
+                independent_full = item["single_output"].float()
+                reference_full = k1_qkv[row, "qkv_out"].float()
+                if independent_full.shape != reference_full.shape:
+                    raise AssertionError(f"Isolated native QKV result full shape mismatch row={row}")
+                delta_full = independent_full - reference_full
+                full_first_layer["k1_vs_single_replay"] = {
+                    "relative_l2": float(delta_full.norm().item() / max(reference_full.norm().item(), 1e-30)),
+                    "max_abs": float(delta_full.abs().max().item()),
+                    "mean_abs": float(delta_full.abs().mean().item()),
+                    "exact": bool(torch.equal(independent_full, reference_full)),
+                    "count": delta_full.numel(),
+                }
             qkv_replay[row] = {
+                "k1_vs_k2_full_first_layer": full_first_layer,
                 "k2_grouped_vs_same_input_single": item["same_input_grouped_vs_single"],
                 "k1_vs_k2_same_input_single": {
                     "relative_l2": float(delta.norm().item() / max(reference.norm().item(), 1e-30)),
