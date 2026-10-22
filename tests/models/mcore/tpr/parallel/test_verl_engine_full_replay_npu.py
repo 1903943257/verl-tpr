@@ -38,6 +38,24 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
     from verl.workers.engine.mindspeed.transformer_impl import MindspeedEngineWithLMHead
     from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
     from verl.trainer.config import CheckpointConfig
+    from ._real_engine_mbridge_local_spec import (
+        assert_replay_local_qwen3_norms,
+        install_replay_local_spec,
+    )
+
+    class ReplayMindspeedEngine(MindspeedEngineWithLMHead):
+        """Genuine VERL Engine, with only this Replay's MBridge instance adapted.
+
+        The production Engine still owns native DDP, CP schedule, optimizer,
+        weight loading and LR scheduler. TPR replaces SelfAttention on TOP
+        of the already-resolved MCore Local Spec, not on an absent TE norm.
+        """
+
+        def _build_megatron_module(self):
+            if not self.vanilla_bridge or self.provider is not None:
+                raise RuntimeError("Replay Local Spec expects vanilla MBridge")
+            install_replay_local_spec(self.bridge)
+            return super()._build_megatron_module()
 
     model_cfg = HFModelConfig(
         path=str(checkpoint),
@@ -120,7 +138,7 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
     old_argv = sys.argv[:]
     try:
         sys.argv[:] = [sys.argv[0]]
-        engine = MindspeedEngineWithLMHead(
+        engine = ReplayMindspeedEngine(
             model_cfg, engine_cfg, opt_cfg, CheckpointConfig(strict=False)
         )
         if not engine.engine_config.vanilla_mbridge:
@@ -142,6 +160,10 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
     finally:
         sys.argv[:] = old_argv
 
+    # Local Spec has independent pre-attention / pre-MLP RMSNorm modules.
+    # The old MBridge maps the TE-fused names instead. Fail closed if
+    # the test-only mapping or Qwen3 model structure is not as expected.
+    assert_replay_local_qwen3_norms(engine.module[0], engine.bridge)
     from megatron.core import parallel_state as mpu
     sizes = {
         "TP": mpu.get_tensor_model_parallel_world_size(),
