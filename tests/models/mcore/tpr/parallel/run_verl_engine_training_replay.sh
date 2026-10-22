@@ -16,6 +16,17 @@ case "$MODE" in both|full|tpr|compare) ;; *) echo "MODE must be both|full|tpr|co
 if ! [[ "$STEPS" =~ ^([1-9]|1[0-9]|20)$ ]]; then
   echo "STEPS must be 1..20" >&2; exit 2
 fi
+# The original online prompt+response 49152 setting is NOT a verified hard
+# cap on the captured full agent session. Run2 contains a genuine 50435-token
+# trajectory. Do not crop PPO inputs/targets or silently replace a session.
+# Limit is a data-validity guard, NOT a guarantee Full fits NPU HBM.
+TPR_REPLAY_MAX_SEQ_LEN="${TPR_REPLAY_MAX_SEQ_LEN:-65536}"
+if ! [[ "$TPR_REPLAY_MAX_SEQ_LEN" =~ ^[1-9][0-9]*$ ]] ||
+  (( 10#$TPR_REPLAY_MAX_SEQ_LEN > 131072 )); then
+  echo "TPR_REPLAY_MAX_SEQ_LEN must be an integer between 1 and 131072" >&2
+  exit 2
+fi
+echo "REAL_ENGINE_CAPTURE_LENGTH_GUARD max_seq_len=$TPR_REPLAY_MAX_SEQ_LEN no_truncation=1"
 # Accept either a historical merged-manifest root or original rank0
 # Actor captures. Rank1..rank7 are TP/CP replicas, NOT independent sessions.
 # Build a NEW merged dataset under this run's output root; never touch input.
@@ -29,7 +40,7 @@ elif compgen -G "$CAPTURE_ROOT/actor_update_step*_rank0_capture*_batch*.pt" > /d
   echo "REAL_ENGINE_CAPTURE_INPUT kind=raw_rank0 source=$CAPTURE_ROOT steps=$STEPS"
   python -m tests.models.mcore.tpr.parallel.prepare_real_actor_20step_manifest \
     "$CAPTURE_ROOT" "$MANIFEST" \
-    --steps "$STEPS" --max-seq-len 49152 --expected-sessions 8
+    --steps "$STEPS" --max-seq-len "$TPR_REPLAY_MAX_SEQ_LEN" --expected-sessions 8
 else
   echo "No manifest or rank0 Actor Capture files found under $CAPTURE_ROOT" >&2
   exit 2
@@ -94,6 +105,23 @@ if (m.get("protocol") != "real_actor_session_first_8merged_v3"
 for item in m["items"][:required_steps]:
     if not os.path.isfile(item["capture"]):
         raise SystemExit("REAL_ENGINE_PREFLIGHT_FAIL: missing original capture " + item["capture"])
+    maximum = int(item["max_sequence_length"])
+    online_limit = 49152
+    if maximum > int(os.environ["TPR_REPLAY_MAX_SEQ_LEN"]):
+        raise SystemExit(
+            "REAL_ENGINE_PREFLIGHT_FAIL: source session longer than "
+            "TPR_REPLAY_MAX_SEQ_LEN; refuse cropping"
+        )
+    print(
+        "REAL_ENGINE_CAPTURE_SHAPE",
+        f"step={item['source_global_step']}",
+        f"selected_sessions={item['session_count']}",
+        f"total_full_tokens={item['logical_full_tokens']}",
+        f"longest_session={maximum}",
+        f"exceeds_online_49152={maximum > online_limit}",
+        "truncated=False",
+        flush=True,
+    )
 print("REAL_ENGINE_PREFLIGHT_PASS", "verl=", verl.__file__,
       "mbridge=", mbridge.__file__, "engine=", MindspeedEngineWithLMHead.__name__,
       f"original_updates_checked={required_steps}", flush=True)
