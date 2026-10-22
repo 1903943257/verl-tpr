@@ -308,6 +308,7 @@ def test_real_actor_cp1_short_full_vs_tpr():
                 directory=trace_dir,
             ).install()
         start = time.perf_counter()
+        leaf_batch_stats = None
         try:
             if mode == "full":
                 result = _run_controlled_full(
@@ -322,6 +323,26 @@ def test_real_actor_cp1_short_full_vs_tpr():
                 result = run_tpr_forward_backward_batch(
                     engine, batch, loss_fn, forward_only=False,
                 )
+                diagnostics = result["metrics"]
+                leaf_batch_stats = {
+                    key: int(diagnostics[f"tpr/{key}"][0])
+                    for key in ("model_forward_calls", "grouped_leaf_calls", "grouped_leaf_segments")
+                }
+                if mode == "shared":
+                    configured_k = int(os.getenv("TPR_LEAF_BATCH_SIZE", "1"))
+                    print(
+                        f"TPR_CP1_LEAF_BATCH_CHECK configured_k={configured_k} "
+                        f"model_forward_calls={leaf_batch_stats['model_forward_calls']} "
+                        f"grouped_leaf_calls={leaf_batch_stats['grouped_leaf_calls']} "
+                        f"grouped_leaf_segments={leaf_batch_stats['grouped_leaf_segments']}",
+                        flush=True,
+                    )
+                    if configured_k > 1 and leaf_batch_stats["grouped_leaf_calls"] == 0:
+                        raise AssertionError(
+                            "TPR_LEAF_BATCH_SIZE>1 but real Qwen3 shared-tree Actor PPO "
+                            "performed zero grouped leaf forwards: check equal-length "
+                            "sibling eligibility and token budget."
+                        )
                 result = {
                     "loss": float(result["loss"][0]),
                     "logprobs": dict(engine._tpr_captured_log_probs),
@@ -399,6 +420,7 @@ def test_real_actor_cp1_short_full_vs_tpr():
             "full_grad_dir": full_grad_dir,
             "full_gradient_scope": "ALL_PARAMETERS_BF16_TP1_CP1" if full_grad_dir else None,
             "fwd_bwd_seconds": seconds,
+            "leaf_batch_stats": leaf_batch_stats,
             "peak_allocated_gib": measured_alloc,
             "peak_reserved_gib": measured_reserved,
             "optimizer_step": False,
