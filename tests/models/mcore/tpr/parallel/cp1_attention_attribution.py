@@ -83,6 +83,10 @@ class CP1AttentionTrace:
         self.first_layer_linear_inputs_root = {}
         self.root_queries = {}
         self.same_qkv_attention = {}
+        # Diagnostic only: collect full first-layer grouped QKV operands for
+        # a controlled M=2S vs two M=S GEMM replay on identical inputs.
+        self.grouped_qkv_operands = {}
+        self.grouped_qkv_replay = {}
         self.original_rectangular = None
         self.replay = {}
         self.relay_accumulation = {}
@@ -179,6 +183,10 @@ class CP1AttentionTrace:
                 selected = selected[:, batch_index:batch_index + 1]
             with torch.no_grad():
                 subset = selected.contiguous().cpu()
+                if layer == 1 and phase == "leaf_group" and stage in ("qkv_in", "qkv_out") and not backward:
+                    self.grouped_qkv_operands[(row, stage)] = (
+                        t.detach()[:, batch_index:batch_index + 1].contiguous().cpu()
+                    )
             suffix = "_grad_out" if backward else ""
             key = f"r{row}|{phase}|L{layer}|{stage}{suffix}"
             if key in self.records:
@@ -422,6 +430,50 @@ class CP1AttentionTrace:
             "individual_original_linear_replays": observed,
         }
 
+    @torch.no_grad()
+    def replay_grouped_leaf_qkv(self):
+        """Replay original QKV module at B=1 using unchanged grouped-model inputs.
+
+        Run after close() so instrumentation hooks cannot recursively intercept
+        these diagnostic GEMMs. The model has not performed any optimizer step.
+        """
+        if self.mode != "shared" or not self.grouped_qkv_operands:
+            return
+        expected = {(row, stage) for row in (0, 1) for stage in ("qkv_in", "qkv_out")}
+        if set(self.grouped_qkv_operands) != expected:
+            raise AssertionError(
+                f"Incomplete first-layer grouped QKV replay operands: "
+                f"missing={sorted(expected - set(self.grouped_qkv_operands))}"
+            )
+        module = self.model.decoder.layers[0].self_attention.linear_qkv
+        device = next(module.parameters()).device
+        for row in (0, 1):
+            operand = self.grouped_qkv_operands[row, "qkv_in"]
+            reference = self.grouped_qkv_operands[row, "qkv_out"]
+            with torch.no_grad():
+                replay_output = _tensor(module(operand.to(device=device))).detach().cpu()
+            if replay_output.shape != reference.shape:
+                raise AssertionError(
+                    f"QKV GEMM replay shape mismatch row={row}: "
+                    f"{tuple(replay_output.shape)} vs {tuple(reference.shape)}"
+                )
+            full_difference = _difference(reference, replay_output)
+            coords = self._indices(reference.shape[0], self.root_len, row=row)
+            indices = torch.tensor(
+                [coordinate - self.root_len for coordinate in coords],
+                dtype=torch.long,
+            )
+            self.grouped_qkv_replay[row] = {
+                "same_input_grouped_vs_single": full_difference,
+                "sampled_single_output": {
+                    "positions": coords,
+                    "values": replay_output.index_select(0, indices).contiguous(),
+                },
+                "grouped_input_shape": tuple(operand.shape),
+                "single_output_shape": tuple(replay_output.shape),
+            }
+        self.grouped_qkv_operands.clear()
+
     def save(self, destination: Path):
         if destination.exists():
             raise FileExistsError(destination)
@@ -435,8 +487,10 @@ class CP1AttentionTrace:
             "root_push": 1, "root_pop": 1, "leaf": 2, "full": 0,
         }:
             raise AssertionError(f"Shared run did not reuse one Root: {self.call_counts}")
+        self.replay_grouped_leaf_qkv()
         destination.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
+            "grouped_qkv_replay": self.grouped_qkv_replay,
             "mode": self.mode,
             "root_length": self.root_len,
             "row_lengths": [len(t) for t in self.tokens],
