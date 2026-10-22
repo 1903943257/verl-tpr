@@ -404,6 +404,7 @@ def run_tpr_forward_backward_batch(
     metrics = _PPOMetrics()
     event_profiler = SegmentEventProfiler() if detailed_profile else None
     tree_number = 0
+    leaf_batch_stats = {"model_forward_calls": 0, "grouped_leaf_calls": 0, "grouped_leaf_segments": 0}
 
     def run_one_tree(tree_plan):
         nonlocal tree_number
@@ -427,6 +428,8 @@ def run_tpr_forward_backward_batch(
         )
         record_stage("executor_setup_cpu_ms", setup_start)
         loss = executor.run(event_profiler=event_profiler, tree_index=tree_number)
+        for name in leaf_batch_stats:
+            leaf_batch_stats[name] += getattr(executor, name)
         tree_number += 1
         metrics_start = time.perf_counter() if detailed_profile else None
         _assert_finite_tree_loss(loss, tp_size=tp_size, cp_size=cp_runtime.size)
@@ -484,6 +487,9 @@ def run_tpr_forward_backward_batch(
         # the globally supervised closure, not Push+Pop forward token totals.
         "tpr/active_tree_tokens": active_tree_tokens,
         "tpr/active_physical_segments": sum(len(tree.active_segment_ids) for tree in forest.trees),
+        "tpr/model_forward_calls": leaf_batch_stats["model_forward_calls"],
+        "tpr/grouped_leaf_calls": leaf_batch_stats["grouped_leaf_calls"],
+        "tpr/grouped_leaf_segments": leaf_batch_stats["grouped_leaf_segments"],
     }
     metric_lists = metrics.scalar_lists(cp_runtime)
     metric_lists.update({name: [float(value)] for name, value in diagnostics.items()})
