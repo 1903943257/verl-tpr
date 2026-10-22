@@ -123,11 +123,29 @@ def assert_replay_local_qwen3_norms(model, bridge, *, num_layers: int = 36) -> N
             f"Local Qwen3 RMSNorm structure mismatch: expected {2*num_layers}, "
             f"missing {len(missing)}: {missing[:5]}"
         )
+    if not hasattr(bridge, "safetensor_io"):
+        raise AssertionError("Replay MBridge must have loaded HF checkpoint weights")
+    io = bridge.safetensor_io
+    available = set(io.load_hf_weight_names())
     for name, hf_names in expected.items():
         if bridge._weight_name_mapping_mcore_to_hf(name) != hf_names:
             raise AssertionError(f"Wrong HF norm mapping for {name}")
+        hf_key = hf_names[0]
+        if hf_key not in available:
+            raise AssertionError(f"Missing required Qwen3 norm checkpoint key: {hf_key}")
+        # Exact BF16/FP16 comparison after the same dtype cast as MBridge's
+        # loader; checking only key names is insufficient because MBridge may
+        # silently skip a parameter and leave random init behind.
+        actual = params[name].detach().cpu()
+        checkpoint = io.load_one_hf_weight(hf_key).detach().cpu().to(actual.dtype)
+        if actual.shape != checkpoint.shape or not actual.equal(checkpoint):
+            raise AssertionError(
+                f"HF Qwen3 norm weight was not loaded exactly: "
+                f"local={name} hf={hf_key} "
+                f"local_shape={tuple(actual.shape)} hf_shape={tuple(checkpoint.shape)}"
+            )
     print(
         f"REAL_ENGINE_QWEN3_LOCAL_NORMS_PASS separate_norms={len(expected)} "
-        "hf_mappings_checked=True",
+        f"hf_mappings_checked=True actual_hf_values_verified={len(expected)}",
         flush=True,
     )
