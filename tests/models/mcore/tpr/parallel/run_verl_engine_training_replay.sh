@@ -16,8 +16,24 @@ case "$MODE" in both|full|tpr|compare) ;; *) echo "MODE must be both|full|tpr|co
 if ! [[ "$STEPS" =~ ^([1-9]|1[0-9]|20)$ ]]; then
   echo "STEPS must be 1..20" >&2; exit 2
 fi
-MANIFEST="$(realpath "$CAPTURE_ROOT/capture_manifest.json")"
-[[ -f "$MANIFEST" ]] || { echo "Missing existing merged Actor manifest: $MANIFEST" >&2; exit 2; }
+# Accept either a historical merged-manifest root or original rank0
+# Actor captures. Rank1..rank7 are TP/CP replicas, NOT independent sessions.
+# Build a NEW merged dataset under this run's output root; never touch input.
+export TPR_REPLAY_STEPS="$STEPS"
+if [[ -f "$CAPTURE_ROOT/capture_manifest.json" ]]; then
+  MANIFEST="$(realpath "$CAPTURE_ROOT/capture_manifest.json")"
+  echo "REAL_ENGINE_CAPTURE_INPUT kind=existing_manifest path=$MANIFEST"
+elif compgen -G "$CAPTURE_ROOT/actor_update_step*_rank0_capture*_batch*.pt" > /dev/null; then
+  mkdir -p "$OUTPUT_ROOT"
+  MANIFEST="$OUTPUT_ROOT/capture_manifest.json"
+  echo "REAL_ENGINE_CAPTURE_INPUT kind=raw_rank0 source=$CAPTURE_ROOT steps=$STEPS"
+  python -m tests.models.mcore.tpr.parallel.prepare_real_actor_20step_manifest \
+    "$CAPTURE_ROOT" "$MANIFEST" \
+    --steps "$STEPS" --max-seq-len 49152 --expected-sessions 8
+else
+  echo "No manifest or rank0 Actor Capture files found under $CAPTURE_ROOT" >&2
+  exit 2
+fi
 [[ -d /workspace/hf_models/Qwen3-4B-128K ]] || {
   echo "Missing Qwen3-4B original weights" >&2; exit 2;
 }
@@ -65,16 +81,22 @@ if not needed <= set(fields):
     raise SystemExit(f"REAL_ENGINE_PREFLIGHT_FAIL missing config fields: {needed - set(fields)}")
 p = os.environ["TPR_OFFLINE_CAPTURE_MANIFEST"]
 m = json.load(open(p))
+required_steps = int(os.environ["TPR_REPLAY_STEPS"])
 if (m.get("protocol") != "real_actor_session_first_8merged_v3"
-        or len(m.get("items", [])) != 20
-        or any(len(item["rows"]) != 8 for item in m["items"])):
-    raise SystemExit("REAL_ENGINE_PREFLIGHT_FAIL: require 20 genuine 8-Session merged updates")
-for item in m["items"]:
+        or m.get("online_steps") != len(m.get("items", []))
+        or not required_steps <= len(m["items"]) <= 20
+        or m.get("expected_sessions") != 8
+        or any(len(item["rows"]) != 8 for item in m["items"][:required_steps])):
+    raise SystemExit(
+        "REAL_ENGINE_PREFLIGHT_FAIL: require enough genuine 8-Session "
+        f"merged Actor steps; requested={required_steps} available={len(m.get('items', []))}"
+    )
+for item in m["items"][:required_steps]:
     if not os.path.isfile(item["capture"]):
         raise SystemExit("REAL_ENGINE_PREFLIGHT_FAIL: missing original capture " + item["capture"])
 print("REAL_ENGINE_PREFLIGHT_PASS", "verl=", verl.__file__,
       "mbridge=", mbridge.__file__, "engine=", MindspeedEngineWithLMHead.__name__,
-      "20_original_updates=True", flush=True)
+      f"original_updates_checked={required_steps}", flush=True)
 PY
 
 export TPR_RUN_VERL_ENGINE_FULL_REPLAY=0
