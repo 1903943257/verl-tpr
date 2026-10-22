@@ -27,22 +27,43 @@ if ! [[ "$TPR_REPLAY_MAX_SEQ_LEN" =~ ^[1-9][0-9]*$ ]] ||
   exit 2
 fi
 echo "REAL_ENGINE_CAPTURE_LENGTH_GUARD max_seq_len=$TPR_REPLAY_MAX_SEQ_LEN no_truncation=1"
-# Accept either a historical merged-manifest root or original rank0
-# Actor captures. Rank1..rank7 are TP/CP replicas, NOT independent sessions.
-# Build a NEW merged dataset under this run's output root; never touch input.
+# Prefer existing merged manifests. For a historical raw rank0 directory
+# or already-derived eight-row capture .pt, use the validated controlled
+# 10K / 30K source-data transforms, NOT an OOM-prone 71K full session.
+# Never modify original captures or mix data from CP-replicated ranks.
 export TPR_REPLAY_STEPS="$STEPS"
-if [[ -f "$CAPTURE_ROOT/capture_manifest.json" ]]; then
+TPR_REPLAY_SHORT_CAP="${TPR_REPLAY_SHORT_CAP:-10240}"
+TPR_REPLAY_REQUIRE_SHARED_PREFIX="${TPR_REPLAY_REQUIRE_SHARED_PREFIX:-1}"
+case "$TPR_REPLAY_SHORT_CAP" in 0|10240|30720) ;; *)
+  echo "TPR_REPLAY_SHORT_CAP must be 0, 10240 or 30720" >&2; exit 2;; esac
+case "$TPR_REPLAY_REQUIRE_SHARED_PREFIX" in 0|1) ;; *)
+  echo "TPR_REPLAY_REQUIRE_SHARED_PREFIX must be 0 or 1" >&2; exit 2;; esac
+if [[ -d "$CAPTURE_ROOT" && -f "$CAPTURE_ROOT/capture_manifest.json" ]]; then
   MANIFEST="$(realpath "$CAPTURE_ROOT/capture_manifest.json")"
   echo "REAL_ENGINE_CAPTURE_INPUT kind=existing_manifest path=$MANIFEST"
-elif compgen -G "$CAPTURE_ROOT/actor_update_step*_rank0_capture*_batch*.pt" > /dev/null; then
+elif [[ -f "$CAPTURE_ROOT" && "$CAPTURE_ROOT" == *.pt ]] ||
+     { [[ -d "$CAPTURE_ROOT" ]] && compgen -G "$CAPTURE_ROOT/actor_update_step*_rank0_capture*_batch*.pt" > /dev/null; }; then
   mkdir -p "$OUTPUT_ROOT"
   MANIFEST="$OUTPUT_ROOT/capture_manifest.json"
-  echo "REAL_ENGINE_CAPTURE_INPUT kind=raw_rank0 source=$CAPTURE_ROOT steps=$STEPS"
-  python -m tests.models.mcore.tpr.parallel.prepare_real_actor_20step_manifest \
-    "$CAPTURE_ROOT" "$MANIFEST" \
-    --steps "$STEPS" --max-seq-len "$TPR_REPLAY_MAX_SEQ_LEN" --expected-sessions 8
+  echo "REAL_ENGINE_CAPTURE_INPUT kind=short_or_raw_actor source=$CAPTURE_ROOT steps=$STEPS cap=$TPR_REPLAY_SHORT_CAP"
+  export TPR_SHORT_CAPTURE_SOURCE="$CAPTURE_ROOT"
+  export TPR_SHORT_CAPTURE_MANIFEST_ROOT="$OUTPUT_ROOT"
+  export TPR_REPLAY_SHORT_CAP
+  export TPR_REPLAY_REQUIRE_SHARED_PREFIX
+  python - <<'PY'
+import os
+from pathlib import Path
+from tests.models.mcore.tpr.parallel.prepare_verl_engine_short_manifest import prepare_short_manifest
+prepare_short_manifest(
+    Path(os.environ["TPR_SHORT_CAPTURE_SOURCE"]),
+    Path(os.environ["TPR_SHORT_CAPTURE_MANIFEST_ROOT"]),
+    steps=int(os.environ["TPR_REPLAY_STEPS"]),
+    cap=int(os.environ["TPR_REPLAY_SHORT_CAP"]),
+    require_shared_prefix=os.environ["TPR_REPLAY_REQUIRE_SHARED_PREFIX"] == "1",
+)
+PY
 else
-  echo "No manifest or rank0 Actor Capture files found under $CAPTURE_ROOT" >&2
+  echo "Expected an existing capture_manifest.json, a direct eight-row Actor .pt file, or rank0 capture directory: $CAPTURE_ROOT" >&2
   exit 2
 fi
 [[ -d /workspace/hf_models/Qwen3-4B-128K ]] || {
