@@ -483,6 +483,7 @@ class CP1AttentionTrace:
                 "single_output_shape": tuple(replay_output.shape),
                 "single_output": replay_output.contiguous(),
             }
+
     def save(self, destination: Path):
         if destination.exists():
             raise FileExistsError(destination)
