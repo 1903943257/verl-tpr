@@ -1,7 +1,8 @@
-"""N=8 Qwen3-4B true captured PPO, controlled CP1 Full MB2 vs TPR K1/2/4.
+"""N=8 Qwen3-4B true captured PPO, controlled CP1 Full MB1/MB2 vs TPR K1/2/4.
 
 Each arm loads same original eight captured distinct trajectories and model
-weights. Full uses four physical [2,S] square-CANN forwards; TPR runs a
+weights. Full MB1 uses eight physical [1,S] forwards; Full MB2 uses four
+physical [2,S] square-CANN forwards; TPR runs a
 single eight-trajectory turn-tree forest, including Root Push/Pop. No
 production VERL scheduler, optimizer, rollout, CP, TP, or activation recompute.
 """
@@ -40,8 +41,14 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _full_mb2(model, batch, forest, loss_fn):
-    """Exactly eight original trajectories in FOUR real physical B=2 forwards."""
+def _full_physical_batch(model, batch, forest, loss_fn, *, micro_batch_size: int):
+    """Eight original trajectories in physical B=1 or B=2 full-sequence forwards.
+
+    Both modes use identical whole-trajectory square-CANN and PPO denominator.
+    Changing micro_batch_size changes only the physical GPT batch size.
+    """
+    if micro_batch_size not in (1, 2):
+        raise ValueError("Only physical Full MB=1/2 controls are supported")
     roots = []
     for tree in forest.trees:
         if len(tree.segment_plan.segments) != 1:
@@ -49,10 +56,10 @@ def _full_mb2(model, batch, forest, loss_fn):
         root = tree.segment_plan.get(tree.segment_plan.root_id)
         roots.append((tree, root))
     if len(roots) != 8:
-        raise AssertionError("Full MB2 requires exactly 8 real distinct rows")
+        raise AssertionError("Physical Full baseline requires exactly 8 real distinct rows")
     lengths = {root.length for _, root in roots}
     if len(lengths) != 1:
-        raise AssertionError(f"Full MB2 refuses unequal lengths: {lengths}")
+        raise AssertionError(f"Physical Full MB1/MB2 refuses unequal lengths: {lengths}")
     length = lengths.pop()
     objective = SegmentPPOObjectiveAdapter(
         batch, loss_fn,
@@ -60,15 +67,15 @@ def _full_mb2(model, batch, forest, loss_fn):
     )
     losses = []
     physical_calls = 0
-    for offset in range(0, len(roots), 2):
-        chunk = roots[offset:offset + 2]
+    for offset in range(0, len(roots), micro_batch_size):
+        chunk = roots[offset:offset + micro_batch_size]
         ids = torch.stack([segment.token_ids for _, segment in chunk]).to(
             device=next(model.parameters()).device
         )
-        positions = torch.arange(length, device=ids.device, dtype=torch.long).unsqueeze(0).expand(2, -1)
+        positions = torch.arange(length, device=ids.device, dtype=torch.long).unsqueeze(0).expand(micro_batch_size, -1)
         logits = model(input_ids=ids, position_ids=positions, attention_mask=None)
-        if tuple(logits.shape[:2]) != (2, length):
-            raise AssertionError("Full MB2 did not execute physical [2,S] GPT")
+        if tuple(logits.shape[:2]) != (micro_batch_size, length):
+            raise AssertionError(f"Full MB={micro_batch_size} did not execute physical [{micro_batch_size},S] GPT")
         physical_calls += 1
         chunk_losses = []
         for j, (tree, segment) in enumerate(chunk):
@@ -134,8 +141,8 @@ def _summarize_stages(records: list[dict]) -> dict:
 
 def test_real_actor_cp1_n8_full_mb2_vs_tpr():
     mode = os.getenv("TPR_CP1_N8_MODE", "")
-    if mode not in ("full_mb2", "tpr"):
-        raise ValueError("N8 benchmark only supports physical full_mb2 or TPR")
+    if mode not in ("full_mb1", "full_mb2", "tpr"):
+        raise ValueError("N8 benchmark only supports physical full_mb1/full_mb2 or TPR")
     if int(os.getenv("WORLD_SIZE", "1")) != 1:
         raise AssertionError("N8 CP1 benchmark requires exactly one NPU")
     if os.getenv("TPR_TREE_POLICY", "qwen_turn") != "qwen_turn":
@@ -163,7 +170,7 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
     try:
         from verl.workers.utils.losses import ppo_loss
         batch, original_keys, ppo_tokens, input_sha = _load_real_pair(
-            cap, tuple(range(8)), "full" if mode == "full_mb2" else "tpr",
+            cap, tuple(range(8)), "tpr" if mode == "tpr" else "full",
         )
         tu.assign_non_tensor(
             batch, dp_size=1, batch_num_tokens=ppo_tokens, global_batch_size=8,
@@ -208,7 +215,7 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
             )
         else:
             if len(forest.trees) != 8 or unique != logical:
-                raise AssertionError("Full MB2 N8 must use eight unrelated complete roots")
+                raise AssertionError("Full MB1/MB2 N8 must use eight unrelated complete roots")
         model, hf = make_real_qwen3_tp_model(
             runtime, model_path=ckpt, tp_size=1, cp_size=1,
             sequence_parallel=False, profile="4b", native_attention=False,
@@ -225,8 +232,11 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
             torch.npu.synchronize()
             torch.npu.reset_peak_memory_stats()
             begin = time.perf_counter()
-            if mode == "full_mb2":
-                result = _full_mb2(model, batch, forest, loss_fn)
+            if mode in ("full_mb1", "full_mb2"):
+                result = _full_physical_batch(
+                    model, batch, forest, loss_fn,
+                    micro_batch_size=1 if mode == "full_mb1" else 2,
+                )
             else:
                 result = _tpr(model, engine, batch, loss_fn)
             torch.npu.synchronize()
@@ -267,6 +277,9 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
             raise AssertionError("N8 missing canonical gradient witness")
         report = {
             "mode": mode, "configured_k": int(os.getenv("TPR_LEAF_BATCH_SIZE", "1")),
+            "physical_full_micro_batch": (
+                1 if mode == "full_mb1" else 2 if mode == "full_mb2" else None
+            ),
             "input_sha256": input_sha, "checkpoint": str(ckpt),
             "source_capture": str(cap), "original_keys": list(original_keys),
             "initial_weights_witness_sha256": initial_weights,
@@ -290,7 +303,10 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
             ),
             "global_grad_norm": grad_norm, "gradient_witness": witness,
             "optimizer_step": False, "original_online_conditioning": False,
-            "reference": "physical_B2_square_CANN" if mode == "full_mb2" else "TPR_CP1_root_leaf",
+            "reference": (
+                f"physical_B{1 if mode == 'full_mb1' else 2}_square_CANN"
+                if mode != "tpr" else "TPR_CP1_root_leaf"
+            ),
         }
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(json.dumps(report, indent=2))
