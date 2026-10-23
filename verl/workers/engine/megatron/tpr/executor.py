@@ -375,6 +375,7 @@ class SegmentExecutor:
                 kind = "visit_leaf_group" if grouped else "pop" if exiting else "push" if children else "visit_leaf"
                 profile = None if event_profiler is None else event_profiler.begin(
                     segment, kind=kind, tree_index=tree_index, depth=depth,
+                    group_size=len(segment_id) if grouped else 1,
                 )
                 if exiting:
                     losses.append(self.pop(segment_id))
@@ -770,7 +771,7 @@ class SegmentEventProfiler:
         self.max_allocated_bytes = 0
         self.max_reserved_bytes = 0
 
-    def begin(self, segment, *, kind: str, tree_index: int, depth: int):
+    def begin(self, segment, *, kind: str, tree_index: int, depth: int, group_size: int = 1):
         self.max_allocated_bytes = max(
             self.max_allocated_bytes, int(torch.npu.max_memory_allocated())
         )
@@ -789,6 +790,7 @@ class SegmentEventProfiler:
             "tree_index": int(tree_index),
             "depth": int(depth),
             "kind": kind,
+            "group_size": group_size,
             "length": int(segment.length),
             "prefix_length": int(segment.prefix_length),
             "start_event": start,
