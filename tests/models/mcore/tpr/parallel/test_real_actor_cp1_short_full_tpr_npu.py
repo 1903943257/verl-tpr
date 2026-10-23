@@ -348,9 +348,12 @@ def test_real_actor_cp1_short_full_vs_tpr():
             raise AssertionError("Parity must disable activation recompute")
         initial_weights = _initial_weight_fingerprint(model)
         loss_fn = partial(ppo_loss, config=_PPO())
-        model.zero_grad(set_to_none=True)
-        torch.npu.synchronize()
-        torch.npu.reset_peak_memory_stats()
+        warmups = int(os.getenv("TPR_CP1_BENCH_WARMUPS", "0"))
+        iterations = int(os.getenv("TPR_CP1_BENCH_REPEATS", "1"))
+        if warmups < 0 or iterations < 1:
+            raise ValueError("TPR_CP1_BENCH_WARMUPS >= 0 and TPR_CP1_BENCH_REPEATS >= 1 required")
+        if os.getenv("TPR_CP1_TRACE", "0") == "1" and (warmups or iterations != 1):
+            raise ValueError("Layer trace requires one un-warmed execution")
         trace = None
         if os.getenv("TPR_CP1_TRACE", "0") == "1" and mode != "one_node":
             from .cp1_attention_attribution import CP1AttentionTrace
@@ -359,9 +362,9 @@ def test_real_actor_cp1_short_full_vs_tpr():
                 model=model, batch=batch, forest=forest, mode=mode,
                 directory=trace_dir,
             ).install()
-        start = time.perf_counter()
-        leaf_batch_stats = None
-        try:
+
+        def _execute_once():
+            local_leaf_stats = None
             if mode == "full":
                 result = _run_controlled_full(
                     model, batch, loss_fn=loss_fn, forest=forest,
@@ -380,7 +383,7 @@ def test_real_actor_cp1_short_full_vs_tpr():
                     engine, batch, loss_fn, forward_only=False,
                 )
                 diagnostics = result["metrics"]
-                leaf_batch_stats = {
+                local_leaf_stats = {
                     key: int(diagnostics[f"tpr/{key}"][0])
                     for key in ("model_forward_calls", "grouped_leaf_calls", "grouped_leaf_segments")
                 }
@@ -388,12 +391,12 @@ def test_real_actor_cp1_short_full_vs_tpr():
                     configured_k = int(os.getenv("TPR_LEAF_BATCH_SIZE", "1"))
                     print(
                         f"TPR_CP1_LEAF_BATCH_CHECK configured_k={configured_k} "
-                        f"model_forward_calls={leaf_batch_stats['model_forward_calls']} "
-                        f"grouped_leaf_calls={leaf_batch_stats['grouped_leaf_calls']} "
-                        f"grouped_leaf_segments={leaf_batch_stats['grouped_leaf_segments']}",
+                        f"model_forward_calls={local_leaf_stats['model_forward_calls']} "
+                        f"grouped_leaf_calls={local_leaf_stats['grouped_leaf_calls']} "
+                        f"grouped_leaf_segments={local_leaf_stats['grouped_leaf_segments']}",
                         flush=True,
                     )
-                    if configured_k > 1 and leaf_batch_stats["grouped_leaf_calls"] == 0:
+                    if configured_k > 1 and local_leaf_stats["grouped_leaf_calls"] == 0:
                         raise AssertionError(
                             "TPR_LEAF_BATCH_SIZE>1 but real Qwen3 shared-tree Actor PPO "
                             "performed zero grouped leaf forwards: check equal-length "
@@ -403,10 +406,39 @@ def test_real_actor_cp1_short_full_vs_tpr():
                     "loss": float(result["loss"][0]),
                     "logprobs": dict(engine._tpr_captured_log_probs),
                 }
-            torch.npu.synchronize()
-            seconds = time.perf_counter() - start
-            measured_alloc = torch.npu.max_memory_allocated() / 2**30
-            measured_reserved = torch.npu.max_memory_reserved() / 2**30
+            return result, local_leaf_stats
+
+        timings = []
+        memory_allocated = []
+        memory_reserved = []
+        leaf_batch_stats = None
+        try:
+            for repeat in range(-warmups, iterations):
+                model.zero_grad(set_to_none=True)
+                torch.npu.synchronize()
+                torch.npu.reset_peak_memory_stats()
+                start = time.perf_counter()
+                result, leaf_batch_stats = _execute_once()
+                torch.npu.synchronize()
+                elapsed = time.perf_counter() - start
+                alloc = torch.npu.max_memory_allocated() / 2**30
+                reserved = torch.npu.max_memory_reserved() / 2**30
+                if repeat < 0:
+                    print(f"TPR_CP1_BENCH_WARMUP mode={mode} duration_s={elapsed:.4f}", flush=True)
+                else:
+                    timings.append(elapsed)
+                    memory_allocated.append(alloc)
+                    memory_reserved.append(reserved)
+                    print(
+                        f"TPR_CP1_BENCH_ITER mode={mode} repeat={repeat} "
+                        f"seconds={elapsed:.6f} peak_alloc_gib={alloc:.6f} "
+                        f"peak_reserved_gib={reserved:.6f}", flush=True,
+                    )
+            from statistics import median
+            seconds = median(timings)
+            # Conservative capacity gate: retain MAX over measured iterations.
+            measured_alloc = max(memory_allocated)
+            measured_reserved = max(memory_reserved)
         finally:
             if trace is not None:
                 trace.close()
@@ -477,6 +509,11 @@ def test_real_actor_cp1_short_full_vs_tpr():
             "full_grad_dir": full_grad_dir,
             "full_gradient_scope": "ALL_PARAMETERS_BF16_TP1_CP1" if full_grad_dir else None,
             "fwd_bwd_seconds": seconds,
+            "bench_warmups": warmups,
+            "bench_repeats": iterations,
+            "bench_times_s": timings,
+            "bench_peak_allocated_gib": memory_allocated,
+            "bench_peak_reserved_gib": memory_reserved,
             "logical_trajectories": 2,
             "physical_full_micro_batch": 2 if mode == "full_batch2" else 1 if mode == "full" else None,
             "benchmark_scope": "controlled_forward_backward_no_optimizer_no_native_VERL_microbatch_scheduler",
