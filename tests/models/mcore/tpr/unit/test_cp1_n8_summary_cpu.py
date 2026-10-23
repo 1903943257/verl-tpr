@@ -33,6 +33,12 @@ def _write_case(root, arm):
         "peak_allocated_gib": 36.0 if full else 22.0,
         "peak_reserved_gib": 39.0 if full else 24.0,
         "loss": -0.8, "global_grad_norm": 7.0,
+        "logprobs": [[0, 0, -0.1], [1, 0, -0.2]],
+        "gradient_witness": {
+            "names": ["p"],
+            "canonical_shapes": [[2]],
+            "values": [0.2, 0.4],
+        },
         "stage_profile": False,
     }
     (folder / "result.json").write_text(json.dumps(result))
