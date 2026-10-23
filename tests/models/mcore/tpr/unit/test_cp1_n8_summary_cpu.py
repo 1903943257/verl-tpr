@@ -8,10 +8,11 @@ from ..parallel.summarize_cp1_n8_fair import summarize
 def _write_case(root, arm):
     folder = root / arm
     folder.mkdir()
-    full = arm == "full_mb2"
+    full = arm in ("full_mb1", "full_mb2")
     k = 1 if full else int(arm[-1])
     result = {
-        "mode": "full_mb2" if full else "tpr", "configured_k": k,
+        "mode": arm if full else "tpr", "configured_k": k,
+        "physical_full_micro_batch": 1 if arm == "full_mb1" else 2 if arm == "full_mb2" else None,
         "logical_trajectories": 8,
         "input_sha256": "sha256-valid",
         "source_capture": "/fake/n8.pt",
@@ -22,7 +23,7 @@ def _write_case(root, arm):
         "unique_tree_tokens": 16000 if full else 9000,
         "input_lengths": [2000] * 8,
         "forest_trees": 8 if full else 1, "forest_segments": 8 if full else 9,
-        "physical_model_forward_calls": 4 if full else 8 // k + 2,
+        "physical_model_forward_calls": (8 if arm == "full_mb1" else 4 if full else 8 // k + 2),
         "leaf_batch_stats": None if full else {
             "grouped_leaf_calls": 0 if k == 1 else 8 // k,
             "grouped_leaf_segments": 0 if k == 1 else 8,
@@ -55,6 +56,24 @@ def test_n8_report_includes_workload_speed_memory(tmp_path):
     assert "memory_margin=PASS" in printed
     assert "tpr_k2:" in printed
     assert (tmp_path / "summary.json").exists()
+
+
+def test_n8_full_mb1_supplement_updates_same_root(tmp_path):
+    for arm in ("full_mb2", "tpr_k1", "tpr_k2", "tpr_k4"):
+        _write_case(tmp_path, arm)
+    old_summary = summarize(tmp_path)
+    assert "Full MB1 supplemental baseline: NOT YET MEASURED." in old_summary
+    assert "MISSING ARMS" not in old_summary
+    _write_case(tmp_path, "full_mb1")
+    new_summary = summarize(tmp_path)
+    assert "Full MB1/Full MB2 physical batching speedup=" in new_summary
+    assert "tpr_k1: FullMB1/TPR speedup=" in new_summary
+    assert "PARITY Full MB1 vs full_mb2:" in new_summary
+    assert "PARITY Full MB1 vs tpr_k1:" in new_summary
+    assert "Full MB1 supplemental baseline: NOT YET MEASURED." not in new_summary
+    meta = json.loads((tmp_path / "summary.json").read_text())
+    assert "full_mb1" in meta["results"]
+    assert "full_mb1_to_full_mb2_speedup" in meta["full_mb1_comparison"]
 
 
 def test_n8_missing_arms_show_partial_results(tmp_path):
