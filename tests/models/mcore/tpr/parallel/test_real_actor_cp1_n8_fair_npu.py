@@ -177,14 +177,24 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
         input_lengths = [int(ids.numel()) for ids in batch["input_ids"].unbind()]
         if len(set(input_lengths)) != 1 or max(input_lengths) > 4096:
             raise AssertionError("N8 controlled Full MB2 requires equal <=4K genuine response windows")
+        root_length = None
+        sibling_suffix_lengths = []
         if mode == "tpr":
             if len(forest.trees) != 1 or unique >= logical:
                 raise AssertionError(
                     f"TPR N8 must have one actually shared same-session tree; "
                     f"trees={len(forest.trees)}, unique={unique}, logical={logical}"
                 )
+            root_plan = forest.trees[0].segment_plan
+            root_segment = root_plan.get(root_plan.root_id)
+            root_length = root_segment.length
+            sibling_suffix_lengths = [
+                item.length for item in root_plan.children_of(root_plan.root_id)
+            ]
             print(
                 "TPR_CP1_N8_TREE " + json.dumps({
+                    "root_length": root_length,
+                    "direct_child_lengths": sibling_suffix_lengths,
                     "logical_rows": 8, "trees": len(forest.trees),
                     "segments": forest.segment_count,
                     "logical_tokens": logical, "unique_tokens": unique,
@@ -265,6 +275,7 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
             "logical_input_tokens": logical, "unique_tree_tokens": unique,
             "token_dedup_fraction": 1 - unique / logical,
             "forest_trees": len(forest.trees), "forest_segments": forest.segment_count,
+            "root_prefix_tokens": root_length, "direct_child_segment_lengths": sibling_suffix_lengths,
             "physical_model_forward_calls": result["physical_model_forward_calls"],
             "leaf_batch_stats": result["leaf_batch_stats"],
             "bench_warmups": warmups, "bench_repeats": repeats,
@@ -292,6 +303,7 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
                 "memory_peak_reserved_gib": report["peak_reserved_gib"],
                 "logical_rows": report["logical_trajectories"],
                 "dedup_pct": round(report["token_dedup_fraction"] * 100, 2),
+                "root_prefix_tokens": root_length, "direct_child_lengths": sibling_suffix_lengths,
                 "forward_calls": report["physical_model_forward_calls"],
                 "grouped": report["leaf_batch_stats"],
                 "stage": stages[0] if stages else None,
