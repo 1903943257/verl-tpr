@@ -1,0 +1,186 @@
+"""N=8 Full physical MB2 versus CP1 TPR K1/K2/K4, with stage attribution."""
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+ARMS = ("full_mb2", "tpr_k1", "tpr_k2", "tpr_k4")
+STAGES = ("push", "visit_leaf", "visit_leaf_group", "pop")
+
+
+def _load(root, arm):
+    path = root / arm / "result.json"
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
+def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
+    results = {arm: _load(root, arm) for arm in ARMS}
+    missing = [arm for arm in ARMS if results[arm] is None]
+    lines = [
+        "=" * 89,
+        "TPR CP1 N=8 | FAIR FULL MB=2 vs TPR K=1/2/4",
+        "Eight DISTINCT actual same-session PPO trajectories per run; one NPU, Qwen3-4B BF16",
+        "Controlled short-crop PPO; square-CANN Full B=2; model F/B, no optimizer/Rollout/CP",
+        f"root={root}",
+        "=" * 89,
+        f"{'Metric':<37} {'Full MB2':>11} {'TPR K1':>11} {'TPR K2':>11} {'TPR K4':>11}",
+        "-" * 89,
+    ]
+    present = [record for record in results.values() if record is not None]
+    if present:
+        keys = ("input_sha256", "source_capture", "checkpoint",
+                "original_keys", "initial_weights_witness_sha256", "ppo_tokens",
+                "logical_input_tokens", "input_lengths")
+        for key in keys:
+            if len({json.dumps(record.get(key), sort_keys=True) for record in present}) != 1:
+                raise AssertionError(f"N8 Full/TPR comparison input/checkpoint mismatch: {key}")
+        for arm, item in results.items():
+            if item is None:
+                continue
+            exp_mode = "full_mb2" if arm == "full_mb2" else "tpr"
+            exp_k = 1 if arm == "full_mb2" else int(arm[-1])
+            if item["mode"] != exp_mode or item["configured_k"] != exp_k:
+                raise AssertionError(f"{arm} mode/K mismatch")
+            if item["logical_trajectories"] != 8 or item["ppo_tokens"] <= 0:
+                raise AssertionError(f"{arm} does not cover 8 valid PPO trajectories")
+            if item.get("stage_profile") or len(item["bench_times_s"]) != item["bench_repeats"]:
+                raise AssertionError(f"{arm} was traced/stage-profiled or missed repeats; not fair F/B")
+            if arm == "full_mb2" and item["physical_model_forward_calls"] != 4:
+                raise AssertionError("Full MB2 expected exactly four B=2 forward calls")
+            if arm.startswith("tpr_k") and (
+                arm != "tpr_k1" and not item["leaf_batch_stats"]["grouped_leaf_calls"]
+            ):
+                raise AssertionError(f"{arm} did not actually group leaves")
+        lines.append(
+            f"Input SHA={present[0]['input_sha256'][:20]} | PPO tokens={present[0]['ppo_tokens']}"
+        )
+
+    def get(record, key):
+        return None if record is None else record.get(key)
+
+    def fmt(value, precision=3):
+        return "—" if value is None else f"{value:.{precision}f}"
+
+    metrics = (
+        ("Logical trajectories", "logical_trajectories", 0),
+        ("Logical token count", "logical_input_tokens", 0),
+        ("Unique physical tree tokens", "unique_tree_tokens", 0),
+        ("Model forward calls", "physical_model_forward_calls", 0),
+        ("NPU F/B median (seconds)", "fwd_bwd_seconds", 4),
+        ("Peak allocated MAX (GiB)", "peak_allocated_gib", 3),
+        ("Peak reserved MAX (GiB)", "peak_reserved_gib", 3),
+        ("PPO Loss", "loss", 6),
+        ("Global grad norm", "global_grad_norm", 4),
+        ("Measured iterations", "bench_repeats", 0),
+    )
+    for label, key, p in metrics:
+        lines.append(
+            f"{label:<37} " + " ".join(
+                f"{fmt(get(results[arm],key),p):>11}" for arm in ARMS
+            )
+        )
+    lines.extend(["-" * 89])
+    comparison = {}
+    full = results["full_mb2"]
+    if full:
+        for arm in ("tpr_k1", "tpr_k2", "tpr_k4"):
+            item = results[arm]
+            if item is None:
+                continue
+            ratio = float(full["fwd_bwd_seconds"] / item["fwd_bwd_seconds"])
+            alloc = float(full["peak_allocated_gib"] - item["peak_allocated_gib"])
+            reserved = float(full["peak_reserved_gib"] - item["peak_reserved_gib"])
+            pass_margin = alloc >= memory_margin_gib and reserved >= memory_margin_gib
+            comparison[arm] = {
+                "speedup_over_full_mb2": ratio,
+                "peak_alloc_headroom_gib": alloc,
+                "peak_reserved_headroom_gib": reserved,
+                "memory_margin_pass": pass_margin,
+                "actual_grouped_leaf_calls": item["leaf_batch_stats"]["grouped_leaf_calls"],
+                "actual_grouped_leaf_segments": item["leaf_batch_stats"]["grouped_leaf_segments"],
+            }
+            lines.append(
+                f"{arm}: FullMB2/TPR speedup={ratio:.4f}x "
+                f"alloc_headroom={alloc:+.3f}GiB reserved_headroom={reserved:+.3f}GiB "
+                f"memory_margin={('PASS' if pass_margin else 'FAIL')}"
+            )
+        if results["tpr_k1"] and results["tpr_k2"]:
+            k1, k2 = results["tpr_k1"], results["tpr_k2"]
+            lines.append(f"Internal batching K1/K2 speedup={k1['fwd_bwd_seconds']/k2['fwd_bwd_seconds']:.4f}x")
+        if results["tpr_k2"] and results["tpr_k4"]:
+            k2, k4 = results["tpr_k2"], results["tpr_k4"]
+            lines.append(f"Internal batching K2/K4 speedup={k2['fwd_bwd_seconds']/k4['fwd_bwd_seconds']:.4f}x")
+        lines.append(
+            f"Actual N8 unique-token saving: {100*(1-results['tpr_k1']['unique_tree_tokens']/results['tpr_k1']['logical_input_tokens']):.2f}%"
+            if results["tpr_k1"] else "Unique-token saving: TPR K1 unavailable"
+        )
+
+    stage_report = {}
+    for k in (2, 4):
+        path = root / f"stage_tpr_k{k}" / "result.json"
+        if not path.is_file():
+            continue
+        item = json.loads(path.read_text())
+        if not item["stage_profile"] or item["configured_k"] != k:
+            raise AssertionError(f"Stage K{k} is not a real measured TPR stage")
+        if present and item["input_sha256"] != present[0]["input_sha256"]:
+            raise AssertionError(f"Stage K{k} input mismatches performance arms")
+        samples = item["stages_by_iteration"]
+        if len(samples) != 1:
+            raise AssertionError(f"Expected one isolated stage sample K={k}")
+        stages = samples[0]
+        stage_report[f"k{k}"] = stages
+        lines.extend(["", f"TPR K={k} STAGE NPU EVENT TIMER (diagnostic; event overhead not in fair timing)"])
+        for stage in STAGES:
+            entry = stages.get(stage)
+            if entry:
+                lines.append(
+                    f"  {stage:<19} calls={entry['calls']:<3} "
+                    f"NPU_event_sum={entry['npu_event_ms']:.3f}ms "
+                    f"enqueue_sum={entry['cpu_enqueue_ms']:.3f}ms "
+                    f"groups={[g['batch'] for g in entry['groups']]}"
+                )
+        lines.append(
+            f"  profile_total_npu_event_sum_ms={sum(e['npu_event_ms'] for e in stages.values()):.3f}"
+        )
+    if missing:
+        lines.extend(["", f"MISSING ARMS (check their run.log): {', '.join(missing)}"])
+    lines.extend([
+        "WARNING: Speedups are diagnostic until BF16 PPO gradients converge.",
+        "Model F/B only; CP1, no optimizer, no production native VERL microbatch schedule.",
+        f"Summary: {root / 'SUMMARY.txt'}",
+        "=" * 89,
+    ])
+    report = {
+        "input_sha256": present[0]["input_sha256"] if present else None,
+        "results": {
+            arm: {
+                key: item.get(key)
+                for key in ("fwd_bwd_seconds","peak_allocated_gib","peak_reserved_gib",
+                            "logical_trajectories","logical_input_tokens","unique_tree_tokens",
+                            "physical_model_forward_calls","ppo_tokens","leaf_batch_stats","loss")
+            }
+            for arm, item in results.items() if item is not None
+        },
+        "comparison": comparison, "stage": stage_report,
+        "missing_arms": missing, "memory_margin_gib": memory_margin_gib,
+    }
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "SUMMARY.txt").write_text("\n".join(lines)+"\n")
+    (root / "summary.json").write_text(json.dumps(report, indent=2)+"\n")
+    return "\n".join(lines)
+
+
+def main():
+    p=argparse.ArgumentParser()
+    p.add_argument("root",type=Path)
+    p.add_argument("--memory-margin-gib",type=float,default=0.5)
+    args=p.parse_args()
+    if args.memory_margin_gib < 0:
+        raise ValueError("memory-margin-gib must be >=0")
+    print(summarize(args.root, memory_margin_gib=args.memory_margin_gib),flush=True)
+
+
+if __name__=="__main__":
+    main()
