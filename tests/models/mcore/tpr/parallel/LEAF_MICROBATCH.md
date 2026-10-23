@@ -141,6 +141,96 @@ weights/capture are enforced, but both Full MB2 and TPR K2 can differ from
 Full MB1 in BF16 GEMM rounding. A speedup or memory PASS is not proof of
 PPO gradient equivalence.
 
+## CP1 N=8: Same two requirements, fair Full MB=2 and stage costs
+
+This next experiment tests the two requested follow-ups:
+(1) holding full physical MB=2 fixed, compare `N=8` shared TPR Leaf
+Batch `K=1/2/4`, and (2) separately inspect **Root Push,
+Leaf/Leaf Group, Root Pop** with NPU-event stage durations.
+
+**N8 data validity:** The default source is a genuine
+`actor_update_mini_batch` capture. The N8 preparation chooses **eight
+different captured rows from the same original session UID**, requires
+identical retained prompt tokens across them, and keeps their original
+recorded PPO labels/masks. It refuses to fabricate eight trajectories
+from the existing two-row capture. If this source has fewer than eight
+same-session rows, it will print `session_group_sizes` and FAIL; find a
+different real Actor capture or explicitly supply `TPR_CP1_N8_SOURCE`.
+Crop changes original conditioning; this remains a controlled PPO F/B
+comparison, not the original on-policy training objective.
+
+### HOST (Git worktree, NOT Docker)
+
+```bash
+cd /mnt/pipeline-data/j00972288/project/uniagent_linear/verl-tpr-leaf-microbatch
+git fetch tpr feat/tpr-leaf-microbatch-cp1-20261022
+git merge --ff-only FETCH_HEAD
+git status --short --branch
+```
+
+### DOCKER (use updated leaf worktree, not /workspace/uni-agent/verl)
+
+```bash
+cd /workspace/verl-tpr-leaf-microbatch
+python -m pytest -q -s tests/models/mcore/tpr/unit/test_cp1_n8_summary_cpu.py
+
+export TPR_CP1_N8_SOURCE=/workspace/tpr_actor_capture_4b_n8_run1/actor_update_rank0_batch0.pt
+export TPR_CP1_N8_ROOT=/workspace/tpr_experiments/cp1_n8_full_mb2_vs_leaf_k_v1
+export TPR_CP1_N8_CAP=2048
+export TPR_CP1_N8_PROMPT_WINDOW=1024
+export TPR_CP1_N8_WARMUPS=1
+export TPR_CP1_N8_REPEATS=3
+export TPR_CP1_N8_MEMORY_MARGIN_GIB=0.5
+export TPR_CP1_N8_RUN_STAGES=1
+
+# Do not mkdir ROOT ahead of time. This run rejects reused results.
+set -o pipefail
+bash tests/models/mcore/tpr/parallel/run_cp1_n8_full_mb2_leaf_k.sh \
+  2>&1 | tee "${TPR_CP1_N8_ROOT}.console.log"
+rc=${PIPESTATUS[0]}
+echo "===== N8 FINAL RESULTS OR ERRORS exit=$rc ====="
+cat "$TPR_CP1_N8_ROOT/SUMMARY.txt" 2>/dev/null || \
+  tail -n 90 "${TPR_CP1_N8_ROOT}.console.log"
+exit "$rc"
+```
+
+Optional `TPR_CP1_N8_ROWS=0,1,2,3,4,5,6,7` selects exact indices,
+but all eight must still be genuine, distinct and from one session.
+
+**Actual work (same for all four benchmark arms):**
+
+- Full MB2: eight complete trajectories, four physical `[2, S]` GPT
+  Forward+Backward microbatches, no Prefix cache
+- TPR K1: the same eight trajectories, one shared Turn-tree forest,
+  sequential sibling visits
+- TPR K2: the same eight trajectories, groups of at most two same-parent,
+  equal-length sibling leaves, still one forest
+- TPR K4: same forest, at most four siblings per grouped Forward;
+  if none eligible, fail instead of reporting a fabricated speedup
+
+All fair F/B benchmark arms independently load the same authentic Qwen3-4B
+BF16 checkpoint, use the same input SHA and PPO label positions. Each
+gets one warmup + 3 measured iterations, full gradient reset between
+iterations and no optimizer step. Outputs record measured timing medians,
+max peak allocated/reserved GiB, actual token savings and physical
+model calls. The summary checks FullMB2-versus-TPR memory safety with
+the fixed 0.5 GiB margin, plus Loss, Logprob and sampled gradient parity.
+
+**Stage profiling is isolated from benchmarking:** after the four fair
+arms, a new process profiles K2 and K4 individually using
+`TPR_EXEC_PROFILE=1` and `SegmentEventProfiler`.
+Outputs include grouped sizes and per-kind event-time sums for
+`push`, `visit_leaf`, `visit_leaf_group`, `pop`. The event timings
+are diagnostic, not independent components that must add up exactly to
+the unprofiled F/B wall time. They should not be used as an E2E
+speedup. Stage instrumented runs are intentionally single-iteration.
+
+**Failure behavior:** the runner's EXIT trap *always* tries to write
+`SUMMARY.txt` and `summary.json`, then prints the current failing
+log's error/last lines. No old error logs get mixed into the summary.
+The return code remains nonzero on capture incompatibility, OOM,
+parity mismatch assertion, or unexpected absence of actual K2/K4 grouping.
+
 ## Supported scope
 
 - **CP=1 only**, dense training, same-parent leaves, equal-length adjacent
