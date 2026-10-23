@@ -49,6 +49,99 @@ it instead identifies missing result arms and prints the current failed log.
 It does not turn gradient mismatch into a "PASS", and preserves the original
 exit code. Detailed raw data remain in `k1_vs_k2.json`.
 
+## Fair comparison against physical Full MB=2 (two trajectories)
+
+The original `full` arm called Qwen3-4B **twice** with batch size one.
+Comparing its time against TPR K2 would unfairly omit conventional batching.
+The four-way benchmark therefore adds the `full_batch2` mode, making
+**one** whole-sequence GPT invocation on physical input `[2, S]` and
+using the same real captured PPO token labels and global denominator.
+
+```text
+Full MB=1   two original full trajectories, 2 full-model forwards
+Full MB=2   two original full trajectories, 1 full-model forward with B=2
+TPR K=1     same two original trajectories, one reused Root + 2 separate Leafs
+TPR K=2     same two original trajectories, one reused Root + 1 two-Leaf group
+```
+
+**All four modes process exactly 2 logical trajectories.** TPR K=2 is *not*
+a smaller dataset: the common Root's tokens are calculated once and the two
+suffixes each receive their own PPO loss/gradient. K controls physical sibling
+batching *inside* that one forest, not a VERL mini-batch size.
+
+This experiment's `full_batch2` is a **controlled physical-MB2** model
+reference using the same square-CANN attention adapter as the other
+Full control. It is not yet a true production native VERL/Megatron
+`prepare_micro_batches + forward_backward_func + optimizer.step` run.
+Consequently, report it as controlled F/B, **not** training step/E2E speedup.
+
+Normal VERL fixed micro-batch configuration is
+`actor_rollout_ref.actor.use_dynamic_bsz=False` plus
+`actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2`.
+The Megatron Engine copies this into `engine_config.micro_batch_size_per_gpu`.
+With dynamic batch scheduling enabled, `ppo_max_token_len_per_gpu`
+rather than this sample-count cap controls micro-batches. **TPR currently
+bypasses `prepare_micro_batches()` and runs the whole supplied mini-batch
+as a Forest**; `TPR_LEAF_BATCH_SIZE` remains an independent optional
+grouping knob. Do not claim these settings are interchangeable.
+
+### Host — Git (not inside Docker)
+
+```bash
+cd /mnt/pipeline-data/j00972288/project/uniagent_linear/verl-tpr-leaf-microbatch
+git fetch tpr feat/tpr-leaf-microbatch-cp1-20261022
+git merge --ff-only FETCH_HEAD
+git status --short --branch
+```
+
+Sync/mount the updated leaf Worktree into the **actual** Docker source
+folder. In the recent run, `/workspace/verl-tpr-leaf-microbatch` had the
+new modules while `/workspace/uni-agent/verl` did not: use the former
+unless you explicitly synchronized the latter.
+
+### Docker — model / NPU experiments
+
+```bash
+cd /workspace/verl-tpr-leaf-microbatch
+export TPR_CP1_CAPTURE=/workspace/tpr_experiments/leaf_batch_k2_first_run/actor_pair_cap2048_p1024.pt
+export TPR_CP1_FULL_K2_ROOT=/workspace/tpr_experiments/full_mb2_vs_leaf_k2_v1
+export TPR_CP1_BENCH_WARMUPS=1
+export TPR_CP1_BENCH_REPEATS=3
+export TPR_CP1_MEMORY_MARGIN_GIB=0.5
+mkdir -p "$TPR_CP1_FULL_K2_ROOT"
+set -o pipefail
+bash tests/models/mcore/tpr/parallel/run_cp1_full_mb2_vs_leaf_k2.sh \
+  2>&1 | tee "$TPR_CP1_FULL_K2_ROOT/run.log"
+rc=${PIPESTATUS[0]}
+echo "===== FINAL FOUR-WAY RESULTS OR FAILURE exit=$rc ====="
+cat "$TPR_CP1_FULL_K2_ROOT/SUMMARY.txt" 2>/dev/null || \
+  tail -n 90 "$TPR_CP1_FULL_K2_ROOT/run.log"
+exit "$rc"
+```
+
+**Do not create the root before invoking this runner**; it deliberately
+requires a fresh root to prevent accidental reuse. If capturing outer logs
+with tee, tee into the *parent* directory or select a new leaf path.
+
+The runner installs an EXIT trap: even on NPU OOM or a failed arm it
+prints a concise table and saves `SUMMARY.txt` and `summary.json`.
+The reported time is a median of repeated F/B iterations after warmup;
+peak allocated and reserved use the **maximum** observed measured iteration
+(per physical Full/TPR arm). A capacity margin is marked PASS only when
+**both** TPR K2 peak allocated and reserved are at least
+`TPR_CP1_MEMORY_MARGIN_GIB` below Full MB2.
+
+K2 grouping also obeys `TPR_LEAF_BATCH_MAX_TOKENS`: a cap on *suffix
+tokens per physical leaf group*, not an absolute memory budget. The
+controlled pair here has exactly two trajectories, but extending to
+an 8-trajectory PPO mini-batch changes the Forest, graph lifetimes,
+and memory; **do not infer its peak from this pair alone.**
+
+The results are diagnostic until numerics are addressed: identical
+weights/capture are enforced, but both Full MB2 and TPR K2 can differ from
+Full MB1 in BF16 GEMM rounding. A speedup or memory PASS is not proof of
+PPO gradient equivalence.
+
 ## Supported scope
 
 - **CP=1 only**, dense training, same-parent leaves, equal-length adjacent
