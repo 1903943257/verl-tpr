@@ -108,14 +108,13 @@ export TPR_CP1_FULL_K2_ROOT=/workspace/tpr_experiments/full_mb2_vs_leaf_k2_v1
 export TPR_CP1_BENCH_WARMUPS=1
 export TPR_CP1_BENCH_REPEATS=3
 export TPR_CP1_MEMORY_MARGIN_GIB=0.5
-mkdir -p "$TPR_CP1_FULL_K2_ROOT"
 set -o pipefail
 bash tests/models/mcore/tpr/parallel/run_cp1_full_mb2_vs_leaf_k2.sh \
-  2>&1 | tee "$TPR_CP1_FULL_K2_ROOT/run.log"
+  2>&1 | tee "${TPR_CP1_FULL_K2_ROOT}.console.log"
 rc=${PIPESTATUS[0]}
 echo "===== FINAL FOUR-WAY RESULTS OR FAILURE exit=$rc ====="
 cat "$TPR_CP1_FULL_K2_ROOT/SUMMARY.txt" 2>/dev/null || \
-  tail -n 90 "$TPR_CP1_FULL_K2_ROOT/run.log"
+  tail -n 90 "${TPR_CP1_FULL_K2_ROOT}.console.log"
 exit "$rc"
 ```
 
