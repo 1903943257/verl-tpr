@@ -141,7 +141,7 @@ for item in m["items"][:required_steps]:
         f"total_full_tokens={item['logical_full_tokens']}",
         f"longest_session={maximum}",
         f"exceeds_online_49152={maximum > online_limit}",
-        "truncated=False",
+        f"truncated={bool(m.get('controlled_short_replay', False))}",
         flush=True,
     )
 print("REAL_ENGINE_PREFLIGHT_PASS", "verl=", verl.__file__,
@@ -168,7 +168,8 @@ if [[ "$MODE" == both || "$MODE" == full ]]; then
   export TPR_VERL_FULL_REPLAY_PREFIX="$FULL_PREFIX"
   echo "REAL_ENGINE_TRAIN_START mode=full steps=$STEPS output=$TPR_OFFLINE_OUTPUT_DIR"
   if torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29787 \
-    -m pytest -vv -s -x tests/models/mcore/tpr/parallel/test_verl_engine_full_replay_npu.py \
+    tests/models/mcore/tpr/parallel/_mindspeed_first_pytest.py -vv -s -x \
+    tests/models/mcore/tpr/parallel/test_verl_engine_full_replay_npu.py \
     2>&1 | tee "$OUTPUT_ROOT/logs/${FULL_PREFIX}.log"; then
     echo "REAL_ENGINE_TRAIN_PASS mode=full"
   else
@@ -184,7 +185,8 @@ if [[ "$MODE" == both || "$MODE" == tpr ]]; then
   export TPR_QKV_GRAD_AUDIT="${TPR_QKV_GRAD_AUDIT:-1}"
   echo "REAL_ENGINE_TRAIN_START mode=tpr steps=$STEPS qkv_audit=$TPR_QKV_GRAD_AUDIT"
   if torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29788 \
-    -m pytest -vv -s -x tests/models/mcore/tpr/parallel/test_verl_engine_tpr_replay_npu.py \
+    tests/models/mcore/tpr/parallel/_mindspeed_first_pytest.py -vv -s -x \
+    tests/models/mcore/tpr/parallel/test_verl_engine_tpr_replay_npu.py \
     2>&1 | tee "$OUTPUT_ROOT/logs/${TPR_PREFIX}.log"; then
     echo "REAL_ENGINE_TRAIN_PASS mode=tpr"
   else
