@@ -13,6 +13,14 @@ import sys
 
 
 def main() -> int:
+    # torchrun passes pytest flags (e.g. -vv -s -x test_file.py) as this
+    # script's argv. MindSpeed parses argv during import/repatch and can turn
+    # pytest options into malformed dynamic TransformerConfig dataclass fields.
+    # Preserve pytest's arguments separately and keep argv clean for every
+    # MindSpeed/Megatron/MBridge import in this bootstrap.
+    pytest_args = sys.argv[1:]
+    sys.argv[:] = [sys.argv[0]]
+
     # Fail explicitly if a test bootstrap or eager plugin already imported
     # GPT specs. An in-process "repatch" is not equivalent to a fresh import.
     polluted = [
@@ -64,7 +72,7 @@ def main() -> int:
 
     import pytest
 
-    return int(pytest.main(sys.argv[1:]))
+    return int(pytest.main(pytest_args))
 
 
 if __name__ == "__main__":
