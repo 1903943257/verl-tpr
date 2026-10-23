@@ -274,8 +274,8 @@ class _RingAttentionConfig:
     coalesce_prefix_full: bool = False
     coalesce_prefix_query: bool = False
     coalesce_prefix_padded: bool = False
-    coalesce_current_full: bool = False
     trace_layer: int | None = None
+    coalesce_current_full: bool = False
 
 
 @dataclass(frozen=True, slots=True)
