@@ -38,28 +38,6 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
     from verl.workers.engine.mindspeed.transformer_impl import MindspeedEngineWithLMHead
     from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
     from verl.trainer.config import CheckpointConfig
-    from ._real_engine_mbridge_local_spec import (
-        assert_replay_local_qwen3_norms,
-        install_replay_local_spec,
-    )
-
-    class ReplayMindspeedEngine(MindspeedEngineWithLMHead):
-        """Genuine VERL Engine, with only this Replay's MBridge instance adapted.
-
-        The production Engine still owns native DDP, CP schedule, optimizer,
-        weight loading and LR scheduler. TPR replaces SelfAttention on TOP
-        of the already-resolved MCore Local Spec, not on an absent TE norm.
-        """
-
-        def _build_megatron_module(self):
-            if not self.vanilla_bridge or self.provider is not None:
-                raise RuntimeError("Replay Local Spec expects vanilla MBridge")
-            install_replay_local_spec(self.bridge)
-            model = super()._build_megatron_module()
-            # Verify checkpoint loading BEFORE allocating optimizer state.
-            assert_replay_local_qwen3_norms(model[0], self.bridge)
-            return model
-
     model_cfg = HFModelConfig(
         path=str(checkpoint),
         enable_gradient_checkpointing=False,
@@ -141,7 +119,7 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
     old_argv = sys.argv[:]
     try:
         sys.argv[:] = [sys.argv[0]]
-        engine = ReplayMindspeedEngine(
+        engine = MindspeedEngineWithLMHead(
             model_cfg, engine_cfg, opt_cfg, CheckpointConfig(strict=False)
         )
         if not engine.engine_config.vanilla_mbridge:
