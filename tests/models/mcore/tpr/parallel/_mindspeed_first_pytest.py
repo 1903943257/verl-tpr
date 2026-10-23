@@ -57,6 +57,11 @@ def main() -> int:
         flush=True,
     )
 
+    # Lightweight executable check: verify the exact worker bootstrap without
+    # initializing NPU distributed or collecting pytest plugins.
+    if sys.argv[1:] == ["--bootstrap-only"]:
+        return 0
+
     import pytest
 
     return int(pytest.main(sys.argv[1:]))
