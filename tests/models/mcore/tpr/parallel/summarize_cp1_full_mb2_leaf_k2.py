@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import statistics
 from pathlib import Path
 
 ARMS = ("full_mb1", "full_mb2", "tpr_k1", "tpr_k2")
@@ -53,6 +52,14 @@ def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
             raise AssertionError(f"{arm} expected mode {mode}, got {item.get('mode')}")
         if item.get("logical_trajectories") != expected_count:
             raise AssertionError(f"{arm} did not use 2 logical trajectories")
+        if int(item.get("bench_repeats", 0)) < 1 or not item.get("bench_times_s"):
+            raise AssertionError(f"{arm} has no measured iterations")
+        if len(item["bench_times_s"]) != item["bench_repeats"]:
+            raise AssertionError(f"{arm} lost measured iterations")
+        if item["fwd_bwd_seconds"] <= 0:
+            raise AssertionError(f"{arm} has invalid measured median time")
+        if arm == "full_mb1" and item.get("physical_full_micro_batch") != 1:
+            raise AssertionError("Full MB1 reference is not one row per model invocation")
         if arm == "full_mb2" and item.get("physical_full_micro_batch") != 2:
             raise AssertionError("Full MB2 run never executed a physical batch of 2")
         if arm == "tpr_k2" and (
@@ -99,6 +106,7 @@ def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
     lines.extend(["-" * 83, ""])
     report = {
         "scope": "controlled_CP1_physical_microbatch_no_native_scheduler",
+        "benchmark_acceptance": "DIAGNOSTIC_ONLY_UNTIL_GRADIENT_EQUIVALENCE",
         "logical_trajectories_per_arm": expected_count,
         "memory_margin_gib": memory_margin_gib,
         "arms": {
