@@ -515,6 +515,11 @@ def test_real_actor_cp1_short_full_vs_tpr():
             "bench_peak_allocated_gib": memory_allocated,
             "bench_peak_reserved_gib": memory_reserved,
             "logical_trajectories": 2,
+            "physical_model_forward_calls": (
+                1 if mode == "full_batch2" else
+                2 if mode == "full" else
+                leaf_batch_stats["model_forward_calls"] if leaf_batch_stats else None
+            ),
             "physical_full_micro_batch": 2 if mode == "full_batch2" else 1 if mode == "full" else None,
             "benchmark_scope": "controlled_forward_backward_no_optimizer_no_native_VERL_microbatch_scheduler",
             "leaf_batch_stats": leaf_batch_stats,
