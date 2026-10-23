@@ -41,7 +41,7 @@ pytestmark = pytest.mark.skipif(
     reason="Set TPR_RUN_CP1_SHORT_ACTOR=1 for opt-in one-NPU Actor PPO parity",
 )
 
-MODES = ("full", "one_node", "split_no_share", "shared")
+MODES = ("full", "full_batch2", "one_node", "split_no_share", "shared")
 
 
 @torch.no_grad()
@@ -206,6 +206,58 @@ def _run_controlled_full(model, batch, *, loss_fn, forest):
 
 
 
+def _run_controlled_full_batch2(model, batch, *, loss_fn, forest):
+    """Physical MB=2 square-CANN whole-sequence GPT baseline, not VERL native scheduler.
+
+    Unlike _run_controlled_full (two individual B=1 forwards), this makes ONE
+    full-sequence model invocation with [2, S] tokens. The same per-row
+    SegmentPPOObjectiveAdapter / global denominator as K1/K2 is used.
+    This tests the *physical batch* of Full fairly without pretending the
+    test's lightweight engine is native VERL prepare_micro_batches.
+    """
+    from verl.models.mcore.tpr.context import get_tpr_attention_context
+    from verl.workers.engine.megatron.tpr.objective import SegmentPPOObjectiveAdapter
+
+    if get_tpr_attention_context() is not None:
+        raise AssertionError("Full physical MB2 must not use a TPR KV context")
+    if len(forest.trees) != 2 or any(len(tree.segment_plan.segments) != 1 for tree in forest.trees):
+        raise AssertionError("Full physical MB2 requires two independent complete trajectories")
+    roots = [tree.segment_plan.get(tree.segment_plan.root_id) for tree in forest.trees]
+    lengths = [segment.length for segment in roots]
+    if lengths[0] != lengths[1]:
+        raise NotImplementedError(
+            "This Full MB=2 control deliberately requires equally long rows; "
+            f"got lengths={lengths}, no silent padding / different valid-token masks."
+        )
+    if len(batch["input_ids"]) != 2:
+        raise AssertionError("Exactly two original logical trajectories required")
+    ids = torch.stack([segment.token_ids for segment in roots], dim=0).to(
+        device=next(model.parameters()).device,
+    )
+    positions = torch.arange(lengths[0], device=ids.device, dtype=torch.long)
+    positions = positions.unsqueeze(0).expand(2, -1).contiguous()
+    chunk_size = int(os.getenv("TPR_PPO_LOGPROB_CHUNK_TOKENS", "0"))
+    if chunk_size < 0:
+        raise ValueError("Negative PPO chunk size")
+    objective = SegmentPPOObjectiveAdapter(batch, loss_fn, log_prob_chunk_size=chunk_size or None)
+    logits = model(input_ids=ids, position_ids=positions, attention_mask=None)
+    if tuple(logits.shape[:2]) != (2, lengths[0]):
+        raise AssertionError(f"Unexpected physical Full MB2 logits: {tuple(logits.shape)}")
+    losses = []
+    for row, (tree, segment) in enumerate(zip(forest.trees, roots, strict=True)):
+        callback, counts = objective.bind_tree(tree)
+        if counts[segment.segment_id] != len(tree.refs_for_segment(segment.segment_id)):
+            raise AssertionError(f"Full MB2 row={row} PPO reference count mismatch")
+        local_loss, _ = callback(segment, logits[row:row + 1])
+        losses.append(local_loss)
+    total_loss = torch.stack(losses).sum()
+    total_loss.backward()
+    return {
+        "loss": float(total_loss.detach().item()),
+        "logprobs": dict(objective.debug_new_log_probs),
+    }
+
+
 def _run_split_no_share(model, engine, batch, *, loss_fn, forest):
     """Run two isolated Root/Leaf chains through the SAME production Executor."""
     from verl.models.mcore.tpr.attention import TPRSelfAttention
@@ -314,6 +366,10 @@ def test_real_actor_cp1_short_full_vs_tpr():
                 result = _run_controlled_full(
                     model, batch, loss_fn=loss_fn, forest=forest,
                 )
+            elif mode == "full_batch2":
+                result = _run_controlled_full_batch2(
+                    model, batch, loss_fn=loss_fn, forest=forest,
+                )
             elif mode == "split_no_share":
                 result = _run_split_no_share(
                     model, engine, batch, loss_fn=loss_fn, forest=forest,
@@ -393,7 +449,8 @@ def test_real_actor_cp1_short_full_vs_tpr():
             "mode": mode,
             "reference": (
                 "whole_GPT_no_TPR_context_CP1_square_CANN"
-                if mode == "full" else "TPR_1root_per_row_CP1"
+                if mode == "full" else "whole_GPT_2rows_1physical_forward_CP1_square_CANN"
+                if mode == "full_batch2" else "TPR_1root_per_row_CP1"
                 if mode == "one_node" else "TPR_independent_root_leaf_chains_CP1"
                 if mode == "split_no_share" else "TPR_shared_root_two_leaves_CP1"
             ),
@@ -420,6 +477,9 @@ def test_real_actor_cp1_short_full_vs_tpr():
             "full_grad_dir": full_grad_dir,
             "full_gradient_scope": "ALL_PARAMETERS_BF16_TP1_CP1" if full_grad_dir else None,
             "fwd_bwd_seconds": seconds,
+            "logical_trajectories": 2,
+            "physical_full_micro_batch": 2 if mode == "full_batch2" else 1 if mode == "full" else None,
+            "benchmark_scope": "controlled_forward_backward_no_optimizer_no_native_VERL_microbatch_scheduler",
             "leaf_batch_stats": leaf_batch_stats,
             "leaf_batch_configured_k": int(os.getenv("TPR_LEAF_BATCH_SIZE", "1")),
             "leaf_batch_max_tokens": int(os.getenv("TPR_LEAF_BATCH_MAX_TOKENS", "8192")),
