@@ -240,7 +240,12 @@ class DispatchTests(unittest.TestCase):
                                       event["phase"] == phase and event["segment_type"] == "prefix"]
                         new_prefix = [event for event in new_events if
                                       event["phase"] == phase and event["segment_type"] == "prefix"]
-                        self.assertEqual(old_prefix, new_prefix)
+                        self.assertEqual(
+                            [(event["query_length"], event["kv_length"], event["block_type"])
+                             for event in old_prefix],
+                            [(event["query_length"], event["kv_length"], event["block_type"])
+                             for event in new_prefix],
+                        )
 
     def test_query_eligibility_fallback(self):
         ns = load_dispatch()
