@@ -116,6 +116,41 @@ def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
             if results["tpr_k1"] else "Unique-token saving: TPR K1 unavailable"
         )
 
+    parity_report = {}
+    if full:
+        from .compare_real_actor_cp1_short_full_tpr import _metrics
+        baseline_lp = {
+            (int(row), int(offset)): float(value)
+            for row, offset, value in full["logprobs"]
+        }
+        for arm in ("tpr_k1", "tpr_k2", "tpr_k4"):
+            item = results[arm]
+            if item is None:
+                continue
+            test_lp = {
+                (int(row), int(offset)): float(value)
+                for row, offset, value in item["logprobs"]
+            }
+            if baseline_lp.keys() != test_lp.keys() or len(baseline_lp) != full["ppo_tokens"]:
+                raise AssertionError(f"N8 Full vs {arm}: supervised response-token coordinates differ")
+            keys = sorted(baseline_lp)
+            lp_metric = _metrics([baseline_lp[key] for key in keys], [test_lp[key] for key in keys])
+            a, b = full["gradient_witness"], item["gradient_witness"]
+            if (a["names"] != b["names"]
+                    or a["canonical_shapes"] != b["canonical_shapes"]):
+                raise AssertionError(f"N8 Full vs {arm}: canonical gradient sample coordinates mismatch")
+            grad_metric = _metrics(a["values"], b["values"])
+            parity_report[arm] = {
+                "ppo_loss_abs": abs(float(full["loss"])-float(item["loss"])),
+                "logprob_rel_l2": lp_metric["relative_l2"],
+                "sampled_parameter_grad_rel_l2": grad_metric["relative_l2"],
+            }
+            lines.append(
+                f"PARITY Full MB2 vs {arm}: loss_gap={parity_report[arm]['ppo_loss_abs']:.7f} "
+                f"logprob_rel_l2={lp_metric['relative_l2']:.6f} "
+                f"sampled_grad_rel_l2={grad_metric['relative_l2']:.6f}"
+            )
+
     stage_report = {}
     for k in (2, 4):
         path = root / f"stage_tpr_k{k}" / "result.json"
@@ -163,7 +198,7 @@ def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
             }
             for arm, item in results.items() if item is not None
         },
-        "comparison": comparison, "stage": stage_report,
+        "comparison": comparison, "parity": parity_report, "stage": stage_report,
         "missing_arms": missing, "memory_margin_gib": memory_margin_gib,
     }
     root.mkdir(parents=True, exist_ok=True)
