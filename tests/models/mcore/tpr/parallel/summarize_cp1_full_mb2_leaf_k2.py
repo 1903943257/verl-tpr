@@ -91,6 +91,11 @@ def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
         return None if item is None else item.get(key)
 
     rows = (
+        ("Logical trajectories", "logical_trajectories", 0),
+        ("Logical input tokens", "logical_input_tokens", 0),
+        ("Unique tree tokens", "unique_tree_tokens", 0),
+        ("Model forward calls", "physical_model_forward_calls", 0),
+        ("Supervised PPO tokens", "ppo_tokens", 0),
         ("Measured iterations", "bench_repeats", 0),
         ("Median F/B (seconds)", "fwd_bwd_seconds", 3),
         ("Peak allocated MAX (GiB)", "peak_allocated_gib", 3),
@@ -115,7 +120,8 @@ def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
                     "fwd_bwd_seconds", "peak_allocated_gib", "peak_reserved_gib",
                     "bench_warmups", "bench_repeats", "bench_times_s",
                     "loss", "global_grad_norm", "logical_trajectories",
-                    "physical_full_micro_batch", "leaf_batch_stats",
+                    "physical_full_micro_batch", "physical_model_forward_calls",
+                    "logical_input_tokens", "unique_tree_tokens", "ppo_tokens", "leaf_batch_stats",
                 )
             }
             for arm, item in data.items()
