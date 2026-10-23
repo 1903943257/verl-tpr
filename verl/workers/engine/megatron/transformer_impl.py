@@ -293,6 +293,14 @@ class MegatronEngine(BaseEngine):
         self.dtype = PrecisionType.to_dtype(self.param_dtype)
 
         override_transformer_config = mapping_string_to_attn_backend({**self.engine_config.override_transformer_config})
+        # Keep the explicit EngineConfig field effective on the vanilla-MBridge
+        # path too. The provider path below already applies this field directly,
+        # but vanilla MBridge only receives override_transformer_config; otherwise
+        # MindSpeed's global/default sequence_parallel can silently win over
+        # engine_config.sequence_parallel (e.g. Full/TPR CP4 parity expects False).
+        override_transformer_config.setdefault(
+            "sequence_parallel", self.engine_config.sequence_parallel
+        )
         if self.is_value_model:
             # A value head cannot share weights with the vocabulary embedding. Force the HF
             # flag off (both bridges derive the model's tie-embeddings behavior from it) and
