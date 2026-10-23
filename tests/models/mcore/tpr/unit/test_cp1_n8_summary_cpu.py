@@ -47,7 +47,7 @@ def test_n8_report_includes_workload_speed_memory(tmp_path):
     assert "Model forward calls" in printed
     assert "Actual N8 unique-token saving" in printed
     assert "memory_margin=PASS" in printed
-    assert "TPR K=2" not in printed or "tpr_k2:" in printed
+    assert "tpr_k2:" in printed
     assert (tmp_path / "summary.json").exists()
 
 
