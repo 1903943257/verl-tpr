@@ -1,11 +1,11 @@
-"""N=8 Full physical MB2 versus CP1 TPR K1/K2/K4, with stage attribution."""
+"""N=8 Full physical MB1/MB2 versus CP1 TPR K1/K2/K4, with stage attribution."""
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
 
-ARMS = ("full_mb2", "tpr_k1", "tpr_k2", "tpr_k4")
+ARMS = ("full_mb1", "full_mb2", "tpr_k1", "tpr_k2", "tpr_k4")
 STAGES = ("push", "visit_leaf", "visit_leaf_group", "pop")
 
 
@@ -16,16 +16,17 @@ def _load(root, arm):
 
 def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
     results = {arm: _load(root, arm) for arm in ARMS}
-    missing = [arm for arm in ARMS if results[arm] is None]
+    # Full MB1 is supplementary: existing roots remain fully reportable.
+    missing = [arm for arm in ARMS if results[arm] is None and arm != "full_mb1"]
     lines = [
-        "=" * 89,
-        "TPR CP1 N=8 | FAIR FULL MB=2 vs TPR K=1/2/4",
+        "=" * 101,
+        "TPR CP1 N=8 | FAIR FULL MB=1/2 vs TPR K=1/2/4",
         "Eight DISTINCT actual same-session PPO trajectories per run; one NPU, Qwen3-4B BF16",
-        "Controlled short-crop PPO; square-CANN Full B=2; model F/B, no optimizer/Rollout/CP",
+        "Controlled short-crop PPO; square-CANN Full B=1/2; model F/B, no optimizer/Rollout/CP",
         f"root={root}",
-        "=" * 89,
-        f"{'Metric':<37} {'Full MB2':>11} {'TPR K1':>11} {'TPR K2':>11} {'TPR K4':>11}",
-        "-" * 89,
+        "=" * 101,
+        f"{'Metric':<37} {'Full MB1':>11} {'Full MB2':>11} {'TPR K1':>11} {'TPR K2':>11} {'TPR K4':>11}",
+        "-" * 101,
     ]
     present = [record for record in results.values() if record is not None]
     if present:
@@ -38,16 +39,20 @@ def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
         for arm, item in results.items():
             if item is None:
                 continue
-            exp_mode = "full_mb2" if arm == "full_mb2" else "tpr"
-            exp_k = 1 if arm == "full_mb2" else int(arm[-1])
+            exp_mode = arm if arm.startswith("full_mb") else "tpr"
+            exp_k = 1 if arm.startswith("full_mb") else int(arm[-1])
             if item["mode"] != exp_mode or item["configured_k"] != exp_k:
                 raise AssertionError(f"{arm} mode/K mismatch")
             if item["logical_trajectories"] != 8 or item["ppo_tokens"] <= 0:
                 raise AssertionError(f"{arm} does not cover 8 valid PPO trajectories")
             if item.get("stage_profile") or len(item["bench_times_s"]) != item["bench_repeats"]:
                 raise AssertionError(f"{arm} was traced/stage-profiled or missed repeats; not fair F/B")
-            if arm == "full_mb2" and item["physical_model_forward_calls"] != 4:
-                raise AssertionError("Full MB2 expected exactly four B=2 forward calls")
+            if arm.startswith("full_mb"):
+                physical_b = 1 if arm == "full_mb1" else 2
+                if item["physical_model_forward_calls"] != 8 // physical_b:
+                    raise AssertionError(f"{arm} forward calls don't match physical B={physical_b}")
+                if item.get("physical_full_micro_batch", physical_b) != physical_b:
+                    raise AssertionError(f"{arm} physical batch size does not match B={physical_b}")
             if arm.startswith("tpr_k") and (
                 arm != "tpr_k1" and not item["leaf_batch_stats"]["grouped_leaf_calls"]
             ):
@@ -80,7 +85,7 @@ def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
                 f"{fmt(get(results[arm],key),p):>11}" for arm in ARMS
             )
         )
-    lines.extend(["-" * 89])
+    lines.extend(["-" * 101])
     comparison = {}
     full = results["full_mb2"]
     if full:
@@ -151,6 +156,25 @@ def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
                 f"sampled_grad_rel_l2={grad_metric['relative_l2']:.6f}"
             )
 
+    # Supplemental Full MB1: existing N8 arms are reused verbatim and only
+    # the new B1 measurement changes this part of the report.
+    full_mb1_comparison = {}
+    mb1 = results["full_mb1"]
+    if mb1 is not None:
+        full_time = float(mb1["fwd_bwd_seconds"])
+        if full is not None:
+            speed = full_time / float(full["fwd_bwd_seconds"])
+            full_mb1_comparison["full_mb1_to_full_mb2_speedup"] = speed
+            lines.append(f"Full MB1/Full MB2 physical batching speedup={speed:.4f}x")
+        for arm in ("tpr_k1", "tpr_k2", "tpr_k4"):
+            item = results[arm]
+            if item is not None:
+                speed = full_time / float(item["fwd_bwd_seconds"])
+                full_mb1_comparison[f"full_mb1_vs_{arm}_speedup"] = speed
+                lines.append(f"{arm}: FullMB1/TPR speedup={speed:.4f}x (Push/Pop included)")
+    else:
+        lines.append("Full MB1 supplemental baseline: NOT YET MEASURED.")
+
     stage_report = {}
     for k in (2, 4):
         path = root / f"stage_tpr_k{k}" / "result.json"
@@ -185,7 +209,7 @@ def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
         "WARNING: Speedups are diagnostic until BF16 PPO gradients converge.",
         "Model F/B only; CP1, no optimizer, no production native VERL microbatch schedule.",
         f"Summary: {root / 'SUMMARY.txt'}",
-        "=" * 89,
+        "=" * 101,
     ])
     report = {
         "input_sha256": present[0]["input_sha256"] if present else None,
@@ -198,7 +222,8 @@ def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
             }
             for arm, item in results.items() if item is not None
         },
-        "comparison": comparison, "parity": parity_report, "stage": stage_report,
+        "comparison": comparison, "full_mb1_comparison": full_mb1_comparison,
+        "parity": parity_report, "stage": stage_report,
         "missing_arms": missing, "memory_margin_gib": memory_margin_gib,
     }
     root.mkdir(parents=True, exist_ok=True)
