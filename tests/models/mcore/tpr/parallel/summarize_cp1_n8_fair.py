@@ -172,6 +172,38 @@ def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
                 speed = full_time / float(item["fwd_bwd_seconds"])
                 full_mb1_comparison[f"full_mb1_vs_{arm}_speedup"] = speed
                 lines.append(f"{arm}: FullMB1/TPR speedup={speed:.4f}x (Push/Pop included)")
+        # A separate numerical check for physical Full batch size itself,
+        # and the original no-Leaf-batching TPR baseline.
+        from .compare_real_actor_cp1_short_full_tpr import _metrics
+        baseline_lp = {
+            (int(r), int(offset)): float(v) for r, offset, v in mb1["logprobs"]
+        }
+        for arm in ("full_mb2", "tpr_k1"):
+            item = results[arm]
+            if item is None:
+                continue
+            test_lp = {
+                (int(r), int(offset)): float(v) for r, offset, v in item["logprobs"]
+            }
+            if baseline_lp.keys() != test_lp.keys() or len(test_lp) != mb1["ppo_tokens"]:
+                raise AssertionError(f"Full MB1 vs {arm}: PPO token coordinates differ")
+            keys = sorted(baseline_lp)
+            lp_metric = _metrics([baseline_lp[k] for k in keys], [test_lp[k] for k in keys])
+            a, b = mb1["gradient_witness"], item["gradient_witness"]
+            if a["names"] != b["names"] or a["canonical_shapes"] != b["canonical_shapes"]:
+                raise AssertionError(f"Full MB1 vs {arm}: gradient witness coordinates differ")
+            grad_metric = _metrics(a["values"], b["values"])
+            parity = {
+                "loss_abs_gap": abs(float(mb1["loss"]) - float(item["loss"])),
+                "logprob_rel_l2": lp_metric["relative_l2"],
+                "sampled_grad_rel_l2": grad_metric["relative_l2"],
+            }
+            full_mb1_comparison[f"parity_vs_{arm}"] = parity
+            lines.append(
+                f"PARITY Full MB1 vs {arm}: loss_gap={parity['loss_abs_gap']:.7f} "
+                f"logprob_rel_l2={parity['logprob_rel_l2']:.6f} "
+                f"sampled_grad_rel_l2={parity['sampled_grad_rel_l2']:.6f}"
+            )
     else:
         lines.append("Full MB1 supplemental baseline: NOT YET MEASURED.")
 
