@@ -95,3 +95,57 @@ equivalence, stable throughput across other datasets, CP>1 Leaf batching.
 
 Do not introduce more branches, production path changes, or larger K in this
 stage. Future work requires a separate correctness gate.
+
+
+## 2026-10-25 repository merge inventory and next PR Draft gates
+
+GitHub REMOTE (not necessarily the server's local worktree) has **18
+branches including `main`**. Core pending work:
+
+| Topic | Branch | GitHub comparison to main | Decision |
+|---|---|---|---|
+| Ring/performance investigation | `feat/tpr-cp1-n8-p8192-s1024-perf-20261019` | ahead 134, behind 9; PR #12 Draft, mergeable=dirty | Rebase/split benchmarks and production Ring change before merging |
+| Old Ring/PPO slim | `refactor/tpr-pr8-net-slim-ring3-20261019` | ahead 24, behind 113 | Inspect overlap with Ring branch; avoid blanket merge |
+| Leaf MB | `feat/tpr-leaf-microbatch-cp1-20261022` | ahead 77, behind 0 at audit time | Full MB1 pending; review and gate correctness |
+| Numerical / QKV audit | `test/tpr-qkv-fp64-grad-buffer-audit-20261022` | ahead 35, behind 0; PR #14 Draft | Distinguish diagnostic tests vs runtime changes; NPU gate |
+| Tests organization | `refactor/tpr-test-suite-organization-20261019` | ahead 51, behind 0; 253 changed files, 19,638 deletions | LAST, after reconciling newer tests |
+| 4K split one-file branch | `test/tpr-cp1-4k-sequence-split-20261023` | ahead 1, behind 0 | Check duplication with PR #14 before merge |
+| Short-fix corpus screening | `feat/tpr-swe-rebench-shortfix-screen-20261023` | ahead 3, behind 0 | Keep independent for later long-prefix/short-suffix task selection |
+
+Historical branches still remotely present: `docs/tpr-learning-guide-20261019`,
+`docs/tpr-long-prefix-performance-20261019`,
+`feat/tpr-full-recompute-on-pr7-main-20261019`,
+`feat/tpr-full-recompute-uniform1-prototype`,
+`feat/tpr-full-recompute-uniform1-refactor`,
+`feat/tpr-production-dp2-ring-3files-20261019`,
+`refactor/tpr-cp-ring-only-qkvmerge-20261015`,
+`refactor/tpr-ppo-engine-ring-turn-20261015`,
+`refactor/tpr-production-api-state-slim-20261016`,
+`refactor/tpr-ring-layout-validation-main-20261016`.
+Previous PRs #6-#11 already merged baseline Ring, DP and Recompute
+pieces. Do NOT merge stale branches solely because they still exist.
+
+**Correct sequence, contingent on passing tests and code review:**
+(1) run only N8 Full MB1, append actual measured result to table above;
+(2) disentangle and validate Ring/performance changes (PR #12 dirty);
+(3) finish correctness audit PR #14, or merge it explicitly as diagnostics
+without claiming gradient parity; (4) Leaf K2 review and verification, rebase
+after conflicting `adapter.py` work; (5) test organization last, retaining
+newer files added to main; (6) AFTER consolidation, resume SWE-reBench
+candidate selection and real UniAgent long-prefix/short-suffix workload
+research; (7) prepare one clearly scoped upstream Draft PR on the resulting
+main once repository/CI and benchmark provenance are audited.
+
+Known blockers for an upstream production PR: ~20-28% sampled gradient rel-L2
+gaps in controlled CP1 comparisons; TPR bypasses native
+`prepare_micro_batches` (K is not VERL native MB); CP1 equal-length only
+for Leaf grouping; NPU acceptance after branch integration; PR #12 conflict
+with main; tests cleanup may delete newer test modules. Upstream claim must
+be limited to verified configurations and clearly distinguish offline
+model-F/B speed from optimizer/rollout E2E.
+
+MB1 result is STILL PENDING: do not insert invented timing, memory, parity or
+speedup numbers. The existing runner
+`tests/models/mcore/tpr/parallel/run_cp1_n8_add_full_mb1.sh` is
+the sole remaining stage performance measurement. It must use the preserved
+old N8 Capture and never overwrite the other four arm result JSON files.
