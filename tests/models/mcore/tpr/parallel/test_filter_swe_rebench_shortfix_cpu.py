@@ -9,6 +9,7 @@ import pytest
 from .filter_swe_rebench_shortfix import (
     decode_array,
     describe,
+    extract_metadata,
     patch_metrics,
     screen,
     tier,
@@ -49,6 +50,32 @@ def _row(instance_id: str, patch: str, *, f2p=1, issue_chars=100,
     }
 
 
+def _row_reward_layout(instance_id: str, patch: str):
+    """Match the local Parquet layout: tools_kwargs.reward.metadata."""
+    metadata = {
+        "instance_id": instance_id,
+        "repo": "demo/pkg",
+        "base_commit": "abc123",
+        "patch": patch,
+        "test_patch": "",
+        "problem_statement": "fix a small bug",
+        "FAIL_TO_PASS": ["test_one"],
+        "PASS_TO_PASS": ["test_existing"],
+        "install": "pip install -e .",
+        "test_cmd": "pytest -q",
+    }
+    return {
+        "prompt": [{"role": "user", "content": "fix a small bug"}],
+        "agent_name": "claude_code",
+        "extra_info": {
+            "tools_kwargs": {
+                "env": {"deployment": {"image": "swerebench/sample"}},
+                "reward": {"name": "swe_rebench", "metadata": metadata},
+            }
+        },
+    }
+
+
 def test_patch_metrics_excludes_headers_and_test_sources():
     patch = _patch("pkg/code.py", 2) + _patch("tests/test_code.py", 1)
     paths, sources, changed, hunks = patch_metrics(patch)
@@ -58,13 +85,25 @@ def test_patch_metrics_excludes_headers_and_test_sources():
     assert hunks == 2
 
 
-def test_serialized_uniagent_metadata_is_read_without_mutation():
+def test_serialized_uniagent_task_metadata_is_read_without_mutation():
     item = _row("case_1", _patch("src/code.py"), serialized=True)
     got = describe(pd.Series(item))
     assert (got["instance_id"], got["source_files"], got["fail_to_pass"]) == ("case_1", 1, 1)
     assert tier(got) == "strict"
     assert decode_array("not-json") == []
     assert item["extra_info"]  # Original row was not mutated.
+
+
+def test_local_reward_metadata_layout_is_supported():
+    item = _row_reward_layout("case_reward", _patch("src/code.py", 2))
+    metadata = extract_metadata(pd.Series(item))
+    got = describe(pd.Series(item))
+    assert metadata["instance_id"] == "case_reward"
+    assert metadata["install"] == "pip install -e ."
+    assert got["repo"] == "demo/pkg"
+    assert got["source_files"] == 1
+    assert got["fail_to_pass"] == 1
+    assert tier(got) == "strict"
 
 
 def test_screen_preserves_original_task_rows_and_prioritizes_strict():
@@ -76,7 +115,7 @@ def test_screen_preserves_original_task_rows_and_prioritizes_strict():
     assert counts == {"strict": 1, "relaxed": 1, "reject": 1}
     assert shortlist["instance_id"].tolist() == ["strict", "relaxed"]
     assert selected.to_dict("records") == [small, large]
-    assert "patch" not in selected.columns  # Only inside original metadata, never a prompt column.
+    assert "patch" not in selected.columns
     assert original.iloc[0]["extra_info"] == large["extra_info"]
 
 
