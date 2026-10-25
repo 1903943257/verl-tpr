@@ -157,10 +157,15 @@ JSON results were retained. Controlled model F/B medians and maximum peaks:
 | TPR K2 | 1.7183 | 28.279 | 31.061 |
 | TPR K4 | 1.5791 | 40.399 | 43.014 |
 
-Relative to Full MB1, measured TPR F/B time ratios are 1.2964x (K1),
+Full MB2 is 1.0392x faster than Full MB1 by measured F/B time (2.5136 s vs
+2.6122 s). Relative to Full MB1, measured TPR F/B speedups are 1.2964x (K1),
 1.5202x (K2), and 1.6543x (K4), with root Push/Pop included. These are
 controlled CP1 model F/B measurements, not rollout-inclusive or optimizer-step
-throughput. K2 peak allocated/reserved exceed Full MB1 by 0.633/0.774 GiB;
+throughput. Full MB1 vs TPR K1 has loss gap 0.0003796, logprob relative L2
+0.030818, and sampled-gradient relative L2 0.301754. Full MB1 vs Full MB2 has
+loss gap 0.0001560, logprob relative L2 0.030898, and sampled-gradient relative
+L2 0.289708. These gradient discrepancies remain a correctness blocker.
+K2 peak allocated/reserved exceed Full MB1 by 0.633/0.774 GiB;
 K2 therefore does **not** fit within Full MB1's measured peak-memory envelope.
 K1 is 5.914 GiB allocated and 6.760 GiB reserved below Full MB1. K4's peak
 is close to Full MB2. BF16 sampled-gradient gaps remain large, so these
@@ -169,8 +174,8 @@ speedups are diagnostic rather than evidence of numerical equivalence.
 The first CPU summary test run exposed a fixture defect: it declared
 `ppo_tokens=3333` but provided only two logprob coordinates. The summary's
 strict coordinate-coverage assertion correctly rejected it; this is not the
-same as a failure of the measured NPU result. The fixture is being corrected
-to supply 3333 unique response-token coordinates, and the runner is being
-hardened to propagate final-summary failures instead of hiding them behind
-`|| true`. Re-run the CPU summary tests after syncing these fixes before
-calling the Leaf Batch stage fully closed.
+same as a failure of the measured NPU result. The fixture now supplies 3333
+unique response-token coordinates, and the runner now propagates final-summary
+failures instead of hiding them behind `|| true`. The changes are committed on
+`feat/tpr-leaf-microbatch-cp1-20261022`; run the CPU summary tests and regenerate
+the report on the user's server before calling the Leaf Batch stage fully closed.
