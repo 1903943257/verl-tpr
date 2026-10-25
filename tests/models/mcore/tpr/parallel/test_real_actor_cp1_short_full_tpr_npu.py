@@ -393,6 +393,8 @@ def test_real_actor_cp1_short_full_vs_tpr():
                 trace.replay_root_qkv_m(
                     Path(os.environ["TPR_CP1_TRACE_DIR"]) / "full/trace.pt"
                 )
+            if mode in ("split_no_share", "shared"):
+                trace.run_same_qkv_attention_backward()
             trace_path = Path(os.environ["TPR_CP1_TRACE_DIR"]) / mode / "trace.pt"
             trace.save(trace_path)
             print(f"TPR_CP1_STAGE_TRACE mode={mode} saved={trace_path}", flush=True)
