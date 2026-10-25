@@ -42,6 +42,13 @@ TIERS = ("strict", "relaxed", "reject")
 DEFAULT_DATA_SOURCE = "nebius/SWE-rebench"
 
 
+def get_image_name(instance_id):
+    """Return the current UniAgent SWE-reBench per-instance image reference."""
+    if not isinstance(instance_id, str) or not instance_id.strip():
+        raise ValueError("SWE-reBench row is missing a non-empty instance_id")
+    return f"swerebench/sweb.eval.x86_64.{instance_id.lower().replace('__', '_1776_')}"
+
+
 def decode_object(value):
     if isinstance(value, dict):
         return value
@@ -93,8 +100,9 @@ def normalize_task_row(row):
     """Convert legacy reward/env metadata into the current UniAgent Task Config row.
 
     The current framework runner requires extra_info.tools_kwargs.task. Legacy
-    rows instead store task payload under tools_kwargs.reward.metadata and the
-    image under tools_kwargs.env.deployment.image.
+    rows store task payload under tools_kwargs.reward.metadata and may use a
+    generic local image plus post_setup_cmd. For legacy SWE-reBench rows, use
+    the current per-instance image naming contract instead of that local image.
     """
     sample = row.to_dict() if hasattr(row, "to_dict") else dict(row)
     extra = decode_object(sample.get("extra_info"))
@@ -103,6 +111,15 @@ def normalize_task_row(row):
     # Normalize even current-format rows if extra_info was serialized as JSON.
     existing_task = decode_object(tools_kwargs.get("task"))
     if existing_task:
+        # Recover rows that were already converted using the old local image.
+        task_meta = decode_object(existing_task.get("metadata"))
+        sandbox = decode_object(existing_task.get("sandbox"))
+        if sandbox.get("image") == "swe-local:3.12" and task_meta.get("instance_id"):
+            existing_task = dict(existing_task)
+            existing_task["sandbox"] = {
+                **sandbox,
+                "image": get_image_name(task_meta["instance_id"]),
+            }
         normalized_tools = dict(tools_kwargs)
         normalized_tools["task"] = existing_task
         normalized_extra = dict(extra)
@@ -115,9 +132,6 @@ def normalize_task_row(row):
     metadata = decode_object(reward.get("metadata"))
     task_name = reward.get("name")
     env = decode_object(tools_kwargs.get("env"))
-    deployment = decode_object(env.get("deployment"))
-    image = deployment.get("image")
-
     if task_name != "swe_rebench":
         raise ValueError(
             f"row {metadata.get('instance_id', '?')}: expected reward.name='swe_rebench', "
@@ -125,14 +139,18 @@ def normalize_task_row(row):
         )
     if not metadata:
         raise ValueError(f"row {metadata.get('instance_id', '?')}: missing reward.metadata")
-    if not isinstance(image, str) or not image.strip():
-        raise ValueError(
-            f"row {metadata.get('instance_id', '?')}: missing env.deployment.image"
-        )
+    instance_id = metadata.get("instance_id")
+    if not isinstance(instance_id, str) or not instance_id.strip():
+        raise ValueError("legacy SWE-reBench row is missing a non-empty instance_id")
 
+    # The legacy swe-local:3.12 image depended on env.post_setup_cmd to clone
+    # a repository. The current OpenYuanrong recipe maps per-instance
+    # swerebench/sweb.eval.x86_64.* images, which should already contain the
+    # repository at base_commit. Do not copy the old local image or setup shell
+    # command into the current task config.
     task_config = {
         "name": task_name,
-        "sandbox": {"image": image},
+        "sandbox": {"image": get_image_name(instance_id)},
         "metadata": metadata,
     }
     normalized_tools = {
