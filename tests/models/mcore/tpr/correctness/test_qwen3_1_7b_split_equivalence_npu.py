@@ -637,15 +637,17 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
             )
         del dw_accum_fp32, dw_split_late_bf16, dw_full_fp32, dw_full_late_bf16
 
+    # Ascend cannot perform actual float64 arithmetic: copy original BF16
+    # operands to CPU first, then cast to float64 for independent scalar dW.
     for flat_index in torch.topk(wdelta.flatten(), k=min(5, wdelta.numel())).indices.tolist():
         oi, ii = divmod(flat_index, ref_wgrad.shape[1])
         f64_full = (
-            full_dy[:, 0, oi].double().cpu() * x_full[:, 0, ii].double().cpu()
+            full_dy[:, 0, oi].cpu().double() * x_full[:, 0, ii].cpu().double()
         ).sum()
         f64_split = (
-            prefix_dy[:, 0, oi].double().cpu() * x_prefix[:, 0, ii].double().cpu()
+            prefix_dy[:, 0, oi].cpu().double() * x_prefix[:, 0, ii].cpu().double()
         ).sum() + (
-            suffix_dy[:, 0, oi].double().cpu() * x_suffix[:, 0, ii].double().cpu()
+            suffix_dy[:, 0, oi].cpu().double() * x_suffix[:, 0, ii].cpu().double()
         ).sum()
         print(
             f"QWEN SPLIT ATTN_QKV_DW_FP64 out={oi} in={ii} "
@@ -671,15 +673,15 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
         ).indices.tolist():
             oi, ii = divmod(flat_index, ref_wgrad.shape[1])
             full_exact = (
-                full_dy[:, 0, oi].double().cpu()
-                * x_full[:, 0, ii].double().cpu()
+                full_dy[:, 0, oi].cpu().double()
+                * x_full[:, 0, ii].cpu().double()
             ).sum()
             split_exact = (
-                prefix_dy[:, 0, oi].double().cpu()
-                * x_prefix[:, 0, ii].double().cpu()
+                prefix_dy[:, 0, oi].cpu().double()
+                * x_prefix[:, 0, ii].cpu().double()
             ).sum() + (
-                suffix_dy[:, 0, oi].double().cpu()
-                * x_suffix[:, 0, ii].double().cpu()
+                suffix_dy[:, 0, oi].cpu().double()
+                * x_suffix[:, 0, ii].cpu().double()
             ).sum()
             print(
                 f"QWEN SPLIT ATTN_QKV_DW_GATE_VIOLATION "
@@ -698,12 +700,12 @@ def test_real_qwen_first_attention_full_vs_external_kv(monkeypatch):
             # correctly-rounded partial scalar dots, not the NPU kernel's
             # unknown internal reduction topology; it is diagnostic only.
             prefix_exact = (
-                prefix_dy[:, 0, oi].double().cpu()
-                * x_prefix[:, 0, ii].double().cpu()
+                prefix_dy[:, 0, oi].cpu().double()
+                * x_prefix[:, 0, ii].cpu().double()
             ).sum()
             suffix_exact = (
-                suffix_dy[:, 0, oi].double().cpu()
-                * x_suffix[:, 0, ii].double().cpu()
+                suffix_dy[:, 0, oi].cpu().double()
+                * x_suffix[:, 0, ii].cpu().double()
             ).sum()
             prefix_bf16 = prefix_exact.to(torch.bfloat16)
             suffix_bf16 = suffix_exact.to(torch.bfloat16)

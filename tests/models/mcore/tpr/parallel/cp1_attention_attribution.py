@@ -87,6 +87,7 @@ class CP1AttentionTrace:
         self.replay = {}
         self.relay_accumulation = {}
         self.original_accumulate = None
+        self.original_anchor_accumulate = None
         self.call_counts = {"root_push": 0, "root_pop": 0, "leaf": 0, "full": 0}
 
     def _model_pre(self, _module, _args, kwargs):
@@ -262,38 +263,75 @@ class CP1AttentionTrace:
         self.original_rectangular = attention_source.rectangular_causal_attention
         if self.mode != "full":
             from verl.workers.engine.megatron.tpr.state import KVPrefixState
-            self.original_accumulate = KVPrefixState.accumulate_layer_gradients
 
-            def audited_accumulate(prefix_state, layer_number, key_grad, value_grad):
-                if layer_number not in (1, 2, 8, 36):
-                    return self.original_accumulate(prefix_state, layer_number, key_grad, value_grad)
+            # Audit every incoming anchor gradient before native consume/
+            # accumulate. The first contribution can initialize the stored
+            # buffer directly, bypassing accumulate_layer_gradients.
+            self.original_anchor_accumulate = (
+                KVPrefixState.accumulate_anchor_gradients
+            )
+
+            def audited_anchor_accumulate(
+                prefix_state, anchors, *, consume=False
+            ):
                 row = 0 if self.mode == "shared" else self.row_cursor
-                key = f"root_r{row}|L{layer_number}"
-                previous = self.relay_accumulation.get(key)
-                inputs = (key_grad.detach().float().cpu(), value_grad.detach().float().cpu())
-                if previous is None:
-                    reference = tuple(x.clone() for x in inputs)
-                    count = 1
-                else:
-                    reference = tuple(
-                        a + b for a, b in zip(previous["_fp32"], inputs, strict=True)
-                    )
-                    count = previous["count"] + 1
-                self.original_accumulate(prefix_state, layer_number, key_grad, value_grad)
-                stored = prefix_state.gradients[layer_number]
-                err = {
-                    name: _difference(ref.float(), actual.detach().float().cpu())
-                    for name, ref, actual in zip(
-                        ("dK", "dV"), reference, stored, strict=True,
-                    )
-                }
-                self.relay_accumulation[key] = {
-                    "_fp32": reference,
-                    "count": count,
-                    "bf16_vs_fp32_accumulate": err,
-                }
+                pending = []
 
-            KVPrefixState.accumulate_layer_gradients = audited_accumulate
+                for layer, (key, value) in anchors.key_values.items():
+                    if layer not in (1, 2, 8, 36):
+                        continue
+                    if key.grad is None or value.grad is None:
+                        raise AssertionError(
+                            f"Missing anchor gradients at layer {layer}"
+                        )
+
+                    incoming = (
+                        key.grad.detach().float().cpu(),
+                        value.grad.detach().float().cpu(),
+                    )
+                    audit_key = f"root_r{row}|L{layer}"
+                    previous = self.relay_accumulation.get(audit_key)
+                    if previous is None:
+                        reference = tuple(x.clone() for x in incoming)
+                        count = 1
+                    else:
+                        reference = tuple(
+                            a + b
+                            for a, b in zip(
+                                previous["_fp32"], incoming, strict=True
+                            )
+                        )
+                        count = previous["count"] + 1
+
+                    self.relay_accumulation[audit_key] = {
+                        "_fp32": reference,
+                        "count": count,
+                    }
+                    pending.append((layer, audit_key, reference))
+
+                # Preserve production accumulation behavior exactly.
+                self.original_anchor_accumulate(
+                    prefix_state, anchors, consume=consume
+                )
+
+                # Compare the complete FP32 sum with the actual stored buffer.
+                for layer, audit_key, reference in pending:
+                    stored = prefix_state.gradients[layer]
+                    error = {
+                        name: _difference(
+                            ref, actual.detach().float().cpu()
+                        )
+                        for name, ref, actual in zip(
+                            ("dK", "dV"), reference, stored, strict=True
+                        )
+                    }
+                    self.relay_accumulation[audit_key][
+                        "bf16_vs_fp32_accumulate"
+                    ] = error
+
+            KVPrefixState.accumulate_anchor_gradients = (
+                audited_anchor_accumulate
+            )
         if self.mode != "full":
             attention_source.rectangular_causal_attention = self._patched_rectangular
         return self
@@ -307,6 +345,11 @@ class CP1AttentionTrace:
         if self.original_accumulate is not None:
             from verl.workers.engine.megatron.tpr.state import KVPrefixState
             KVPrefixState.accumulate_layer_gradients = self.original_accumulate
+        if self.original_anchor_accumulate is not None:
+            from verl.workers.engine.megatron.tpr.state import KVPrefixState
+            KVPrefixState.accumulate_anchor_gradients = (
+                self.original_anchor_accumulate
+            )
         self.root_queries.clear()
 
     @torch.no_grad()
@@ -405,6 +448,22 @@ class CP1AttentionTrace:
             "root_push": 1, "root_pop": 1, "leaf": 2, "full": 0,
         }:
             raise AssertionError(f"Shared run did not reuse one Root: {self.call_counts}")
+        if self.mode == "shared":
+            expected_audit_keys = {
+                f"root_r0|L{layer}" for layer in (1, 2, 8, 36)
+            }
+            missing = expected_audit_keys - self.relay_accumulation.keys()
+            wrong_counts = {
+                key: self.relay_accumulation[key]["count"]
+                for key in expected_audit_keys & self.relay_accumulation.keys()
+                if self.relay_accumulation[key]["count"] != 2
+            }
+            if missing or wrong_counts:
+                raise AssertionError(
+                    "Shared KV accumulation audit must observe two Leaf "
+                    f"contributions per selected layer; missing={sorted(missing)}, "
+                    f"wrong_counts={wrong_counts}"
+                )
         destination.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             "mode": self.mode,

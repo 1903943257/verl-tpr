@@ -427,6 +427,8 @@ def run_tpr_forward_backward_batch(
         )
         record_stage("executor_setup_cpu_ms", setup_start)
         loss = executor.run(event_profiler=event_profiler, tree_index=tree_number)
+        if grad_audit is not None:
+            grad_audit.snapshot("AFTER_TREE", tree_index=tree_number)
         tree_number += 1
         metrics_start = time.perf_counter() if detailed_profile else None
         _assert_finite_tree_loss(loss, tp_size=tp_size, cp_size=cp_runtime.size)
@@ -436,12 +438,28 @@ def run_tpr_forward_backward_batch(
         record_stage("segment_metrics_cpu_ms", metrics_start)
         return loss
 
+    # The production DDP/main_grad path can differ from standalone BF16
+    # param.grad tests. Opt-in audit observes metadata only; it never casts,
+    # clones or retains dW, nor changes gradient finalization.
+    grad_audit = None
+    if os.getenv("TPR_QKV_GRAD_AUDIT", "0") == "1":
+        from .grad_buffer_audit import QKVGradBufferAudit
+
+        grad_audit = QKVGradBufferAudit(model, wrapped_model).install()
+
+    def finalize_with_audit():
+        if grad_audit is not None:
+            grad_audit.snapshot("BEFORE_FINALIZE")
+        finalize(engine.module, None, force_all_reduce=True)
+        if grad_audit is not None:
+            grad_audit.snapshot("AFTER_FINALIZE")
+
     run_start = time.perf_counter() if detailed_profile else None
-    loss = run_forest(
-        forest, run_one_tree,
-        lambda: finalize(engine.module, None, force_all_reduce=True),
-        no_sync_func,
-    )
+    try:
+        loss = run_forest(forest, run_one_tree, finalize_with_audit, no_sync_func)
+    finally:
+        if grad_audit is not None:
+            grad_audit.close()
     record_stage("tree_run_and_finalize_host_ms", run_start)
     if not bool(torch.isfinite(loss).item()):
         raise FloatingPointError("non-finite TPR PPO mini-batch loss")

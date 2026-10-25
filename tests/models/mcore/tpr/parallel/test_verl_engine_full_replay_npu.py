@@ -31,13 +31,13 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, steps: int):
+def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, steps: int,
+                           tpr_enabled: bool = False):
     # On NPU this class (not the generic CUDA MegatronEngine) owns the
     # MindSpeed repatch and parallel-state initialization.
     from verl.workers.engine.mindspeed.transformer_impl import MindspeedEngineWithLMHead
     from verl.workers.config import HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
     from verl.trainer.config import CheckpointConfig
-
     model_cfg = HFModelConfig(
         path=str(checkpoint),
         enable_gradient_checkpointing=False,
@@ -69,6 +69,8 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
         vanilla_mbridge=True,
         use_fused_kernels=False,
         forward_only=False,
+        tpr_enabled=tpr_enabled,
+        tpr_cp_backend="ring" if tpr_enabled else None,
         use_distributed_optimizer=True,
         param_offload=False,
         optimizer_offload=False,
@@ -101,20 +103,43 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
             "overlap_cpu_optimizer_d2h_h2d": True,
         },
     )
-    # MindSpeed may inspect sys.argv through repatch/get_full_args.  Do not
-    # parse the torchrun/pytest flags as Megatron launcher options.
+    # MindSpeed repatch is triggered by the real Engine constructor and
+    # keeps its parsed args globally. Under `torchrun -m pytest` that object
+    # can contain the empty-string key ("") from pytest's launcher flags.
+    # Later TransformerConfig dataclass generation rejects it as a field
+    # name. The existing offline TP2CP4 runner already handles this artifact;
+    # apply precisely that same fix to the GENUINE Engine path, before
+    # initialize() builds TransformerConfig. Keep argv scrubbed during both
+    # constructor and initialize to avoid repatch observing pytest options.
+    from mindspeed.args_utils import get_full_args
+    from .test_real_actor_tp2cp4_offline_ppo_npu import (
+        _sanitize_mindspeed_repatch_args,
+    )
+
     old_argv = sys.argv[:]
     try:
         sys.argv[:] = [sys.argv[0]]
         engine = MindspeedEngineWithLMHead(
             model_cfg, engine_cfg, opt_cfg, CheckpointConfig(strict=False)
         )
+        if not engine.engine_config.vanilla_mbridge:
+            raise AssertionError("Offline Engine must follow online E2E vanilla_mbridge=True")
+        label = "TPR" if tpr_enabled else "FULL"
+        print(
+            f"VERL_{label}_BRIDGE_SELECTED backend=legacy_mbridge vanilla_mbridge=True",
+            flush=True,
+        )
+        full_args = get_full_args()
+        had_empty_key = "" in vars(full_args)
+        _sanitize_mindspeed_repatch_args(full_args)
+        print(
+            f"VERL_{label}_MINDSPEED_ARGS_SANITIZED "
+            f"empty_key_removed={had_empty_key}",
+            flush=True,
+        )
+        engine.initialize()
     finally:
         sys.argv[:] = old_argv
-    if not engine.engine_config.vanilla_mbridge:
-        raise AssertionError("Offline Full must follow online E2E vanilla_mbridge=True")
-    print("VERL_FULL_BRIDGE_SELECTED backend=legacy_mbridge vanilla_mbridge=True", flush=True)
-    engine.initialize()
 
     from megatron.core import parallel_state as mpu
     sizes = {
@@ -136,16 +161,43 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
             "TPR's PPO objective uses vanilla global-token-mean loss"
         )
     from verl.models.mcore.tpr import TPRSelfAttention
-    if any(isinstance(x, TPRSelfAttention) for module in engine.module for x in module.modules()):
+    attn_layers = [
+        x for module in engine.module for x in module.modules()
+        if isinstance(x, TPRSelfAttention)
+    ]
+    if tpr_enabled:
+        if len(attn_layers) != 36:
+            raise AssertionError(
+                f"Real TPR Engine requires all 36 Qwen3-4B attention layers, got {len(attn_layers)}"
+            )
+        from verl.utils.megatron_utils import unwrap_model
+        wrapped = engine.module[0]
+        if wrapped is unwrap_model(wrapped):
+            raise AssertionError("TPR experiment must use genuine Megatron DDP, not an unwrapped GPTModel")
+        if getattr(engine, "optimizer", None) is None:
+            raise AssertionError("TPR Engine requires actual VERL Megatron optimizer")
+        # No silent switch to FP32: match the original online precision-aware BF16 main grads.
+        if engine.optimizer_config.main_grads_dtype != "bf16":
+            raise AssertionError("TPR Replay changed the online BF16 main_grads_dtype")
+        print(
+            "VERL_TPR_DDP_SELECTED "
+            f"wrapper={type(wrapped).__name__} main_grads_dtype=bf16 "
+            f"tpr_cp_backend={engine.engine_config.tpr_cp_backend}",
+            flush=True,
+        )
+    elif attn_layers:
         raise AssertionError("Full Engine unexpectedly installed TPRSelfAttention")
-    # Verify entrypoint is the unmodified native VERL schedule, not any
-    # test-generated adapter.  This check is version-agnostic enough for bridge.
+    # Native Full remains on the unmodified VERL schedule. The TPR engine
+    # routes into run_tpr_forward_backward_batch before microbatch packing.
     import inspect
     source = inspect.getsource(engine.forward_backward_batch)
-    if "prepare_micro_batches" not in source or "get_forward_backward_func" not in source:
-        raise AssertionError("This Engine has no native VERL microbatch schedule")
+    if ("prepare_micro_batches" not in source
+            or "get_forward_backward_func" not in source):
+        raise AssertionError("This Engine lacks the tested native schedule")
+    if tpr_enabled and "run_tpr_forward_backward_batch" not in source:
+        raise AssertionError("This Engine cannot route TPR PPO updates")
     print(
-        "VERL_FULL_ENGINE_INIT_PASS "
+        f"VERL_{label}_ENGINE_INIT_PASS "
         f"engine={type(engine).__name__} mesh={sizes} "
         f"recompute={engine.tf_config.recompute_granularity} "
         f"per_token_loss={engine.tf_config.calculate_per_token_loss}",
@@ -154,13 +206,15 @@ def _construct_real_engine(checkpoint: Path, *, lr: float, clip_norm: float, ste
     return engine
 
 
-def _load_step(item: dict, *, row_count: int = 8):
+def _load_step(item: dict, *, row_count: int = 8, mode: str = "full"):
     capture = Path(item["capture"])
     rows = tuple(item["rows"])
     if len(rows) != row_count or len(set(rows)) != row_count:
         raise AssertionError("VERL Full requires the exact eight Session rows")
+    if mode not in ("full", "tpr"):
+        raise ValueError(f"unsupported Replay mode: {mode!r}")
     batch, original_keys, ppo_tokens, digest = _load_real_pair(
-        capture, rows, "full"
+        capture, rows, mode
     )
     # The native Engine denominator is computed from original loss_mask,
     # whereas the original TPR replay used response_mask.  Never silently
@@ -183,6 +237,8 @@ def _load_step(item: dict, *, row_count: int = 8):
         force_group_size=1,
         global_batch_size=row_count,
     )
+    if mode == "tpr":
+        tu.assign_non_tensor(batch, tpr_capture_log_probs=True)
     return batch, original_keys, ppo_tokens, digest, rows, capture
 
 
@@ -277,12 +333,16 @@ def test_verl_engine_full_replay():
         checkpoint = Path(os.getenv("TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"))
         manifest = json.loads(manifest_path.read_text())
         if (manifest.get("protocol") != "real_actor_session_first_8merged_v3"
-                or len(manifest.get("items", [])) != 20
+                or not 1 <= len(manifest.get("items", [])) <= 20
+                or manifest.get("online_steps") != len(manifest["items"])
                 or manifest.get("expected_sessions") != 8):
-            raise AssertionError("Requires original 20-step, eight-Session v3 manifest")
+            raise AssertionError("Requires 1..20 original eight-Session v3 merged Actor steps")
         run_steps = int(os.getenv("TPR_VERL_FULL_REPLAY_STEPS", "1"))
-        if run_steps < 1 or run_steps > 20:
-            raise ValueError("TPR_VERL_FULL_REPLAY_STEPS must be 1..20")
+        if not 1 <= run_steps <= len(manifest["items"]):
+            raise ValueError(
+                f"TPR_VERL_FULL_REPLAY_STEPS={run_steps} exceeds "
+                f"available original Actor steps={len(manifest['items'])}"
+            )
         lr = float(os.getenv("TPR_OFFLINE_ADAMW_LR", "2e-5"))
         clip_norm = float(os.getenv("TPR_OFFLINE_ADAMW_CLIP_NORM", "1.0"))
         output_dir.mkdir(parents=True, exist_ok=True)
