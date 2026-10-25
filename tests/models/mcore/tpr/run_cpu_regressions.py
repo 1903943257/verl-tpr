@@ -35,6 +35,7 @@ UNIT = (
     "sequence_shard_cpu", "unified_kv_state_cpu", "prefix_state", "kv_stack",
     "shard", "tpr_self_attention", "context", "rectangular_attention_contract",
     "ring_streaming_transport", "ring_coalescing_schedule", "production_architecture",
+    "tpr_production_dp2_gate_cpu",
     "segment_plan", "tree_plan_builder", "trajectory_tree_turn", "trajectory_tree",
     "segment_executor", "fixed_topology_scheduler", "segment_external_objective",
     "tp_validation", "rope", "gdn_prefix_state", "tpr_batch_runner",
@@ -43,7 +44,8 @@ UNIT = (
     "dp_placement", "gdn_context",
 )
 PARALLEL = (
-    "ring_cp_attention_contract", "cp_padding_contract", "cp_backend_contract",
+    "ring_cp_attention_contract", "ring_numerics_cpu",
+    "cp_padding_contract", "cp_backend_contract",
     "cp_segment_execution_contract", "allgather_cp_attention_contract",
     "hybrid_cp_attention_contract", "ulysses_cp_attention_contract",
     "cp1_n8_perf_contract_cpu", "cp4_ring_timeline_cpu",
@@ -51,8 +53,7 @@ PARALLEL = (
 
 
 def main():
-    # Narrow perf-data preflight must not collect the full TPR suite or
-    # import Megatron/MindSpeed in a production Ascend Docker environment.
+    # Narrow performance-data preflight without collecting Megatron/NPU tests.
     cp1_perf_only = "--only-cp1-n8-perf" in sys.argv[1:]
     if cp1_perf_only:
         sys.argv.remove("--only-cp1-n8-perf")
