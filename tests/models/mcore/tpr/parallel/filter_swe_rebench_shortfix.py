@@ -86,7 +86,6 @@ def extract_metadata(row):
     if reward_meta:
         return reward_meta
 
-    # Also accept raw datasets where task fields are top-level columns.
     return row.to_dict()
 
 
@@ -94,16 +93,21 @@ def normalize_task_row(row):
     """Convert legacy reward/env metadata into the current UniAgent Task Config row.
 
     The current framework runner requires extra_info.tools_kwargs.task. Legacy
-    rows instead store the task payload under tools_kwargs.reward.metadata and
-    the image under tools_kwargs.env.deployment.image.
+    rows instead store task payload under tools_kwargs.reward.metadata and the
+    image under tools_kwargs.env.deployment.image.
     """
     sample = row.to_dict() if hasattr(row, "to_dict") else dict(row)
     extra = decode_object(sample.get("extra_info"))
     tools_kwargs = decode_object(extra.get("tools_kwargs"))
 
-    # Already in the current framework format: preserve its Task Config.
+    # Normalize even current-format rows if extra_info was serialized as JSON.
     existing_task = decode_object(tools_kwargs.get("task"))
     if existing_task:
+        normalized_tools = dict(tools_kwargs)
+        normalized_tools["task"] = existing_task
+        normalized_extra = dict(extra)
+        normalized_extra["tools_kwargs"] = normalized_tools
+        sample["extra_info"] = normalized_extra
         sample["data_source"] = sample.get("data_source") or DEFAULT_DATA_SOURCE
         return sample
 
@@ -131,7 +135,6 @@ def normalize_task_row(row):
         "sandbox": {"image": image},
         "metadata": metadata,
     }
-    # Keep unrelated tools_kwargs entries but replace the legacy env/reward pair.
     normalized_tools = {
         key: value for key, value in tools_kwargs.items()
         if key not in {"env", "reward", "task"}
@@ -151,9 +154,7 @@ def normalize_candidates(df):
         if "data_source" not in normalized.columns:
             normalized["data_source"] = pd.Series(dtype="object")
         return normalized
-    return pd.DataFrame(
-        [normalize_task_row(row) for _, row in df.iterrows()]
-    )
+    return pd.DataFrame([normalize_task_row(row) for _, row in df.iterrows()])
 
 
 def patch_metrics(patch):
@@ -254,9 +255,7 @@ def main(argv=None):
     normalized = normalize_candidates(selected)
     args.out.mkdir(parents=True, exist_ok=True)
     ranked.to_csv(args.out / "shortfix_ranked.csv", index=False)
-    # Original schema is retained for audit/reuse with legacy consumers.
     selected.to_parquet(args.out / "shortfix_candidates.parquet", index=False)
-    # Current UniAgent framework requires tools_kwargs.task, not legacy reward/env.
     normalized.to_parquet(args.out / "shortfix_candidates_task.parquet", index=False)
     (args.out / "shortfix_counts.json").write_text(
         json.dumps({"input": len(df), "selected": len(selected), "tiers": counts},
