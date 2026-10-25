@@ -175,8 +175,14 @@ def test_real_actor_cp1_sequence_split_multistep():
         named_parameters = dict(model.named_parameters())
         if not named_parameters:
             raise AssertionError("Model has no parameters")
+        # Keep FP32 master weights and Adam moments on host memory so the 4B
+        # model's optimizer state does not compete with NPU activations/gradients.
+        # This preserves FP32 AdamW arithmetic; only state/gradient transfer is
+        # offloaded, and both arms use the exact same optimizer path.
         masters = {
-            name: torch.nn.Parameter(parameter.detach().float().clone())
+            name: torch.nn.Parameter(
+                parameter.detach().to(device="cpu", dtype=torch.float32).clone()
+            )
             for name, parameter in named_parameters.items()
         }
         optimizer = torch.optim.AdamW(
@@ -253,12 +259,16 @@ def test_real_actor_cp1_sequence_split_multistep():
                     if parameter.grad is None:
                         masters[name].grad = None
                     else:
-                        masters[name].grad = parameter.grad.detach().float().clone()
+                        masters[name].grad = parameter.grad.detach().to(
+                            device="cpu", dtype=torch.float32,
+                        )
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 with torch.no_grad():
                     for name, parameter in named_parameters.items():
-                        parameter.copy_(masters[name].to(dtype=parameter.dtype))
+                        parameter.copy_(masters[name].to(
+                            device=parameter.device, dtype=parameter.dtype,
+                        ))
                 parameter_samples = _sample_values(named_parameters.items(), schema)
 
                 record = {
@@ -301,10 +311,14 @@ def test_real_actor_cp1_sequence_split_multistep():
         for state_name in ("exp_avg", "exp_avg_sq"):
             optimizer_state_samples[state_name] = _sample_values(
                 (
-                    (name, optimizer.state[masters[name]][state_name])
+                    (
+                        name,
+                        optimizer.state[masters[name]].get(state_name),
+                    )
                     for name in masters
                 ),
                 schema,
+                allow_missing=True,
             )
         summary = {
             "mode": mode,
