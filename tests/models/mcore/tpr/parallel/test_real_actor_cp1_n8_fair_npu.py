@@ -30,7 +30,7 @@ from verl.workers.engine.megatron.tpr.objective import SegmentPPOObjectiveAdapte
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 from .test_real_actor_cp1_short_full_tpr_npu import _initial_weight_fingerprint
 from .test_real_actor_tp2cp4_offline_ppo_npu import (
-    _PPO, _load_real_pair, _global_bf16_gradient_norm,
+    _PPO, _load_real_pair, _global_bf16_gradient_norm, _save_complete_grads,
 )
 from .test_tpr_10k_parallel_parity_npu import _runtime, _engine
 from .tpr_10k_canonical_witness import canonical_grad_witness
@@ -275,8 +275,28 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
         )
         if witness is None:
             raise AssertionError("N8 missing canonical gradient witness")
+        configured_k = int(os.getenv("TPR_LEAF_BATCH_SIZE", "1"))
+        full_parameter_grad_dir = None
+        if os.getenv("TPR_CP1_N8_SAVE_FULL_GRADS", "0") == "1":
+            if mode != "tpr":
+                raise ValueError("Full parameter gradient dumps are currently scoped to TPR K1/K2")
+            if configured_k not in (1, 2):
+                raise ValueError("TreeBatch parity full-gradient dumps support K=1/2 only")
+            # This opt-in diagnostic is outside the timed iterations. It writes
+            # one exact BF16 parameter-gradient tensor per file so K1/K2 can be
+            # compared over the complete model, not just the canonical sample.
+            full_parameter_grad_dir = _save_complete_grads(
+                model, runtime, destination.parent, f"tpr_k{configured_k}", step=1,
+            )
+            if full_parameter_grad_dir is None:
+                raise AssertionError("Full gradient dump unexpectedly skipped this CP rank")
+            print(
+                "TPR_CP1_N8_FULL_GRADS "
+                + json.dumps({"K": configured_k, "directory": full_parameter_grad_dir}),
+                flush=True,
+            )
         report = {
-            "mode": mode, "configured_k": int(os.getenv("TPR_LEAF_BATCH_SIZE", "1")),
+            "mode": mode, "configured_k": configured_k,
             "physical_full_micro_batch": (
                 1 if mode == "full_mb1" else 2 if mode == "full_mb2" else None
             ),
@@ -302,6 +322,7 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
                 for (row, off), value in result["logprobs"].items()
             ),
             "global_grad_norm": grad_norm, "gradient_witness": witness,
+            "full_parameter_grad_dir": full_parameter_grad_dir,
             "optimizer_step": False, "original_online_conditioning": False,
             "reference": (
                 f"physical_B{1 if mode == 'full_mb1' else 2}_square_CANN"
