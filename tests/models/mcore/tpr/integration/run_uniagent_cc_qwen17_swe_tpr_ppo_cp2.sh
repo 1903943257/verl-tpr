@@ -8,6 +8,8 @@ set -euo pipefail
 # The online TPR adapter in this branch supports TP2 x CP4 only with DP1 (PP=EP=1).
 # ============================================================
 ROOT=/workspace/uni-agent-cc
+# Use the selected VERL worktree for both the production TPR route and capture hook.
+VERL_CODE_ROOT="${VERL_CODE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)}"
 # ------------------------------------------------------------
 # Same model / data / task as the verified inference E2E
 # ------------------------------------------------------------
@@ -117,7 +119,7 @@ fi
 # IMPORTANT:
 # 不加入 /workspace/Megatron-Bridge/src。
 # 本次明确走 vanilla mbridge。
-export PYTHONPATH="/workspace/vllm-ascend:${ROOT}/verl:${ROOT}:${PYTHONPATH:-}"
+export PYTHONPATH="/workspace/vllm-ascend:${VERL_CODE_ROOT}:${ROOT}:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export VLLM_USE_V1=1
 export TASK_QUEUE_ENABLE=1
@@ -196,9 +198,9 @@ if [[ "${TPR_ENABLED}" == "True" ]]; then
         echo "ERROR: online TPR PPO with CP4 requires TPR_CP_BACKEND=ring." >&2
         exit 2
     fi
-    TPR_ENGINE_CONFIG="${ROOT}/verl/verl/workers/config/engine.py"
-    TPR_ENGINE_IMPL="${ROOT}/verl/verl/workers/engine/megatron/transformer_impl.py"
-    TPR_ADAPTER="${ROOT}/verl/verl/workers/engine/megatron/tpr/adapter.py"
+    TPR_ENGINE_CONFIG="${VERL_CODE_ROOT}/verl/workers/config/engine.py"
+    TPR_ENGINE_IMPL="${VERL_CODE_ROOT}/verl/workers/engine/megatron/transformer_impl.py"
+    TPR_ADAPTER="${VERL_CODE_ROOT}/verl/workers/engine/megatron/tpr/adapter.py"
     for required in "${TPR_ENGINE_CONFIG}" "${TPR_ENGINE_IMPL}" "${TPR_ADAPTER}"; do
         if [[ ! -f "${required}" ]]; then
             echo "ERROR: active VERL checkout is missing TPR engine source: ${required}" >&2
