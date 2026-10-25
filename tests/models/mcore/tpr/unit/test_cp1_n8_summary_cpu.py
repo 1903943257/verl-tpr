@@ -34,7 +34,7 @@ def _write_case(root, arm):
         "peak_allocated_gib": 36.0 if full else 22.0,
         "peak_reserved_gib": 39.0 if full else 24.0,
         "loss": -0.8, "global_grad_norm": 7.0,
-        "logprobs": [[0, 0, -0.1], [1, 0, -0.2]],
+        "logprobs": [\n            [i % 8, i // 8, -0.1 - i * 1e-6] for i in range(3333)\n        ],
         "gradient_witness": {
             "names": ["p"],
             "canonical_shapes": [[2]],
@@ -66,14 +66,14 @@ def test_n8_full_mb1_supplement_updates_same_root(tmp_path):
     assert "MISSING ARMS" not in old_summary
     _write_case(tmp_path, "full_mb1")
     new_summary = summarize(tmp_path)
-    assert "Full MB1/Full MB2 physical batching speedup=" in new_summary
-    assert "tpr_k1: FullMB1/TPR speedup=" in new_summary
+    assert "Full MB2 speedup over Full MB1=" in new_summary
+    assert "TPR K1 speedup over Full MB1=" in new_summary
     assert "PARITY Full MB1 vs full_mb2:" in new_summary
     assert "PARITY Full MB1 vs tpr_k1:" in new_summary
     assert "Full MB1 supplemental baseline: NOT YET MEASURED." not in new_summary
     meta = json.loads((tmp_path / "summary.json").read_text())
     assert "full_mb1" in meta["results"]
-    assert "full_mb1_to_full_mb2_speedup" in meta["full_mb1_comparison"]
+    assert "full_mb2_vs_full_mb1_speedup" in meta["full_mb1_comparison"]
 
 
 def test_n8_missing_arms_show_partial_results(tmp_path):
@@ -89,4 +89,14 @@ def test_n8_report_rejects_fake_input_mismatch(tmp_path):
     item["input_sha256"] = "not-same"
     (tmp_path / "tpr_k2" / "result.json").write_text(json.dumps(item))
     with pytest.raises(AssertionError, match="input_sha256"):
+        summarize(tmp_path)
+
+ 
+def test_n8_report_rejects_incomplete_supervised_logprobs(tmp_path):
+    for arm in ("full_mb2", "tpr_k1", "tpr_k2", "tpr_k4"):
+        item = _write_case(tmp_path, arm)
+        if arm == "tpr_k1":
+            item["logprobs"] = item["logprobs"][:-1]
+            (tmp_path / arm / "result.json").write_text(json.dumps(item))
+    with pytest.raises(AssertionError, match="supervised response-token coordinates differ"):
         summarize(tmp_path)
