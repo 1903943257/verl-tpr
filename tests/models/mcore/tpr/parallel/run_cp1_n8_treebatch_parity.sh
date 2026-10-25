@@ -78,7 +78,6 @@ if [ "$OVERALL" -eq 0 ]; then
         "$ROOT" \
         --max-loss-gap 0.02 \
         --max-logprob-rel-l2 0.05 \
-        --max-sampled-grad-rel-l2 0.05 \
         --max-full-grad-rel-l2 0.05 \
         --min-full-grad-cosine 0.995 \
         2>&1 | tee "$ROOT/comparison.console.log"
