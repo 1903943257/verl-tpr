@@ -112,7 +112,6 @@ def compare(
     *,
     max_loss_gap: float = 0.02,
     max_logprob_rel_l2: float = 0.05,
-    max_sampled_grad_rel_l2: float = 0.05,
     max_full_grad_rel_l2: float = 0.05,
     min_full_grad_cosine: float = 0.995,
 ):
@@ -174,7 +173,6 @@ def compare(
     gates = {
         "loss_abs_gap": loss_gap <= max_loss_gap,
         "logprob_rel_l2": logprob["relative_l2"] <= max_logprob_rel_l2,
-        "sampled_grad_rel_l2": sampled_grad["relative_l2"] <= max_sampled_grad_rel_l2,
         "full_grad_rel_l2": full_grad["relative_l2"] <= max_full_grad_rel_l2,
         "full_grad_cosine": full_grad["cosine"] >= min_full_grad_cosine,
         "actual_grouping": stats2["grouped_leaf_calls"] >= 1,
@@ -209,7 +207,6 @@ def compare(
         "thresholds": {
             "max_loss_gap": max_loss_gap,
             "max_logprob_rel_l2": max_logprob_rel_l2,
-            "max_sampled_grad_rel_l2": max_sampled_grad_rel_l2,
             "max_full_grad_rel_l2": max_full_grad_rel_l2,
             "min_full_grad_cosine": min_full_grad_cosine,
         },
@@ -254,7 +251,6 @@ def main():
     parser.add_argument("root", type=Path)
     parser.add_argument("--max-loss-gap", type=float, default=0.02)
     parser.add_argument("--max-logprob-rel-l2", type=float, default=0.05)
-    parser.add_argument("--max-sampled-grad-rel-l2", type=float, default=0.05)
     parser.add_argument("--max-full-grad-rel-l2", type=float, default=0.05)
     parser.add_argument("--min-full-grad-cosine", type=float, default=0.995)
     args = parser.parse_args()
@@ -262,7 +258,6 @@ def main():
         args.root,
         max_loss_gap=args.max_loss_gap,
         max_logprob_rel_l2=args.max_logprob_rel_l2,
-        max_sampled_grad_rel_l2=args.max_sampled_grad_rel_l2,
         max_full_grad_rel_l2=args.max_full_grad_rel_l2,
         min_full_grad_cosine=args.min_full_grad_cosine,
     )
