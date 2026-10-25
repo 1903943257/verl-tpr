@@ -164,8 +164,8 @@ def _short_forest(batch, *, mode: str):
     return result, logical, physical
 
 
-def _run_controlled_full(model, batch, *, loss_fn, forest):
-    """A genuine whole-sequence model call without any active TPR context."""
+def _run_controlled_full(model, engine, batch, *, loss_fn, forest):
+    """Whole-sequence control without TPR context, finalized like TPR modes."""
     from verl.models.mcore.tpr.context import get_tpr_attention_context
     from verl.workers.engine.megatron.tpr.objective import SegmentPPOObjectiveAdapter
 
@@ -199,6 +199,15 @@ def _run_controlled_full(model, batch, *, loss_fn, forest):
         loss.backward()
         losses.append(loss.detach())
         del logits, loss
+
+    # Match split_no_share/shared: all per-row backward calls accumulate first,
+    # then invoke the same Megatron gradient finalizer exactly once. Without
+    # this, Full-vs-split would also compare different gradient-finalization
+    # paths, confounding the sequence-splitting experiment.
+    finalize_model_grads = getattr(model.config, "finalize_model_grads_func", None)
+    if finalize_model_grads is None:
+        raise AssertionError("Full control requires Megatron gradient finalization")
+    finalize_model_grads(engine.module, None, force_all_reduce=True)
     return {
         "loss": float(torch.stack(losses).sum().item()),
         "logprobs": dict(objective.debug_new_log_probs),
@@ -311,7 +320,7 @@ def test_real_actor_cp1_short_full_vs_tpr():
         try:
             if mode == "full":
                 result = _run_controlled_full(
-                    model, batch, loss_fn=loss_fn, forest=forest,
+                    model, engine, batch, loss_fn=loss_fn, forest=forest,
                 )
             elif mode == "split_no_share":
                 result = _run_split_no_share(
