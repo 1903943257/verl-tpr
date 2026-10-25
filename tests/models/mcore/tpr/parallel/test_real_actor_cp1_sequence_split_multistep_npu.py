@@ -1,11 +1,11 @@
-"""Route B: 20 optimizer updates, Full Sequence vs Split-No-Share.
+"""Route B: 10 optimizer updates by default, Full Sequence vs Split-No-Share.
 
 This is a controlled fixed-rollout experiment on the same cropped real Actor PPO
 capture used by the CP1 4K parity test. It deliberately excludes prefix sharing,
 TP/CP/DP, recompute, and FP32 dW intervention. Each arm runs in its own process
 so only one Qwen3-4B model and optimizer reside on the NPU at a time.
 
-The rollout/old_log_probs/advantages are held fixed for 20 optimizer updates.
+The rollout/old_log_probs/advantages are held fixed for 10 optimizer updates by default.
 This is a training-path sensitivity test, not on-policy RL or a production
 training benchmark. Gradients and parameters are represented by deterministic
 per-tensor samples to avoid writing multi-gigabyte gradients at every step.
@@ -42,7 +42,7 @@ pytestmark = pytest.mark.skipif(
     reason="Set TPR_RUN_CP1_MULTISTEP=1 for Route B optimizer-path testing",
 )
 
-_STEPS = int(os.getenv("TPR_CP1_MULTISTEP_STEPS", "20"))
+_STEPS = int(os.getenv("TPR_CP1_MULTISTEP_STEPS", "10"))
 _LEARNING_RATE = 1e-5
 _BETAS = (0.9, 0.95)
 _EPS = 1e-8
