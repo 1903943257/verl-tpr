@@ -2,7 +2,7 @@
 
 The test folder is intentionally limited to maintained **Dense Full Attention / Ring CP / real Qwen3 Actor PPO** contracts. Older Qwen3-1.7B/AReaL-DTA numerical investigations, Tiny GPT synthetic model suites, alternative CP research backends, and historical one-off diagnostic launchers were retired from this branch. Their previous implementations remain in git history.
 
-As of 2026-10-20: **52 mainline `test_*.py` files + 32 optional `experimental/linear` test files**. The latter are GDN/Qwen3.5 research, never a production Dense FA gate. Mainline tests are grouped in `unit/`, `equivalence/`, `parallel/`, `correctness/`, `integration/`, and `profiling/`.
+As of 2026-10-25, after syncing with current `main`: **65 mainline `test_*.py` files + 32 optional `experimental/linear` test files**. The count includes the latest TreeBatch leaf-microbatch, CP1 performance, and real-Actor test additions from `main`. The latter are GDN/Qwen3.5 research, never a production Dense FA gate. Mainline tests are grouped in `unit/`, `equivalence/`, `parallel/`, `correctness/`, `integration/`, and `profiling/`.
 
 ## Four supported entry points
 
@@ -46,7 +46,9 @@ The `integration/` scripts run Uni-Agent capture/online experiments; do not conf
 
 ## Second-pass consolidation (2026-10-20)
 
-Eight small CPU test files were consolidated into seven existing test modules. Their **28 test functions remain**; the CPU entry list and CP4 offline preflight were updated to point to the retained files. No production implementation was modified. The core suite now has **52** test files; `experimental/linear` remains **32**. The eight `parallel/run_*.sh` launchers are retained because each owns a distinct maintained real-Actor/DP2/recompute/30K/40K/Full replay workflow; the two `integration/` launchers remain paired for online Native capture.
+Eight small CPU test files were consolidated into seven existing test modules. Their **28 test functions remain**; the CPU entry list and CP4 offline preflight were updated to point to the retained files. No production implementation was modified. After syncing with `main@9493dfa2`, the core suite has **65** test files; `experimental/linear` remains **32**. The original real-Actor/DP2/recompute/30K/40K/Full launchers remain, and the newer TreeBatch-specific launchers from `main` are preserved for those workflows. The two `integration/` launchers remain paired for online Native capture.
+
+Current `main` includes opt-in CP1 TreeBatch leaf micro-batching. `TPR_LEAF_BATCH_SIZE=1` remains the default; full-model numerical parity for `K>1` is unresolved and must not be presented as production acceptance. See `parallel/LEAF_MICROBATCH.md` and `parallel/LEAF_MICROBATCH_STAGE_CLOSEOUT.md`.
 
 These are **source-level changes, not CPU/NPU acceptance evidence**. Re-run `run_suite.py check`, `run_unit.sh core`, and the hardware-specific NPU gates on the new checkout before claiming numerical or performance validation.
 

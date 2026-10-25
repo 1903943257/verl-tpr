@@ -143,6 +143,11 @@ class TPRSelfAttention(SelfAttention):
                 value = new_value
             else:
                 past_key, past_value = past_kv
+                if context.batch_size > 1:
+                    # Broadcast the same detached Prefix anchors to all leaves.
+                    # ExpandBackward sums their dK/dV back onto the single owner.
+                    past_key = past_key.expand(-1, context.batch_size, -1, -1)
+                    past_value = past_value.expand(-1, context.batch_size, -1, -1)
                 _validate_past_compatibility(self.layer_number, past_key, past_value, new_key, new_value)
                 key = _concat_sequence(past_key, new_key)
                 value = _concat_sequence(past_value, new_value)
@@ -190,9 +195,9 @@ class TPRSelfAttention(SelfAttention):
             context.local_suffix_length // tp_size if sp_enabled
             else context.local_suffix_length
         )
-        if hidden_states.ndim != 3 or hidden_states.shape[1] != 1:
+        if hidden_states.ndim != 3 or hidden_states.shape[1] != context.batch_size:
             raise ValueError(
-                "TPR external-KV mode requires hidden_states [sequence, 1, hidden], "
+                f"TPR external-KV mode requires hidden_states [sequence, {context.batch_size}, hidden], "
                 f"got {hidden_states.shape}"
             )
         if hidden_states.shape[0] != expected_input_len:

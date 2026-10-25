@@ -32,7 +32,7 @@ import torch
 ROOT = Path(__file__).resolve().parents[4]
 UNIT = (
     "turn_tree_cpu", "ppo_objective_cpu", "ppo_batch_cpu", "ppo_executor_cpu",
-    "unified_kv_state_cpu", "prefix_state", "kv_stack",
+    "unified_kv_state_cpu", "leaf_microbatch_cpu", "prefix_state", "kv_stack",
     "shard", "tpr_self_attention", "context", "rectangular_attention_contract",
     "ring_streaming_transport",  "production_architecture",
     "tpr_production_dp2_gate_cpu",
@@ -44,12 +44,15 @@ UNIT = (
 PARALLEL = (
     "ring_cp_attention_contract", "ring_numerics_cpu",
     "cp_padding_contract", "cp_backend_contract",
-    "cp_segment_execution_contract", 
-     
+    "cp_segment_execution_contract", "cp1_n8_perf_contract_cpu",
+    "cp4_ring_timeline_cpu",
 )
 
 
 def main():
+    cp1_perf_only = "--only-cp1-n8-perf" in sys.argv[1:]
+    if cp1_perf_only:
+        sys.argv.remove("--only-cp1-n8-perf")
     sys.path.insert(0, str(ROOT))
     for name in (
         "verl", "verl.utils", "verl.models", "verl.models.mcore", "verl.workers",
@@ -79,8 +82,11 @@ def main():
         module = types.ModuleType(name)
         module.__dict__.update(values)
         sys.modules[name] = module
-    paths = [str(ROOT / f"tests/models/mcore/tpr/unit/test_{name}.py") for name in UNIT]
-    paths += [str(ROOT / f"tests/models/mcore/tpr/parallel/test_{name}.py") for name in PARALLEL]
+    if cp1_perf_only:
+        paths = [str(ROOT / "tests/models/mcore/tpr/parallel/test_cp1_n8_perf_contract_cpu.py")]
+    else:
+        paths = [str(ROOT / f"tests/models/mcore/tpr/unit/test_{name}.py") for name in UNIT]
+        paths += [str(ROOT / f"tests/models/mcore/tpr/parallel/test_{name}.py") for name in PARALLEL]
     return pytest.main(["-q", "-p", "no:cacheprovider", *paths, *sys.argv[1:]])
 
 

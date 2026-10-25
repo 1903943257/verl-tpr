@@ -75,6 +75,7 @@ def _validate_layer_number(layer: int) -> None:
 
 def _validate_kv_pair(
     layer: int, key: Tensor, value: Tensor, *, expected_sequence_length: int, kind: str,
+    expected_batch_size: int = 1,
 ) -> None:
     if not isinstance(key, Tensor) or not isinstance(value, Tensor):
         raise TypeError(f"layer {layer} {kind} K/V must be torch tensors")
@@ -85,8 +86,10 @@ def _validate_kv_pair(
             f"layer {layer} {kind} KV sequence length must be {expected_sequence_length}, "
             f"got {key.shape[0]}"
         )
-    if key.shape[1] != 1:
-        raise ValueError(f"layer {layer} {kind} KV batch size must be 1, got {key.shape[1]}")
+    if key.shape[1] != expected_batch_size:
+        raise ValueError(
+            f"layer {layer} {kind} KV batch size must be {expected_batch_size}, got {key.shape[1]}"
+        )
     if key.device != value.device or key.dtype != value.dtype:
         raise ValueError(f"layer {layer} {kind} K/V device and dtype must match")
 
@@ -113,6 +116,7 @@ class TPRAttentionContext:
     attention_backend: TPRAttentionBackend | None = None
 
     compact_new_kv: bool = False
+    batch_size: int = 1
     _new_key_values: dict[int, KVPair] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -122,6 +126,10 @@ class TPRAttentionContext:
         ):
             if type(value) is not int or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+        if type(self.batch_size) is not int or self.batch_size < 1:
+            raise ValueError("TPR context batch_size must be a positive integer")
+        if self.batch_size > 1 and self.attention_backend is not None:
+            raise NotImplementedError("grouped TPR leaf execution is restricted to CP=1")
         if not isinstance(self.compact_new_kv, bool):
             raise TypeError("compact_new_kv must be a bool")
         if self.prefix_length == 0:
@@ -163,6 +171,7 @@ class TPRAttentionContext:
         return TPRAttentionContext(
             prefix_length=self.prefix_length,
             suffix_length=self.suffix_length,
+            batch_size=self.batch_size,
             past_key_values=self.past_key_values,
             suffix_rotary_pos_emb=self.suffix_rotary_pos_emb,
             attention_backend=self.attention_backend,
@@ -188,7 +197,10 @@ class TPRAttentionContext:
         _validate_layer_number(layer_number)
         if layer_number in self._new_key_values:
             raise RuntimeError(f"new KV for layer {layer_number} was already recorded")
-        _validate_kv_pair(layer_number, key, value, expected_sequence_length=self.local_suffix_length, kind="new")
+        _validate_kv_pair(
+            layer_number, key, value, expected_sequence_length=self.local_suffix_length,
+            kind="new", expected_batch_size=self.batch_size,
+        )
         if self.compact_new_kv:
             if torch.is_grad_enabled():
                 raise RuntimeError("compact_new_kv requires a no-grad Push forward")

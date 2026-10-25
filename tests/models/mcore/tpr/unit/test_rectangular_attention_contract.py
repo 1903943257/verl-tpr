@@ -40,7 +40,7 @@ def test_contract_accepts_rectangular_gqa_shapes():
     [
         (lambda q, k, v: (q[:, :, :, :-1], k, v), "head dimensions"),
         (lambda q, k, v: (q, k[:, :, :1], v), "identical shapes"),
-        (lambda q, k, v: (q.repeat(1, 2, 1, 1), k, v), "batch size 1"),
+        (lambda q, k, v: (q.repeat(1, 2, 1, 1), k, v), "batch sizes"),
         (lambda q, k, v: (q, k.to(torch.float64), v), "dtypes must match"),
     ],
 )

@@ -1,0 +1,104 @@
+name: Export SWE-ReBench Docker image
+
+run-name: Export ${{ inputs.image }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: >-
+          Docker Hub image reference, for example
+          swerebench/sweb.eval.x86_64.aspp_1776_pelita-875:latest
+        required: true
+        type: string
+        default: swerebench/sweb.eval.x86_64.aspp_1776_pelita-875:latest
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    name: Pull and export image
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Validate image reference
+        id: image
+        shell: bash
+        env:
+          IMAGE_INPUT: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+
+          image="${IMAGE_INPUT}"
+          if [[ "$image" != *:* ]]; then
+            image="${image}:latest"
+          fi
+
+          # Restrict pulls to the public SWE-ReBench namespace.
+          if [[ ! "$image" =~ ^swerebench/sweb\.eval\.x86_64\.[A-Za-z0-9._-]+:[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Expected swerebench/sweb.eval.x86_64.<task>:<tag>"
+            exit 1
+          fi
+
+          safe_name="$(printf '%s' "$image" | tr '/:' '--' | tr -cd 'A-Za-z0-9._-')"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=swe-rebench-${safe_name}" >> "$GITHUB_OUTPUT"
+
+      - name: Pull image from Docker Hub
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE"
+          docker image inspect "$IMAGE" --format 'Image ID: {{.Id}}'
+
+      - name: Export compressed archive and checksum
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          # Stream the archive through gzip to avoid storing an extra uncompressed tar.
+          docker save "$IMAGE" | gzip -1 > dist/image.tar.gz
+          printf '%s\n' "$IMAGE" > dist/IMAGE.txt
+          (cd dist && sha256sum image.tar.gz > image.tar.gz.sha256)
+
+          echo "Exported archive:"
+          ls -lh dist/
+
+      - name: Upload archive as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.image.outputs.artifact_name }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Print download and import instructions
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        shell: bash
+        run: |
+          {
+            echo "## SWE-ReBench image export complete"
+            echo
+            echo "- Image: `$IMAGE`"
+            echo "- Artifact: `${{ steps.image.outputs.artifact_name }}`"
+            echo "- Retention: 7 days"
+            echo
+            echo "Download and extract the artifact, then transfer `image.tar.gz` to the target host."
+            echo
+            echo 'Load it into the Docker daemon with:'
+            echo
+            echo '```bash'
+            echo 'sha256sum -c image.tar.gz.sha256'
+            echo 'gzip -dc image.tar.gz | docker load'
+            echo '```'
+            echo
+            echo "This loads the image into that Docker daemon; it does not push the image to Huawei SWR."
+          } >> "$GITHUB_STEP_SUMMARY"
