@@ -83,8 +83,6 @@ class CP1AttentionTrace:
         self.first_layer_linear_inputs_root = {}
         self.root_queries = {}
         self.same_qkv_attention = {}
-        self.same_qkv_attention_backward = {}
-        self.same_qkv_backward_inputs = {}
         self.original_rectangular = None
         self.replay = {}
         self.relay_accumulation = {}
@@ -240,150 +238,7 @@ class CP1AttentionTrace:
             self.same_qkv_attention[f"r{row}|L{layer}"] = _difference(
                 out.detach(), same_qkv_square,
             )
-
-            # Capture one real Leaf's exact Q/K/V and its actual upstream dO.
-            # The post-backward probe replays these identical tensors through
-            # both the rectangular adapter and MCore's square core-attention
-            # module, isolating attention-backend/shape effects from upstream
-            # gradient differences. Limit this diagnostic to row 0.
-            if row == 0:
-                probe_key = f"r{row}|L{layer}"
-                if probe_key in self.same_qkv_backward_inputs:
-                    raise AssertionError(f"Duplicate same-QKV backward probe {probe_key}")
-                attention_kwargs = {
-                    name: kwargs.get(name)
-                    for name in (
-                        "softmax_scale", "dropout_p", "pre_tokens",
-                        "inner_precise", "attention_mask",
-                    )
-                    if name in kwargs
-                }
-                if isinstance(attention_kwargs.get("attention_mask"), torch.Tensor):
-                    attention_kwargs["attention_mask"] = (
-                        attention_kwargs["attention_mask"].detach().cpu()
-                    )
-                self.same_qkv_backward_inputs[probe_key] = {
-                    "query_prefix": prefix_q.detach().cpu(),
-                    "query_suffix": query.detach().cpu(),
-                    "key": key.detach().cpu(),
-                    "value": value.detach().cpu(),
-                    "rectangular_output": out.detach().cpu(),
-                    "attention_kwargs": attention_kwargs,
-                }
-
-                def save_upstream_gradient(gradient, probe_key=probe_key):
-                    self.same_qkv_backward_inputs[probe_key][
-                        "grad_output"
-                    ] = gradient.detach().cpu()
-                    return gradient
-
-                if not out.requires_grad:
-                    raise AssertionError(
-                        f"Leaf attention output has no grad_fn for {probe_key}"
-                    )
-                out.register_hook(save_upstream_gradient)
         return out
-
-    def run_same_qkv_attention_backward(self):
-        """Compare square MCore and rectangular backward on identical Q/K/V,dO."""
-        if self.mode == "full":
-            return
-        expected = {f"r0|L{layer}" for layer in (1, 2, 8, 36)}
-        missing = expected - self.same_qkv_backward_inputs.keys()
-        if missing:
-            raise AssertionError(
-                f"Missing same-QKV backward probe inputs: {sorted(missing)}"
-            )
-
-        device = next(self.model.parameters()).device
-        for probe_key in sorted(expected, key=lambda item: int(item.split("|L")[1])):
-            item = self.same_qkv_backward_inputs[probe_key]
-            if "grad_output" not in item:
-                raise AssertionError(f"Missing real upstream gradient for {probe_key}")
-            layer = int(probe_key.split("|L")[1])
-            attention_module = self.model.decoder.layers[layer - 1].self_attention
-            kwargs = dict(item["attention_kwargs"])
-            if isinstance(kwargs.get("attention_mask"), torch.Tensor):
-                kwargs["attention_mask"] = kwargs["attention_mask"].to(device)
-
-            q_prefix = item["query_prefix"].to(device)
-            q_suffix_data = item["query_suffix"].to(device)
-            k_data = item["key"].to(device)
-            v_data = item["value"].to(device)
-            grad_output = item["grad_output"].to(device)
-
-            with torch.enable_grad():
-                # Rectangular path: only suffix queries produce outputs.
-                q_rect = q_suffix_data.detach().requires_grad_(True)
-                k_rect = k_data.detach().requires_grad_(True)
-                v_rect = v_data.detach().requires_grad_(True)
-                rect_output = self.original_rectangular(
-                    q_rect, k_rect, v_rect, **kwargs,
-                )
-                rect_grads = torch.autograd.grad(
-                    rect_output, (q_rect, k_rect, v_rect),
-                    grad_outputs=grad_output,
-                )
-
-                # Square path: identical Q/K/V values; zero dO for prefix
-                # outputs ensures only suffix-query contributions enter dK/dV.
-                q_square = torch.cat(
-                    (q_prefix, q_suffix_data), dim=0,
-                ).detach().requires_grad_(True)
-                k_square = k_data.detach().requires_grad_(True)
-                v_square = v_data.detach().requires_grad_(True)
-                square_output = _tensor(attention_module.core_attention(
-                    q_square,
-                    k_square,
-                    v_square,
-                    kwargs.get("attention_mask"),
-                    attn_mask_type=attention_module.attn_mask_type,
-                    attention_bias=None,
-                    packed_seq_params=None,
-                ))
-                if square_output is None:
-                    raise AssertionError(
-                        f"MCore square core attention returned no tensor at {probe_key}"
-                    )
-                suffix_length = grad_output.shape[0]
-                if tuple(square_output[-suffix_length:].shape) != tuple(grad_output.shape):
-                    raise AssertionError(
-                        f"Square output/dO mismatch at {probe_key}: "
-                        f"square={tuple(square_output.shape)}, dO={tuple(grad_output.shape)}"
-                    )
-                square_grad_output = torch.zeros_like(square_output)
-                square_grad_output[-suffix_length:] = grad_output
-                square_grads = torch.autograd.grad(
-                    square_output, (q_square, k_square, v_square),
-                    grad_outputs=square_grad_output,
-                )
-
-            self.same_qkv_attention_backward[probe_key] = {
-                "rectangular_replay_vs_actual_output": _difference(
-                    item["rectangular_output"].to(device), rect_output.detach(),
-                ),
-                "square_mcore_vs_rectangular_forward_suffix": _difference(
-                    rect_output.detach(), square_output[-suffix_length:].detach(),
-                ),
-                "dQ_suffix_rectangular_vs_square_mcore": _difference(
-                    rect_grads[0], square_grads[0][-suffix_length:],
-                ),
-                "dK_rectangular_vs_square_mcore": _difference(
-                    rect_grads[1], square_grads[1],
-                ),
-                "dV_rectangular_vs_square_mcore": _difference(
-                    rect_grads[2], square_grads[2],
-                ),
-                "same_upstream_dO": True,
-                "suffix_length": int(suffix_length),
-                "kv_length": int(k_data.shape[0]),
-                "q_dtype": str(q_suffix_data.dtype),
-                "attention_module": type(attention_module.core_attention).__name__,
-            }
-            del q_rect, k_rect, v_rect, q_square, k_square, v_square
-            del rect_output, square_output, rect_grads, square_grads
-
-        self.same_qkv_backward_inputs.clear()
 
     def install(self):
         self.handles.append(
@@ -617,7 +472,6 @@ class CP1AttentionTrace:
             "call_counts": self.call_counts,
             "records": self.records,
             "same_qkv_attention": self.same_qkv_attention,
-            "same_qkv_attention_backward": self.same_qkv_attention_backward,
             "same_input_gemm_replay": self.replay,
             "kv_relay_roundoff": {
                 k: {
