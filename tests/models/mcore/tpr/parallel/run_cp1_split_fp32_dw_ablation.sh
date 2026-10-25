@@ -71,8 +71,12 @@ export PYTHONUNBUFFERED=1
 unset TPR_QWEN17_SPLIT_FP32_DW_BACKWARD TPR_CP1_SPLIT_FP32_LINEAR_DW
 unset TPR_CP1_PROGRESS_LAYERS
 
-python tests/models/mcore/tpr/parallel/_mindspeed_first_pytest.py \
-  --bootstrap-only 2>&1 | tee "$ROOT/bootstrap.log"
+if [[ -f "$ROOT/split_fp32/result.json" && -f "$ROOT/split_bf16_reverse/result.json" ]]; then
+  echo "CP1_FP32_DW_REUSE_ALL_ARTIFACTS comparison_only=1"
+else
+  python tests/models/mcore/tpr/parallel/_mindspeed_first_pytest.py \
+    --bootstrap-only 2>&1 | tee "$ROOT/bootstrap.log"
+fi
 
 run_split() {
   local label="$1"
