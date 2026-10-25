@@ -6,6 +6,10 @@ preserves the original UniAgent rows and never inserts the gold patch into a
 model-facing prompt. This is a proxy for short agent trajectories, NOT a
 measurement of response length or prefix reuse.
 
+Supported metadata layouts include both:
+  extra_info.tools_kwargs.task.metadata
+  extra_info.tools_kwargs.reward.metadata
+
 Usage:
   python tests/models/mcore/tpr/parallel/filter_swe_rebench_shortfix.py \
       /path/to/swe_rebench_filtered.parquet --out /path/to/shortfix --limit 50
@@ -35,6 +39,8 @@ TIERS = ("strict", "relaxed", "reject")
 def decode_object(value):
     if isinstance(value, dict):
         return value
+    if hasattr(value, "as_py"):
+        return decode_object(value.as_py())
     if isinstance(value, str):
         try:
             parsed = json.loads(value)
@@ -52,17 +58,30 @@ def decode_array(value):
             value = json.loads(value)
         except ValueError:
             return []
+    if hasattr(value, "as_py"):
+        value = value.as_py()
     if hasattr(value, "tolist"):
         value = value.tolist()
     return list(value) if isinstance(value, (list, tuple)) else []
 
 
 def extract_metadata(row):
+    """Read metadata from both UniAgent task and reward configuration layouts."""
     root = decode_object(row.get("extra_info"))
-    task = decode_object(decode_object(root.get("tools_kwargs")).get("task"))
-    meta = decode_object(task.get("metadata"))
-    # The preprocessed UniAgent format nests metadata here; also accept raw rows.
-    return meta or row.to_dict()
+    tools_kwargs = decode_object(root.get("tools_kwargs"))
+
+    task = decode_object(tools_kwargs.get("task"))
+    task_meta = decode_object(task.get("metadata"))
+    if task_meta:
+        return task_meta
+
+    reward = decode_object(tools_kwargs.get("reward"))
+    reward_meta = decode_object(reward.get("metadata"))
+    if reward_meta:
+        return reward_meta
+
+    # Also accept raw datasets where task fields are top-level columns.
+    return row.to_dict()
 
 
 def patch_metrics(patch):
