@@ -12,6 +12,7 @@ per-tensor samples to avoid writing multi-gigabyte gradients at every step.
 """
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
@@ -320,6 +321,20 @@ def test_real_actor_cp1_sequence_split_multistep():
                 schema,
                 allow_missing=True,
             )
+        # The optimizer states live on CPU; release them before staging the
+        # final BF16 model weights on CPU. The two final snapshots let the
+        # comparator compute an exact all-parameter distance without keeping
+        # two 4B models on the NPU or loading both snapshots fully into RAM.
+        del optimizer, masters
+        gc.collect()
+        final_state_path = destination.with_suffix(".final_state.pt")
+        torch.save(
+            {
+                name: parameter.detach().to(device="cpu")
+                for name, parameter in named_parameters.items()
+            },
+            final_state_path,
+        )
         summary = {
             "mode": mode,
             "steps": _STEPS,
@@ -332,13 +347,15 @@ def test_real_actor_cp1_sequence_split_multistep():
             "post_update_eval_after_step_n": _STEPS,
             "post_update_eval": final_eval_record,
             "optimizer_state_samples": optimizer_state_samples,
+            "final_state_path": str(final_state_path),
             "sample_scope": header["gradient_sample_scope"],
         }
         summary_path.write_text(json.dumps(summary, indent=2, allow_nan=False))
         print(
             f"TPR_CP1_MULTISTEP_RESULT mode={mode} steps={_STEPS} "
             f"input_sha={input_sha} final_loss={final_eval_record['loss']:.9g} "
-            f"trajectory={destination} summary={summary_path}",
+            f"trajectory={destination} summary={summary_path} "
+            f"final_state={final_state_path}",
             flush=True,
         )
     finally:
