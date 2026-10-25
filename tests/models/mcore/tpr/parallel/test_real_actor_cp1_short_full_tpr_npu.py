@@ -260,6 +260,17 @@ def _run_split_no_share(model, engine, batch, *, loss_fn, forest):
 
 def test_real_actor_cp1_short_full_vs_tpr():
     mode = os.getenv("TPR_CP1_MODE", "")
+    test_started = time.perf_counter()
+
+    def progress(phase, **fields):
+        details = " ".join(f"{key}={value}" for key, value in fields.items())
+        print(
+            f"TPR_CP1_PROGRESS mode={mode} phase={phase} "
+            f"elapsed_s={time.perf_counter() - test_started:.1f} {details}",
+            flush=True,
+        )
+
+    progress("test_start")
     if mode not in MODES:
         raise ValueError(f"TPR_CP1_MODE must be one of {MODES}, got {mode!r}")
     if int(os.getenv("WORLD_SIZE", "1")) != 1:
@@ -277,7 +288,9 @@ def test_real_actor_cp1_short_full_vs_tpr():
     )).resolve()
     if not checkpoint.is_dir():
         raise FileNotFoundError(checkpoint)
+    progress("runtime_init_start")
     runtime = _runtime(1, 1, 1)
+    progress("runtime_init_done")
     try:
         from verl.workers.utils.losses import ppo_loss
 
@@ -294,13 +307,17 @@ def test_real_actor_cp1_short_full_vs_tpr():
             global_batch_size=2, tpr_capture_log_probs=True,
         )
         forest, logical, physical = _short_forest(batch, mode=mode)
+        progress("model_build_start", checkpoint=checkpoint)
         model, hf = make_real_qwen3_tp_model(
             runtime, model_path=checkpoint, tp_size=1, cp_size=1,
             sequence_parallel=False, profile="4b", native_attention=False,
         )
+        progress("model_build_done", layers=hf.num_hidden_layers)
         if hf.num_hidden_layers != 36:
             raise AssertionError("Only authentic Qwen3-4B is accepted")
+        progress("engine_build_start")
         engine = _engine(model, runtime, 1, 1, 1)
+        progress("engine_build_done")
         if model.config.recompute_granularity is not None:
             raise AssertionError("Parity must disable activation recompute")
         initial_weights = _initial_weight_fingerprint(model)
@@ -316,7 +333,31 @@ def test_real_actor_cp1_short_full_vs_tpr():
                 model=model, batch=batch, forest=forest, mode=mode,
                 directory=trace_dir,
             ).install()
+        progress_hook_handles = []
+        if mode == "shared" and os.getenv("TPR_CP1_PROGRESS_LAYERS", "0") == "1":
+            from verl.models.mcore.tpr.attention import TPRSelfAttention
+
+            attention_calls = {"count": 0}
+
+            def _attention_progress(module, inputs, output):
+                attention_calls["count"] += 1
+                count = attention_calls["count"]
+                if count % 6 == 0:
+                    progress(
+                        "attention_forward_progress",
+                        calls=count,
+                        approximate_layer_passes=f"{count / 36:.1f}",
+                    )
+
+            for module in model.modules():
+                if isinstance(module, TPRSelfAttention):
+                    progress_hook_handles.append(
+                        module.register_forward_hook(_attention_progress)
+                    )
+            progress("attention_hooks_installed", modules=len(progress_hook_handles))
+
         start = time.perf_counter()
+        progress("forward_backward_start")
         try:
             if mode == "full":
                 result = _run_controlled_full(
@@ -335,11 +376,16 @@ def test_real_actor_cp1_short_full_vs_tpr():
                     "loss": float(result["loss"][0]),
                     "logprobs": dict(engine._tpr_captured_log_probs),
                 }
+            progress("forward_backward_returned")
+            progress("npu_synchronize_start")
             torch.npu.synchronize()
+            progress("npu_synchronize_done")
             seconds = time.perf_counter() - start
             measured_alloc = torch.npu.max_memory_allocated() / 2**30
             measured_reserved = torch.npu.max_memory_reserved() / 2**30
         finally:
+            for handle in progress_hook_handles:
+                handle.remove()
             if trace is not None:
                 trace.close()
         if trace is not None:
@@ -361,6 +407,7 @@ def test_real_actor_cp1_short_full_vs_tpr():
         }
         if result["logprobs"].keys() != expected_keys or len(expected_keys) != ppo_tokens:
             raise AssertionError("Full/TPR did not produce identical logical PPO supervision")
+        progress("gradient_witness_start")
         grad_norm = _global_bf16_gradient_norm(model, runtime)
         witness = canonical_grad_witness(
             model, tp_size=1, tp_rank=0,
@@ -368,8 +415,10 @@ def test_real_actor_cp1_short_full_vs_tpr():
         )
         if witness is None:
             raise AssertionError("Missing CP1 canonical gradient witness")
+        progress("gradient_witness_done")
         full_grad_dir = None
         if os.getenv("TPR_CP1_SAVE_FULL_GRADS", "0") == "1":
+            progress("full_gradient_save_start")
             from .test_real_actor_tp2cp4_offline_ppo_npu import _save_complete_grads
             # Single-card TP1/CP1 has no replicated parameter shards:
             # persist every finalized BF16 gradient exactly once. This
@@ -377,6 +426,7 @@ def test_real_actor_cp1_short_full_vs_tpr():
             full_grad_dir = _save_complete_grads(
                 model, runtime, destination.parent, mode, step=1,
             )
+            progress("full_gradient_save_done", directory=full_grad_dir)
         stats = {
             "mode": mode,
             "reference": (
@@ -416,6 +466,7 @@ def test_real_actor_cp1_short_full_vs_tpr():
         }
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(json.dumps(stats, indent=2))
+        progress("result_written", path=destination)
         print(
             f"TPR_CP1_SHORT_RESULT mode={mode} input_sha={input_sha} "
             f"trees={stats['forest_trees']} segments={stats['forest_segments']} "
