@@ -37,9 +37,10 @@ for mode in full split_no_share; do
   dir="$ROOT/$mode"
   trajectory="$dir/trajectory.jsonl"
   summary="$dir/trajectory.summary.json"
-  if [[ -f "$trajectory" && -f "$summary" ]]; then
-    echo "ROUTE_B_REUSE_COMPLETE_ARM mode=$mode trajectory=$trajectory"
-  elif [[ -e "$trajectory" || -e "$summary" ]]; then
+  final_state="$dir/trajectory.final_state.pt"
+  if [[ -f "$trajectory" && -f "$summary" && -f "$final_state" ]]; then
+    echo "ROUTE_B_REUSE_COMPLETE_ARM mode=$mode trajectory=$trajectory final_state=$final_state"
+  elif [[ -e "$trajectory" || -e "$summary" || -e "$final_state" ]]; then
     echo "Incomplete Route B artifacts for $mode under $dir." >&2
     echo "Use a fresh TPR_CP1_MULTISTEP_ROOT to avoid mixing partial runs." >&2
     exit 2
@@ -59,8 +60,9 @@ run_arm() {
   local dir="$ROOT/$mode"
   local trajectory="$dir/trajectory.jsonl"
   local summary="$dir/trajectory.summary.json"
+  local final_state="$dir/trajectory.final_state.pt"
 
-  if [[ -f "$trajectory" && -f "$summary" ]]; then
+  if [[ -f "$trajectory" && -f "$summary" && -f "$final_state" ]]; then
     echo "ROUTE_B_SKIP_ARM mode=$mode existing_result=True"
     return 0
   fi
