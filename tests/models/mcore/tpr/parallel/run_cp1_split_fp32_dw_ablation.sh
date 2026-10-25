@@ -219,25 +219,36 @@ def compare(label, a, b):
 
 comparisons = {
     "full_vs_split_bf16": compare("full_vs_split_bf16", full, baseline),
+    "full_vs_split_bf16_reverse": compare("full_vs_split_bf16_reverse", full, reverse),
     "full_vs_split_all_linear_dw_fp32": compare("full_vs_split_all_linear_dw_fp32", full, candidate),
     "split_bf16_vs_split_all_linear_dw_fp32": compare("split_bf16_vs_split_all_linear_dw_fp32", baseline, candidate),
     "split_bf16_vs_bf16_reverse": compare("split_bf16_vs_bf16_reverse", baseline, reverse),
 }
+# Native BF16 replay need not be bitwise/reduction-order identical. Record its
+# observed full-gradient discrepancy as a repeatability diagnostic; do not let
+# that diagnostic suppress the primary Full-vs-FP32-Split comparison.
 reverse_error = comparisons["split_bf16_vs_bf16_reverse"]["full_parameter_gradient"]["relative_l2"]
-if reverse_error > 1e-6:
-    raise AssertionError(f"BF16 reverse did not reproduce baseline gradients: rel_l2={reverse_error}")
-
 baseline_error = comparisons["full_vs_split_bf16"]["full_parameter_gradient"]["relative_l2"]
+reverse_full_error = comparisons["full_vs_split_bf16_reverse"]["full_parameter_gradient"]["relative_l2"]
 fp32_error = comparisons["full_vs_split_all_linear_dw_fp32"]["full_parameter_gradient"]["relative_l2"]
+error_reduction = baseline_error - fp32_error
 report = {
     "scope": "Qwen3-4B BF16, CP1, sequence split without shared prefix",
     "intervention": intervention,
     "forward_loss_and_logprobs_unchanged": True,
-    "bf16_reverse_reproduced_baseline": True,
+    "bf16_reverse_gradient_rel_l2_vs_bf16_baseline": reverse_error,
+    "bf16_reverse_matches_baseline_with_1e-6_tolerance": reverse_error <= 1e-6,
     "full_vs_split_bf16_gradient_rel_l2": baseline_error,
+    "full_vs_split_bf16_reverse_gradient_rel_l2": reverse_full_error,
     "full_vs_split_all_linear_dw_fp32_gradient_rel_l2": fp32_error,
+    "gradient_error_absolute_reduction": error_reduction,
     "gradient_error_reduction_factor": baseline_error / max(fp32_error, 1e-30),
     "fp32_reduced_full_gradient_error": fp32_error < baseline_error,
+    "improvement_exceeds_observed_bf16_repeat_discrepancy": error_reduction > reverse_error,
+    "repeatability_note": (
+        "BF16 reverse discrepancy is reported as a diagnostic, not a hard gate; "
+        "interpret FP32 improvement alongside this measured repeat-run difference."
+    ),
     "comparisons": comparisons,
 }
 output = root / "comparison_fp32_dw_ablation.json"
@@ -257,16 +268,26 @@ for name, item in comparisons.items():
 print(
     "CP1_FP32_DW_EFFECT",
     f"baseline_grad_rel_l2={baseline_error:.9g}",
+    f"bf16_reverse_grad_rel_l2={reverse_full_error:.9g}",
+    f"bf16_repeat_grad_rel_l2={reverse_error:.9g}",
     f"all_layer_fp32_grad_rel_l2={fp32_error:.9g}",
+    f"error_reduction={error_reduction:.9g}",
     f"error_reduction_factor={baseline_error/max(fp32_error, 1e-30):.6g}",
     f"improved={fp32_error < baseline_error}",
+    f"improvement_exceeds_bf16_repeat_discrepancy={error_reduction > reverse_error}",
     flush=True,
 )
 print("CP1_FP32_DW_TOP_ERRORS full_vs_split_all_linear_dw_fp32:")
 for name, error in comparisons["full_vs_split_all_linear_dw_fp32"]["full_parameter_gradient"]["top_absolute_gradient_errors"][:8]:
     print(f"  {name}: {error:.9g}", flush=True)
 print(f"CP1_FP32_DW_REPORT={output}", flush=True)
-print("CP1_FP32_DW_ABLATION_VALIDATED forward_unchanged=True bf16_reverse_reproduced=True", flush=True)
+print(
+    "CP1_FP32_DW_ABLATION_ANALYSIS_COMPLETE",
+    "forward_unchanged=True",
+    f"bf16_repeat_rel_l2={reverse_error:.9g}",
+    f"fp32_improved={fp32_error < baseline_error}",
+    flush=True,
+)
 PY
 
 echo
@@ -274,4 +295,4 @@ echo "========== FINAL STATUS =========="
 echo "fp32_exit_code=$FP32_RC"
 echo "bf16_reverse_exit_code=$BF16_RC"
 echo "report=$ROOT/comparison_fp32_dw_ablation.json"
-echo "CP1_FP32_DW_ABLATION_PASS"
+echo "CP1_FP32_DW_ABLATION_ANALYSIS_COMPLETE"
