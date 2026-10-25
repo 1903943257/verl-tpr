@@ -10,6 +10,7 @@ from .filter_swe_rebench_shortfix import (
     decode_array,
     describe,
     extract_metadata,
+    normalize_task_row,
     patch_metrics,
     screen,
     tier,
@@ -104,6 +105,28 @@ def test_local_reward_metadata_layout_is_supported():
     assert got["source_files"] == 1
     assert got["fail_to_pass"] == 1
     assert tier(got) == "strict"
+
+
+def test_legacy_reward_layout_normalizes_to_current_task_config():
+    item = _row_reward_layout("case_reward", _patch("src/code.py", 2))
+    normalized = normalize_task_row(pd.Series(item))
+    tools_kwargs = normalized["extra_info"]["tools_kwargs"]
+    task = tools_kwargs["task"]
+
+    assert normalized["data_source"] == "nebius/SWE-rebench"
+    assert task["name"] == "swe_rebench"
+    assert task["sandbox"]["image"] == "swerebench/sample"
+    assert task["metadata"]["instance_id"] == "case_reward"
+    assert "reward" not in tools_kwargs
+    assert "env" not in tools_kwargs
+    assert normalized["agent_name"] == "claude_code"
+
+
+def test_current_task_layout_is_preserved():
+    item = _row("case_current", _patch("src/code.py"))
+    normalized = normalize_task_row(pd.Series(item))
+    assert normalized["extra_info"]["tools_kwargs"]["task"]["name"] == "swe_rebench"
+    assert normalized["data_source"] == "nebius/SWE-rebench"
 
 
 def test_screen_preserves_original_task_rows_and_prioritizes_strict():
