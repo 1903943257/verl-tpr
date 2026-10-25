@@ -119,6 +119,133 @@ def _tpr(model, engine, batch, loss_fn):
     }
 
 
+def _make_unshared_split_n8(shared_forest, batch):
+    """Recreate the exact Root/Leaf boundary per row, without sharing any Root."""
+    from verl.workers.engine.megatron.tpr.tree import (
+        ForestExecutionPlan, SegmentObjectiveRef, SegmentPlan, SegmentSpec,
+        TreeExecutionPlan,
+    )
+
+    if len(shared_forest.trees) != 1:
+        raise AssertionError("N8 split attribution needs one original shared tree")
+    original = shared_forest.trees[0]
+    plan = original.segment_plan
+    root = plan.get(plan.root_id)
+    children = plan.children_of(plan.root_id)
+    rows = tuple(sorted(original.member_rows))
+    if len(rows) != 8 or len(children) != 8:
+        raise AssertionError(
+            f"Expected one Root with eight sibling Leaves, rows={rows}, children={len(children)}"
+        )
+    boundary = root.length
+    independent = []
+    for row in rows:
+        tokens = batch["input_ids"][row].detach().cpu().long()
+        if not 0 < boundary < tokens.numel():
+            raise AssertionError(f"Invalid root boundary for row {row}: {boundary}")
+        if not torch.equal(tokens[:boundary], root.token_ids):
+            raise AssertionError(f"Row {row} does not have the exact shared root prefix")
+        local_plan = SegmentPlan(
+            (
+                SegmentSpec(0, None, tokens[:boundary], 0, 0),
+                SegmentSpec(1, 0, tokens[boundary:], boundary, boundary),
+            ),
+            root_id=0,
+        )
+        refs = []
+        for ref in original.objective_refs:
+            if ref.sample_row != row:
+                continue
+            source_segment = plan.get(ref.segment_id)
+            global_query = source_segment.position_start + ref.query_offset
+            target_global = global_query + 1
+            if target_global >= tokens.numel() or int(tokens[target_global]) != ref.target_token_id:
+                raise AssertionError(
+                    f"Split objective target mismatch row={row}, query={global_query}"
+                )
+            local_segment_id = 0 if global_query < boundary else 1
+            local_query = global_query if local_segment_id == 0 else global_query - boundary
+            refs.append(SegmentObjectiveRef(
+                local_segment_id, local_query, ref.target_token_id,
+                ref.sample_row, ref.response_offset,
+            ))
+        if not refs:
+            raise AssertionError(f"Split tree row {row} has no supervised targets")
+        independent.append(TreeExecutionPlan(
+            uid=f"{original.uid}_split_no_share_{row}",
+            tree_index=row,
+            member_rows=(row,),
+            segment_plan=local_plan,
+            objective_refs=tuple(refs),
+        ))
+    split = ForestExecutionPlan(tuple(independent), shared_forest.logical_loss_tokens)
+    split_tokens = sum(
+        segment.length for tree in split.trees
+        for segment in tree.segment_plan.segments.values()
+    )
+    logical_tokens = sum(int(ids.numel()) for ids in batch["input_ids"].unbind())
+    if len(split.trees) != 8 or split.segment_count != 16 or split_tokens != logical_tokens:
+        raise AssertionError(
+            f"Invalid split-no-share topology: trees={len(split.trees)}, "
+            f"segments={split.segment_count}, physical={split_tokens}, logical={logical_tokens}"
+        )
+    return split
+
+
+def _run_split_no_share(model, engine, batch, loss_fn, forest):
+    """Run independent Root/Leaf chains through the same production SegmentExecutor."""
+    from verl.models.mcore.tpr.attention import TPRSelfAttention
+    from verl.workers.engine.megatron.tpr.adapter import run_forest
+    from verl.workers.engine.megatron.tpr.executor import SegmentExecutor
+    from verl.workers.engine.megatron.tpr.objective import SegmentPPOObjectiveAdapter
+
+    chunk_size = int(os.getenv("TPR_PPO_LOGPROB_CHUNK_TOKENS", "256"))
+    if chunk_size < 0:
+        raise ValueError("Negative PPO logprob chunk size")
+    objective = SegmentPPOObjectiveAdapter(
+        batch, loss_fn, log_prob_chunk_size=chunk_size or None,
+    )
+    layers = tuple(sorted(
+        module.layer_number for module in model.modules()
+        if isinstance(module, TPRSelfAttention)
+    ))
+    if len(layers) != 36:
+        raise AssertionError("N8 split attribution requires all 36 TPR attention layers")
+    model_config = model.config
+    if model_config.recompute_granularity is not None:
+        raise AssertionError("N8 split attribution requires recompute disabled")
+    stats = {"model_forward_calls": 0, "grouped_leaf_calls": 0, "grouped_leaf_segments": 0}
+
+    def run_one_tree(tree):
+        callback, counts = objective.bind_tree(tree)
+        executor = SegmentExecutor(
+            model,
+            tree.segment_plan,
+            expected_layer_numbers=layers,
+            loss_scale_func=getattr(model_config, "grad_scale_func", None),
+            segment_loss_fn=callback,
+            segment_loss_term_counts=counts,
+        )
+        value = executor.run()
+        for key in stats:
+            stats[key] += int(getattr(executor, key))
+        return value
+
+    total_loss = run_forest(
+        forest,
+        run_one_tree,
+        lambda: model_config.finalize_model_grads_func(
+            engine.module, None, force_all_reduce=True,
+        ),
+    )
+    return {
+        "loss": float(total_loss.detach().item()),
+        "logprobs": dict(objective.debug_new_log_probs),
+        "physical_model_forward_calls": stats["model_forward_calls"],
+        "leaf_batch_stats": stats,
+    }
+
+
 def _summarize_stages(records: list[dict]) -> dict:
     by_kind = {}
     for rec in records:
@@ -141,8 +268,8 @@ def _summarize_stages(records: list[dict]) -> dict:
 
 def test_real_actor_cp1_n8_full_mb2_vs_tpr():
     mode = os.getenv("TPR_CP1_N8_MODE", "")
-    if mode not in ("full_mb1", "full_mb2", "tpr"):
-        raise ValueError("N8 benchmark only supports physical full_mb1/full_mb2 or TPR")
+    if mode not in ("full_mb1", "full_mb2", "split_no_share", "tpr"):
+        raise ValueError("N8 benchmark supports full_mb1/full_mb2/split_no_share/tpr")
     if int(os.getenv("WORLD_SIZE", "1")) != 1:
         raise AssertionError("N8 CP1 benchmark requires exactly one NPU")
     if os.getenv("TPR_TREE_POLICY", "qwen_turn") != "qwen_turn":
@@ -170,7 +297,7 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
     try:
         from verl.workers.utils.losses import ppo_loss
         batch, original_keys, ppo_tokens, input_sha = _load_real_pair(
-            cap, tuple(range(8)), "tpr" if mode == "tpr" else "full",
+            cap, tuple(range(8)), "tpr" if mode in ("tpr", "split_no_share") else "full",
         )
         tu.assign_non_tensor(
             batch, dp_size=1, batch_num_tokens=ppo_tokens, global_batch_size=8,
@@ -186,7 +313,7 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
             raise AssertionError("N8 controlled Full MB2 requires equal <=4K genuine response windows")
         root_length = None
         sibling_suffix_lengths = []
-        if mode == "tpr":
+        if mode in ("tpr", "split_no_share"):
             if len(forest.trees) != 1 or unique >= logical:
                 raise AssertionError(
                     f"TPR N8 must have one actually shared same-session tree; "
@@ -213,6 +340,21 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
                     ],
                 }), flush=True,
             )
+            if mode == "split_no_share":
+                forest = _make_unshared_split_n8(forest, batch)
+                unique = sum(
+                    seg.length for tree in forest.trees
+                    for seg in tree.segment_plan.segments.values()
+                )
+                print(
+                    "TPR_CP1_N8_SPLIT_NO_SHARE "
+                    + json.dumps({
+                        "trees": len(forest.trees), "segments": forest.segment_count,
+                        "logical_tokens": logical, "physical_tokens": unique,
+                        "root_length": root_length,
+                    }),
+                    flush=True,
+                )
         else:
             if len(forest.trees) != 8 or unique != logical:
                 raise AssertionError("Full MB1/MB2 N8 must use eight unrelated complete roots")
@@ -237,6 +379,8 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
                     model, batch, forest, loss_fn,
                     micro_batch_size=1 if mode == "full_mb1" else 2,
                 )
+            elif mode == "split_no_share":
+                result = _run_split_no_share(model, engine, batch, loss_fn, forest)
             else:
                 result = _tpr(model, engine, batch, loss_fn)
             torch.npu.synchronize()
@@ -278,15 +422,13 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
         configured_k = int(os.getenv("TPR_LEAF_BATCH_SIZE", "1"))
         full_parameter_grad_dir = None
         if os.getenv("TPR_CP1_N8_SAVE_FULL_GRADS", "0") == "1":
-            if mode != "tpr":
-                raise ValueError("Full parameter gradient dumps are currently scoped to TPR K1/K2")
-            if configured_k not in (1, 2):
+            if mode == "tpr" and configured_k not in (1, 2):
                 raise ValueError("TreeBatch parity full-gradient dumps support K=1/2 only")
-            # This opt-in diagnostic is outside the timed iterations. It writes
-            # one exact BF16 parameter-gradient tensor per file so K1/K2 can be
-            # compared over the complete model, not just the canonical sample.
+            # Opt-in attribution diagnostic: save exact BF16 parameter gradients
+            # for Full, split-no-share, TPR K1 and TPR K2, outside the timed region.
+            grad_arm = f"tpr_k{configured_k}" if mode == "tpr" else mode
             full_parameter_grad_dir = _save_complete_grads(
-                model, runtime, destination.parent, f"tpr_k{configured_k}", step=1,
+                model, runtime, destination.parent, grad_arm, step=1,
             )
             if full_parameter_grad_dir is None:
                 raise AssertionError("Full gradient dump unexpectedly skipped this CP rank")
@@ -326,7 +468,9 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
             "optimizer_step": False, "original_online_conditioning": False,
             "reference": (
                 f"physical_B{1 if mode == 'full_mb1' else 2}_square_CANN"
-                if mode != "tpr" else "TPR_CP1_root_leaf"
+                if mode in ("full_mb1", "full_mb2") else
+                "TPR_CP1_independent_root_leaf_chains"
+                if mode == "split_no_share" else "TPR_CP1_root_leaf"
             ),
         }
         destination.parent.mkdir(parents=True, exist_ok=True)
