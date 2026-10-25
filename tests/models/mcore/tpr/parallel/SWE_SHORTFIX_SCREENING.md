@@ -11,13 +11,24 @@ Test: test_filter_swe_rebench_shortfix_cpu.py
 
 The filter supports both metadata layouts:
 
-- \`extra_info.tools_kwargs.task.metadata\` (newer UniAgent preprocessor output)
-- \`extra_info.tools_kwargs.reward.metadata\` (the local 50-row Parquet layout)
+- \`extra_info.tools_kwargs.task.metadata\` (current UniAgent format)
+- \`extra_info.tools_kwargs.reward.metadata\` (legacy local 50-row Parquet)
 
-It reads the gold patch and task metadata **offline only**. The output Parquet
-preserves original rows, including the existing prompt, agent name, environment,
-reward configuration and metadata. The gold patch is not inserted into any
-model-facing prompt.
+It writes two Parquet files intentionally:
+
+- \`shortfix_candidates.parquet\`: filtered rows preserving the input schema.
+- \`shortfix_candidates_task.parquet\`: normalized to the current UniAgent
+  framework schema, with \`extra_info.tools_kwargs.task\`, for use with
+  \`examples/inference/parallel_infer_verl.py\`.
+
+The legacy-to-current conversion maps \`reward.name\` to \`task.name\`,
+\`reward.metadata\` to \`task.metadata\`, and
+\`env.deployment.image\` to \`task.sandbox.image\`. It keeps the original prompt
+and agent_name. The current Claude Code task-config YAML supplies the sandbox
+provider, agent configuration and prompt template.
+
+The gold patch is used **offline only** for task selection; it is not inserted
+into the model-facing prompt.
 
 ## Run stage 1
 
@@ -32,18 +43,17 @@ For the local 50-row file already present in this environment:
         --out /workspace/tpr_experiments/shortfix \
         --limit 50
 
-Alternatively, pass the output from the UniAgent preprocessor:
-
-    python tests/models/mcore/tpr/parallel/filter_swe_rebench_shortfix.py \
-        /workspace/tpr_experiments/datasets/swe_rebench_filtered.parquet \
-        --out /workspace/tpr_experiments/shortfix \
-        --limit 50
-
 Outputs:
 - \`shortfix_counts.json\`: input, selected, strict/relaxed/reject counts;
 - \`shortfix_ranked.csv\`: selected instance IDs and static audit metrics;
-- \`shortfix_candidates.parquet\`: original UniAgent rows, reordered/filtered
-  and retaining the original schema.
+- \`shortfix_candidates.parquet\`: original row schema;
+- \`shortfix_candidates_task.parquet\`: current framework Task Config schema.
+
+Use **\`shortfix_candidates_task.parquet\`** as \`--data-path\` for the current
+\`examples/inference/parallel_infer_verl.py\` entrypoint. Do not pass the legacy
+\`shortfix_candidates.parquet\` directly: the framework runner requires
+\`tools_kwargs['task']\`, while the legacy rows only contain \`env\` and
+\`reward\`.
 
 Strict tier: 1 modified source file (1 total), <=30 changed lines,
 <=3 diff hunks, 1-3 FAIL_TO_PASS tests and <=3K issue characters.
@@ -56,7 +66,7 @@ Gold-patch scope is only a **proxy** for short Claude Code completions.
 
 Run unchanged Claude Code + UniAgent inference, initially \`n=1\` or \`n=2\`
 on a small candidate batch. Use the actual existing inference launcher and
-configuration, and point \`--data-path\` at \`shortfix_candidates.parquet\`.
+configuration, and point \`--data-path\` at \`shortfix_candidates_task.parquet\`.
 
 For a validated candidate, repeat with \`--n 8\`; do not infer any 8-way
 sharing from gold patch size.
