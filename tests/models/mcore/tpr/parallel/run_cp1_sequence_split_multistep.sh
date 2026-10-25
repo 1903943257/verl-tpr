@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Route B: 20 real Actor PPO optimizer updates, Full Sequence vs Split-No-Share.
+# Route B: 10 real Actor PPO optimizer updates by default, Full Sequence vs Split-No-Share.
 # The two arms run sequentially, one Qwen3-4B model at a time, from the same
 # checkpoint and the same fixed cropped Actor capture.
 set -euo pipefail
@@ -8,8 +8,8 @@ cd "$(dirname "$0")/../../../../.."
 BASE="${TPR_CP1_BASE:-/workspace/tpr_experiments/cp1_sequence_split_4k_precision_20261025_v1}"
 CAPTURE="${TPR_CP1_CAPTURE:-$BASE/actor_pair_cap4096_p3072.pt}"
 CHECKPOINT="${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}"
-ROOT="${TPR_CP1_MULTISTEP_ROOT:-/workspace/tpr_experiments/cp1_sequence_split_route_b_20261025_v1}"
-STEPS="${TPR_CP1_MULTISTEP_STEPS:-20}"
+ROOT="${TPR_CP1_MULTISTEP_ROOT:-/workspace/tpr_experiments/cp1_sequence_split_route_b_10step_20261025_v1}"
+STEPS="${TPR_CP1_MULTISTEP_STEPS:-10}"
 
 [[ -f "$CAPTURE" ]] || { echo "Missing fixed Actor capture: $CAPTURE" >&2; exit 2; }
 [[ -d "$CHECKPOINT" ]] || { echo "Missing Qwen3-4B checkpoint: $CHECKPOINT" >&2; exit 2; }
