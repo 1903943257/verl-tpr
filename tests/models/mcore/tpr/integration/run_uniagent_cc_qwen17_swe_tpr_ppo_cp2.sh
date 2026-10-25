@@ -3,10 +3,9 @@ set -euo pipefail
 # ============================================================
 # Uni-Agent Qwen3-4B SWE end-to-end: rollout -> TQ -> GRPO/PPO -> actor update.
 # Retains the established Uni-Agent-CC V1 Trainer path and SWE task.
-# TP2*CP4=8 NPU ranks per replica. Default 16 NPUs -> DP2; set
-# N_GPUS_PER_NODE=8 to run the smaller DP1 smoke. Native only.
-# NOTE: current Bridge main includes TP2 CP1 but still rejects TP2 CP4 and DP2, so this is
-# a NATIVE baseline + real Actor PPO capture, NOT a TPR TP2/CP4 acceptance.
+# TP2*CP4=8 NPU ranks per replica. Use N_GPUS_PER_NODE=8 for TP2 x RingCP4 x DP1.
+# TPR_ENABLED=False runs the native Full baseline; True routes Actor PPO through TPR.
+# The online TPR adapter in this branch supports TP2 x CP4 only with DP1 (PP=EP=1).
 # ============================================================
 ROOT=/workspace/uni-agent-cc
 # ------------------------------------------------------------
@@ -19,7 +18,7 @@ TEST_FILE=/workspace/data/uniagent-cc/django_11163_smoke_py311.parquet
 TASK_CONFIG=${ROOT}/examples/claude_code_swe_task/task_config_claude_code_django11163.yaml
 # tpr
 # Deliberately native until TP2 x CP4 TPR production guard is implemented.
-TPR_ENABLED=False
+TPR_ENABLED=${TPR_ENABLED:-False}
 # ------------------------------------------------------------
 # Same rollout config as run_e2e.sh
 # ------------------------------------------------------------
@@ -69,7 +68,7 @@ OPTIMIZER_OFFLOAD=True
 # Capture an authentic actor update first; do not pretend zero-advantage means PPO parity.
 TOTAL_TRAINING_STEPS=${TOTAL_TRAINING_STEPS:-1}
 TOTAL_EPOCHS=${TOTAL_EPOCHS:-1}
-# E1 Native only: opt-in full activation recompute to reduce online OOM.
+# Optional full activation recompute; default off for comparable Full/TPR runs.
 # Offline Native/TPR Replay must disable recompute independently.
 NATIVE_RECOMPUTE=${NATIVE_RECOMPUTE:-False}
 RECOMPUTE_ARGS=()
@@ -182,9 +181,44 @@ fi
 if (( TRAIN_DP > 1 )); then
     echo "NOTE: DP${TRAIN_DP} will distribute actor mini-batches; verify per-DP sibling grouping and reward diversity." >&2
 fi
-if [[ "${TPR_ENABLED}" != "False" ]]; then
-    echo "ERROR: TPR TP2 x CP4 PPO is not enabled in the production Engine. Run Native first." >&2
-    exit 2
+case "${TPR_ENABLED}" in
+    True|true|1) TPR_ENABLED=True ;;
+    False|false|0) TPR_ENABLED=False ;;
+    *) echo "ERROR: TPR_ENABLED must be False/True (or 0/1), got: ${TPR_ENABLED}" >&2; exit 2 ;;
+esac
+if [[ "${TPR_ENABLED}" == "True" ]]; then
+    if (( TRAIN_TP != 2 || TRAIN_PP != 1 || TRAIN_CP != 4 || TRAIN_DP != 1 )); then
+        echo "ERROR: this online TPR E2E is validated for TP2 x RingCP4 x DP1 (8 NPUs), PP=1." >&2
+        echo "Got TP=${TRAIN_TP} PP=${TRAIN_PP} CP=${TRAIN_CP} DP=${TRAIN_DP}." >&2
+        exit 2
+    fi
+    if [[ "${TPR_CP_BACKEND}" != "ring" ]]; then
+        echo "ERROR: online TPR PPO with CP4 requires TPR_CP_BACKEND=ring." >&2
+        exit 2
+    fi
+    TPR_ENGINE_CONFIG="${ROOT}/verl/verl/workers/config/engine.py"
+    TPR_ENGINE_IMPL="${ROOT}/verl/verl/workers/engine/megatron/transformer_impl.py"
+    TPR_ADAPTER="${ROOT}/verl/verl/workers/engine/megatron/tpr/adapter.py"
+    for required in "${TPR_ENGINE_CONFIG}" "${TPR_ENGINE_IMPL}" "${TPR_ADAPTER}"; do
+        if [[ ! -f "${required}" ]]; then
+            echo "ERROR: active VERL checkout is missing TPR engine source: ${required}" >&2
+            exit 2
+        fi
+    done
+    grep -Fq 'tpr_enabled: bool' "${TPR_ENGINE_CONFIG}" || {
+        echo "ERROR: active McoreEngineConfig does not expose tpr_enabled." >&2; exit 2;
+    }
+    grep -Fq 'run_tpr_forward_backward_batch' "${TPR_ENGINE_IMPL}" || {
+        echo "ERROR: active Megatron Engine does not route PPO updates to the TPR adapter." >&2; exit 2;
+    }
+    grep -Fq 'TPR PPO supports TP1 CP1/2 DP1, TP2 CP1/2/4 DP1' "${TPR_ADAPTER}" || {
+        echo "ERROR: active TPR adapter does not advertise the expected TP2/CP4/DP1 support." >&2; exit 2;
+    }
+    export TPR_TREE_POLICY="${TPR_TREE_POLICY:-qwen_turn}"
+    if [[ "${TPR_TREE_POLICY}" != "qwen_turn" ]]; then
+        echo "ERROR: production TPR only supports TPR_TREE_POLICY=qwen_turn." >&2; exit 2
+    fi
+    echo "TPR_ROUTE_PREFLIGHT_PASS topology=TP2xRingCP4xDP1 tree_policy=${TPR_TREE_POLICY}"
 fi
 if find "${TPR_CAPTURE_ACTOR_MINIBATCH_DIR}" -maxdepth 1 -name 'actor_update_*.pt' | grep -q .; then
     echo "ERROR: Actor capture directory already has .pt snapshots; choose a NEW directory." >&2
@@ -195,7 +229,7 @@ echo "Uni-Agent TRAIN/TQ E2E"
 echo "============================================================"
 echo "MODEL_PATH        = ${MODEL_PATH}"
 echo "MODEL_NAME        = ${MODEL_NAME}"
-echo "TPR_ENABLED       = ${TPR_ENABLED} (Native baseline; TPR TP2 x CP4 not wired)"
+echo "TPR_ENABLED       = ${TPR_ENABLED} (False=Native Full, True=online TPR PPO)"
 echo "TRAIN_FILE        = ${TRAIN_FILE}"
 echo "TASK_CONFIG       = ${TASK_CONFIG}"
 echo
