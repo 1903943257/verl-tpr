@@ -173,7 +173,13 @@ class FP32SplitLinearWGrad:
             }
             for name in self.forward_counts
             if self.forward_counts[name] == 0
-            or self.backward_counts[name] != self.forward_counts[name]
+            # Some segment outputs (notably final-layer Root activations whose
+            # positions are not supervised) are legitimately disconnected from
+            # the PPO loss. Only outputs that receive dY contribute to dW.
+            # Require at least one contribution per parameter and reject
+            # impossible counts, rather than requiring every forward to backprop.
+            or self.backward_counts[name] == 0
+            or self.backward_counts[name] > self.forward_counts[name]
             or self.native_weight_hook_counts[name] == 0
         }
         if missing:
@@ -206,9 +212,13 @@ class FP32SplitLinearWGrad:
             "max_forward_calls_per_module": max(forward, default=0),
             "min_backward_calls_per_module": min(backward, default=0),
             "max_backward_calls_per_module": max(backward, default=0),
-            "all_modules_backwarded": bool(forward) and all(
-                self.forward_counts[name] == self.backward_counts[name] > 0
+            "all_modules_have_backward_contribution": bool(forward) and all(
+                0 < self.backward_counts[name] <= self.forward_counts[name]
                 and self.native_weight_hook_counts[name] > 0
+                for name in self.forward_counts
+            ),
+            "modules_with_unused_forward_outputs": sum(
+                self.backward_counts[name] < self.forward_counts[name]
                 for name in self.forward_counts
             ),
             "accumulation_dtype": "torch.float32",
