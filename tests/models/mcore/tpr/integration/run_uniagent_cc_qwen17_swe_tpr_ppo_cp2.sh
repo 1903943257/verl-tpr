@@ -19,7 +19,7 @@ TRAIN_FILE=/workspace/data/uniagent-cc/django_11163_smoke_py311.parquet
 TEST_FILE=/workspace/data/uniagent-cc/django_11163_smoke_py311.parquet
 TASK_CONFIG=${ROOT}/examples/claude_code_swe_task/task_config_claude_code_django11163.yaml
 # tpr
-# Deliberately native until TP2 x CP4 TPR production guard is implemented.
+# The orchestrator sets False for the Full baseline and True for the TPR E2E.
 TPR_ENABLED=${TPR_ENABLED:-False}
 # ------------------------------------------------------------
 # Same rollout config as run_e2e.sh
