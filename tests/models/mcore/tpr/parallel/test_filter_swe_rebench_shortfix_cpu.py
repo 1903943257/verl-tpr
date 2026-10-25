@@ -89,9 +89,12 @@ def test_patch_metrics_excludes_headers_and_test_sources():
 def test_serialized_uniagent_task_metadata_is_read_without_mutation():
     item = _row("case_1", _patch("src/code.py"), serialized=True)
     got = describe(pd.Series(item))
+    normalized = normalize_task_row(pd.Series(item))
     assert (got["instance_id"], got["source_files"], got["fail_to_pass"]) == ("case_1", 1, 1)
     assert tier(got) == "strict"
     assert decode_array("not-json") == []
+    assert isinstance(normalized["extra_info"], dict)
+    assert normalized["extra_info"]["tools_kwargs"]["task"]["name"] == "swe_rebench"
     assert item["extra_info"]  # Original row was not mutated.
 
 
