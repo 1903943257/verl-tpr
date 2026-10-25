@@ -4,19 +4,19 @@
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-REF_ROOT="\${TPR_CP1_N8_REFERENCE_ROOT:-/workspace/tpr_experiments/cp1_n8_full_mb2_vs_leaf_k_v1}"
-ROOT="\${TPR_CP1_N8_ATTRIBUTION_ROOT:-/workspace/tpr_experiments/cp1_n8_split_attribution_v1}"
+REF_ROOT="${TPR_CP1_N8_REFERENCE_ROOT:-/workspace/tpr_experiments/cp1_n8_full_mb2_vs_leaf_k_v1}"
+ROOT="${TPR_CP1_N8_ATTRIBUTION_ROOT:-/workspace/tpr_experiments/cp1_n8_split_attribution_v1}"
 REF_RESULT="$REF_ROOT/tpr_k1/result.json"
 
 if [ -e "$ROOT" ]; then
     stamp=$(date +%Y%m%d_%H%M%S)
-    mv "$ROOT" "\${ROOT}.previous_\${stamp}"
-    echo "Existing attribution output moved to \${ROOT}.previous_\${stamp}"
+    mv "$ROOT" "${ROOT}.previous_${stamp}"
+    echo "Existing attribution output moved to ${ROOT}.previous_${stamp}"
 fi
 mkdir -p "$ROOT"
 
-CAPTURE="\${TPR_CP1_N8_CAPTURE:-$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_capture"])' "$REF_RESULT" 2>/dev/null)}"
-CKPT="\${TPR_QWEN_4B_PATH:-$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["checkpoint"])' "$REF_RESULT" 2>/dev/null)}"
+CAPTURE="${TPR_CP1_N8_CAPTURE:-$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_capture"])' "$REF_RESULT" 2>/dev/null)}"
+CKPT="${TPR_QWEN_4B_PATH:-$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["checkpoint"])' "$REF_RESULT" 2>/dev/null)}"
 OVERALL=0
 
 if [ ! -f "$CAPTURE" ]; then
@@ -38,8 +38,8 @@ if [ "$OVERALL" -eq 0 ]; then
     export TPR_CP1_N8_STAGE_PROFILE=0
     export TPR_EXEC_PROFILE=0
     export TPR_CP1_N8_SAVE_FULL_GRADS=1
-    export ASCEND_RT_VISIBLE_DEVICES="\${ASCEND_RT_VISIBLE_DEVICES:-8}"
-    PORT_BASE="\${TPR_CP1_N8_MASTER_PORT:-29711}"
+    export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-8}"
+    PORT_BASE="${TPR_CP1_N8_MASTER_PORT:-29711}"
 
     run_arm() {
         local arm="$1"
@@ -61,7 +61,7 @@ if [ "$OVERALL" -eq 0 ]; then
             -m pytest -q -s \
             tests/models/mcore/tpr/parallel/test_real_actor_cp1_n8_fair_npu.py::test_real_actor_cp1_n8_full_mb2_vs_tpr \
             2>&1 | tee "$log"
-        local rc=\${PIPESTATUS[0]}
+        local rc=${PIPESTATUS[0]}
         echo "===== SPLIT ATTRIBUTION ARM=$arm rc=$rc ====="
         tail -n 80 "$log"
         if [ "$rc" -ne 0 ]; then
@@ -78,7 +78,7 @@ if [ "$OVERALL" -eq 0 ]; then
     echo "===== SPLIT ATTRIBUTION COMPARISON ====="
     python -m tests.models.mcore.tpr.parallel.compare_cp1_n8_split_attribution \
         "$ROOT" 2>&1 | tee "$ROOT/comparison.console.log"
-    compare_rc=\${PIPESTATUS[0]}
+    compare_rc=${PIPESTATUS[0]}
     echo "===== SPLIT ATTRIBUTION COMPARATOR rc=$compare_rc ====="
     tail -n 120 "$ROOT/comparison.console.log"
     if [ "$compare_rc" -ne 0 ]; then
