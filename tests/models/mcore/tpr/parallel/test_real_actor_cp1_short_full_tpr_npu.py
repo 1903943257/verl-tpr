@@ -273,6 +273,12 @@ def test_real_actor_cp1_short_full_vs_tpr():
     progress("test_start")
     if mode not in MODES:
         raise ValueError(f"TPR_CP1_MODE must be one of {MODES}, got {mode!r}")
+    fp32_dw_enabled = os.getenv("TPR_CP1_SPLIT_FP32_LINEAR_DW", "0") == "1"
+    if fp32_dw_enabled and mode != "split_no_share":
+        raise ValueError(
+            "TPR_CP1_SPLIT_FP32_LINEAR_DW=1 is restricted to split_no_share "
+            "to isolate sequence splitting from shared-prefix scheduling"
+        )
     if int(os.getenv("WORLD_SIZE", "1")) != 1:
         raise AssertionError("Short Qwen3-4B parity must run on exactly one NPU")
     if os.getenv("TPR_TREE_POLICY", "qwen_turn") != "qwen_turn":
@@ -333,6 +339,15 @@ def test_real_actor_cp1_short_full_vs_tpr():
                 model=model, batch=batch, forest=forest, mode=mode,
                 directory=trace_dir,
             ).install()
+        fp32_dw = None
+        if fp32_dw_enabled:
+            from .fp32_split_linear_wgrad import FP32SplitLinearWGrad
+            fp32_dw = FP32SplitLinearWGrad(model).install()
+            progress(
+                "fp32_linear_dw_installed",
+                linear_modules=len(fp32_dw.forward_counts),
+                fp32_buffers=len(fp32_dw.buffers),
+            )
         progress_hook_handles = []
         if mode == "shared" and os.getenv("TPR_CP1_PROGRESS_LAYERS", "0") == "1":
             from verl.models.mcore.tpr.attention import TPRSelfAttention
@@ -388,6 +403,20 @@ def test_real_actor_cp1_short_full_vs_tpr():
                 handle.remove()
             if trace is not None:
                 trace.close()
+            if fp32_dw is not None:
+                fp32_dw.close()
+        if fp32_dw is not None and not fp32_dw.flushed:
+            raise AssertionError(
+                "FP32 dW intervention did not flush before gradient finalization"
+            )
+        gradient_intervention = (
+            fp32_dw.summary() if fp32_dw is not None else {
+                "enabled": False,
+                "scope": "native BF16 per-segment Linear weight gradients",
+                "accumulation_dtype": "native",
+                "writeback_dtype": "torch.bfloat16",
+            }
+        )
         if trace is not None:
             if mode == "split_no_share":
                 trace.replay_root_qkv_m(
@@ -457,6 +486,7 @@ def test_real_actor_cp1_short_full_vs_tpr():
             "global_grad_norm": grad_norm,
             "full_grad_dir": full_grad_dir,
             "full_gradient_scope": "ALL_PARAMETERS_BF16_TP1_CP1" if full_grad_dir else None,
+            "gradient_intervention": gradient_intervention,
             "fwd_bwd_seconds": seconds,
             "peak_allocated_gib": measured_alloc,
             "peak_reserved_gib": measured_reserved,
@@ -467,6 +497,11 @@ def test_real_actor_cp1_short_full_vs_tpr():
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(json.dumps(stats, indent=2))
         progress("result_written", path=destination)
+        print(
+            "TPR_CP1_GRADIENT_INTERVENTION "
+            + json.dumps(gradient_intervention, sort_keys=True),
+            flush=True,
+        )
         print(
             f"TPR_CP1_SHORT_RESULT mode={mode} input_sha={input_sha} "
             f"trees={stats['forest_trees']} segments={stats['forest_segments']} "
