@@ -85,11 +85,12 @@ def _load_summary(path: Path):
 
 def _exact_final_parameter_metrics(full_path: Path, split_path: Path) -> dict:
     """Exact full-vector comparison, streamed one parameter tensor at a time."""
+    # torch_npu's torch.load wrapper requires a string path when mmap=True.
     left = torch.load(
-        full_path, map_location="cpu", weights_only=True, mmap=True,
+        str(full_path), map_location="cpu", weights_only=True, mmap=True,
     )
     right = torch.load(
-        split_path, map_location="cpu", weights_only=True, mmap=True,
+        str(split_path), map_location="cpu", weights_only=True, mmap=True,
     )
     if left.keys() != right.keys():
         raise AssertionError("Final Full/Split parameter names differ")
