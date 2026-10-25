@@ -1,3 +1,5 @@
+> **Merge scope / correctness caveat (2026-10-25):** TreeBatch K>1 is being integrated as an opt-in CP1 capability; this does not mean full-model numerical equivalence has passed. The default remains `TPR_LEAF_BATCH_SIZE=1`. The isolated two-sibling test passes in FP32 (gradient rel-L2 ~`6.3e-8`) and BF16 (rel-L2 ~`2.53e-3`, within the test's `5e-2` tolerance). However, the real Qwen3-4B N=8 K1-vs-K2 comparison still reports full-gradient rel-L2 ~`0.321` and cosine ~`0.951`; this is unresolved and must not be described as numerical equivalence. The performance numbers are controlled CP1 model F/B, not native VERL microbatch scheduling or rollout/optimizer-inclusive E2E. Further parity work is separate from this feature-integration scope.
+
 # CP1 Leaf Micro-batch experiment (opt-in)
 
 This branch explores memory-constrained leaf grouping without replacing the
