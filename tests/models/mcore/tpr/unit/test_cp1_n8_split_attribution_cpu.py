@@ -64,7 +64,7 @@ def test_n8_split_attribution_reports_segment_prefix_and_treebatch_deltas(tmp_pa
     alignment = report["gradient_differences"]["error_vector_alignment"]["segment_vs_treebatch"]
     assert alignment["error_vector_cosine"] > 0.99
     saved = json.loads((tmp_path / "split_attribution.json").read_text())
-    assert "diagnostic only" in saved["interpretation_note"]
+    assert "diagnostic only" in saved["interpretation_note"].lower()
 
 
 def test_n8_split_attribution_rejects_mismatched_capture(tmp_path):
