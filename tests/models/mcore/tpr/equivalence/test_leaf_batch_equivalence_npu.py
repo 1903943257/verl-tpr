@@ -83,6 +83,29 @@ def _install_single_rank_runtime(monkeypatch, device):
     )
 
 
+class _TorchLayerNorm(torch.nn.Module):
+    """Apex-independent LayerNorm for this isolated correctness test."""
+
+    def __init__(
+        self, config, hidden_size, eps=1e-5, zero_centered_gamma=False,
+        normalization=None, **kwargs
+    ):
+        super().__init__()
+        del kwargs, normalization
+        self.eps = eps
+        self.zero_centered_gamma = zero_centered_gamma or config.layernorm_zero_centered_gamma
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+        self.bias = torch.nn.Parameter(torch.zeros(hidden_size))
+        self.weight.sequence_parallel = config.sequence_parallel
+        self.bias.sequence_parallel = config.sequence_parallel
+
+    def forward(self, hidden_states):
+        weight = self.weight + 1 if self.zero_centered_gamma else self.weight
+        return F.layer_norm(
+            hidden_states, (self.weight.numel(),), weight, self.bias, self.eps
+        )
+
+
 def _make_model(device, dtype):
     config = TransformerConfig(
         num_layers=NUM_LAYERS,
@@ -105,9 +128,16 @@ def _make_model(device, dtype):
     )
     process_group = _SingleProcessGroup()
     pg_collection = SimpleNamespace(tp=process_group, cp=process_group, pp=process_group, embd=None)
-    spec = replace_self_attention_with_tpr(
-        get_gpt_decoder_block_spec(config, use_transformer_engine=False, pp_rank=0)
-    )
+    spec = get_gpt_decoder_block_spec(config, use_transformer_engine=False, pp_rank=0)
+    # The local Megatron spec otherwise selects PTNorm/FusedLayerNorm, which
+    # requires Apex in this environment. Replace only the normalization
+    # implementation; keep the attention, MLP, executor, and KV-gradient path.
+    for layer_spec in spec.layer_specs:
+        layer_submodules = layer_spec.submodules
+        layer_submodules.input_layernorm = _TorchLayerNorm
+        layer_submodules.pre_mlp_layernorm = _TorchLayerNorm
+    spec.layer_norm = _TorchLayerNorm
+    spec = replace_self_attention_with_tpr(spec)
     model = GPTModel(
         config=config,
         transformer_layer_spec=spec,
