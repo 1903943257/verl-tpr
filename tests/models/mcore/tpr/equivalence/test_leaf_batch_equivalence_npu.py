@@ -147,10 +147,6 @@ def _segment_loss(segment, logits):
     del segment
     # A deterministic per-leaf token objective. Both execution modes receive
     # the same objective; this test is about forward/backward batching only.
-    token_ids = logits.new_tensor(
-        [], dtype=torch.long
-    )  # replaced below to avoid depending on host-side targets
-    del token_ids
     targets = torch.arange(logits.shape[1], device=logits.device, dtype=torch.long)
     targets = (targets * 7 + 3) % logits.shape[-1]
     return F.cross_entropy(logits.float().reshape(-1, logits.shape[-1]), targets, reduction="mean"), {}
