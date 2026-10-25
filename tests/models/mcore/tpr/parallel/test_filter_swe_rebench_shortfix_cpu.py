@@ -70,7 +70,10 @@ def _row_reward_layout(instance_id: str, patch: str):
         "agent_name": "claude_code",
         "extra_info": {
             "tools_kwargs": {
-                "env": {"deployment": {"image": "swerebench/sample"}},
+                "env": {
+                    "deployment": {"image": "swe-local:3.12"},
+                    "post_setup_cmd": "mkdir -p /testbed && git fetch origin abc123",
+                },
                 "reward": {"name": "swe_rebench", "metadata": metadata},
             }
         },
@@ -118,10 +121,11 @@ def test_legacy_reward_layout_normalizes_to_current_task_config():
 
     assert normalized["data_source"] == "nebius/SWE-rebench"
     assert task["name"] == "swe_rebench"
-    assert task["sandbox"]["image"] == "swerebench/sample"
+    assert task["sandbox"]["image"] == "swerebench/sweb.eval.x86_64.case_reward"
     assert task["metadata"]["instance_id"] == "case_reward"
     assert "reward" not in tools_kwargs
     assert "env" not in tools_kwargs
+    assert "post_setup_cmd" not in task["metadata"]
     assert normalized["agent_name"] == "claude_code"
 
 
