@@ -51,9 +51,9 @@ def _write_arm(root, arm, grad_values):
 def test_n8_split_attribution_reports_segment_prefix_and_treebatch_deltas(tmp_path):
     values = {
         "full_mb1": [1.0, 2.0, 3.0],
-        "split_no_share": [1.2, 2.1, 3.1],
-        "tpr_k1": [1.21, 2.11, 3.11],
-        "tpr_k2": [1.22, 2.12, 3.12],
+        "split_no_share": [1.2, 2.0, 3.0],
+        "tpr_k1": [1.21, 2.0, 3.0],
+        "tpr_k2": [1.22, 2.0, 3.0],
     }
     for arm in ARMS:
         _write_arm(tmp_path, arm, values[arm])
