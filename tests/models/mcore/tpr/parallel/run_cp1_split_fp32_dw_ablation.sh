@@ -4,6 +4,17 @@
 set -euo pipefail
 cd "$(dirname "$0")/../../../../.."
 
+python - <<'PY'
+import ast
+from pathlib import Path
+for name in (
+    "tests/models/mcore/tpr/parallel/fp32_split_linear_wgrad.py",
+    "tests/models/mcore/tpr/parallel/test_real_actor_cp1_short_full_tpr_npu.py",
+):
+    ast.parse(Path(name).read_text(), filename=name)
+print("CP1_FP32_DW_PYTHON_SYNTAX_PASS", flush=True)
+PY
+
 BASE="${TPR_CP1_BASE:-/workspace/tpr_experiments/cp1_sequence_split_4k_precision_20261025_v1}"
 ROOT="${TPR_CP1_FP32_DW_ROOT:-/workspace/tpr_experiments/cp1_sequence_split_all_linear_dw_fp32_20261025_v1}"
 CHECKPOINT="${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}"
