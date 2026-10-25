@@ -163,15 +163,20 @@ def summarize(root: Path, *, memory_margin_gib: float = 0.5) -> str:
     if mb1 is not None:
         full_time = float(mb1["fwd_bwd_seconds"])
         if full is not None:
+            # MB2 speedup over MB1 is T(MB1) / T(MB2); the old
+            # label accidentally described this inverse ratio as MB1 speedup.
             speed = full_time / float(full["fwd_bwd_seconds"])
-            full_mb1_comparison["full_mb1_to_full_mb2_speedup"] = speed
-            lines.append(f"Full MB1/Full MB2 physical batching speedup={speed:.4f}x")
+            full_mb1_comparison["full_mb2_vs_full_mb1_speedup"] = speed
+            lines.append(f"Full MB2 speedup over Full MB1={speed:.4f}x")
         for arm in ("tpr_k1", "tpr_k2", "tpr_k4"):
             item = results[arm]
             if item is not None:
+                # This ratio is T(Full MB1) / T(TPR), i.e. TPR
+                # speedup over Full MB1, with Push/Pop included.
                 speed = full_time / float(item["fwd_bwd_seconds"])
-                full_mb1_comparison[f"full_mb1_vs_{arm}_speedup"] = speed
-                lines.append(f"{arm}: FullMB1/TPR speedup={speed:.4f}x (Push/Pop included)")
+                full_mb1_comparison[f"{arm}_speedup_over_full_mb1"] = speed
+                label = arm.upper().replace("_", " ")
+                lines.append(f"{label} speedup over Full MB1={speed:.4f}x (Push/Pop included)")
         # A separate numerical check for physical Full batch size itself,
         # and the original no-Leaf-batching TPR baseline.
         from .compare_real_actor_cp1_short_full_tpr import _metrics
