@@ -295,8 +295,8 @@ def main():
         f"{exact_final_parameters['relative_l2']:.9g} "
         f"cos={exact_final_parameters['cosine']:.9g}"
     )
-    print(f"post20_eval_loss_gap={final_eval_loss_gap:.9g}")
-    print(f"post20_eval_logprob_rel_l2={final_eval['relative_l2']:.9g}")
+    print(f"post{steps_n}_eval_loss_gap={final_eval_loss_gap:.9g}")
+    print(f"post{steps_n}_eval_logprob_rel_l2={final_eval['relative_l2']:.9g}")
     print(f"clip_status_mismatches={s['clip_status_mismatch_count']}")
     print(f"report={report_path}")
     print("ROUTE_B_ANALYSIS_COMPLETE", flush=True)
