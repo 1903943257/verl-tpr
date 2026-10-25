@@ -144,8 +144,33 @@ with main; tests cleanup may delete newer test modules. Upstream claim must
 be limited to verified configurations and clearly distinguish offline
 model-F/B speed from optimizer/rollout E2E.
 
-MB1 result is STILL PENDING: do not insert invented timing, memory, parity or
-speedup numbers. The existing runner
-`tests/models/mcore/tpr/parallel/run_cp1_n8_add_full_mb1.sh` is
-the sole remaining stage performance measurement. It must use the preserved
-old N8 Capture and never overwrite the other four arm result JSON files.
+### Full MB1 supplement result (2026-10-25)
+
+The preserved N8 Capture was used to run only `full_mb1`; the other four arm
+JSON results were retained. Controlled model F/B medians and maximum peaks:
+
+| Arm | F/B median (s) | Peak allocated (GiB) | Peak reserved (GiB) |
+|---|---:|---:|---:|
+| Full MB1 | 2.6122 | 27.646 | 30.287 |
+| Full MB2 | 2.5136 | 41.629 | 44.918 |
+| TPR K1 | 2.0150 | 21.732 | 23.527 |
+| TPR K2 | 1.7183 | 28.279 | 31.061 |
+| TPR K4 | 1.5791 | 40.399 | 43.014 |
+
+Relative to Full MB1, measured TPR F/B time ratios are 1.2964x (K1),
+1.5202x (K2), and 1.6543x (K4), with root Push/Pop included. These are
+controlled CP1 model F/B measurements, not rollout-inclusive or optimizer-step
+throughput. K2 peak allocated/reserved exceed Full MB1 by 0.633/0.774 GiB;
+K2 therefore does **not** fit within Full MB1's measured peak-memory envelope.
+K1 is 5.914 GiB allocated and 6.760 GiB reserved below Full MB1. K4's peak
+is close to Full MB2. BF16 sampled-gradient gaps remain large, so these
+speedups are diagnostic rather than evidence of numerical equivalence.
+
+The first CPU summary test run exposed a fixture defect: it declared
+`ppo_tokens=3333` but provided only two logprob coordinates. The summary's
+strict coordinate-coverage assertion correctly rejected it; this is not the
+same as a failure of the measured NPU result. The fixture is being corrected
+to supply 3333 unique response-token coordinates, and the runner is being
+hardened to propagate final-summary failures instead of hiding them behind
+`|| true`. Re-run the CPU summary tests after syncing these fixes before
+calling the Leaf Batch stage fully closed.
