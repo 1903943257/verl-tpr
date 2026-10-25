@@ -275,7 +275,6 @@ class _RingAttentionConfig:
     coalesce_prefix_query: bool = False
     coalesce_prefix_padded: bool = False
     trace_layer: int | None = None
-    coalesce_current_full: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -573,7 +572,6 @@ def _normalize_inputs(
         coalesce_prefix_full=coalesce_full,
         coalesce_prefix_query=coalesce_query,
         coalesce_prefix_padded=coalesce_padded,
-        coalesce_current_full=os.getenv("TPR_RING_COALESCE_CURRENT_FULL", "0") == "1",
         trace_layer=_trace_layer if cp_rank == 0 else None,
     )
     return blocks, config
@@ -1011,15 +1009,7 @@ def _reduce_ring_gradients_to_owner(key, value, config, consume):
 
 def _source_schedule(query_slices, source_key, source_value, config,
                      segment_index, source_rank, phase):
-    """Classify each Query/KV block and optionally merge Current FULL KV pairs.
-
-    A Ring source owns two Zigzag ranges. For Current, only the later Query
-    chunk on an earlier source can see BOTH ranges with FULL visibility. Their
-    physical local KV is already contiguous, so one zero-copy FULL FA can
-    replace two independent FA calls. Never merge CAUSAL or SKIP blocks.
-    The same schedule is used for forward and backward, including dK/dV owner
-    buffer slices; the result must never outlive the current Ring source.
-    """
+    """Existing TPR block classification/padding, evaluated for ONE live source."""
     is_prefix = segment_index + 1 < len(config.segment_lengths)
     global_length = config.segment_lengths[segment_index]
     padded_length = config.segment_padded_lengths[segment_index]
@@ -1027,39 +1017,13 @@ def _source_schedule(query_slices, source_key, source_value, config,
         global_length, cp_rank=source_rank, cp_size=config.cp_size,
         padded_length=padded_length,
     )
-    prefix_coalesced = is_prefix and _can_coalesce_prefix_kv(global_length, padded_length, config)
-    source_key = source_key.squeeze(1)
-    key_slices = _prefix_full_slices(source_key, source_shard, enabled=prefix_coalesced)
+    coalesced = is_prefix and _can_coalesce_prefix_kv(global_length, padded_length, config)
+    key_slices = _prefix_full_slices(source_key.squeeze(1), source_shard, enabled=coalesced)
     source_value = source_value.squeeze(1)
     for query_index, query_item in enumerate(query_slices):
-        # Both ranges must be entirely visible. A partially padded second
-        # range is safe: _prefix_full_slices strips its virtual tail; the
-        # valid tokens remain physically contiguous in the source buffer.
-        current_full_coalesced = (
-            not is_prefix
-            and config.coalesce_current_full
-            and len(key_slices) == 2
-            and all(
-                classify_ring_block(
-                    query_item.logical_range, item.logical_range, is_prefix=False,
-                ) is RingBlockKind.FULL
-                for item in key_slices
-            )
-        )
-        visible_slices = (
-            _prefix_full_slices(source_key, source_shard, enabled=True)
-            if current_full_coalesced else key_slices
-        )
-        coalesced = prefix_coalesced or current_full_coalesced
-        for key_item in visible_slices:
-            # The artificial (0, valid_local_length) interval created by
-            # zero-copy coalescing is not a global position; its FULL status
-            # was established from both original logical ranges above.
-            block_kind = (
-                RingBlockKind.FULL if current_full_coalesced else
-                classify_ring_block(
-                    query_item.logical_range, key_item.logical_range, is_prefix=is_prefix,
-                )
+        for key_item in key_slices:
+            block_kind = classify_ring_block(
+                query_item.logical_range, key_item.logical_range, is_prefix=is_prefix,
             )
             if _trace_ring_block is not None:
                 _trace_ring_block(
@@ -1117,7 +1081,6 @@ def _emit_ring_block_stats(
         "current_length": config.current_shard.global_length,
         "current_padded_length": config.current_shard.padded_length,
         "kv_merge_requested": config.coalesce_prefix_full,
-        "current_full_merge_requested": config.coalesce_current_full,
         "query_merge_requested": config.coalesce_prefix_query,
         "padded_kv_merge_requested": config.coalesce_prefix_padded,
         "kv_merge_eligible_segments": sum(
