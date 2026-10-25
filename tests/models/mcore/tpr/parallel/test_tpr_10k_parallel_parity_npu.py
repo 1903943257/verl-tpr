@@ -27,7 +27,9 @@ from verl.utils import tensordict_utils as tu
 
 from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
 from .grad_sync_precision import offline_grad_sync_dtype,reduce_average_weight_grad
-from .test_real_actor_tp2cp4_offline_ppo_npu import _PPO,_load_real_pair
+from .test_real_actor_tp2cp4_offline_ppo_npu import (
+    _PPO, _load_real_pair, _sanitize_mindspeed_repatch_args,
+)
 from .tpr_10k_canonical_witness import canonical_grad_witness,gather_logprobs
 
 pytestmark=pytest.mark.skipif(
@@ -59,6 +61,12 @@ def _runtime(tp: int,cp: int,dp: int):
         "sequence_parallel":False,
         "use_flash_attn":True,
     })
+    # pytest/torchrun can leave an empty-string key in MindSpeed's full args.
+    # Remove that known parser artifact before GPTModel constructs TransformerConfig.
+    args=get_full_args()
+    _sanitize_mindspeed_repatch_args(args)
+    if args.context_parallel_algo != "megatron_cp_algo":
+        raise AssertionError(f"Unexpected CP algorithm after repatch: {args.context_parallel_algo!r}")
     if not parallel_state.model_parallel_is_initialized():
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=tp,

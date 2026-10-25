@@ -83,6 +83,12 @@ class CP1AttentionTrace:
         self.first_layer_linear_inputs_root = {}
         self.root_queries = {}
         self.same_qkv_attention = {}
+        self.group_vs_single_rectangular = {}
+        # Diagnostic only: collect full first-layer grouped QKV operands for
+        # a controlled M=2S vs two M=S GEMM replay on identical inputs.
+        self.grouped_qkv_operands = {}
+        self.grouped_qkv_replay = {}
+        self.grouped_leaf_seen = False
         self.original_rectangular = None
         self.replay = {}
         self.relay_accumulation = {}
@@ -91,21 +97,29 @@ class CP1AttentionTrace:
 
     def _model_pre(self, _module, _args, kwargs):
         ids = kwargs.get("input_ids")
-        if ids is None or ids.ndim != 2 or ids.shape[0] != 1:
-            raise AssertionError("Unexpected Qwen3 model call for attribution")
-        tokens = ids[0].detach().cpu().long()
+        if ids is None or ids.ndim != 2 or ids.shape[0] < 1:
+            raise AssertionError("Unexpected Qwen3 model input_ids layout")
+        token_rows = [ids[index].detach().cpu().long() for index in range(ids.shape[0])]
         context = get_tpr_attention_context()
+        frames = []
         if self.mode == "full":
             if context is not None:
                 raise AssertionError("Full Qwen3 forward unexpectedly has TPR context")
+            if len(token_rows) != 1:
+                raise AssertionError("Full trace expects one trajectory per model call")
+            tokens = token_rows[0]
             matches = [i for i, row in enumerate(self.tokens) if torch.equal(tokens, row)]
             if len(matches) != 1:
                 raise AssertionError("Full input does not uniquely match an original row")
-            row, phase, start = matches[0], "full", 0
+            frames.append((matches[0], "full", 0, 0))
+            self.call_counts["full"] += 1
         else:
             if context is None:
                 raise AssertionError("Split/Shared model forward has no TPR context")
             if context.prefix_length == 0:
+                if len(token_rows) != 1:
+                    raise AssertionError("Root Push/Pop must execute with batch size one")
+                tokens = token_rows[0]
                 if not torch.is_grad_enabled():
                     self.row_cursor += 1
                     phase = "push"
@@ -118,23 +132,29 @@ class CP1AttentionTrace:
                     raise AssertionError("Shared tree pushed Root multiple times")
                 if not 0 <= row < 2 or not torch.equal(tokens, self.tokens[row][:self.root_len]):
                     raise AssertionError("Root tokens or traversal order incorrect")
-                start = 0
+                frames.append((row, phase, 0, 0))
             else:
                 start = context.prefix_length
-                matches = [
-                    i for i, row in enumerate(self.tokens)
-                    if len(row) == start + len(tokens)
-                    and torch.equal(tokens, row[start:])
-                ]
-                if len(matches) != 1:
-                    raise AssertionError("Leaf tokens do not uniquely match an original sibling")
-                row, phase = matches[0], "leaf"
-                self.call_counts["leaf"] += 1
-                if self.mode == "split_no_share" and row != self.row_cursor:
-                    raise AssertionError("Independent split did not preserve row traversal")
-        self.current = (row, phase, start)
+                phase = "leaf_group" if len(token_rows) > 1 else "leaf"
+                if phase == "leaf_group":
+                    self.grouped_leaf_seen = True
+                for batch_index, tokens in enumerate(token_rows):
+                    matches = [
+                        i for i, row_tokens in enumerate(self.tokens)
+                        if len(row_tokens) == start + len(tokens)
+                        and torch.equal(tokens, row_tokens[start:])
+                    ]
+                    if len(matches) != 1:
+                        raise AssertionError(
+                            f"Leaf batch row {batch_index} does not uniquely match an original sibling"
+                        )
+                    row = matches[0]
+                    if self.mode == "split_no_share" and row != self.row_cursor:
+                        raise AssertionError("Independent split did not preserve row traversal")
+                    frames.append((row, phase, start, batch_index))
+                self.call_counts["leaf"] += len(frames)
+        self.current = frames
         self.attention_call_index = 0
-        self.call_counts["full"] += int(phase == "full")
 
     def _indices(self, width: int, start: int, *, row: int) -> list[int]:
         boundary = self.root_len
@@ -152,50 +172,67 @@ class CP1AttentionTrace:
             return
         if self.current is None:
             raise AssertionError("Forward hook ran without model frame")
-        row, phase, start = self.current
-        coords = self._indices(t.shape[0], start, row=row)
-        if not coords:
-            return
-        local = torch.tensor([i - start for i in coords], device=t.device, dtype=torch.long)
-        with torch.no_grad():
-            subset = t.detach().index_select(0, local).contiguous().cpu()
-        suffix = "_grad_out" if backward else ""
-        key = f"r{row}|{phase}|L{layer}|{stage}{suffix}"
-        if key in self.records:
-            raise AssertionError(f"Duplicate forward/backward trace {key}")
-        self.records[key] = {"positions": coords, "values": subset}
+        frames = self.current
+        for row, phase, start, batch_index in frames:
+            coords = self._indices(t.shape[0], start, row=row)
+            if not coords:
+                continue
+            local = torch.tensor([i - start for i in coords], device=t.device, dtype=torch.long)
+            selected = t.detach().index_select(0, local)
+            if len(frames) > 1:
+                if t.ndim < 3 or t.shape[1] != len(frames):
+                    raise AssertionError(
+                        f"Grouped trace expected [sequence, batch, ...] at {stage}, got {tuple(t.shape)}"
+                    )
+                selected = selected[:, batch_index:batch_index + 1]
+            with torch.no_grad():
+                subset = selected.contiguous().cpu()
+                if layer == 1 and phase in ("leaf", "leaf_group") and stage in ("qkv_in", "qkv_out") and not backward:
+                    self.grouped_qkv_operands[(row, stage)] = (
+                        t.detach()[:, batch_index:batch_index + 1].contiguous().cpu()
+                    )
+            suffix = "_grad_out" if backward else ""
+            key = f"r{row}|{phase}|L{layer}|{stage}{suffix}"
+            if key in self.records:
+                raise AssertionError(f"Duplicate forward/backward trace {key}")
+            self.records[key] = {"positions": coords, "values": subset}
 
-        if not backward and layer == 1 and stage in (
-            "qkv_in", "proj_in", "fc1_in", "fc2_in"
-        ) and row == 0:
-            if phase == "full":
-                self.first_layer_linear_inputs_full[stage] = t.detach().cpu().contiguous()
-            elif phase == "push":
-                self.first_layer_linear_inputs_root[stage] = t.detach().cpu().contiguous()
-            if stage == "qkv_in":
+            if (not backward and layer == 1 and stage in (
+                "qkv_in", "proj_in", "fc1_in", "fc2_in"
+            ) and row == 0):
                 if phase == "full":
-                    self.full_first_qkv_x = self.first_layer_linear_inputs_full[stage]
+                    self.first_layer_linear_inputs_full[stage] = t.detach().cpu().contiguous()
                 elif phase == "push":
-                    self.root_first_qkv_x = self.first_layer_linear_inputs_root[stage]
+                    self.first_layer_linear_inputs_root[stage] = t.detach().cpu().contiguous()
+                if stage == "qkv_in":
+                    if phase == "full":
+                        self.full_first_qkv_x = self.first_layer_linear_inputs_full[stage]
+                    elif phase == "push":
+                        self.root_first_qkv_x = self.first_layer_linear_inputs_root[stage]
 
-        if (not backward and torch.is_grad_enabled() and t.requires_grad
-                and stage in ("qkv_out", "proj_out", "fc2_out")
-                and layer in (1, 2, 8, 36)):
-            # Save the exact forward stage metadata; backwards execute after
-            # other forwards and cannot use self.current at callback time.
-            def record_backward(gradient, layer=layer, stage=stage, row=row,
-                                phase=phase, start=start, coords=coords):
-                chosen = torch.tensor(
-                    [p-start for p in coords], device=gradient.device,
-                    dtype=torch.long,
-                )
-                value = gradient.detach().index_select(0, chosen).contiguous().cpu()
-                grad_key = f"r{row}|{phase}|L{layer}|{stage}_grad_out"
-                if grad_key in self.records:
-                    raise AssertionError(f"Duplicate gradient trace {grad_key}")
-                self.records[grad_key] = {"positions": coords, "values": value}
-                return gradient
-            t.register_hook(record_backward)
+            if (not backward and torch.is_grad_enabled() and t.requires_grad
+                    and stage in ("qkv_out", "proj_out", "fc2_out")
+                    and layer in (1, 2, 8, 36)):
+                # Save the forward row index because backward follows later forwards.
+                def record_backward(
+                    gradient, layer=layer, stage=stage, row=row,
+                    phase=phase, start=start, coords=coords,
+                    batch_index=batch_index, batch_count=len(frames),
+                ):
+                    chosen = torch.tensor(
+                        [p-start for p in coords], device=gradient.device,
+                        dtype=torch.long,
+                    )
+                    value = gradient.detach().index_select(0, chosen)
+                    if batch_count > 1:
+                        value = value[:, batch_index:batch_index + 1]
+                    value = value.contiguous().cpu()
+                    grad_key = f"r{row}|{phase}|L{layer}|{stage}_grad_out"
+                    if grad_key in self.records:
+                        raise AssertionError(f"Duplicate gradient trace {grad_key}")
+                    self.records[grad_key] = {"positions": coords, "values": value}
+                    return gradient
+                t.register_hook(record_backward)
 
     def _pre(self, layer, stage):
         def handler(_module, args):
@@ -218,25 +255,36 @@ class CP1AttentionTrace:
     def _patched_rectangular(self, query, key, value, **kwargs):
         self.attention_call_index += 1
         layer = self.attention_call_index
+        if self.mode != "full" and layer in (1, 2, 8, 36):
+            self._snapshot(layer, "query_post_rope", query)
         out = self.original_rectangular(query, key, value, **kwargs)
         if self.mode == "full" or layer not in (1, 2, 8, 36):
             return out
-        row, phase, _ = self.current
-        if phase == "push":
-            self.root_queries[(row, layer)] = query.detach()
-        elif phase == "leaf":
-            stored_row = 0 if self.mode == "shared" else row
-            prefix_q = self.root_queries.get((stored_row, layer))
-            if prefix_q is None or prefix_q.shape[0] != key.shape[0] - query.shape[0]:
-                raise AssertionError(f"Layer {layer} Prefix Q was not saved")
-            with torch.no_grad():
-                same_qkv_square = self.original_rectangular(
-                    torch.cat((prefix_q, query.detach()), dim=0),
-                    key.detach(), value.detach(), **kwargs,
-                )[-query.shape[0]:]
-            self.same_qkv_attention[f"r{row}|L{layer}"] = _difference(
-                out.detach(), same_qkv_square,
-            )
+        for row, phase, _start, batch_index in self.current:
+            query_row = query[:, batch_index:batch_index + 1]
+            if phase == "push":
+                self.root_queries[(row, layer)] = query_row.detach()
+            elif phase in ("leaf", "leaf_group"):
+                stored_row = 0 if self.mode == "shared" else row
+                prefix_q = self.root_queries.get((stored_row, layer))
+                if prefix_q is None or prefix_q.shape[0] != key.shape[0] - query.shape[0]:
+                    raise AssertionError(f"Layer {layer} Prefix Q was not saved")
+                key_row = key[:, batch_index:batch_index + 1].detach()
+                value_row = value[:, batch_index:batch_index + 1].detach()
+                with torch.no_grad():
+                    independent_rectangle = self.original_rectangular(
+                        query_row.detach(), key_row, value_row, **kwargs,
+                    )
+                    same_qkv_square = self.original_rectangular(
+                        torch.cat((prefix_q, query_row.detach()), dim=0),
+                        key_row, value_row, **kwargs,
+                    )[-query.shape[0]:]
+                self.group_vs_single_rectangular[f"r{row}|L{layer}"] = _difference(
+                    out[:, batch_index:batch_index + 1].detach(), independent_rectangle,
+                )
+                self.same_qkv_attention[f"r{row}|L{layer}"] = _difference(
+                    out[:, batch_index:batch_index + 1].detach(), same_qkv_square,
+                )
         return out
 
     def install(self):
@@ -392,6 +440,50 @@ class CP1AttentionTrace:
             "individual_original_linear_replays": observed,
         }
 
+    @torch.no_grad()
+    def replay_grouped_leaf_qkv(self):
+        """Replay original QKV module at B=1 using unchanged grouped-model inputs.
+
+        Run after close() so instrumentation hooks cannot recursively intercept
+        these diagnostic GEMMs. The model has not performed any optimizer step.
+        """
+        if self.mode != "shared" or not self.grouped_leaf_seen:
+            return
+        expected = {(row, stage) for row in (0, 1) for stage in ("qkv_in", "qkv_out")}
+        if set(self.grouped_qkv_operands) != expected:
+            raise AssertionError(
+                f"Incomplete first-layer grouped QKV replay operands: "
+                f"missing={sorted(expected - set(self.grouped_qkv_operands))}"
+            )
+        module = self.model.decoder.layers[0].self_attention.linear_qkv
+        device = next(module.parameters()).device
+        for row in (0, 1):
+            operand = self.grouped_qkv_operands[row, "qkv_in"]
+            reference = self.grouped_qkv_operands[row, "qkv_out"]
+            with torch.no_grad():
+                replay_output = _tensor(module(operand.to(device=device))).detach().cpu()
+            if replay_output.shape != reference.shape:
+                raise AssertionError(
+                    f"QKV GEMM replay shape mismatch row={row}: "
+                    f"{tuple(replay_output.shape)} vs {tuple(reference.shape)}"
+                )
+            full_difference = _difference(reference, replay_output)
+            coords = self._indices(reference.shape[0], self.root_len, row=row)
+            indices = torch.tensor(
+                [coordinate - self.root_len for coordinate in coords],
+                dtype=torch.long,
+            )
+            self.grouped_qkv_replay[row] = {
+                "same_input_grouped_vs_single": full_difference,
+                "sampled_single_output": {
+                    "positions": coords,
+                    "values": replay_output.index_select(0, indices).contiguous(),
+                },
+                "grouped_input_shape": tuple(operand.shape),
+                "single_output_shape": tuple(replay_output.shape),
+                "single_output": replay_output.contiguous(),
+            }
+
     def save(self, destination: Path):
         if destination.exists():
             raise FileExistsError(destination)
@@ -405,13 +497,19 @@ class CP1AttentionTrace:
             "root_push": 1, "root_pop": 1, "leaf": 2, "full": 0,
         }:
             raise AssertionError(f"Shared run did not reuse one Root: {self.call_counts}")
+        self.replay_grouped_leaf_qkv()
         destination.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
+            "grouped_qkv_replay": self.grouped_qkv_replay,
+            "first_layer_leaf_qkv_operands": self.grouped_qkv_operands,
             "mode": self.mode,
             "root_length": self.root_len,
             "row_lengths": [len(t) for t in self.tokens],
             "call_counts": self.call_counts,
             "records": self.records,
+            # Separate physical B=2 TND vs B=1 TND on the same exact Q/K/V.
+            "group_vs_single_rectangular": self.group_vs_single_rectangular,
+            # Existing square-causal oracle is a different numerical comparison.
             "same_qkv_attention": self.same_qkv_attention,
             "same_input_gemm_replay": self.replay,
             "kv_relay_roundoff": {

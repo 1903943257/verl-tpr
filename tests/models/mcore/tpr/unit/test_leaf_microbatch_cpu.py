@@ -1,0 +1,171 @@
+"""CPU correctness gates for opt-in CP1 leaf micro-batching."""
+
+import copy
+import json
+
+import pytest
+import torch
+
+from verl.models.mcore.tpr.context import TPRAttentionContext
+from verl.models.mcore.tpr.rectangular_attention import _validate_inputs
+from verl.workers.engine.megatron.tpr.executor import SegmentExecutor
+from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
+from .test_ppo_executor_cpu import _PrefixModel
+
+
+def _siblings():
+    root = SegmentSpec(0, None, torch.tensor([1, 2, 3]), 0, 0)
+    # First four siblings have identical lengths. Last child is different.
+    leaves = [
+        SegmentSpec(i, 0, torch.tensor([i + 3, i + 4, i + 5]), 3, 3)
+        for i in range(1, 5)
+    ]
+    leaves.append(SegmentSpec(5, 0, torch.tensor([8, 9, 10, 11, 12]), 3, 3))
+    return SegmentPlan([root, *leaves], root_id=0)
+
+
+def _run(model, plan, monkeypatch, *, k, budget, loss_scale):
+    monkeypatch.setenv("TPR_LEAF_BATCH_SIZE", str(k))
+    monkeypatch.setenv("TPR_LEAF_BATCH_MAX_TOKENS", str(budget))
+    seen = []
+
+    def objective(segment, logits):
+        # Same global denominator across all physical micro-batches.
+        return logits.square().sum() / 37, {"count": 1}
+
+    executor = SegmentExecutor(
+        model, plan, expected_layer_numbers=(1,),
+        segment_loss_fn=objective,
+        segment_loss_term_counts={s: int(s != 0) for s in plan.segments},
+        loss_scale_func=lambda loss: loss * loss_scale,
+    )
+    class Events:
+        def begin(self, segment, *, kind, **_):
+            seen.append((kind, segment.segment_id))
+            return None
+
+        def end(self, _):
+            pass
+
+    loss = executor.run(event_profiler=Events())
+    executor.kv_stack.assert_empty()
+    assert not executor.failed
+    return loss, seen, executor
+
+
+@pytest.mark.parametrize("loss_scale", [1.0, 8.0])
+@pytest.mark.parametrize("group_size", [2, 4])
+def test_grouped_leaves_match_sequential_loss_parameter_and_prefix_gradients(
+    monkeypatch, loss_scale, group_size,
+):
+    torch.manual_seed(1234)
+    plan = _siblings()
+    baseline = _PrefixModel()
+    grouped = copy.deepcopy(baseline)
+
+    baseline_loss, baseline_events, baseline_executor = _run(
+        baseline, plan, monkeypatch, k=1, budget=12, loss_scale=loss_scale,
+    )
+    grouped_loss, group_events, grouped_executor = _run(
+        grouped, plan, monkeypatch, k=group_size, budget=12, loss_scale=loss_scale,
+    )
+
+    # K=2 executes two two-leaf groups; K=4 executes one four-leaf group.
+    assert [kind for kind, _ in group_events].count("visit_leaf_group") == 4 // group_size
+    assert [kind for kind, _ in group_events].count("visit_leaf") == 1
+    assert grouped_executor.grouped_leaf_calls == 4 // group_size
+    assert grouped_executor.grouped_leaf_segments == 4
+    assert baseline_executor.model_forward_calls == 7  # 5 leaves + root Push/Pop
+    assert grouped_executor.model_forward_calls == 3 + 4 // group_size
+    assert [kind for kind, _ in baseline_events].count("visit_leaf") == 5
+    assert [kind for kind, _ in group_events].count("push") == 1
+    assert [kind for kind, _ in group_events].count("pop") == 1
+
+    torch.testing.assert_close(grouped_loss, baseline_loss, rtol=1e-12, atol=1e-12)
+    differences = []
+    for left, right in zip(grouped.parameters(), baseline.parameters(), strict=True):
+        torch.testing.assert_close(left.grad, right.grad, rtol=1e-11, atol=1e-11)
+        differences.append((left.grad.detach() - right.grad.detach()).float().square().sum())
+    grad_l2 = torch.sqrt(torch.stack(differences).sum()).item()
+    loss_gap = (grouped_loss - baseline_loss).abs().item()
+    print(
+        f"TPR_LEAF_CPU_RESULT K={group_size} scale={loss_scale:g} "
+        f"group_calls={grouped_executor.grouped_leaf_calls} "
+        f"grouped_leaves={grouped_executor.grouped_leaf_segments} "
+        f"forwards_k1={baseline_executor.model_forward_calls} "
+        f"forwards_grouped={grouped_executor.model_forward_calls} "
+        f"loss_abs={loss_gap:.6e} grad_abs_l2={grad_l2:.6e}",
+        flush=True,
+    )
+
+
+def test_grouping_respects_maximum_token_budget(monkeypatch):
+    plan = _siblings()
+    model = _PrefixModel()
+    monkeypatch.setenv("TPR_LEAF_BATCH_SIZE", "4")
+    monkeypatch.setenv("TPR_LEAF_BATCH_MAX_TOKENS", "6")
+    executor = SegmentExecutor(
+        model, plan, expected_layer_numbers=(1,),
+        segment_loss_fn=lambda _segment, logits: (logits.square().sum(), {}),
+        segment_loss_term_counts={i: 1 for i in range(6)},
+    )
+    assert executor._group_ready_children(plan.children_of(0)) == [(1, 2), (3, 4), 5]
+
+
+@pytest.mark.parametrize("batch_size", [0, -1, 1.5])
+def test_context_rejects_invalid_batch_size(batch_size):
+    with pytest.raises(ValueError, match="batch_size"):
+        TPRAttentionContext(0, 3, batch_size=batch_size)
+
+
+def test_grouped_context_requires_matching_new_kv_batch_size():
+    context = TPRAttentionContext(0, 3, batch_size=2)
+    good = torch.randn(3, 2, 1, 8)
+    context.set_new_kv(1, good, good.square())
+    with pytest.raises(ValueError, match="batch size"):
+        context.set_new_kv(2, torch.randn(3, 1, 1, 8), torch.randn(3, 1, 1, 8))
+
+
+def test_rectangular_attention_contract_accepts_equal_length_batched_layout():
+    query = torch.randn(3, 2, 4, 8)
+    key = torch.randn(9, 2, 2, 8)
+    assert _validate_inputs(query, key, torch.randn_like(key), 0.0) == (3, 9, 4, 8)
+
+
+def test_leaf_run_summary_includes_values_and_survives_missing_results(tmp_path):
+    from ..parallel.summarize_cp1_leaf_batch import summarize
+
+    partial = summarize(tmp_path, exit_code=1)
+    assert "runner_exit=1" in partial
+    assert "Comparison missing/incomplete" in partial
+    assert "k2 result missing" in partial
+
+    for k, calls, groups in ((1, 4, 0), (2, 3, 1)):
+        folder = tmp_path / f"k{k}"
+        folder.mkdir()
+        (folder / "result.json").write_text(json.dumps({
+            "leaf_batch_stats": {
+                "model_forward_calls": calls, "grouped_leaf_calls": groups,
+                "grouped_leaf_segments": groups * 2,
+            },
+            "fwd_bwd_seconds": 2.0 / k,
+            "peak_allocated_gib": 21.5 / k,
+            "peak_reserved_gib": 22.0 / k,
+            "loss": -0.8, "global_grad_norm": 7.8,
+        }))
+    (tmp_path / "k1_vs_k2.json").write_text(json.dumps({
+        "comparison": "identical_shared_tree_K1_vs_K2",
+        "speedup": 2.0, "loss_abs_gap": 0.0001,
+        "logprob": {"relative_l2": 0.03},
+        "sampled_gradient": {"relative_l2": 0.13},
+        "complete_norm_gradient": {"relative_l2": 0.18},
+        "full_parameter_gradient": None,
+        "layer_trace": None,
+    }))
+    summary = summarize(tmp_path, exit_code=0)
+    assert "runner_exit=0" in summary
+    assert "Forward calls" in summary
+    assert "Grouped leaf calls" in summary
+    assert "2.0000x" in summary
+    assert "0.130000" in summary
+    assert "NOT proof of matching gradients" in summary
