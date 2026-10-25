@@ -131,7 +131,6 @@ def normalize_task_row(row):
     reward = decode_object(tools_kwargs.get("reward"))
     metadata = decode_object(reward.get("metadata"))
     task_name = reward.get("name")
-    env = decode_object(tools_kwargs.get("env"))
     if task_name != "swe_rebench":
         raise ValueError(
             f"row {metadata.get('instance_id', '?')}: expected reward.name='swe_rebench', "
