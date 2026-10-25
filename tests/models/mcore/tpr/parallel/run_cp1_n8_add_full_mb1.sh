@@ -60,22 +60,36 @@ unset TPR_CP1_TRACE TPR_CP1_TRACE_DIR TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRS
 mkdir "$NEW_DIR"
 
 finish() {
-  local rc=$?
+  local runner_rc=$?
+  local summary_rc=0
   trap - EXIT
   set +e
   echo
-  echo "===== N8 FULL MB1 SUPPLEMENT: FINAL SUMMARY (runner_rc=$rc) ====="
+  echo "===== N8 FULL MB1 SUPPLEMENT: FINAL SUMMARY (runner_rc=$runner_rc) ====="
+  # Never mask a failed summary: otherwise a stale SUMMARY.txt can be mistaken
+  # for the report generated from the just-completed MB1 result.
   python -m tests.models.mcore.tpr.parallel.summarize_cp1_n8_fair \
-    "$ROOT" --memory-margin-gib "${TPR_CP1_N8_MEMORY_MARGIN_GIB:-0.5}" || true
-  if ((rc != 0)); then
+    "$ROOT" --memory-margin-gib "${TPR_CP1_N8_MEMORY_MARGIN_GIB:-0.5}" \
+    2>&1 | tee "$ROOT/final_summary.log"
+  summary_rc=${PIPESTATUS[0]}
+  if ((summary_rc != 0)); then
+    echo "ERROR: final N8 summary generation failed (summary_rc=$summary_rc)."
+    echo "Do not treat any pre-existing SUMMARY.txt as current."
+  fi
+  if ((runner_rc != 0)); then
     echo "===== MB1 CURRENT FAILURE (no historical logs) ====="
     grep -E 'Traceback|ERROR|FAILED|NPU out of memory|^E[[:space:]]' "$CURRENT_LOG" | tail -n 40 || true
     tail -n 60 "$CURRENT_LOG" || true
   fi
   echo "===== MB1 RESULT FILE: $NEW_DIR/result.json ====="
   echo "===== N8 SUMMARY FILE: $ROOT/SUMMARY.txt ====="
-  # The original pytest failure remains visible. Script does not alter other
-  # arms' result JSON or force an interactive shell logout.
+  if ((runner_rc != 0)); then
+    exit "$runner_rc"
+  fi
+  if ((summary_rc != 0)); then
+    exit "$summary_rc"
+  fi
+  exit 0
 }
 trap finish EXIT
 
