@@ -99,6 +99,8 @@ if not grad_dir or not (Path(grad_dir) / "manifest.pt").is_file():
     raise SystemExit("Existing result lacks complete parameter gradients")
 print(f"CP1_FP32_DW_REUSE_RESULT path={sys.argv[1]} enabled={want_fp32}", flush=True)
 PY
+    local reuse_rc=$?
+    [[ "$reuse_rc" -eq 0 ]] || return "$reuse_rc"
     return 0
   fi
   if [[ "$use_fp32" == "1" ]]; then
