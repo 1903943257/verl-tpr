@@ -6,6 +6,8 @@ import math
 import sys
 from pathlib import Path
 
+import torch
+
 
 def _read_jsonl(path: Path):
     with path.open(encoding="utf-8") as handle:
@@ -79,6 +81,52 @@ def _load_summary(path: Path):
     if not summary_path.is_file():
         raise FileNotFoundError(summary_path)
     return json.loads(summary_path.read_text())
+
+
+def _exact_final_parameter_metrics(full_path: Path, split_path: Path) -> dict:
+    """Exact full-vector comparison, streamed one parameter tensor at a time."""
+    left = torch.load(
+        full_path, map_location="cpu", weights_only=True, mmap=True,
+    )
+    right = torch.load(
+        split_path, map_location="cpu", weights_only=True, mmap=True,
+    )
+    if left.keys() != right.keys():
+        raise AssertionError("Final Full/Split parameter names differ")
+    diff_sq = full_sq = split_sq = dot = 0.0
+    per_parameter = []
+    for name in left:
+        a = left[name].float()
+        b = right[name].float()
+        if a.shape != b.shape:
+            raise AssertionError(f"{name}: final parameter shape mismatch")
+        difference = a - b
+        tensor_diff_sq = torch.sum(difference.square(), dtype=torch.float64).item()
+        tensor_full_sq = torch.sum(a.square(), dtype=torch.float64).item()
+        tensor_split_sq = torch.sum(b.square(), dtype=torch.float64).item()
+        tensor_dot = torch.sum(a * b, dtype=torch.float64).item()
+        diff_sq += tensor_diff_sq
+        full_sq += tensor_full_sq
+        split_sq += tensor_split_sq
+        dot += tensor_dot
+        per_parameter.append({
+            "name": name,
+            "relative_l2": math.sqrt(tensor_diff_sq) / max(math.sqrt(tensor_full_sq), 1e-30),
+            "difference_l2": math.sqrt(tensor_diff_sq),
+            "full_l2": math.sqrt(tensor_full_sq),
+            "split_l2": math.sqrt(tensor_split_sq),
+        })
+        del a, b, difference
+    del left, right
+    per_parameter.sort(key=lambda row: row["relative_l2"], reverse=True)
+    return {
+        "parameter_tensors": len(per_parameter),
+        "relative_l2": math.sqrt(diff_sq) / max(math.sqrt(full_sq), 1e-30),
+        "cosine": dot / max(math.sqrt(full_sq * split_sq), 1e-30),
+        "full_norm": math.sqrt(full_sq),
+        "split_norm": math.sqrt(split_sq),
+        "top_relative_errors": per_parameter[:10],
+    }
 
 
 def main():
@@ -166,6 +214,13 @@ def main():
             flush=True,
         )
 
+    full_final_state = Path(full_summary["final_state_path"])
+    split_final_state = Path(split_summary["final_state_path"])
+    if not full_final_state.is_file() or not split_final_state.is_file():
+        raise FileNotFoundError("Missing exact final model state snapshot")
+    exact_final_parameters = _exact_final_parameter_metrics(
+        full_final_state, split_final_state,
+    )
     final_eval = _logprob_metrics(
         full_summary["post_update_eval"]["logprobs"],
         split_summary["post_update_eval"]["logprobs"],
@@ -210,6 +265,7 @@ def main():
             "sampled_parameter_gap_growth_factor": (
                 final_parameter_gap / max(first_parameter_gap, 1e-30)
             ),
+            "exact_final_parameter_comparison": exact_final_parameters,
             "final_post_update_eval_loss_abs_gap": final_eval_loss_gap,
             "final_post_update_eval_logprob": final_eval,
             "clip_status_mismatch_count": sum(row["clip_status_mismatch"] for row in rows),
@@ -234,6 +290,11 @@ def main():
     print(f"first_parameter_sample_rel_l2={first_parameter_gap:.9g}")
     print(f"final_parameter_sample_rel_l2={final_parameter_gap:.9g}")
     print(f"parameter_gap_growth_factor={s['sampled_parameter_gap_growth_factor']:.9g}")
+    print(
+        "exact_final_parameter_rel_l2="
+        f"{exact_final_parameters['relative_l2']:.9g} "
+        f"cos={exact_final_parameters['cosine']:.9g}"
+    )
     print(f"post20_eval_loss_gap={final_eval_loss_gap:.9g}")
     print(f"post20_eval_logprob_rel_l2={final_eval['relative_l2']:.9g}")
     print(f"clip_status_mismatches={s['clip_status_mismatch_count']}")
