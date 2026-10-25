@@ -65,7 +65,7 @@ jobs:
           # Stream the archive through gzip to avoid storing an extra uncompressed tar.
           docker save "$IMAGE" | gzip -1 > dist/image.tar.gz
           printf '%s\n' "$IMAGE" > dist/IMAGE.txt
-          sha256sum dist/image.tar.gz > dist/image.tar.gz.sha256
+          (cd dist && sha256sum image.tar.gz > image.tar.gz.sha256)
 
           echo "Exported archive:"
           ls -lh dist/
