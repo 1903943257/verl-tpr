@@ -10,6 +10,11 @@ Supported metadata layouts include both:
   extra_info.tools_kwargs.task.metadata
   extra_info.tools_kwargs.reward.metadata
 
+The script writes:
+  shortfix_candidates.parquet      -- original row schema, filtered/reordered
+  shortfix_candidates_task.parquet -- current UniAgent Task Config schema for
+                                     examples/inference/parallel_infer_verl.py
+
 Usage:
   python tests/models/mcore/tpr/parallel/filter_swe_rebench_shortfix.py \
       /path/to/swe_rebench_filtered.parquet --out /path/to/shortfix --limit 50
@@ -34,6 +39,7 @@ NON_SOURCE = re.compile(
     re.IGNORECASE,
 )
 TIERS = ("strict", "relaxed", "reject")
+DEFAULT_DATA_SOURCE = "nebius/SWE-rebench"
 
 
 def decode_object(value):
@@ -82,6 +88,72 @@ def extract_metadata(row):
 
     # Also accept raw datasets where task fields are top-level columns.
     return row.to_dict()
+
+
+def normalize_task_row(row):
+    """Convert legacy reward/env metadata into the current UniAgent Task Config row.
+
+    The current framework runner requires extra_info.tools_kwargs.task. Legacy
+    rows instead store the task payload under tools_kwargs.reward.metadata and
+    the image under tools_kwargs.env.deployment.image.
+    """
+    sample = row.to_dict() if hasattr(row, "to_dict") else dict(row)
+    extra = decode_object(sample.get("extra_info"))
+    tools_kwargs = decode_object(extra.get("tools_kwargs"))
+
+    # Already in the current framework format: preserve its Task Config.
+    existing_task = decode_object(tools_kwargs.get("task"))
+    if existing_task:
+        sample["data_source"] = sample.get("data_source") or DEFAULT_DATA_SOURCE
+        return sample
+
+    reward = decode_object(tools_kwargs.get("reward"))
+    metadata = decode_object(reward.get("metadata"))
+    task_name = reward.get("name")
+    env = decode_object(tools_kwargs.get("env"))
+    deployment = decode_object(env.get("deployment"))
+    image = deployment.get("image")
+
+    if task_name != "swe_rebench":
+        raise ValueError(
+            f"row {metadata.get('instance_id', '?')}: expected reward.name='swe_rebench', "
+            f"got {task_name!r}"
+        )
+    if not metadata:
+        raise ValueError(f"row {metadata.get('instance_id', '?')}: missing reward.metadata")
+    if not isinstance(image, str) or not image.strip():
+        raise ValueError(
+            f"row {metadata.get('instance_id', '?')}: missing env.deployment.image"
+        )
+
+    task_config = {
+        "name": task_name,
+        "sandbox": {"image": image},
+        "metadata": metadata,
+    }
+    # Keep unrelated tools_kwargs entries but replace the legacy env/reward pair.
+    normalized_tools = {
+        key: value for key, value in tools_kwargs.items()
+        if key not in {"env", "reward", "task"}
+    }
+    normalized_tools["task"] = task_config
+    normalized_extra = dict(extra)
+    normalized_extra["tools_kwargs"] = normalized_tools
+    sample["extra_info"] = normalized_extra
+    sample["data_source"] = sample.get("data_source") or DEFAULT_DATA_SOURCE
+    return sample
+
+
+def normalize_candidates(df):
+    """Normalize candidate rows for the current framework inference entrypoint."""
+    if df.empty:
+        normalized = df.copy()
+        if "data_source" not in normalized.columns:
+            normalized["data_source"] = pd.Series(dtype="object")
+        return normalized
+    return pd.DataFrame(
+        [normalize_task_row(row) for _, row in df.iterrows()]
+    )
 
 
 def patch_metrics(patch):
@@ -179,17 +251,23 @@ def main(argv=None):
         parser.error("--limit must be >= 1")
     df = pd.read_parquet(args.input_parquet)
     ranked, selected, counts = screen(df, args.limit)
+    normalized = normalize_candidates(selected)
     args.out.mkdir(parents=True, exist_ok=True)
     ranked.to_csv(args.out / "shortfix_ranked.csv", index=False)
-    # Always write a valid Parquet, even if nothing passes the filter.
+    # Original schema is retained for audit/reuse with legacy consumers.
     selected.to_parquet(args.out / "shortfix_candidates.parquet", index=False)
+    # Current UniAgent framework requires tools_kwargs.task, not legacy reward/env.
+    normalized.to_parquet(args.out / "shortfix_candidates_task.parquet", index=False)
     (args.out / "shortfix_counts.json").write_text(
         json.dumps({"input": len(df), "selected": len(selected), "tiers": counts},
                    indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
     print(f"Input={len(df)}, selected={len(selected)}, tiers={counts}")
-    print(f"Outputs: {args.out}/shortfix_ranked.csv, shortfix_candidates.parquet, shortfix_counts.json")
+    print(
+        f"Outputs: {args.out}/shortfix_ranked.csv, shortfix_candidates.parquet, "
+        "shortfix_candidates_task.parquet, shortfix_counts.json"
+    )
     print("Gold patches used only for screening; verify suffix length and reward in real Claude Code rollouts.")
 
 
