@@ -1,4 +1,4 @@
-"""Native Megatron schedule control for the fixed-trajectory TP2/CP4 PPO replay.
+"""Native Megatron schedule control for fixed-trajectory TP2/CP2 or TP2/CP4 PPO replay.
 
 This is *not* the TPR unshared-forest path. It uses an unmodified Megatron
 GPT attention module, VERL's THD/zigzag-CP preprocessing and PPO/log-prob
@@ -15,6 +15,7 @@ grads over CP replicas once, as in the existing offline experiment.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 import time
 
 import torch
@@ -117,11 +118,11 @@ def _compact_native_ppo(loss_function, logprobs, response_offsets, batch, row,
 
 
 def run_native_full_step(model, batch, runtime, loss_function, *,
-                         capture_logprobs: bool) -> NativeFullResult:
+                         capture_logprobs: bool, phase_sampler=None) -> NativeFullResult:
     """Execute the real no-PP Megatron F/B schedule over CP-sharded rows.
 
     Deliberately fails rather than silently falling back to SegmentExecutor.
-    Native model and schedule versions need an 8-NPU integration gate.
+    Native model and schedule versions need matching CP2/CP4 integration gates.
     """
     from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
     from verl.models.mcore.util import preprocess_thd_engine
@@ -130,11 +131,12 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
 
     if any(isinstance(m, TPRSelfAttention) for m in model.modules()):
         raise AssertionError("Native Full must not contain TPRSelfAttention")
-    if getattr(model.config, "context_parallel_size", None) != 4:
-        raise AssertionError("Native Full requires CP4")
+    cp = getattr(model.config, "context_parallel_size", None)
+    if cp not in (2, 4):
+        raise AssertionError("Native Full requires CP2 or CP4")
     if getattr(model.config, "tensor_model_parallel_size", None) != 2:
         raise AssertionError("Native Full requires TP2")
-    if dist.get_world_size(runtime.cp_group) != 4:
+    if dist.get_world_size(runtime.cp_group) != cp:
         raise AssertionError("native CP group mismatch")
 
     input_rows = batch["input_ids"].unbind(0)
@@ -169,7 +171,7 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
     prepared = []
     for row in range(count):
         length = int(input_rows[row].numel())
-        global_positions = native_cp_query_indices(length, runtime.cp_rank)
+        global_positions = native_cp_query_indices(length, runtime.cp_rank, cp_size=cp)
         local_lookup = {position: i for i, position in enumerate(global_positions)
                         if position < length}
         mask_indices = torch.nonzero(masks[row].bool(), as_tuple=False).flatten().tolist()
@@ -211,7 +213,7 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
         packed_ids, packed_params, packed_positions = preprocess_thd_engine(
             nested, pre_process=True, need_roll=False, cp_layout="zigzag"
         )
-        expected_indices = native_cp_query_indices(length, runtime.cp_rank)
+        expected_indices = native_cp_query_indices(length, runtime.cp_rank, cp_size=cp)
         if packed_positions.shape[-1] != len(expected_indices):
             raise AssertionError("Native THD preprocessor changed CP partition length")
         if local_indices:
@@ -316,11 +318,16 @@ def run_native_full_step(model, batch, runtime, loss_function, *,
     )
     grad_dtype = offline_grad_sync_dtype()
     t0 = time.perf_counter()
-    for name, param in model.named_parameters():
-        reduce_average_weight_grad(
-            param, runtime.cp_group, name=name, reduce_dtype=grad_dtype,
-        )
-    torch.npu.synchronize()
+    finalize_scope = (
+        phase_sampler.phase("gradient_finalize")
+        if phase_sampler is not None else nullcontext()
+    )
+    with finalize_scope:
+        for name, param in model.named_parameters():
+            reduce_average_weight_grad(
+                param, runtime.cp_group, name=name, reduce_dtype=grad_dtype,
+            )
+        torch.npu.synchronize()
     finalize_seconds = time.perf_counter() - t0
 
     # Reporting-only reduction: all CP participants MUST pass the same dtype
