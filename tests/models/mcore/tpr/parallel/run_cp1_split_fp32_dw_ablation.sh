@@ -24,7 +24,19 @@ CAPTURE="$BASE/actor_pair_cap4096_p3072.pt"
 [[ -d "$CHECKPOINT" ]] || { echo "Missing checkpoint: $CHECKPOINT" >&2; exit 2; }
 [[ -f "$BASE/full/result.json" ]] || { echo "Missing baseline: $BASE/full/result.json" >&2; exit 2; }
 [[ -f "$BASE/split_no_share/result.json" ]] || { echo "Missing baseline: $BASE/split_no_share/result.json" >&2; exit 2; }
-[[ ! -e "$ROOT" ]] || { echo "Output exists: $ROOT (set TPR_CP1_FP32_DW_ROOT to a fresh path)" >&2; exit 2; }
+# Resume the interrupted run in place: keep the successful BF16 reverse and rerun
+# only the missing/failed FP32 arm. Refuse unrelated or incomplete output trees.
+if [[ -e "$ROOT" ]]; then
+  [[ -f "$ROOT/split_bf16_reverse/result.json" ]] || {
+    echo "Existing output tree has no completed BF16 reverse; use a fresh TPR_CP1_FP32_DW_ROOT=$ROOT" >&2
+    exit 2
+  }
+  [[ -f "$ROOT/split_bf16_reverse/split_no_share_step1_tp0_full_grads/manifest.pt" ]] || {
+    echo "Existing BF16 reverse is missing complete gradients; use a fresh output root" >&2
+    exit 2
+  }
+  echo "CP1_FP32_DW_RESUME root=$ROOT"
+fi
 
 # Reuse the existing full-gradient baselines; fail early if the artifacts are incomplete.
 python - "$BASE" <<'PY'
@@ -70,6 +82,25 @@ run_split() {
   mkdir -p "$ROOT/$label"
   export TPR_CP1_MODE=split_no_share
   export TPR_CP1_OUTPUT="$ROOT/$label/result.json"
+
+  if [[ -f "$TPR_CP1_OUTPUT" ]]; then
+    python - "$TPR_CP1_OUTPUT" "$use_fp32" <<'PY'
+import json, sys
+from pathlib import Path
+record = json.loads(Path(sys.argv[1]).read_text())
+want_fp32 = sys.argv[2] == "1"
+intervention = record.get("gradient_intervention", {})
+if record.get("mode") != "split_no_share":
+    raise SystemExit("Existing result has the wrong mode")
+if bool(intervention.get("enabled")) != want_fp32:
+    raise SystemExit("Existing result has the wrong gradient-intervention setting")
+grad_dir = record.get("full_grad_dir")
+if not grad_dir or not (Path(grad_dir) / "manifest.pt").is_file():
+    raise SystemExit("Existing result lacks complete parameter gradients")
+print(f"CP1_FP32_DW_REUSE_RESULT path={sys.argv[1]} enabled={want_fp32}", flush=True)
+PY
+    return 0
+  fi
   if [[ "$use_fp32" == "1" ]]; then
     export TPR_CP1_SPLIT_FP32_LINEAR_DW=1
   else
@@ -156,7 +187,7 @@ if not intervention.get("enabled"):
     raise AssertionError("FP32 candidate did not record the intervention as enabled")
 if intervention.get("layers") != 36 or intervention.get("linear_modules") != 144:
     raise AssertionError(f"Incomplete layer/module coverage: {intervention}")
-if not intervention.get("all_modules_backwarded") or not intervention.get("flushed_before_native_finalizer"):
+if not intervention.get("all_modules_have_backward_contribution") or not intervention.get("flushed_before_native_finalizer"):
     raise AssertionError(f"FP32 dW intervention did not complete correctly: {intervention}")
 
 def logprobs(record):
