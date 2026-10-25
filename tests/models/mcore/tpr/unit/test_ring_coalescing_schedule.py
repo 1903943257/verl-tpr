@@ -112,7 +112,7 @@ def load_dispatch():
 
 
 class DispatchTests(unittest.TestCase):
-    def run_attention(self, cp, rank, prefix, enabled, query_enabled=False, current_full=False):
+    def run_attention(self, cp, rank, prefix, enabled, query_enabled=False):
         ns = load_dispatch()
         events, calls = [], {"forward": 0, "backward": 0}
         query_storage = []
@@ -148,8 +148,7 @@ class DispatchTests(unittest.TestCase):
                                  cp_size=cp, cp_rank=rank, current_shard=current,
                                  query_heads=16, head_dim=128, softmax_scale=1,
                                  coalesce_prefix_full=enabled, coalesce_prefix_query=query_enabled,
-                                 coalesce_prefix_padded=False, coalesce_current_full=current_full,
-                                 trace_layer=None)
+                                 coalesce_prefix_padded=False, trace_layer=None)
         q = Tensor((current.local_length, 1, 16, 128))
         query_storage.append(q.storage)
         kv = [Tensor((current.local_length, 1, 8, 128)) for _ in range(2 * len(config.segment_lengths))]
@@ -202,50 +201,6 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual((8 * 13 + 9) * 28, 3164)
         self.assertEqual((1 + 8 * 2 + 1) * 28, 504)
         self.assertEqual((8 * 2 + 1) * 28, 476)
-
-
-    def test_current_full_coalesce_reduces_only_eligible_source_pairs(self):
-        # CP-rank r has CP-r-1 earlier Zigzag sources with TWO fully visible
-        # Current KV slices for its later Query chunk.
-        for cp in (2, 4, 8):
-            for rank in range(cp):
-                for has_prefix in (False, True):
-                    old, old_events = self.run_attention(
-                        cp, rank, has_prefix, enabled=True, query_enabled=True,
-                        current_full=False,
-                    )
-                    new, new_events = self.run_attention(
-                        cp, rank, has_prefix, enabled=True, query_enabled=True,
-                        current_full=True,
-                    )
-                    saved = cp - rank - 1
-                    self.assertEqual(old["forward"] - new["forward"], saved)
-                    self.assertEqual(old["backward"] - new["backward"], saved)
-                    for phase in ("forward", "backward"):
-                        old_current = [event for event in old_events
-                                       if event["phase"] == phase and
-                                       event["segment_type"] == "current" and
-                                       event["fa_called"]]
-                        new_current = [event for event in new_events
-                                       if event["phase"] == phase and
-                                       event["segment_type"] == "current" and
-                                       event["fa_called"]]
-                        self.assertEqual(len(old_current), 2 * cp + 1)
-                        self.assertEqual(len(new_current), cp + rank + 2)
-                        self.assertEqual(sum(bool(event["coalesced"])
-                                             for event in new_current), saved)
-                        self.assertTrue(all(event["block_type"] == "full"
-                                            for event in new_current if event["coalesced"]))
-                        old_prefix = [event for event in old_events if
-                                      event["phase"] == phase and event["segment_type"] == "prefix"]
-                        new_prefix = [event for event in new_events if
-                                      event["phase"] == phase and event["segment_type"] == "prefix"]
-                        self.assertEqual(
-                            [(event["query_length"], event["kv_length"], event["block_type"])
-                             for event in old_prefix],
-                            [(event["query_length"], event["kv_length"], event["block_type"])
-                             for event in new_prefix],
-                        )
 
     def test_query_eligibility_fallback(self):
         ns = load_dispatch()
