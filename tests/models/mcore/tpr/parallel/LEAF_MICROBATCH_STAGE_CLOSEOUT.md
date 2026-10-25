@@ -179,3 +179,14 @@ unique response-token coordinates, and the runner now propagates final-summary
 failures instead of hiding them behind `|| true`. The changes are committed on
 `feat/tpr-leaf-microbatch-cp1-20261022`; run the CPU summary tests and regenerate
 the report on the user's server before calling the Leaf Batch stage fully closed.
+
+
+## 2026-10-25 merge scope decision: TreeBatch K>1 support
+
+This change is being merged to land the **opt-in CP1 TreeBatch / leaf micro-batching capability**. It is not a declaration that numerical equivalence is fully accepted.
+
+- The default remains `TPR_LEAF_BATCH_SIZE=1`; K>1 is explicitly opt-in.
+- The isolated two-sibling NPU equivalence test passes in FP32 (gradient relative L2 about `6.3e-8`) and BF16 (about `2.53e-3`, within that test's stated `5e-2` tolerance).
+- The real Qwen3-4B N=8 controlled comparison still has a substantial K1-vs-K2 full-gradient difference (relative L2 about `0.321`, cosine about `0.951`). This has **not** been explained or accepted as numerically equivalent. Do not infer that the small isolated test proves full-model correctness.
+- Performance measurements are controlled CP1 model forward/backward only, not native VERL microbatch scheduling, rollout-inclusive throughput, or a production optimizer-step benchmark.
+- This merge enables further evaluation of the feature; it does **not** close the full-model correctness question. Keep the caveat visible in future reports and PR descriptions, and investigate numerical parity separately without expanding this TreeBatch implementation task.
