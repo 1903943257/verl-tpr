@@ -1,0 +1,139 @@
+diff --git a/uni_agent/tasks/swe_bench/reward.py b/uni_agent/tasks/swe_bench/reward.py
+--- a/uni_agent/tasks/swe_bench/reward.py
++++ b/uni_agent/tasks/swe_bench/reward.py
+@@ -1,8 +1,9 @@
+ from __future__ import annotations
+ 
+ import json
+ import logging
++import re
+ import time
+ import uuid
+ 
+ from swebench.harness.constants import (
+@@ -19,10 +20,29 @@
+ from swebench.harness.utils import get_modified_files
+ 
+ logger = logging.getLogger(__name__)
+ 
+-
+-def _make_eval_script_list(instance, specs, env_name, repo_directory, base_commit, test_patch):
++# Diagnostic only. Markers are outside START_TEST_OUTPUT/END_TEST_OUTPUT so that
++# the SWE-bench test parser sees the same test output as before.
++_REWARD_PHASE_TIMING_FUNCTIONS = r"""
++__reward_phase_start() {
++    __REWARD_PHASE_NAME="$1"
++    __REWARD_PHASE_START_NS="$(date +%s%N)"
++}
++__reward_phase_end() {
++    local end_ns duration_ms
++    end_ns="$(date +%s%N)"
++    duration_ms=$(((end_ns - __REWARD_PHASE_START_NS) / 1000000))
++    printf 'REWARD_PHASE name=%s duration_ms=%s\n' \
++        "$__REWARD_PHASE_NAME" "$duration_ms"
++}
++"""
++
++
++def _make_eval_script_list(
++    instance, specs, env_name, repo_directory, base_commit, test_patch,
++    instrument=False,
++):
+     _HEREDOC_DELIMITER = "EOF_114329324912"
+     base_commit = instance["base_commit"]
+     test_files = get_modified_files(test_patch)
+     if test_files:
+@@ -33,34 +53,46 @@
+     apply_test_patch_command = f"git apply -v - <<'{_HEREDOC_DELIMITER}'\n{test_patch}\n{_HEREDOC_DELIMITER}"
+     test_cmd = MAP_REPO_VERSION_TO_SPECS[instance["repo"]][instance["version"]]["test_cmd"]
+     test_command = " ".join([test_cmd, *get_test_directives(instance)])
+ 
+-    eval_commands = [
++    def timed_phase(name, commands):
++        if not instrument:
++            return commands
++        return [f"__reward_phase_start {name}", *commands, "__reward_phase_end"]
++
++    eval_commands = timed_phase("environment_setup", [
+         "source /opt/miniconda3/bin/activate",
+         f"conda activate {env_name}",
+         f"cd {repo_directory}",
+-    ]
++    ])
+     if "eval_commands" in specs:
+-        eval_commands += specs["eval_commands"]
+-    eval_commands += [
++        eval_commands += timed_phase("custom_eval_commands", specs["eval_commands"])
++    eval_commands += timed_phase("repo_inspection", [
+         f"git config --global --add safe.directory {repo_directory}",
+         f"cd {repo_directory}",
+         "git status",
+         "git show",
+         f"git -c core.fileMode=false diff {base_commit}",
++    ])
++    eval_commands += timed_phase("reactivate_test_env", [
+         "source /opt/miniconda3/bin/activate",
+         f"conda activate {env_name}",
+-    ]
++    ])
+     if "install" in specs:
+-        eval_commands.append(specs["install"])
++        eval_commands += timed_phase("install", [specs["install"]])
++    eval_commands += timed_phase("reset_before_test", [reset_tests_command])
++    eval_commands += timed_phase("apply_test_patch", [apply_test_patch_command])
++    # Keep the parser delimiters byte-for-byte and the timing markers outside.
++    if instrument:
++        eval_commands.append("__reward_phase_start test_command")
+     eval_commands += [
+-        reset_tests_command,
+-        apply_test_patch_command,
+         f": '{START_TEST_OUTPUT}'",
+         test_command,
+         f": '{END_TEST_OUTPUT}'",
+-        reset_tests_command,
+     ]
++    if instrument:
++        eval_commands.append("__reward_phase_end")
++    eval_commands += timed_phase("cleanup", [reset_tests_command])
+     return eval_commands
+ 
+ 
+ def _get_logs_eval(metadata, eval_output: str):
+@@ -129,10 +161,14 @@
+         env_name=env_name,
+         repo_directory=repo_directory,
+         base_commit=base_commit,
+         test_patch=test_patch,
++        instrument=True,
+     )
+-    eval_script = "\n".join(["#!/bin/bash", "set -uxo pipefail"] + eval_script_list) + "\n"
++    eval_script = "\n".join(
++        ["#!/bin/bash", "set -uxo pipefail", _REWARD_PHASE_TIMING_FUNCTIONS]
++        + eval_script_list
++    ) + "\n"
+ 
+     # write eval script to container
+     eval_script_container = f"/tmp/eval_script_{uuid.uuid4()}.sh"
+     await sandbox.write_file(eval_script_container, eval_script)
+@@ -142,8 +178,22 @@
+ 
+     resp = await sandbox.exec_shell(f"bash {eval_script_container} 2>&1", workdir="/testbed", timeout=eval_timeout)
+     output, exit_code = resp.stdout, resp.exit_code
+     execution_time = time.perf_counter() - execution_t0
++    phase_times_ms = []
++    for phase_name, duration_ms in re.findall(
++        r"(?m)^REWARD_PHASE name=([a-z_]+) duration_ms=(\d+)$", output
++    ):
++        phase_times_ms.append(int(duration_ms))
++        logger.info(
++            "REWARD_PHASE instance_id=%s name=%s duration_s=%.3f",
++            instance_id, phase_name, int(duration_ms) / 1000.0,
++        )
++    logger.info(
++        "REWARD_PHASE_SUMMARY instance_id=%s shell_s=%.3f measured_phases_s=%.3f unaccounted_s=%.3f",
++        instance_id, execution_time, sum(phase_times_ms) / 1000.0,
++        execution_time - sum(phase_times_ms) / 1000.0,
++    )
+     result["eval_completed"] = exit_code == 0
+     result["eval_execution_time"] = execution_time
+     logger.info(f"eval finished in {execution_time:.1f}s (exit_code={exit_code})")
