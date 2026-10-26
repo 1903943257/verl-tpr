@@ -1,18 +1,18 @@
-# 从零搭建 VERL-TPR + UniAgent SWE-reBench E2E（uniagent:new）
+# 从零搭建 VERL-TPR + UniAgent SWE-reBench E2E（uniagent:qwen36）
 
 > 状态：**迁移操作指南，不是新服务器验收通过证明**。2026-10-26；仅写入 `feat/tpr-rebench-e2e-20261026`。不修改 TPR 算法和测试整理分支。
 >
-> 范围：旧机 Ascend 单机实验 → 新机基于 `uniagent:new` 的 Docker；先跑单机 Full/TPR，再规划四机 16 卡。现有 `run_uniagent_rebench_ppo_e2e.sh` **固定 `NNODES=1`**，尚不能声称直接支持三机推理、一机训练。
+> 范围：旧机 Ascend 单机实验 → 新机基于 `uniagent:qwen36` 的 Docker；先跑单机 Full/TPR，再规划四机 16 卡。现有 `run_uniagent_rebench_ppo_e2e.sh` **固定 `NNODES=1`**，尚不能声称直接支持三机推理、一机训练。
 
 ## 0. 最先确认：新服务器到底是 Ascend 还是 NVIDIA
 
-`docker images` 只能证明镜像存在，不能证明机器是 NPU，也不能证明 `uniagent:new` 装有 torch-npu/CANN。该镜像曾在 GPU 环境中使用；**先检查硬件，不要在 NVIDIA 节点上直接运行 trainer.device=npu**。
+`docker images` 只能证明镜像存在，不能证明机器是 NPU，也不能证明 `uniagent:qwen36` 装有 torch-npu/CANN。该镜像标签不代表设备适配已通过；**先检查硬件，不要在 NVIDIA 节点上直接运行 trainer.device=npu**。
 
 宿主机（不要进入 Docker）：
 
 ```bash
 hostname
-docker image inspect uniagent:new --format '{{.Id}} {{.Architecture}} {{.Os}}'
+docker image inspect uniagent:qwen36 --format '{{.Id}} {{.Architecture}} {{.Os}}'
 ls -l /dev/davinci* /dev/davinci_manager 2>/dev/null || true
 command -v npu-smi && npu-smi info || true
 command -v nvidia-smi && nvidia-smi -L || true
@@ -21,12 +21,22 @@ ls -ld /usr/local/Ascend/driver /usr/local/dcmi 2>/dev/null || true
 
 以下流程仅针对 **Ascend NPU + 驱动已安装在宿主机**。若只有 `nvidia-smi`，停止 NPU E2E 操作：需要另做 CUDA/PyTorch/TPR 适配，不能把镜像名字当作硬件兼容证明。
 
+**目录映射约定（四机每台应保持一致）：**
+
+```text
+宿主机 /ssd_3/jyb/project/uniagent_linear/  -->  Docker /workspace/
+宿主机 /ssd_3/jyb/project/uniagent_linear/verl-tpr-e2e/  -->  Docker /workspace/verl-tpr-e2e/
+宿主机 /ssd_3/jyb/project/uniagent_linear/uni-agent-cc/  -->  Docker /workspace/uni-agent-cc/
+```
+
+宿主机命令使用 `/ssd_3/...`；进入 Docker 后才使用 `/workspace/...`。两侧是同一批文件，不要在容器内再次复制一份仓库。
+
 ## 1. 宿主机取得代码（所有 Git 在宿主机）
 
-新服务器初始目录：`/home/j00972288/project`。沿用旧容器工作目录映射：`HOST_WORKSPACE → /workspace`。先用一个稳定根目录收纳所有工程及数据：
+新服务器项目根目录：`/ssd_3/jyb/project/uniagent_linear/`。沿用旧容器工作目录映射：`HOST_WORKSPACE → /workspace`。先用一个稳定根目录收纳所有工程及数据：
 
 ```bash
-export WS=/home/j00972288/project/uniagent_linear
+export WS=/ssd_3/jyb/project/uniagent_linear
 mkdir -p "$WS" "$WS/hf_models" "$WS/data/swe_agent" \
   "$WS/tpr_experiments/shortfix" "$WS/tpr_experiments/e2e"
 
@@ -85,7 +95,7 @@ git -C "$WS/verl-tpr-e2e" rev-parse HEAD
 ```bash
 # 宿主机（镜像必须已经 docker image inspect 成功）
 cd "$WS/verl-tpr-e2e"
-IMAGE=uniagent:new \
+IMAGE=uniagent:qwen36 \
 HOST_WORKSPACE="$WS" \
 CONTAINER_NAME=uniagent_16npu \
 bash scripts/tpr/run_uniagent_new_container.sh
@@ -118,7 +128,7 @@ try:
     print("NPU available:", torch.npu.is_available(), "count:", torch.npu.device_count())
     assert torch.npu.is_available()
 except Exception as exc:
-    raise SystemExit("STOP: uniagent:new is not a proven Ascend runtime: " + repr(exc))
+    raise SystemExit("STOP: uniagent:qwen36 is not a proven Ascend runtime: " + repr(exc))
 PY
 docker info >/dev/null && echo 'Nested Docker socket/CLI OK'
 ```
@@ -235,12 +245,12 @@ rsync -avP <OLD_SERVER>:/mnt/pipeline-data/j00972288/project/uniagent_linear/tpr
 swerebench/sweb.eval.x86_64.aspp_1776_pelita-875:latest
 ```
 
-若使用旧机的 OpenYuanrong registry 镜像映射，必须先确认新机的 registry 权限、镜像架构及 digest，拉取后用 `docker tag` 标记成数据集要求的逻辑名。**不要因为本机存在 `uniagent:new` 就认为存在任务 sandbox 镜像**。
+若使用旧机的 OpenYuanrong registry 镜像映射，必须先确认新机的 registry 权限、镜像架构及 digest，拉取后用 `docker tag` 标记成数据集要求的逻辑名。**不要因为本机存在 `uniagent:qwen36` 就认为存在任务 sandbox 镜像**。
 
 ```bash
 # 宿主机检查；Docker 内共享该 daemon
 docker image inspect swerebench/sweb.eval.x86_64.aspp_1776_pelita-875:latest
-docker image inspect uniagent:new
+docker image inspect uniagent:qwen36
 ```
 
 一个成功的 E2E 还需要工具 sidecar 镜像、可用 Docker daemon、Agent 工具调用网络，以及正确的 reward 环境。先运行下面的单任务 inference smoke，再消耗 8 条 rollout。
@@ -318,7 +328,7 @@ SESSION_HARD_CAP=True TPR_ENABLED=True RUN_NAME=pelita-tpr-step1 \
 
 ```text
 host / accelerator:
-uniagent:new digest:
+uniagent:qwen36 digest:
 Docker mount root:
 CANN / driver / torch / torch_npu / vllm_ascend versions:
 uni-agent-cc SHA:
@@ -338,7 +348,7 @@ Next: 10 step + controlled identical-capture performance replay
 
 ## 9. 当前未验证的项目（不能用“脚本存在”替代 PASS）
 
-1. 当前实际新机是否为 Ascend NPU，`uniagent:new` 是否自带可用的 torch-npu/vLLM-Ascend，镜像内虚拟环境是否完整。
+1. 当前实际新机是否为 Ascend NPU，`uniagent:qwen36` 是否自带可用的 torch-npu/vLLM-Ascend，镜像内虚拟环境是否完整。
 2. 公开 `RichardFido/uni-agent` 新 checkout 与 `verl-tpr-e2e` 运行时 VERL 的 V1/TQ API 兼容性。
 3. 旧 Bridge hard-cap patch 对新 UniAgent 版本的适用性。
 4. 新增加的本地 Docker task YAML、Claude Code sidecar 镜像、pelita reward sandbox 是否配套。
