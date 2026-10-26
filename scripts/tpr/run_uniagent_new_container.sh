@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Reproduce the 2026-10-13 Ascend development container layout, using uniagent:new.
+# Reproduce the 2026-10-13 Ascend development container layout, using uniagent:qwen36 (filename retained for compatibility).
 # Run on the HOST after cloning verl-tpr-e2e. Git remains on the host.
 set -euo pipefail
-IMAGE="${IMAGE:-uniagent:new}"
+IMAGE="${IMAGE:-uniagent:qwen36}"
 NAME="${CONTAINER_NAME:-uniagent_16npu}"
-WS="${HOST_WORKSPACE:-/home/j00972288/project/uniagent_linear}"
+WS="${HOST_WORKSPACE:-/ssd_3/jyb/project/uniagent_linear}"
 
 command -v docker >/dev/null || { echo "ERROR: Docker CLI missing on host" >&2; exit 2; }
 [[ -S /var/run/docker.sock ]] || { echo "ERROR: Docker socket unavailable" >&2; exit 2; }
@@ -23,6 +23,7 @@ if docker container inspect "$NAME" >/dev/null 2>&1; then
   echo "ERROR: container $NAME already exists; inspect before changing or deleting it." >&2
   exit 2
 fi
+[[ "$WS" = /* ]] || { echo "ERROR: HOST_WORKSPACE must be an absolute host path" >&2; exit 2; }
 mkdir -p "$WS"
 # Preserve the old development contract: host network, privileged, Docker-in-Docker via
 # host socket, workspace -> /workspace. These grants are powerful; use trusted hosts only.
