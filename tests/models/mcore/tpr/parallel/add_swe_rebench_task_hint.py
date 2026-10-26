@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 TARGET_INSTANCE = "ASPP__pelita-875"
@@ -80,6 +81,10 @@ def append_to_prompt(prompt: Any, hint: str, level: str) -> Any:
             raise ValueError("prompt already contains a TPR_TASK_HINT marker")
         updated["content"] += suffix
         return updated
+    if isinstance(prompt, np.ndarray):
+        # pandas/pyarrow may deserialize a list-of-messages column as ndarray.
+        # Normalize only the selected row to a regular message list before editing.
+        return append_to_prompt(prompt.tolist(), hint, level)
     if isinstance(prompt, list):
         updated = [dict(message) if isinstance(message, dict) else message for message in prompt]
         user_indices = [
