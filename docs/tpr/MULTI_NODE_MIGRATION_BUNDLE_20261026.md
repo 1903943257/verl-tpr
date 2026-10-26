@@ -72,10 +72,11 @@ Copy task data and model files only after checking whether the destination alrea
 ```bash
 mkdir -p /workspace/tpr_experiments/shortfix /workspace/hf_models
 cp -an data/shortfix/. /workspace/tpr_experiments/shortfix/
-cp -an models/Qwen3-4B/. /workspace/hf_models/Qwen3-4B/
+# Only if target does not already exist; bundle and target must be on the same filesystem.
+cp -al models/Qwen3-4B /workspace/hf_models/Qwen3-4B
 ```
 
-cp -an avoids overwriting existing files. Compare SHA256 values if a destination already has Qwen3-4B.
+cp -an avoids overwriting existing task files. The cp -al model command creates hard links instead of duplicating 8 GB of weights; run it only if /workspace/hf_models/Qwen3-4B does not already exist. Compare SHA256 values before reusing an existing model.
 
 To create /workspace/hf_models/Qwen3-4B-128K with the same weight inodes and the separate YaRN config, run:
 
