@@ -67,7 +67,7 @@ def apply_oracle_pelita_fix(container, output_dir):
         cli(["docker", "cp", f"{container}:/testbed/pelita/utils.py", str(source)])
         original = source.read_text()
     function_match = re.search(
-        r"(?ms)^def run_background_game\\(.*?(?=^def |\\Z)", original
+        r"(?ms)^def run_background_game\(.*?(?=^def |\Z)", original
     )
     if not function_match:
         raise RuntimeError("Cannot find run_background_game() in sandbox source")
@@ -82,7 +82,7 @@ def apply_oracle_pelita_fix(container, output_dir):
         )
     replacement = body.replace(incorrect, corrected, 1)
     fixed = original[:function_match.start()] + replacement + original[function_match.end():]
-    patch_text = "diff --git a/pelita/utils.py b/pelita/utils.py\\n" + "".join(
+    patch_text = "diff --git a/pelita/utils.py b/pelita/utils.py\n" + "".join(
         difflib.unified_diff(
             original.splitlines(keepends=True),
             fixed.splitlines(keepends=True),
