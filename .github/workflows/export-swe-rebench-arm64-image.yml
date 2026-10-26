@@ -57,12 +57,14 @@ jobs:
           source = source.replace("    # USE_X86,\n", "    USE_X86,\n", 1)
 
           needle = '    arch = "x86_64"\n\n    return TestSpec('
-          replacement = '''    if platform.machine() in {"aarch64", "arm64"}:
-              arch = "x86_64" if instance_id.lower() in USE_X86 else "arm64"
-          else:
-              arch = "x86_64"
-
-          return TestSpec('''
+          replacement = "\n".join([
+              '    if platform.machine() in {"aarch64", "arm64"}:',
+              '        arch = "x86_64" if instance_id.lower() in USE_X86 else "arm64"',
+              '    else:',
+              '        arch = "x86_64"',
+              "",
+              "    return TestSpec(",
+          ])
           if needle not in source:
               raise SystemExit("Could not find the expected architecture assignment in upstream test_spec.py")
 
