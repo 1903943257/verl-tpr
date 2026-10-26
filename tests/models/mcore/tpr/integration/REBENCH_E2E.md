@@ -35,9 +35,13 @@ image `swerebench/sweb.eval.x86_64.aspp_1776_pelita-875:latest` only covers
 its corresponding instance; do not assume every candidate image is installed.
 The image must already contain the correct `/testbed` checkout.
 
-For a controlled single-instance run, write a normalized Parquet containing
-that instance to a separate path and set `TRAIN_FILE` explicitly. Do not
-repeat identical dataset rows to inflate the number of independent tasks.
+For a controlled run, `REBENCH_INSTANCE_IDS` selects exact instance IDs
+from the normalized `TRAIN_FILE` and writes a separate, immutable Parquet to
+the run directory. For example, use
+`REBENCH_INSTANCE_IDS=aspp__pelita-875` with **DP1**, or provide two
+comma-separated instance IDs with the default DP2 configuration. The ID
+must match `task.metadata.instance_id` exactly. Do not repeat identical
+dataset rows to inflate the number of independent tasks.
 
 ## 2. Check the new environment before launching Ray
 
