@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# Resolve this script while invoked from the TPR checkout, before any cd to ROOT.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # SWE-reBench full E2E: UniAgent Claude Code -> vLLM -> TQ -> GRPO/PPO -> Actor update.
 # Forked from run_uniagent_cc_qwen17_swe_tpr_ppo_cp2.sh.
 # A/B runs use the same data and settings; TPR_ENABLED alone selects the actor path.
@@ -140,7 +142,7 @@ fi
 # Uni-Agent upstream implements per-trajectory materialization, NOT a hard
 # Session token stop. Install Bridge's strict, opt-in patch before Ray starts.
 if [[ "${SESSION_HARD_CAP}" == "True" || "${SESSION_HARD_CAP}" == "true" || "${SESSION_HARD_CAP}" == "1" ]]; then
-    BRIDGE_ROOT="${BRIDGE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)}"
+    BRIDGE_ROOT="${BRIDGE_ROOT:-$(cd "${SCRIPT_DIR}/../../../../.." && pwd)}"
     SESSION_PATCHER="${UNIAGENT_SESSION_PATCHER:-${BRIDGE_ROOT}/patches/apply_uniagent_session_hardcap.py}"
     if [[ ! -f "${SESSION_PATCHER}" ]]; then
         echo "ERROR: session-cap patcher not found: ${SESSION_PATCHER}; set UNIAGENT_SESSION_PATCHER" >&2
@@ -267,7 +269,7 @@ fi
 echo "============================================================"
 echo "Uni-Agent TRAIN/TQ E2E"
 echo "============================================================"
-SOURCE_CHECKOUT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../../.." && pwd)"
+SOURCE_CHECKOUT="$(cd "${SCRIPT_DIR}/../../../../.." && pwd)"
 echo "RUNNER_CHECKOUT   = ${SOURCE_CHECKOUT}"
 echo "RUNTIME_VERL      = ${ROOT}/verl (actual trainer Python package)"
 echo "MODEL_PATH        = ${MODEL_PATH}"
