@@ -2,9 +2,52 @@
 
 > **2026-10-26 新环境修订**：本指南以正在运行的 `uniagent:qwen36` 容器为起点。镜像根目录已有 `/Megatron-LM`、`/Megatron-Bridge`、`/MindSpeed`、`/verl`、`/uni-agent`、`/vllm-ascend`。不要无目的地重复克隆这些依赖。
 >
-> 当前文档是**部署流程和待验收清单**，不是新机 E2E PASS 报告。此阶段仅处理单节点路径；现有 E2E 脚本中 `NNODES=1`，四机 16 卡（三机推理、一机训练）另行开发和验收。
+> 当前文档是**部署流程和待验收清单**，不是新机 E2E PASS 报告。此阶段仅处理单节点路径；现有 E2E 脚本中 `NNODES=1`。用户新提供的硬件是**四机、每机约 8 张卡/每卡 32 GiB（需以 `npu-smi info` 核对）**，故不能沿用原先四机 16 卡的资源假设；三机推理、一机训练仍需单独开发和验收。
 >
 > 本文件保留旧文件名 `GETTING_STARTED_UNIAGENT_NEW.md` 以兼容仓库已有引用，但**实际镜像是 `uniagent:qwen36`**。
+
+## 0. 优先做单机环境检查（当前 UniAgent c3edb1a）
+
+在 Docker 内运行；只做路径、版本、模块定位、镜像服务、模型/数据存在性检查，**不启动 Ray、不加载 Qwen、不申请 NPU 显存**：
+
+```bash
+cd /workspace/verl-tpr-e2e
+git status --short --branch
+git pull --ff-only
+bash scripts/tpr/check_single_node_env.sh \
+  2>&1 | tee /workspace/tpr_single_node_env.log
+```
+
+脚本对缺失项会输出 `MISSING` 或 `FAIL`；它是盘点脚本，最后打印 `Inventory complete` **不是全部通过**。特别核对 `IMPORT PASS verl` 是否指向 `/workspace/verl-tpr-e2e`、`IMPORT PASS uni_agent` 是否指向 `/workspace/uni-agent`；`npu-smi info` 是否有 8 张 NPU、每张显存是否约 32 GiB。镜像中原有 `/verl` 和 `/uni-agent` 不得覆盖运行时路径。
+
+然后单独检查 1 卡上的 NPU Runtime（这一步会创建一个微小张量，实际占用极少显存；不要同时启动任何大型模型）：
+
+```bash
+cd /workspace/verl-tpr-e2e
+ASCEND_RT_VISIBLE_DEVICES=0 PYTHONPATH="/workspace/verl-tpr-e2e:/workspace/uni-agent:${PYTHONPATH:-}" python - <<'PY'
+import torch
+import torch_npu
+print("torch", torch.__version__, "torch_npu", torch_npu.__version__)
+print("visible NPU", torch.npu.device_count(), "available", torch.npu.is_available())
+assert torch.npu.is_available()
+x = torch.ones(16, 16, device="npu:0", requires_grad=True)
+(x * x).sum().backward()
+torch.npu.synchronize()
+print("NPU_TINY_FWD_BWD_PASS", x.grad.shape, x.grad[0, 0].item())
+PY
+```
+
+**Session Hard Cap 是另一项必须单独验证的环境依赖**。当前 `/workspace/uni-agent` 是 `c3edb1a`，可能与历史补丁的代码锚点不同。用 `--check` 先验证，不要立即修改代码：
+
+```bash
+python /workspace/verl-tpr-e2e/patches/apply_uniagent_session_hardcap.py \
+  --check /workspace/uni-agent \
+  > /workspace/tpr_hardcap_check.log 2>&1
+echo "hardcap_check_exit=$?"
+tail -n 20 /workspace/tpr_hardcap_check.log
+```
+
+只有基础环境和 hard-cap 检查通过，且模型、数据和任务 sandbox 镜像都齐全，才运行本文件第 6、7 节的单任务 inference/Reward 以及 Full/TPR PPO。注意 `PRECHECK_ONLY=True` 的 E2E launcher 本身仍要求模型和 Parquet 已存在，所以不应拿它替代本节的空环境盘点。
 
 ## 1. 文件系统：宿主机映射与镜像自带路径
 
