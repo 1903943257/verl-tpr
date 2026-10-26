@@ -16,7 +16,7 @@ jobs:
 
     steps:
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -37,8 +37,16 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          python -m pip install -e . --no-deps
-          python -m pip install docker datasets packaging python-dotenv requests tqdm unidiff
+          # Install the builder with its declared runtime dependencies. The package
+          # imports collection modules from swebench/__init__.py, so --no-deps
+          # leaves required imports such as bs4 and ghapi unavailable.
+          python -m pip install -e . packaging
+          python - <<'PY'
+          from swebench.harness.docker_build import build_instance_images
+          from swebench.harness.test_spec.test_spec import make_test_spec
+          from swebench.harness.utils import load_swebench_dataset
+          print("SWE-ReBench image-builder imports OK")
+          PY
 
       - name: Enable native ARM64 image generation
         working-directory: builder
