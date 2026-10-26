@@ -100,6 +100,43 @@ cd "${ROOT}"
 if [ -f /workspace/.venvs/uniagent-cc/bin/activate ]; then
     source /workspace/.venvs/uniagent-cc/bin/activate
 fi
+# Optional exact instance selection from the already-normalized ReBench Parquet.
+# For TP2/CP2/DP2 choose two IDs; for one task use DP1 (4x CP2 or 8x CP4).
+if [[ -n "${REBENCH_INSTANCE_IDS:-}" ]]; then
+    SOURCE_TRAIN_FILE="${TRAIN_FILE}"
+    mkdir -p "${RUN_ROOT}"
+    TRAIN_FILE="${RUN_ROOT}/selected_rebench_tasks.parquet"
+    SOURCE_TRAIN_FILE="${SOURCE_TRAIN_FILE}" TRAIN_FILE="${TRAIN_FILE}" \
+      REBENCH_INSTANCE_IDS="${REBENCH_INSTANCE_IDS}" python - <<'PY_SELECT'
+import json, os
+from pathlib import Path
+import pandas as pd
+src = Path(os.environ["SOURCE_TRAIN_FILE"])
+dest = Path(os.environ["TRAIN_FILE"])
+ids = [s.strip() for s in os.environ["REBENCH_INSTANCE_IDS"].split(",") if s.strip()]
+if not ids or len(set(ids)) != len(ids):
+    raise SystemExit("ERROR: REBENCH_INSTANCE_IDS must contain distinct nonempty IDs")
+if dest.exists():
+    raise SystemExit(f"ERROR: selected dataset already exists: {dest}; choose a new RUN_NAME")
+df = pd.read_parquet(src)
+def instance_id(extra):
+    if isinstance(extra, str):
+        extra = json.loads(extra)
+    return (((extra or {}).get("tools_kwargs") or {}).get("task") or {}).get(
+        "metadata", {}
+    ).get("instance_id")
+instances = df["extra_info"].map(instance_id)
+selected = []
+for instance in ids:
+    hit = df.loc[instances == instance]
+    if len(hit) != 1:
+        raise SystemExit(f"ERROR: instance {instance!r} has {len(hit)} matches in {src} (expected 1)")
+    selected.append(hit)
+pd.concat(selected, ignore_index=True).to_parquet(dest, index=False)
+print(f"REBENCH_SELECTED ids={ids} file={dest}")
+PY_SELECT
+    if [[ "${TEST_FILE}" == "${SOURCE_TRAIN_FILE}" ]]; then TEST_FILE="${TRAIN_FILE}"; fi
+fi
 # Uni-Agent upstream implements per-trajectory materialization, NOT a hard
 # Session token stop. Install Bridge's strict, opt-in patch before Ray starts.
 if [[ "${SESSION_HARD_CAP}" == "True" || "${SESSION_HARD_CAP}" == "true" || "${SESSION_HARD_CAP}" == "1" ]]; then
