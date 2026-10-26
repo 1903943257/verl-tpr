@@ -1,5 +1,8 @@
 # SWE-reBench PPO E2E (Ascend / UniAgent)
 
+> **New host?** Follow [uniagent:new from-zero bootstrap](../../../../../docs/tpr/GETTING_STARTED_UNIAGENT_NEW.md) first. The older launcher assumes model, dataset, Docker task config, a compatible UniAgent checkout and TPR-enabled runtime VERL already exist. The launcher is currently single-node (`NNODES=1`), not a 3-inference/1-training multinode setup.
+
+
 This branch is based on **latest `main`**, not on the old SWE-reBench
 screening branch. It carries the existing short-fix screener and adds an
 online Full/TPR launcher and real-prefix audit. **No NPU E2E result has been
