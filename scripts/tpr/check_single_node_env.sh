@@ -6,7 +6,7 @@ set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 TPR_ROOT="$(cd -- "$HERE/../.." && pwd -P)"
 UNIAGENT_ROOT="${UNIAGENT_ROOT:-/workspace/uni-agent}"
-MODEL_PATH="${MODEL_PATH:-/workspace/hf_models/Qwen3-4B-128K}"
+MODEL_PATH="${MODEL_PATH:-/workspace/hf_models/Qwen3-4B}"
 TRAIN_FILE="${TRAIN_FILE:-/workspace/tpr_experiments/shortfix/shortfix_candidates_task.parquet}"
 TASK_CONFIG="${TASK_CONFIG:-$TPR_ROOT/examples/tpr/task_config_swe_rebench_docker.yaml}"
 VLLM_ASCEND_SRC=""
@@ -37,6 +37,10 @@ if command -v npu-smi >/dev/null 2>&1; then
   npu-smi info || echo "NPU-SMI ERROR"
 else
   echo "NPU-SMI MISSING: check Ascend runtime or device mounts"
+fi
+echo "--- Existing Qwen3 model directories (no model load) ---"
+if [[ -d /workspace/hf_models ]]; then
+  find /workspace/hf_models -maxdepth 2 -name config.json -print
 fi
 echo "--- Files (only existence, not valid contents) ---"
 for f in "$MODEL_PATH/config.json" "$TRAIN_FILE" "$TASK_CONFIG" "$TPR_ROOT/patches/apply_uniagent_session_hardcap.py"; do
