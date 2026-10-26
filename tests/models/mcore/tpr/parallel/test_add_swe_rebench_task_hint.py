@@ -6,7 +6,7 @@ import copy
 import pandas as pd
 import pytest
 
-from add_swe_rebench_task_hint import HINTS, append_to_prompt, build_variant
+from .add_swe_rebench_task_hint import HINTS, append_to_prompt, build_variant
 
 
 def _row(instance_id: str, prompt_text: str = "Original issue") -> dict:
