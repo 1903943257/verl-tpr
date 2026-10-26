@@ -120,6 +120,7 @@ def main(argv=None) -> int:
     parser.add_argument("--output", type=Path, required=True, help="New output path; source is never overwritten")
     parser.add_argument("--instance-id", default=TARGET_INSTANCE)
     parser.add_argument("--level", choices=tuple(HINTS), default="h2")
+    parser.add_argument("--only-target", action="store_true", help="Write only the selected task row (recommended for N=1 screening)")
     parser.add_argument("--overwrite", action="store_true", help="Allow replacing the output file only")
     args = parser.parse_args(argv)
 
@@ -134,6 +135,8 @@ def main(argv=None) -> int:
 
     df = pd.read_parquet(source)
     out = build_variant(df, args.instance_id, args.level)
+    if args.only_target:
+        out = out.loc[out.apply(get_instance_id, axis=1) == args.instance_id].reset_index(drop=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
     out.to_parquet(destination, index=False)
     print(json.dumps({
@@ -143,6 +146,7 @@ def main(argv=None) -> int:
         "instance_id": args.instance_id,
         "hint_level": args.level,
         "hinted_rows": 1,
+        "only_target_row": args.only_target,
         "original_prompt_unchanged_for_other_rows": True,
         "source_overwritten": False,
     }, ensure_ascii=False, indent=2))
