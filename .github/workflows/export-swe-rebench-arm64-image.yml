@@ -37,13 +37,36 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          # Install the package without resolving every optional/collection dependency.
-          # ytsaurus-yson is declared upstream but unavailable from the runner's index;
-          # it is not needed to build this task image.
+          # Install only dependencies needed by the image builder. The full
+          # upstream dependency set includes ytsaurus-yson, which is unavailable
+          # from the runner's package index and is unrelated to Docker image builds.
           python -m pip install -e . --no-deps
           python -m pip install \
-            beautifulsoup4 chardet datasets docker fastcore ghapi GitPython modal \
-            packaging pydantic python-dotenv requests rich tenacity tqdm unidiff
+            beautifulsoup4 datasets docker fastcore ghapi packaging python-dotenv \
+            requests tqdm unidiff
+          # Importing swebench eagerly imports its optional Tracto evaluation backend,
+          # which requires YTsaurus. The image-building API does not use that backend.
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("swebench/__init__.py")
+          source = path.read_text()
+          optional_import = (
+              "from swebench.harness.run_evaluation import (\n"
+              "    main as run_evaluation,\n"
+              ")\n"
+          )
+          if optional_import not in source:
+              raise SystemExit("Could not find the expected optional run_evaluation import")
+          source = source.replace(
+              optional_import,
+              "# run_evaluation is omitted in this image-builder-only environment; "
+              "it eagerly imports the optional Tracto/YTsaurus backend.\n",
+              1,
+          )
+          path.write_text(source)
+          print("Skipped optional Tracto/YTsaurus import for image-builder run.")
+          PY
           python - <<'PY'
           from swebench.harness.docker_build import build_instance_images
           from swebench.harness.test_spec.test_spec import make_test_spec
