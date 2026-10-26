@@ -44,13 +44,13 @@ jobs:
           python -m pip install \
             beautifulsoup4 datasets docker fastcore ghapi packaging python-dotenv \
             requests tqdm unidiff
-          # Importing swebench eagerly imports its optional Tracto evaluation backend,
-          # which requires YTsaurus. The image-building API does not use that backend.
+          # Avoid eager imports of optional evaluation backends (Modal/Tracto).
+          # This job only needs the Docker image-building API, not evaluation runners.
           python - <<'PY'
           from pathlib import Path
 
-          path = Path("swebench/__init__.py")
-          source = path.read_text()
+          top_level = Path("swebench/__init__.py")
+          source = top_level.read_text()
           optional_import = (
               "from swebench.harness.run_evaluation import (\n"
               "    main as run_evaluation,\n"
@@ -58,14 +58,25 @@ jobs:
           )
           if optional_import not in source:
               raise SystemExit("Could not find the expected optional run_evaluation import")
-          source = source.replace(
+          top_level.write_text(source.replace(
               optional_import,
-              "# run_evaluation is omitted in this image-builder-only environment; "
-              "it eagerly imports the optional Tracto/YTsaurus backend.\n",
+              "# run_evaluation is omitted in this image-builder-only environment.\n",
               1,
-          )
-          path.write_text(source)
-          print("Skipped optional Tracto/YTsaurus import for image-builder run.")
+          ))
+
+          harness_init = Path("swebench/harness/__init__.py")
+          source = harness_init.read_text()
+          for line in (
+              "    run_evaluation,\n",
+              "    modal_eval,\n",
+              '    "run_evaluation",\n',
+              '    "modal_eval",\n',
+          ):
+              if line not in source:
+                  raise SystemExit(f"Could not find expected optional backend entry: {line!r}")
+              source = source.replace(line, "", 1)
+          harness_init.write_text(source)
+          print("Skipped optional Modal/Tracto imports for image-builder run.")
           PY
           python - <<'PY'
           from swebench.harness.docker_build import build_instance_images
