@@ -1,6 +1,6 @@
 # SWE-reBench PPO E2E (Ascend / UniAgent)
 
-> **New host?** Follow [uniagent:new from-zero bootstrap](../../../../../docs/tpr/GETTING_STARTED_UNIAGENT_NEW.md) first. The older launcher assumes model, dataset, Docker task config, a compatible UniAgent checkout and TPR-enabled runtime VERL already exist. The launcher is currently single-node (`NNODES=1`), not a 3-inference/1-training multinode setup.
+> **New host?** Follow [uniagent:qwen36 from-zero bootstrap](../../../../../docs/tpr/GETTING_STARTED_UNIAGENT_NEW.md) first. The older launcher assumes model, dataset, Docker task config, a compatible UniAgent checkout and TPR-enabled runtime VERL already exist. The launcher is currently single-node (`NNODES=1`), not a 3-inference/1-training multinode setup.
 
 
 This branch is based on **latest `main`**, not on the old SWE-reBench
