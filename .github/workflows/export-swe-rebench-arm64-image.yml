@@ -1,0 +1,166 @@
+name: Export SWE-ReBench ARM64 Docker image
+
+run-name: Export pelita-875 ARM64 sandbox image
+
+on:
+  workflow_dispatch:
+    inputs:
+      preferred_image:
+        description: >-
+          Preferred ARM64 image tag. The workflow also tries the arm64 tag
+          and the existing x86_64 tag as a multi-platform fallback.
+        required: true
+        type: string
+        default: swerebench/sweb.eval.aarch64.aspp_1776_pelita-875:latest
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    name: Find, verify, and export ARM64 image
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Validate image reference
+        id: image
+        shell: bash
+        env:
+          IMAGE_INPUT: ${{ inputs.preferred_image }}
+        run: |
+          set -euo pipefail
+
+          image="${IMAGE_INPUT}"
+          if [[ "$image" != *:* ]]; then
+            image="${image}:latest"
+          fi
+
+          # Only permit this public task image in the SWE-ReBench namespace.
+          if [[ ! "$image" =~ ^swerebench/sweb\.eval\.(aarch64|arm64|x86_64)\.aspp_1776_pelita-875:[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Expected swerebench/sweb.eval.{aarch64|arm64|x86_64}.aspp_1776_pelita-875:<tag>"
+            exit 1
+          fi
+
+          echo "preferred=$image" >> "$GITHUB_OUTPUT"
+
+      - name: Pull the first available ARM64 candidate
+        id: pull
+        shell: bash
+        env:
+          PREFERRED_IMAGE: ${{ steps.image.outputs.preferred }}
+        run: |
+          set -euo pipefail
+
+          target="uniagent-swe-pelita-875:latest"
+          candidates=(
+            "$PREFERRED_IMAGE"
+            "swerebench/sweb.eval.arm64.aspp_1776_pelita-875:latest"
+            "swerebench/sweb.eval.x86_64.aspp_1776_pelita-875:latest"
+          )
+
+          declare -A seen=()
+          selected=""
+
+          for candidate in "${candidates[@]}"; do
+            if [[ -n "${seen[$candidate]:-}" ]]; then
+              continue
+            fi
+            seen["$candidate"]=1
+
+            echo "::group::Trying $candidate as linux/arm64"
+            if docker pull --platform=linux/arm64 "$candidate"; then
+              actual_platform="$(docker image inspect "$candidate" --format '{{.Os}}/{{.Architecture}}')"
+              image_id="$(docker image inspect "$candidate" --format '{{.Id}}')"
+              echo "Pulled image ID: $image_id"
+              echo "Reported platform: $actual_platform"
+
+              if [[ "$actual_platform" == "linux/arm64" ]]; then
+                selected="$candidate"
+                echo "::endgroup::"
+                break
+              fi
+
+              echo "::warning::Ignoring $candidate because it resolved to $actual_platform, not linux/arm64."
+            else
+              echo "::warning::Could not pull $candidate for linux/arm64; trying the next candidate."
+            fi
+            echo "::endgroup::"
+          done
+
+          if [[ -z "$selected" ]]; then
+            {
+              echo "## No downloadable ARM64 image was found"
+              echo
+              echo "Tried the aarch64-tagged image, arm64-tagged image, and the existing x86_64 tag with --platform=linux/arm64."
+              echo "None provided an image whose inspected platform is linux/arm64."
+              echo "No artifact was created. A real ARM64 task image must be built/published before export."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::No candidate image is available for linux/arm64. See the job log."
+            exit 1
+          fi
+
+          docker tag "$selected" "$target"
+          final_platform="$(docker image inspect "$target" --format '{{.Os}}/{{.Architecture}}')"
+          final_id="$(docker image inspect "$target" --format '{{.Id}}')"
+          [[ "$final_platform" == "linux/arm64" ]]
+
+          echo "source=$selected" >> "$GITHUB_OUTPUT"
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          echo "image_id=$final_id" >> "$GITHUB_OUTPUT"
+          echo "platform=$final_platform" >> "$GITHUB_OUTPUT"
+
+      - name: Export compressed ARM64 archive and checksum
+        env:
+          SOURCE_IMAGE: ${{ steps.pull.outputs.source }}
+          TARGET_IMAGE: ${{ steps.pull.outputs.target }}
+          IMAGE_ID: ${{ steps.pull.outputs.image_id }}
+          PLATFORM: ${{ steps.pull.outputs.platform }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          # Export only ARM64. The loaded tag matches the image name UniAgent expects.
+          docker image save --platform=linux/arm64 "$TARGET_IMAGE" | gzip -1 > dist/image.tar.gz
+          printf '%s\n' "$TARGET_IMAGE" > dist/IMAGE.txt
+          printf '%s\n' "$SOURCE_IMAGE" > dist/SOURCE_IMAGE.txt
+          printf '%s\n' "$PLATFORM" > dist/PLATFORM.txt
+          printf '%s\n' "$IMAGE_ID" > dist/IMAGE_ID.txt
+          (cd dist && sha256sum image.tar.gz > image.tar.gz.sha256)
+
+          echo "Exported ARM64 archive:"
+          ls -lh dist/
+          cat dist/PLATFORM.txt
+          cat dist/IMAGE_ID.txt
+
+      - name: Upload ARM64 archive as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: swe-rebench-pelita-875-linux-arm64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Print download and import instructions
+        env:
+          SOURCE_IMAGE: ${{ steps.pull.outputs.source }}
+          TARGET_IMAGE: ${{ steps.pull.outputs.target }}
+          IMAGE_ID: ${{ steps.pull.outputs.image_id }}
+        shell: bash
+        run: |
+          {
+            echo "## SWE-ReBench ARM64 image export complete"
+            echo
+            echo "- Source image: $SOURCE_IMAGE"
+            echo "- Imported tag: $TARGET_IMAGE"
+            echo "- Platform: linux/arm64"
+            echo "- Image ID: $IMAGE_ID"
+            echo "- Artifact: swe-rebench-pelita-875-linux-arm64"
+            echo "- Retention: 7 days"
+            echo
+            echo "Download and extract the artifact, then transfer image.tar.gz and image.tar.gz.sha256 to the ARM64 host."
+            echo
+            echo "Import command: sha256sum -c image.tar.gz.sha256 && gzip -dc image.tar.gz | docker load"
+          } >> "$GITHUB_STEP_SUMMARY"
