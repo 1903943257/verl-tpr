@@ -1,6 +1,6 @@
 # TPR开发文档
 
-**新服务器从零开始**：[uniagent:new Docker → UniAgent SWE-reBench Full/TPR E2E](GETTING_STARTED_UNIAGENT_NEW.md)（包含宿主机 Git、Docker 创建、NPU 镜像验证、模型/数据、Runtime VERL、Reward、单机 E2E；多机尚未验收）
+**新服务器从零开始**：[uniagent:qwen36 Docker → UniAgent SWE-reBench Full/TPR E2E](GETTING_STARTED_UNIAGENT_NEW.md)（包含宿主机 Git、Docker 创建、NPU 镜像验证、模型/数据、Runtime VERL、Reward、单机 E2E；多机尚未验收）
 
 
 **主文档**：[TPR开发文档](TPR开发文档.md)  
