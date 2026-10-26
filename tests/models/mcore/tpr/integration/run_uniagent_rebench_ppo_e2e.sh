@@ -217,6 +217,11 @@ if (( TRAIN_DP > 1 )); then
     echo "NOTE: DP${TRAIN_DP} will distribute actor mini-batches; verify per-DP sibling grouping and reward diversity." >&2
 fi
 if [[ "${CAPTURE_ACTOR}" == "True" || "${CAPTURE_ACTOR}" == "true" || "${CAPTURE_ACTOR}" == "1" ]]; then
+    WORKER_FILE="${ROOT}/verl/verl/workers/engine_workers.py"
+    if [[ ! -f "${WORKER_FILE}" ]] || ! grep -Fq 'TPR P0 real actor-update capture' "${WORKER_FILE}"; then
+        echo "ERROR: CAPTURE_ACTOR=True requires patched actor-update hook in ${WORKER_FILE}" >&2
+        exit 2
+    fi
     if find "${TPR_CAPTURE_ACTOR_MINIBATCH_DIR}" -maxdepth 1 -name 'actor_update_*.pt' | grep -q .; then
         echo "ERROR: Actor capture directory already has .pt snapshots; use a new RUN_NAME" >&2
         exit 2
@@ -286,6 +291,13 @@ for m in [
     except Exception as e:
         print(m, "=> ERROR:", repr(e))
 PY
+# PRECHECK_ONLY validates the new container's model, dataset and task configuration
+# without killing its Ray runtime or allocating NPU resources.
+case "${PRECHECK_ONLY:-False}" in
+  True|true|1) echo "PRECHECK_ONLY PASS: no Ray/NPU jobs started"; exit 0 ;;
+  False|false|0) ;;
+  *) echo "ERROR: PRECHECK_ONLY must be True or False" >&2; exit 2 ;;
+esac
 # ============================================================
 # Clean stale local Ray
 # ============================================================
