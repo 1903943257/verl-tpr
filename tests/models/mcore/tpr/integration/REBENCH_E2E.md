@@ -43,6 +43,43 @@ comma-separated instance IDs with the default DP2 configuration. The ID
 must match `task.metadata.instance_id` exactly. Do not repeat identical
 dataset rows to inflate the number of independent tasks.
 
+## 1a. Controlled prompt-hint experiment for pelita-875
+
+Do not edit or regenerate the source dataset. Create a separate, one-row
+variant from the existing normalized Parquet; only the selected row's final
+user message is extended, while its task ID, reward metadata, and image stay
+unchanged:
+
+```bash
+cd /workspace/verl-tpr-e2e
+python -m pytest -q tests/models/mcore/tpr/parallel/test_add_swe_rebench_task_hint.py
+
+python tests/models/mcore/tpr/parallel/add_swe_rebench_task_hint.py \
+  --input /workspace/tpr_experiments/shortfix/shortfix_candidates_task.parquet \
+  --output /workspace/tpr_experiments/shortfix/pelita875_hint_h2.parquet \
+  --instance-id ASPP__pelita-875 \
+  --level h2 \
+  --only-target
+```
+
+The helper supports three levels: `h1` (file/function localization),
+`h2` (explicit diagnosis and regression-test guidance), and `h3`
+(answer-assisted/oracle-style code hint). Start with H2. Label H3 results as
+assisted; do not report them as unassisted SWE-agent success.
+
+For a one-task, one-rollout inference/Reward screen, use the generated file
+as the data path with the existing Uni-Agent inference entrypoint and
+`--n 1 --limit 1`. Keep the original model, task config, token cap and
+reward evaluator unchanged. Save logs/results to a new run directory so
+the baseline and hinted outputs cannot overwrite each other.
+
+Before interpreting token counts, record both model-generated tokens and
+the full interaction/response tokens. Compare reward correctness, generation
+time, reward time and full session time. Only run N=8 after the hint produces
+a correct, complete trajectory and the task's runtime is acceptable. If
+testing the training launcher instead, set `TRAIN_FILE` to this one-row
+variant and use a topology with DP=1; do not duplicate the row to fill DP2.
+
 ## 2. Check the new environment before launching Ray
 
 Use the actual UniAgent/MBridge image, task config, model path, and supported
