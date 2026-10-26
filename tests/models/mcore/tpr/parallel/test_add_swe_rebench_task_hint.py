@@ -62,16 +62,40 @@ def test_prompt_hint_cannot_be_appended_twice():
         append_to_prompt(prompt, HINTS["h2"], "h2")
 
 
-def test_ndarray_prompt_from_parquet_is_supported():
+def test_zero_dimensional_ndarray_prompt_from_pandas_is_supported():
     original = pd.DataFrame([_row("ASPP__pelita-875")])
+    # Assigning a length-one ndarray through .at can be scalarized by pandas
+    # into a zero-dimensional ndarray containing the single message dict.
     original.at[0, "prompt"] = np.array(
         [{"role": "user", "content": "Original issue"}], dtype=object
     )
+    assert original.at[0, "prompt"].shape == ()
+
+    result = build_variant(original, "ASPP__pelita-875", "h2")
+
+    updated_prompt = result.iloc[0]["prompt"]
+    assert isinstance(updated_prompt, dict)
+    assert updated_prompt["role"] == "user"
+    assert "[TPR_TASK_HINT:H2]" in updated_prompt["content"]
+    assert updated_prompt["content"].startswith("Original issue")
+    assert isinstance(original.iloc[0]["prompt"], np.ndarray)
+    assert "TPR_TASK_HINT" not in original.iloc[0]["prompt"].item()["content"]
+
+
+def test_one_dimensional_ndarray_prompt_is_preserved_as_message_list():
+    original = pd.DataFrame([_row("ASPP__pelita-875")])
+    prompt_array = np.array(
+        [{"role": "user", "content": "Original issue"}], dtype=object
+    )
+    # Construct the object column without pandas scalarizing the ndarray.
+    original["prompt"] = pd.Series([prompt_array], dtype=object)
+    assert original.at[0, "prompt"].shape == (1,)
 
     result = build_variant(original, "ASPP__pelita-875", "h2")
 
     updated_prompt = result.iloc[0]["prompt"]
     assert isinstance(updated_prompt, list)
+    assert len(updated_prompt) == 1
     assert "[TPR_TASK_HINT:H2]" in updated_prompt[-1]["content"]
     assert updated_prompt[-1]["content"].startswith("Original issue")
     assert isinstance(original.iloc[0]["prompt"], np.ndarray)
