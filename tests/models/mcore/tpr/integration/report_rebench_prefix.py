@@ -18,9 +18,11 @@ from pathlib import Path
 import torch
 
 # Shared by the existing 20-step real actor capture replay code.
-from tests.models.mcore.tpr.parallel.offline_session_selection import session_rows
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "parallel"))
+from offline_session_selection import session_rows
 
-NAME = re.compile(r"actor_update_step(?P<step>\\d+)_rank0_capture(?P<ordinal>\\d+)_batch(?P<batch>\\d+)\\.pt$")
+NAME = re.compile(r"actor_update_step(?P<step>\d+)_rank0_capture(?P<ordinal>\d+)_batch(?P<batch>\d+)\.pt$")
 
 
 def common_prefix_length(sequences):
