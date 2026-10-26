@@ -1,6 +1,6 @@
 # SWE-reBench PPO E2E (Ascend / UniAgent)
 
-> **New host?** Follow [uniagent:qwen36 from-zero bootstrap](../../../../../docs/tpr/GETTING_STARTED_UNIAGENT_NEW.md) first. The older launcher assumes model, dataset, Docker task config, a compatible UniAgent checkout and TPR-enabled runtime VERL already exist. The launcher is currently single-node (`NNODES=1`), not a 3-inference/1-training multinode setup.
+> **Current Docker checkout:** See [the `/workspace/uni-agent` + `/workspace/verl-tpr-e2e` bootstrap guide](../../../../../docs/tpr/GETTING_STARTED_UNIAGENT_NEW.md). Git and Python run inside the container; the host mount is `/ssd_3/jyb/project/uniagent_linear -> /workspace`. The E2E runner explicitly uses the TPR fork as its VERL runtime. `bridge` is no longer needed; the optional Session Hard Cap patcher is in this branch. The launcher is still single-node (`NNODES=1`), not a 3-inference/1-training multi-node setup.
 
 
 This branch is based on **latest `main`**, not on the old SWE-reBench
@@ -89,30 +89,29 @@ Use the actual UniAgent/MBridge image, task config, model path, and supported
 sandbox backend. The default task config is:
 
 ```
-/workspace/uni-agent-cc/examples/claude_code_swe_task/task_config_claude_code_swe_rebench_docker.yaml
+/workspace/verl-tpr-e2e/examples/tpr/task_config_swe_rebench_docker.yaml
 ```
 
 Preflight (does not stop Ray, start a trainer, or allocate an NPU):
 
 ```bash
-cd /workspace/verl-tpr-main  # or your checkout of feat/tpr-rebench-e2e-20261026
+cd /workspace/verl-tpr-e2e
 PRECHECK_ONLY=True SESSION_HARD_CAP=False \
   bash tests/models/mcore/tpr/integration/run_uniagent_rebench_ppo_e2e.sh
 ```
 
 Preflight checks data schema, instance images, model config and dependencies.
-For actual runs, `SESSION_HARD_CAP=True` is the default and requires
-`patches/apply_uniagent_session_hardcap.py` from the prior UniAgent Bridge
-setup; set `BRIDGE_ROOT` or `UNIAGENT_SESSION_PATCHER` to its **real** location.
+For actual runs, `SESSION_HARD_CAP=True` is the default and invokes the vendored
+`/workspace/verl-tpr-e2e/patches/apply_uniagent_session_hardcap.py`.
+Run its `--check /workspace/uni-agent` first; on `PRECHECK_ONLY=True`, the launcher
+only checks the patch and will not modify UniAgent.
 Do not disable the cap just to bypass a missing patch during a 48K session.
 
-**Runtime checkout warning:** this launcher keeps the original UniAgent-CC
-setup, so `python -m verl.trainer.main_ppo` imports code from
-`/workspace/uni-agent-cc/verl`, not automatically from the checkout where
-you read the new script. Confirm that the runtime UniAgent VERL has the
-matching TPR production implementation before interpreting `TPR_ENABLED=True`
-as a valid E2E test. The launcher prints both checkout paths. Do not replace
-the UniAgent fork blindly with vanilla VERL if that breaks the V1/TQ trainer.
+**Runtime import gate:** `ROOT=/workspace/uni-agent` supplies the Agent code;
+`TPR_VERL_ROOT=/workspace/verl-tpr-e2e` supplies the **actual** VERL trainer.
+The launcher checks the `verl` and `uni_agent` import source paths before Ray.
+Do not interpret `TPR_ENABLED=True` as proof of a successful optimizer step;
+check the training logs and parity evidence.
 
 ## 3. Online Full vs TPR
 
@@ -150,7 +149,7 @@ timed E2E comparisons.
 
 For discovery, repeat short candidate runs with `CAPTURE_ACTOR=True`.
 This requires the previously patched actor-update capture hook in
-`/workspace/uni-agent-cc/verl/verl/workers/engine_workers.py` and writes
+`/workspace/verl-tpr-e2e/verl/workers/engine_workers.py` and writes
 captures under:
 
 ```
