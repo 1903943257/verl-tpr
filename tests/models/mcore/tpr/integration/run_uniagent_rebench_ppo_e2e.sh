@@ -277,7 +277,7 @@ if (( TRAIN_DP > 1 )); then
     echo "NOTE: DP${TRAIN_DP} will distribute actor mini-batches; verify per-DP sibling grouping and reward diversity." >&2
 fi
 if [[ "${CAPTURE_ACTOR}" == "True" || "${CAPTURE_ACTOR}" == "true" || "${CAPTURE_ACTOR}" == "1" ]]; then
-    WORKER_FILE="${ROOT}/verl/verl/workers/engine_workers.py"
+    WORKER_FILE="${TPR_VERL_ROOT}/verl/workers/engine_workers.py"
     if [[ ! -f "${WORKER_FILE}" ]] || ! grep -Fq 'TPR P0 real actor-update capture' "${WORKER_FILE}"; then
         echo "ERROR: CAPTURE_ACTOR=True requires patched actor-update hook in ${WORKER_FILE}" >&2
         exit 2
