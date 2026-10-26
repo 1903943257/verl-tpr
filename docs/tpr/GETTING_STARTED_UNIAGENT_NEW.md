@@ -49,6 +49,67 @@ tail -n 20 /workspace/tpr_hardcap_check.log
 
 只有基础环境和 hard-cap 检查通过，且模型、数据和任务 sandbox 镜像都齐全，才运行本文件第 6、7 节的单任务 inference/Reward 以及 Full/TPR PPO。注意 `PRECHECK_ONLY=True` 的 E2E launcher 本身仍要求模型和 Parquet 已存在，所以不应拿它替代本节的空环境盘点。
 
+## 已确认环境：2026-10-26，新机 8 × Ascend 910B4
+
+来自新 Docker 实际环境检查（非猜测）：
+
+- UniAgent：/workspace/uni-agent，commit c3edb1a；TPR：/workspace/verl-tpr-e2e，环境检查时为 953e9153。
+- 每台 8 × Ascend 910B4，每卡 HBM 32768 MB。npu-smi Health OK；16×16 NPU 张量前向/反向通过。
+- torch 2.9.0、torch-npu 2.9.0、Ray 2.55.0、vLLM 0.18.0+empty、vLLM-Ascend 0.17.0rc2.dev109、Megatron-Core 0.16.1。
+- 导入路径：VERL 是 /workspace/verl-tpr-e2e，UniAgent 是 /workspace/uni-agent（均通过）。mbridge 和 megatron 的顶层模块查找为 None，仍需检查 PYTHONPATH/旧版 MBridge。
+- 模型已下载：/workspace/hf_models/Qwen3-4B，**不是**原脚本默认 /workspace/hf_models/Qwen3-4B-128K。先读取 config.json 确认 max_position_embeddings、rope_scaling。
+- 旧脚本 MAX_PROMPT_LENGTH=16384、MAX_RESPONSE_LENGTH=32768，合计 49152；使用原生模型做短窗口 smoke 时，必须显式调整长度，例如 4096 + 8192 = 12288，并确认没有超出真实模型配置。旧 128K 性能实验不可直接与新原生模型对比。
+- Parquet /workspace/tpr_experiments/shortfix/shortfix_candidates_task.parquet 缺失；新机 Docker 当前未发现对应 SWE-reBench sandbox 镜像。
+- 旧 Session Hard Cap 安装器在 UniAgent c3edb1a 的 --check 失败：framework.select_first_chain_after_hardcap: expected one unmodified anchor, got 0。停止应用；先做版本适配与隔离测试，不得把 48K Session 截断声明为已正确。
+- PID 1578588 正占用 8 卡、每卡约 20.7 GiB 进程显存，用户说明是矩阵乘法测试程序。应先确认所有权并协调停止，再跑大模型；勿直接清理未知任务。
+
+### 新旧服务器数据迁移
+
+旧主机地址 80.48.5.51；新主机地址 10.74.98.35。新宿主机目录 /ssd_3/jyb/project/uniagent_linear，通过 bind mount 对应 Docker /workspace。
+
+先在**新宿主机**检查旧数据是否存在。旧目录依据历史日志推定，若失败需要检查旧机的真实 Docker mount：
+
+```bash
+OLD_HOST=80.48.5.51
+OLD_USER=root
+OLD_ROOT=/mnt/pipeline-data/j00972288/project/uniagent_linear
+NEW_ROOT=/ssd_3/jyb/project/uniagent_linear
+ssh -o ConnectTimeout=10 "$OLD_USER@$OLD_HOST" \
+  "ls -lh '$OLD_ROOT/tpr_experiments/shortfix/shortfix_candidates_task.parquet'"
+```
+
+确认路径后迁移数据（不迁整个 tpr_experiments）：
+
+```bash
+mkdir -p "$NEW_ROOT/tpr_experiments/shortfix"
+rsync -avP \
+  "$OLD_USER@$OLD_HOST:$OLD_ROOT/tpr_experiments/shortfix/shortfix_candidates_task.parquet" \
+  "$NEW_ROOT/tpr_experiments/shortfix/"
+```
+
+如果旧机有 pelita-875 sandbox 镜像，先确认旧 Docker daemon 的镜像名，之后在新宿主机执行：
+
+```bash
+ssh "$OLD_USER@$OLD_HOST" 'docker image ls | grep -E "swerebench|sweb"'
+# 仅在源镜像确实存在且新机磁盘足够时：
+set -o pipefail
+ssh "$OLD_USER@$OLD_HOST" \
+  'docker save swerebench/sweb.eval.x86_64.aspp_1776_pelita-875:latest' | docker load
+```
+
+**新机器已有的模型不要重复下载。** 在 Docker 里查真实配置：
+
+```bash
+python - <<'PY'
+import json
+c=json.load(open('/workspace/hf_models/Qwen3-4B/config.json'))
+print('max_position_embeddings:',c.get('max_position_embeddings'))
+print('rope_scaling:',c.get('rope_scaling'))
+PY
+```
+
+暂时以环境、数据、单任务 inference/Reward 验收优先；Session Hard Cap 和设备内存未解决前不要启动 8 卡 PPO E2E。
+
 ## 1. 文件系统：宿主机映射与镜像自带路径
 
 ```text
