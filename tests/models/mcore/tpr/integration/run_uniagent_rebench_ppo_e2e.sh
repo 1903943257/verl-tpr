@@ -8,13 +8,15 @@ TPR_CHECKOUT="$(cd -- "${SCRIPT_DIR}/../../../../.." && pwd -P)"
 # A/B runs use the same data and settings; TPR_ENABLED alone selects the actor path.
 # Full and TPR are independent online rollouts (not identical-trajectory replays).
 
-ROOT=${ROOT:-/workspace/uni-agent-cc}
+ROOT=${ROOT:-/workspace/uni-agent}
+# TPR checkout is the VERL runtime; UniAgent's upstream VERL submodule is not used.
+TPR_VERL_ROOT=${TPR_VERL_ROOT:-${TPR_CHECKOUT}}
 MODEL_PATH=${MODEL_PATH:-/workspace/hf_models/Qwen3-4B-128K}
 MODEL_NAME=${MODEL_NAME:-Qwen3-4B}
 # Use the normalized ReBench Parquet, NOT the legacy reward/env-layout input.
 TRAIN_FILE=${TRAIN_FILE:-/workspace/tpr_experiments/shortfix/shortfix_candidates_task.parquet}
 TEST_FILE=${TEST_FILE:-${TRAIN_FILE}}
-TASK_CONFIG=${TASK_CONFIG:-${ROOT}/examples/claude_code_swe_task/task_config_claude_code_swe_rebench_docker.yaml}
+TASK_CONFIG=${TASK_CONFIG:-${TPR_CHECKOUT}/examples/tpr/task_config_swe_rebench_docker.yaml}
 TPR_ENABLED=${TPR_ENABLED:-False}
 export TPR_TREE_POLICY=${TPR_TREE_POLICY:-qwen_turn}
 
@@ -99,7 +101,15 @@ TPR_CAPTURE_ACTOR_MINIBATCH_DIR=${TPR_CAPTURE_ACTOR_MINIBATCH_DIR:-${RUN_ROOT}/a
 # ============================================================
 # Environment
 # ============================================================
-cd "${ROOT}"
+[[ -f "${ROOT}/uni_agent/framework/entry.py" ]] || {
+    echo "ERROR: UniAgent checkout missing: ${ROOT}" >&2; exit 2;
+}
+[[ -f "${TPR_VERL_ROOT}/verl/workers/engine/megatron/tpr/adapter.py" ]] || {
+    echo "ERROR: TPR VERL runtime missing: ${TPR_VERL_ROOT}" >&2; exit 2;
+}
+# Python -m puts cwd first on sys.path; run from the TPR fork rather than
+# ROOT, otherwise ROOT/verl (upstream submodule) can silently shadow TPR.
+cd "${TPR_VERL_ROOT}"
 if [ -f /workspace/.venvs/uniagent-cc/bin/activate ]; then
     source /workspace/.venvs/uniagent-cc/bin/activate
 fi
@@ -141,20 +151,30 @@ PY_SELECT
     if [[ "${TEST_FILE}" == "${SOURCE_TRAIN_FILE}" ]]; then TEST_FILE="${TRAIN_FILE}"; fi
 fi
 # Uni-Agent upstream implements per-trajectory materialization, NOT a hard
-# Session token stop. Install Bridge's strict, opt-in patch before Ray starts.
+# session token stop. Optional installer is vendored in this E2E checkout.
 if [[ "${SESSION_HARD_CAP}" == "True" || "${SESSION_HARD_CAP}" == "true" || "${SESSION_HARD_CAP}" == "1" ]]; then
-    BRIDGE_ROOT="${BRIDGE_ROOT:-${TPR_CHECKOUT}}"
-    SESSION_PATCHER="${UNIAGENT_SESSION_PATCHER:-${BRIDGE_ROOT}/patches/apply_uniagent_session_hardcap.py}"
+    SESSION_PATCHER="${UNIAGENT_SESSION_PATCHER:-${TPR_CHECKOUT}/patches/apply_uniagent_session_hardcap.py}"
     if [[ ! -f "${SESSION_PATCHER}" ]]; then
         echo "ERROR: session-cap patcher not found: ${SESSION_PATCHER}; set UNIAGENT_SESSION_PATCHER" >&2
         exit 2
     fi
-    python "${SESSION_PATCHER}" "${ROOT}" || exit 2
+# During PRECHECK_ONLY don't mutate UniAgent; only validate patch compatibility.
+    if [[ "${PRECHECK_ONLY:-False}" == "True" || "${PRECHECK_ONLY:-False}" == "true" || "${PRECHECK_ONLY:-False}" == "1" ]]; then
+        python "${SESSION_PATCHER}" --check "${ROOT}" || exit 2
+    else
+        python "${SESSION_PATCHER}" "${ROOT}" || exit 2
+    fi
 fi
 # IMPORTANT:
 # 不加入 /workspace/Megatron-Bridge/src。
 # 本次明确走 vanilla mbridge。
-export PYTHONPATH="/workspace/vllm-ascend:${ROOT}/verl:${ROOT}:${PYTHONPATH:-}"
+VLLM_ASCEND_SRC=""
+if [[ -d /workspace/vllm-ascend ]]; then
+    VLLM_ASCEND_SRC=/workspace/vllm-ascend:
+elif [[ -d /vllm-ascend ]]; then
+    VLLM_ASCEND_SRC=/vllm-ascend:
+fi
+export PYTHONPATH="${TPR_VERL_ROOT}:${ROOT}:${VLLM_ASCEND_SRC}${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export VLLM_USE_V1=1
 export TASK_QUEUE_ENABLE=1
@@ -272,7 +292,8 @@ echo "Uni-Agent TRAIN/TQ E2E"
 echo "============================================================"
 SOURCE_CHECKOUT="${TPR_CHECKOUT}"
 echo "RUNNER_CHECKOUT   = ${SOURCE_CHECKOUT}"
-echo "RUNTIME_VERL      = ${ROOT}/verl (actual trainer Python package)"
+echo "UNIAGENT_ROOT     = ${ROOT}"
+echo "RUNTIME_VERL      = ${TPR_VERL_ROOT} (selected trainer Python package)"
 echo "MODEL_PATH        = ${MODEL_PATH}"
 echo "MODEL_NAME        = ${MODEL_NAME}"
 echo "TPR_ENABLED       = ${TPR_ENABLED}"
@@ -315,6 +336,22 @@ echo "TPR_TREE_POLICY   = ${TPR_TREE_POLICY}"
 echo "AGENT_LOG_DIR     = ${AGENT_LOG_DIR}"
 echo "ACTOR_CAPTURE_DIR = ${TPR_CAPTURE_ACTOR_MINIBATCH_DIR:-disabled}"
 echo "============================================================"
+# Fail closed if Python is importing an unrelated VERL checkout.
+TPR_VERL_ROOT="${TPR_VERL_ROOT}" ROOT="${ROOT}" python - <<'PY_TPR_IMPORT'
+import importlib.util
+import os
+from pathlib import Path
+for mod, expected in (("verl", "TPR_VERL_ROOT"), ("uni_agent", "ROOT")):
+    spec = importlib.util.find_spec(mod)
+    origin = getattr(spec, "origin", None)
+    if origin is None:
+        raise SystemExit(f"ERROR: {mod} is not importable as a regular package")
+    actual = Path(origin).resolve()
+    required = Path(os.environ[expected]).resolve()
+    if not actual.is_relative_to(required):
+        raise SystemExit(f"ERROR: {mod} resolved to {actual}, expected inside {required}")
+    print(f"IMPORT_SOURCE_OK {mod}={actual}")
+PY_TPR_IMPORT
 python - <<'PY'
 import importlib.util
 import sys
