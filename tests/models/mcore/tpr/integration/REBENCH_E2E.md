@@ -66,6 +66,14 @@ For actual runs, `SESSION_HARD_CAP=True` is the default and requires
 setup; set `BRIDGE_ROOT` or `UNIAGENT_SESSION_PATCHER` to its **real** location.
 Do not disable the cap just to bypass a missing patch during a 48K session.
 
+**Runtime checkout warning:** this launcher keeps the original UniAgent-CC
+setup, so `python -m verl.trainer.main_ppo` imports code from
+`/workspace/uni-agent-cc/verl`, not automatically from the checkout where
+you read the new script. Confirm that the runtime UniAgent VERL has the
+matching TPR production implementation before interpreting `TPR_ENABLED=True`
+as a valid E2E test. The launcher prints both checkout paths. Do not replace
+the UniAgent fork blindly with vanilla VERL if that breaks the V1/TQ trainer.
+
 ## 3. Online Full vs TPR
 
 The default parallelism is **TP=2, CP=2, DP=2 on eight NPUs**. Thus a normal
