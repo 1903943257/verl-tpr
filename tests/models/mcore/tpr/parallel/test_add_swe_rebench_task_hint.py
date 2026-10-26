@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -59,3 +60,19 @@ def test_prompt_hint_cannot_be_appended_twice():
     prompt = [{"role": "user", "content": "Issue\n\n[TPR_TASK_HINT:H2]\nexisting"}]
     with pytest.raises(ValueError, match="already contains"):
         append_to_prompt(prompt, HINTS["h2"], "h2")
+
+
+def test_ndarray_prompt_from_parquet_is_supported():
+    original = pd.DataFrame([_row("ASPP__pelita-875")])
+    original.at[0, "prompt"] = np.array(
+        [{"role": "user", "content": "Original issue"}], dtype=object
+    )
+
+    result = build_variant(original, "ASPP__pelita-875", "h2")
+
+    updated_prompt = result.iloc[0]["prompt"]
+    assert isinstance(updated_prompt, list)
+    assert "[TPR_TASK_HINT:H2]" in updated_prompt[-1]["content"]
+    assert updated_prompt[-1]["content"].startswith("Original issue")
+    assert isinstance(original.iloc[0]["prompt"], np.ndarray)
+    assert "TPR_TASK_HINT" not in original.iloc[0]["prompt"][0]["content"]
