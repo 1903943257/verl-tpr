@@ -142,9 +142,10 @@ The script verifies the embedded image.tar.gz SHA256, streams it to docker load,
 Extract the outer bundle under /workspace so this directory is /workspace/tpr_migration_bundle_20261026. Then install the primary task files and model:
     mkdir -p /workspace/tpr_experiments/shortfix /workspace/hf_models
     cp -an data/shortfix/. /workspace/tpr_experiments/shortfix/
-    cp -an models/Qwen3-4B/. /workspace/hf_models/Qwen3-4B/
+    # Only if the target model directory does not already exist; same filesystem required.
+    cp -al models/Qwen3-4B /workspace/hf_models/Qwen3-4B
 
-If the target model already exists, compare hashes before replacing anything.
+If /workspace/hf_models/Qwen3-4B already exists, do not run the cp -al line; compare hashes first. The model bundle and destination must be on the same filesystem for hard links.
 To create the 128K YaRN model directory while sharing identical weight inodes:
     bash tools/materialize_qwen3_4b_128k.sh
 This refuses to overwrite an existing target and requires base and target on the same filesystem.
