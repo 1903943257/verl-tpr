@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import difflib
 import json
+import re
 import logging
 import subprocess
 import sys
@@ -53,6 +55,59 @@ class DockerSandbox:
         return await asyncio.to_thread(run)
 
 
+def apply_oracle_pelita_fix(container, output_dir):
+    """Inject the known one-line solution into a fresh Pelita-875 sandbox.
+
+    This is an oracle workspace patch, NOT an Agent rollout or a benchmark
+    trajectory. Derive the patch from the actual container file so mismatches
+    fail before scoring rather than silently changing unrelated functions.
+    """
+    with tempfile.TemporaryDirectory(prefix="pelita-oracle-") as tempdir:
+        source = Path(tempdir) / "utils.py"
+        cli(["docker", "cp", f"{container}:/testbed/pelita/utils.py", str(source)])
+        original = source.read_text()
+    function_match = re.search(
+        r"(?ms)^def run_background_game\\(.*?(?=^def |\\Z)", original
+    )
+    if not function_match:
+        raise RuntimeError("Cannot find run_background_game() in sandbox source")
+    body = function_match.group(0)
+    incorrect = "parse_layout(layout, food=food, bots=bots)"
+    corrected = "parse_layout(layout)"
+    if body.count(incorrect) != 1:
+        raise RuntimeError(
+            "Expected exactly one incorrect parse_layout call inside "
+            "run_background_game(), found "
+            f"{body.count(incorrect)}; source was not modified"
+        )
+    replacement = body.replace(incorrect, corrected, 1)
+    fixed = original[:function_match.start()] + replacement + original[function_match.end():]
+    patch_text = "diff --git a/pelita/utils.py b/pelita/utils.py\\n" + "".join(
+        difflib.unified_diff(
+            original.splitlines(keepends=True),
+            fixed.splitlines(keepends=True),
+            fromfile="a/pelita/utils.py",
+            tofile="b/pelita/utils.py",
+        )
+    )
+    patch_file = output_dir / "oracle_pelita875_solution.patch"
+    patch_file.write_text(patch_text)
+    cli(["docker", "cp", str(patch_file), f"{container}:/tmp/oracle_pelita875_solution.patch"])
+    cli([
+        "docker", "exec", "-w", "/testbed", container,
+        "git", "apply", "--check", "/tmp/oracle_pelita875_solution.patch",
+    ])
+    cli([
+        "docker", "exec", "-w", "/testbed", container,
+        "git", "apply", "/tmp/oracle_pelita875_solution.patch",
+    ])
+    diff = cli(["docker", "exec", "-w", "/testbed", container, "git", "diff", "--", "pelita/utils.py"])
+    (output_dir / "oracle_workspace_diff.patch").write_text(diff.stdout)
+    if incorrect in diff.stdout and corrected in diff.stdout:
+        return patch_file
+    raise RuntimeError("Oracle patch applied but worktree diff did not confirm replacement")
+
+
 async def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-path", required=True)
@@ -60,6 +115,8 @@ async def main():
     parser.add_argument("--row", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=1200.0)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--apply-pelita-fix", action="store_true", help="Apply known one-line oracle fix for Pelita #875 before scoring")
+    parser.add_argument("--expect-resolved", action="store_true", help="Exit nonzero if reward does not resolve")
     args = parser.parse_args()
 
     out = Path(args.output_dir).expanduser().resolve()
@@ -93,6 +150,12 @@ async def main():
     logger.info("install=%s", str(metadata.get("install", ""))[:500])
     logger.info("eval_commands=%s", str(metadata.get("eval_commands", ""))[:500])
     logger.info("reward_module=%s", reward.__file__)
+    if args.apply_pelita_fix:
+        if metadata["instance_id"] != "ASPP__pelita-875" or metadata["repo"] != "ASPP/pelita":
+            raise SystemExit("--apply-pelita-fix only supports ASPP__pelita-875")
+        if metadata.get("install"):
+            raise SystemExit("Oracle no-install test requires dataset metadata.install to be empty")
+        logger.info("ORACLE_MODE: manually fixing sandbox workspace, not an Agent trajectory")
 
     if not hasattr(reward, "_REWARD_PHASE_FUNCTIONS"):
         raise SystemExit("Actual reward.py has no phase timing; apply reward_phase_timing.patch first")
@@ -134,6 +197,9 @@ async def main():
         )
         cid = created.stdout.strip()
         logger.info("container_id=%s", cid)
+        if args.apply_pelita_fix:
+            applied = await asyncio.to_thread(apply_oracle_pelita_fix, name, out)
+            logger.info("ORACLE_PATCH_APPLIED path=%s", applied)
         start = time.perf_counter()
         result = await reward.compute_reward(
             metadata, DockerSandbox(name, out), eval_timeout=args.timeout
@@ -146,6 +212,8 @@ async def main():
         (out / "result.json").write_text(
             json.dumps(result, indent=2, ensure_ascii=False, default=str)
         )
+        if args.expect_resolved and not result["resolved"]:
+            raise RuntimeError("Expected resolved=True but reward returned unresolved; see eval_raw.log and result.json")
     finally:
         if cid:
             cli(["docker", "rm", "-f", name], timeout=60, check=False)
