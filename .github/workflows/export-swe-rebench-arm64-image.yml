@@ -1,132 +1,181 @@
-name: Export SWE-ReBench ARM64 Docker image
+name: Build and export SWE-ReBench ARM64 Docker image
 
-run-name: Export pelita-875 ARM64 sandbox image
+run-name: Build pelita-875 ARM64 sandbox image
 
 on:
   workflow_dispatch:
-    inputs:
-      preferred_image:
-        description: >-
-          Preferred ARM64 image tag. The workflow also tries the arm64 tag
-          and the existing x86_64 tag as a multi-platform fallback.
-        required: true
-        type: string
-        default: swerebench/sweb.eval.aarch64.aspp_1776_pelita-875:latest
 
 permissions:
   contents: read
 
 jobs:
-  export:
-    name: Find, verify, and export ARM64 image
-    runs-on: ubuntu-latest
+  build-export:
+    name: Build, verify, and export ARM64 image
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 120
 
     steps:
-      - name: Validate image reference
-        id: image
-        shell: bash
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fetch pinned SWE-ReBench image builder
         env:
-          IMAGE_INPUT: ${{ inputs.preferred_image }}
+          BUILDER_REF: e4907b7a90eafaa1f0a6428fd04fe31cdd8b4284
+        shell: bash
         run: |
           set -euo pipefail
+          git init builder
+          git -C builder remote add origin https://github.com/SWE-rebench/SWE-bench-fork.git
+          git -C builder fetch --depth 1 origin "$BUILDER_REF"
+          git -C builder checkout --detach FETCH_HEAD
 
-          image="${IMAGE_INPUT}"
-          if [[ "$image" != *:* ]]; then
-            image="${image}:latest"
-          fi
-
-          # Only permit this public task image in the SWE-ReBench namespace.
-          if [[ ! "$image" =~ ^swerebench/sweb\.eval\.(aarch64|arm64|x86_64)\.aspp_1776_pelita-875:[A-Za-z0-9._-]+$ ]]; then
-            echo "::error::Expected swerebench/sweb.eval.{aarch64|arm64|x86_64}.aspp_1776_pelita-875:<tag>"
-            exit 1
-          fi
-
-          echo "preferred=$image" >> "$GITHUB_OUTPUT"
-
-      - name: Pull the first available ARM64 candidate
-        id: pull
+      - name: Install image-builder dependencies
+        working-directory: builder
         shell: bash
-        env:
-          PREFERRED_IMAGE: ${{ steps.image.outputs.preferred }}
         run: |
           set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e . --no-deps
+          python -m pip install docker datasets packaging python-dotenv requests tqdm unidiff
 
-          target="uniagent-swe-pelita-875:latest"
-          candidates=(
-            "$PREFERRED_IMAGE"
-            "swerebench/sweb.eval.arm64.aspp_1776_pelita-875:latest"
-            "swerebench/sweb.eval.x86_64.aspp_1776_pelita-875:latest"
+      - name: Enable native ARM64 image generation
+        working-directory: builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("swebench/harness/test_spec/test_spec.py")
+          source = path.read_text()
+
+          source = source.replace("# import platform", "import platform", 1)
+          source = source.replace("    # USE_X86,\n", "    USE_X86,\n", 1)
+
+          old = '''    # if platform.machine() in {"aarch64", "arm64"}:
+              # use arm64 unless explicitly specified
+              # arch = "arm64" if instance_id not in USE_X86 else "x86_64"
+              # else:
+
+              arch = "x86_64"'''
+          new = '''    if platform.machine() in {"aarch64", "arm64"}:
+              arch = "x86_64" if instance_id.lower() in USE_X86 else "arm64"
+          else:
+              arch = "x86_64"'''
+
+          # Match the upstream block exactly, but tolerate its original indentation.
+          if old not in source:
+              old = '''    # if platform.machine() in {"aarch64", "arm64"}:
+          #     # use arm64 unless explicitly specified
+          #     # arch = "arm64" if instance_id not in USE_X86 else "x86_64"
+          # else:
+
+          arch = "x86_64"'''
+          new = '''    if platform.machine() in {"aarch64", "arm64"}:
+              arch = "x86_64" if instance_id.lower() in USE_X86 else "arm64"
+          else:
+              arch = "x86_64"'''
+
+          if old not in source:
+              raise SystemExit("Could not find the expected architecture block in upstream test_spec.py")
+          path.write_text(source.replace(old, new, 1))
+          print("Patched SWE-bench fork to select ARM64 on an ARM64 runner.")
+          PY
+
+      - name: Build Pelita task image from SWE-ReBench metadata
+        working-directory: builder
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import platform
+          import docker
+
+          from swebench.harness.docker_build import build_instance_images
+          from swebench.harness.test_spec.test_spec import make_test_spec
+          from swebench.harness.utils import load_swebench_dataset
+
+          instance_id = "ASPP__pelita-875"
+          if platform.machine() not in {"aarch64", "arm64"}:
+              raise RuntimeError(f"Expected an ARM64 runner, got {platform.machine()}")
+
+          dataset = load_swebench_dataset(
+              "nebius/SWE-rebench",
+              split="test",
+              instance_ids=[instance_id],
           )
+          if len(dataset) != 1:
+              raise RuntimeError(f"Expected one task row for {instance_id}, got {len(dataset)}")
 
-          declare -A seen=()
-          selected=""
+          # The published row points at the x86_64 Docker Hub image. Remove that
+          # reference so the upstream builder creates a fresh local ARM64 image.
+          dataset[0].pop("image_name", None)
 
-          for candidate in "${candidates[@]}"; do
-            if [[ -n "${seen[$candidate]:-}" ]]; then
-              continue
-            fi
-            seen["$candidate"]=1
+          spec = make_test_spec(dataset[0], namespace=None, instance_image_tag="latest")
+          if spec.arch != "arm64" or spec.platform != "linux/arm64/v8":
+              raise RuntimeError(f"Unexpected target: arch={spec.arch}, platform={spec.platform}")
 
-            echo "::group::Trying $candidate as linux/arm64"
-            if docker pull --platform=linux/arm64 "$candidate"; then
-              actual_platform="$(docker image inspect "$candidate" --format '{{.Os}}/{{.Architecture}}')"
-              image_id="$(docker image inspect "$candidate" --format '{{.Id}}')"
-              echo "Pulled image ID: $image_id"
-              echo "Reported platform: $actual_platform"
+          client = docker.from_env(timeout=600)
+          print(f"Building {spec.instance_image_key} for {spec.platform}")
+          successful, failed = build_instance_images(
+              client=client,
+              dataset=dataset,
+              force_rebuild=False,
+              max_workers=1,
+              namespace=None,
+              tag="latest",
+          )
+          if failed:
+              raise RuntimeError(f"Image build failed for {len(failed)} build task(s): {failed}")
 
-              if [[ "$actual_platform" == "linux/arm64" ]]; then
-                selected="$candidate"
-                echo "::endgroup::"
-                break
-              fi
+          image = client.images.get(spec.instance_image_key)
+          attrs = image.attrs
+          actual = f'{attrs.get("Os")}/{attrs.get("Architecture")}'
+          if actual != "linux/arm64":
+              raise RuntimeError(f"Built image has platform {actual}, expected linux/arm64")
 
-              echo "::warning::Ignoring $candidate because it resolved to $actual_platform, not linux/arm64."
-            else
-              echo "::warning::Could not pull $candidate for linux/arm64; trying the next candidate."
-            fi
-            echo "::endgroup::"
-          done
+          target = "uniagent-swe-pelita-875"
+          if not image.tag(target, tag="latest", force=True):
+              raise RuntimeError(f"Failed to tag image as {target}:latest")
 
-          if [[ -z "$selected" ]]; then
-            {
-              echo "## No downloadable ARM64 image was found"
-              echo
-              echo "Tried the aarch64-tagged image, arm64-tagged image, and the existing x86_64 tag with --platform=linux/arm64."
-              echo "None provided an image whose inspected platform is linux/arm64."
-              echo "No artifact was created. A real ARM64 task image must be built/published before export."
-            } >> "$GITHUB_STEP_SUMMARY"
-            echo "::error::No candidate image is available for linux/arm64. See the job log."
-            exit 1
-          fi
+          target_image = client.images.get(f"{target}:latest")
+          print(f"Built image: {spec.instance_image_key}")
+          print(f"Export image: {target}:latest")
+          print(f"Platform: {actual}")
+          print(f"Image ID: {target_image.id}")
+          PY
 
-          docker tag "$selected" "$target"
-          final_platform="$(docker image inspect "$target" --format '{{.Os}}/{{.Architecture}}')"
-          final_id="$(docker image inspect "$target" --format '{{.Id}}')"
-          [[ "$final_platform" == "linux/arm64" ]]
-
-          echo "source=$selected" >> "$GITHUB_OUTPUT"
-          echo "target=$target" >> "$GITHUB_OUTPUT"
-          echo "image_id=$final_id" >> "$GITHUB_OUTPUT"
-          echo "platform=$final_platform" >> "$GITHUB_OUTPUT"
+      - name: Smoke-test the ARM64 task image
+        env:
+          TARGET_IMAGE: uniagent-swe-pelita-875:latest
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(docker image inspect "$TARGET_IMAGE" --format '{{.Os}}/{{.Architecture}}')"
+          test "$actual" = "linux/arm64"
+          docker run --rm --platform linux/arm64 "$TARGET_IMAGE" \
+            /bin/bash -lc \
+            'source /opt/miniconda3/bin/activate && conda activate testbed && python --version && python -m pytest --version && python -m pytest -q test/test_utils.py::test_default_rng'
 
       - name: Export compressed ARM64 archive and checksum
         env:
-          SOURCE_IMAGE: ${{ steps.pull.outputs.source }}
-          TARGET_IMAGE: ${{ steps.pull.outputs.target }}
-          IMAGE_ID: ${{ steps.pull.outputs.image_id }}
-          PLATFORM: ${{ steps.pull.outputs.platform }}
+          TARGET_IMAGE: uniagent-swe-pelita-875:latest
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
 
-          # Export only ARM64. The loaded tag matches the image name UniAgent expects.
-          docker image save --platform=linux/arm64 "$TARGET_IMAGE" | gzip -1 > dist/image.tar.gz
+          actual="$(docker image inspect "$TARGET_IMAGE" --format '{{.Os}}/{{.Architecture}}')"
+          test "$actual" = "linux/arm64"
+          image_id="$(docker image inspect "$TARGET_IMAGE" --format '{{.Id}}')"
+
+          docker save "$TARGET_IMAGE" | gzip -1 > dist/image.tar.gz
           printf '%s\n' "$TARGET_IMAGE" > dist/IMAGE.txt
-          printf '%s\n' "$SOURCE_IMAGE" > dist/SOURCE_IMAGE.txt
-          printf '%s\n' "$PLATFORM" > dist/PLATFORM.txt
-          printf '%s\n' "$IMAGE_ID" > dist/IMAGE_ID.txt
+          printf '%s\n' "SWE-ReBench task ASPP__pelita-875 rebuilt natively for ARM64" > dist/SOURCE_IMAGE.txt
+          printf '%s\n' "$actual" > dist/PLATFORM.txt
+          printf '%s\n' "$image_id" > dist/IMAGE_ID.txt
           (cd dist && sha256sum image.tar.gz > image.tar.gz.sha256)
 
           echo "Exported ARM64 archive:"
@@ -145,22 +194,18 @@ jobs:
 
       - name: Print download and import instructions
         env:
-          SOURCE_IMAGE: ${{ steps.pull.outputs.source }}
-          TARGET_IMAGE: ${{ steps.pull.outputs.target }}
-          IMAGE_ID: ${{ steps.pull.outputs.image_id }}
+          TARGET_IMAGE: uniagent-swe-pelita-875:latest
         shell: bash
         run: |
           {
             echo "## SWE-ReBench ARM64 image export complete"
             echo
-            echo "- Source image: $SOURCE_IMAGE"
-            echo "- Imported tag: $TARGET_IMAGE"
+            echo "- Image: $TARGET_IMAGE"
             echo "- Platform: linux/arm64"
-            echo "- Image ID: $IMAGE_ID"
             echo "- Artifact: swe-rebench-pelita-875-linux-arm64"
             echo "- Retention: 7 days"
             echo
             echo "Download and extract the artifact, then transfer image.tar.gz and image.tar.gz.sha256 to the ARM64 host."
             echo
-            echo "Import command: sha256sum -c image.tar.gz.sha256 && gzip -dc image.tar.gz | docker load"
+            echo 'Import command: sha256sum -c image.tar.gz.sha256 && gzip -dc image.tar.gz | docker load'
           } >> "$GITHUB_STEP_SUMMARY"
