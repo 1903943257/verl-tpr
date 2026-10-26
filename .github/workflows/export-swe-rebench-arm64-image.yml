@@ -37,10 +37,13 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          # Install the builder with its declared runtime dependencies. The package
-          # imports collection modules from swebench/__init__.py, so --no-deps
-          # leaves required imports such as bs4 and ghapi unavailable.
-          python -m pip install -e . packaging
+          # Install the package without resolving every optional/collection dependency.
+          # ytsaurus-yson is declared upstream but unavailable from the runner's index;
+          # it is not needed to build this task image.
+          python -m pip install -e . --no-deps
+          python -m pip install \
+            beautifulsoup4 chardet datasets docker fastcore ghapi GitPython modal \
+            packaging pydantic python-dotenv requests rich tenacity tqdm unidiff
           python - <<'PY'
           from swebench.harness.docker_build import build_instance_images
           from swebench.harness.test_spec.test_spec import make_test_spec
