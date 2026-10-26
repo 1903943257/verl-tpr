@@ -46,6 +46,8 @@ cp -a "$EXTRAS/." "$STAGE/migration_extras/"
 link_or_copy "$ZIP" "$STAGE/sandbox/pelita875.zip"
 [[ ! -f "$TPR/docs/tpr/GETTING_STARTED_UNIAGENT_NEW.md" ]] || \
   cp -p "$TPR/docs/tpr/GETTING_STARTED_UNIAGENT_NEW.md" "$STAGE/docs/"
+[[ ! -f "$TPR/docs/tpr/MULTI_NODE_MIGRATION_BUNDLE_20261026.md" ]] || \
+  cp -p "$TPR/docs/tpr/MULTI_NODE_MIGRATION_BUNDLE_20261026.md" "$STAGE/docs/"
 [[ ! -f "$TPR/tests/models/mcore/tpr/integration/REBENCH_E2E.md" ]] || \
   cp -p "$TPR/tests/models/mcore/tpr/integration/REBENCH_E2E.md" "$STAGE/docs/"
 
