@@ -50,16 +50,18 @@ def sp_runtime():
         dist.init_process_group(backend="hccl")
     argv = sys.argv[:]
     try:
+        # Keep pytest/torchrun flags away from MindSpeed's argument parser.
         sys.argv[:] = [sys.argv[0]]
         from mindspeed.megatron_adaptor import repatch
+
+        repatch({
+            "tensor_model_parallel_size": 2,
+            "context_parallel_size": 1,
+            "pipeline_model_parallel_size": 1,
+            "sequence_parallel": True,
+        })
     finally:
         sys.argv[:] = argv
-    repatch({
-        "tensor_model_parallel_size": 2,
-        "context_parallel_size": 1,
-        "pipeline_model_parallel_size": 1,
-        "sequence_parallel": True,
-    })
     if not parallel_state.model_parallel_is_initialized():
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=2,
