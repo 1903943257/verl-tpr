@@ -109,7 +109,12 @@ for mode in full tpr; do
   if [[ "$mode" == full ]]; then
     find "$TPR_CAPTURE_ACTOR_MINIBATCH_DIR" -type f -name 'actor_update_*.pt' -print \
       > "$MODE_ROOT/actor_capture_files.txt" 2>/dev/null || true
-    echo "[$(date -Is)] FULL_CAPTURE_COUNT=$(wc -l < "$MODE_ROOT/actor_capture_files.txt")" | tee -a "$BASE/experiment.txt"
+    capture_count=$(wc -l < "$MODE_ROOT/actor_capture_files.txt")
+    echo "[$(date -Is)] FULL_CAPTURE_COUNT=$capture_count" | tee -a "$BASE/experiment.txt"
+    if ((capture_count == 0)); then
+      echo "[$(date -Is)] WARNING: Full produced no actor_update_*.pt snapshots" | tee -a "$BASE/experiment.txt"
+      failures=$((failures + 1))
+    fi
   fi
   grep -E 'training/global_step|timing_s/gen|timing_s/update_actor|actor/loss|STRICT_SESSION_CAP_PASS' \
     "$MODE_ROOT/launcher.log" | tail -25 > "$MODE_ROOT/key_metrics.txt" || true
