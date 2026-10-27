@@ -84,15 +84,17 @@ def _runtime():
     if int(os.getenv("WORLD_SIZE", "1")) != 8:
         raise AssertionError("offline replay requires exactly TP2 x RingCP4 x DP1 (8 ranks)")
     import torch_npu  # noqa: F401
-    from mindspeed.args_utils import get_full_args
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(local_rank)
     dist.init_process_group(backend="hccl")
     old_argv = sys.argv[:]
     try:
-        # MindSpeed parses sys.argv during repatch/get_full_args. Keep pytest
-        # and torchrun flags out until its argument state is normalized.
+        # Importing mindspeed.args_utils can trigger MindSpeed's argument
+        # setup too. Hide pytest/torchrun arguments before importing ANY
+        # MindSpeed argument/adaptor modules, and keep them hidden through
+        # repatch and get_full_args.
         sys.argv[:] = [sys.argv[0]]
+        from mindspeed.args_utils import get_full_args
         from mindspeed.megatron_adaptor import repatch
 
         repatch({
