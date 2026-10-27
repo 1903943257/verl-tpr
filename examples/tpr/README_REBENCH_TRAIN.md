@@ -47,6 +47,11 @@ MODE=tpr CHECK_ONLY=1 bash examples/tpr/run_train_rebench.sh
 MODE=tpr bash examples/tpr/run_train_rebench.sh
 ```
 
+The wrapper deliberately ignores inherited `RUN_NAME` / `RUN_ROOT` from
+previous experiments. To choose explicit outputs, use `REBENCH_RUN_NAME` /
+`REBENCH_RUN_ROOT` instead; otherwise each mode receives its own timestamped
+run directory. Set `MODE=tpr` on the **same command line** as `bash`.
+
 Each invocation creates a unique directory
 `/workspace/tpr_experiments/e2e/rebench-4b-16k8k-<mode>-.../`
 with `launcher.log` and `exit_code.txt`. Confirm
