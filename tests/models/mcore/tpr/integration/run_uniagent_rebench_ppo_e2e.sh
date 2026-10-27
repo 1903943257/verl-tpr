@@ -39,10 +39,10 @@ GATEWAY_COUNT=${GATEWAY_COUNT:-1}
 CONCURRENCY=${CONCURRENCY:-8}
 # 一个 prompt group 即可。
 NUM_AGENT_WORKERS=${NUM_AGENT_WORKERS:-1}
-# Session-level hard stop prevents split materializations; keep ALL to avoid
-# silently choosing the wrong member of a group if a regression occurs.
+# Keep all materialized trajectory segments. The strict session hard-cap patcher
+# is incompatible with the current UniAgent checkout, so default it off.
 TRAJECTORY_SELECTION=${TRAJECTORY_SELECTION:-all}
-SESSION_HARD_CAP=${SESSION_HARD_CAP:-True}
+SESSION_HARD_CAP=${SESSION_HARD_CAP:-False}
 MASK_UNFINISHED_EPISODE=False
 # ------------------------------------------------------------
 # Training side: production Megatron Full/TPR with TP2 x CP2 by default
@@ -67,6 +67,7 @@ TRAIN_DP=$((N_GPUS_PER_NODE / (TRAIN_TP * TRAIN_PP * TRAIN_CP)))
 TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-$TRAIN_DP}
 GEN_BATCH_SIZE=${GEN_BATCH_SIZE:-$TRAIN_DP}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$TRAIN_DP}
+EXPECTED_ROLLOUT_SESSIONS=$((TRAIN_PROMPT_BSZ * N))
 PPO_MICRO_BATCH_SIZE_PER_GPU=1
 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU=1
 # Keep the established MBridge/MindSpeed integration from the reference script.
@@ -102,6 +103,21 @@ NUM_WARMUP_BATCHES=0
 # ------------------------------------------------------------
 RUN_NAME=${RUN_NAME:-rebench-${TPR_ENABLED,,}-n${N}-tp${TRAIN_TP}cp${TRAIN_CP}dp${TRAIN_DP}-step${TOTAL_TRAINING_STEPS}-$(date +%Y%m%d_%H%M%S)}
 RUN_ROOT=${RUN_ROOT:-/workspace/tpr_experiments/e2e/${RUN_NAME}}
+
+# Direct invocations get a persistent combined launcher/trainer log by default.
+# The recipe wrapper sets TPR_E2E_EXTERNAL_LOG=1 because it already tees output.
+if [[ "${TPR_E2E_EXTERNAL_LOG:-0}" != "1" ]]; then
+    mkdir -p "${RUN_ROOT}"
+    E2E_LOG_FILE=${E2E_LOG_FILE:-${RUN_ROOT}/launcher.log}
+    if [[ -e "${E2E_LOG_FILE}" ]]; then
+        echo "ERROR: refusing to overwrite existing log: ${E2E_LOG_FILE}" >&2
+        echo "Choose a new RUN_NAME or set E2E_LOG_FILE explicitly." >&2
+        exit 2
+    fi
+    exec > >(tee -a "${E2E_LOG_FILE}") 2>&1
+    echo "E2E_LOG_FILE      = ${E2E_LOG_FILE}"
+fi
+
 AGENT_LOG_DIR=${RUN_ROOT}/agent
 TRAIN_LOG_DIR=${RUN_ROOT}/logs
 CKPTS_DIR=${RUN_ROOT}/ckpts
@@ -310,7 +326,10 @@ echo "TRAIN_FILE        = ${TRAIN_FILE}"
 echo "TASK_CONFIG       = ${TASK_CONFIG}"
 echo
 echo "SESSION_HARD_CAP  = ${SESSION_HARD_CAP}"
-echo "N                 = ${N}"
+echo "N                 = ${N} (sessions per input prompt)"
+echo "EXPECTED_SESSIONS = ${EXPECTED_ROLLOUT_SESSIONS} (TRAIN_PROMPT_BSZ x N)"
+echo "CONCURRENCY_CAP   = ${CONCURRENCY} (max in-flight sessions; not total rollouts)"
+echo "ROLLOUT_GPU_MEMORY_UTILIZATION = ${ROLLOUT_GPU_MEMORY_UTILIZATION}"
 echo "TEMPERATURE       = ${TEMPERATURE}"
 echo "TOP_P             = ${TOP_P}"
 echo "TOP_K             = ${TOP_K}"
