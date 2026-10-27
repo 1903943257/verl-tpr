@@ -19,6 +19,7 @@ from statistics import median
 
 TS = re.compile(r"(20\d\d-\d\d-\d\d \d\d:\d\d:\d\d)")
 RULES = {
+    "session_start": re.compile(r"\bsession session-sample-.* start: runner="),
     "task_start": re.compile(r"\brun_task start:"),
     "claude_start": re.compile(r"\bclaude_code: launch"),
     "claude_end": re.compile(r"\bclaude_code: claude (?:finished|exited)"),
@@ -91,6 +92,9 @@ def main():
         output.append({
             "name": f"s{ident.group(1)}r{ident.group(2)}" if ident else folder.name[:16],
             "elapsed": (logs[-1][0] - logs[0][0]).total_seconds(),
+            "started": times.get("session_start", logs[0][0]),
+            "ended": logs[-1][0],
+            "queue": seconds(times, "session_start", "task_start"),
             "prep": seconds(times, "task_start", "claude_start"),
             "agent": seconds(times, "claude_start", "claude_end"),
             "reward": seconds(times, "reward_start", "reward_end"),
@@ -103,19 +107,44 @@ def main():
     print(f"Sessions with logs: {len(output)}/{len(paths)}")
     print("Approximate stage seconds; 'post' includes 'reward', so do not sum both.")
     print("stage                 count    p50    p90    max")
-    for key in ("elapsed", "prep", "agent", "reward", "post"):
+    for key in ("elapsed", "queue", "prep", "agent", "reward", "post"):
         vals = [entry[key] for entry in output if entry[key] is not None]
         if vals:
             print(f"{key:20s}{len(vals):5d} {fmt(median(vals)):>6s} "
                   f"{fmt(pct(vals, .9)):>6s} {fmt(max(vals)):>6s}")
         else:
             print(f"{key:20s}    0      -      -      -")
+    # Best-effort *observed* overlap from framework/task log spans, not the
+    # true number of simultaneous NPU decode requests.
+    events = []
+    for entry in output:
+        if entry["ended"] > entry["started"]:
+            events.extend(((entry["started"], 1), (entry["ended"], -1)))
+    if events:
+        events.sort(key=lambda item: (item[0], item[1]))  # finish before start
+        active = maximum = 0
+        busy_seconds = 0.0
+        previous = events[0][0]
+        for timestamp, delta in events:
+            dt = max(0, (timestamp - previous).total_seconds())
+            busy_seconds += dt * active
+            active += delta
+            maximum = max(maximum, active)
+            previous = timestamp
+        horizon = max(0, (events[-1][0] - events[0][0]).total_seconds())
+        mean_active = busy_seconds / horizon if horizon else 0.0
+        print(
+            f"Observed session-log overlap: max={maximum}, mean={mean_active:.2f} "
+            f"of configured cap=8, span={horizon:.0f}s"
+        )
+        print("This measures log overlap, not actual Ray CPU slots or vLLM running requests.")
     print("\nLongest sessions:")
-    print("session      total  prep agent reward tracks turns model_tokens rewards")
+    print("session      total queue prep agent reward tracks turns model_tokens rewards")
     for entry in sorted(output, key=lambda item: item["elapsed"], reverse=True)[:12]:
         print(
             f"{entry['name']:<11s}{fmt(entry['elapsed']):>6s} "
-            f"{fmt(entry['prep']):>5s} {fmt(entry['agent']):>5s} "
+            f"{fmt(entry['queue']):>6s} {fmt(entry['prep']):>5s} "
+            f"{fmt(entry['agent']):>5s} 
             f"{fmt(entry['reward']):>6s} {entry['tracks']:>6d} "
             f"{entry['turns']:>5d} {entry['tokens']:>12d} {entry['rewards']}"
         )
