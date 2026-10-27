@@ -24,11 +24,19 @@ from megatron.core import parallel_state
 if os.getenv("TPR_RUN_TP2_SP_CP2") == "1":
     import torch_npu  # noqa: F401
 
-from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
-from .test_real_actor_tp2cp4_offline_ppo_npu import _sanitize_mindspeed_repatch_args
-from verl.workers.engine.megatron.tpr.executor import SegmentExecutor
-from verl.workers.engine.megatron.tpr.ring import make_ring_sequence_shard
-from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
+# The TPR engine imports go through verl.workers.engine/__init__.py, which
+# eagerly imports MindSpeed. Hide pytest's argv during these imports so its
+# import-time feature patching cannot turn pytest arguments into config fields.
+_original_argv = sys.argv[:]
+try:
+    sys.argv[:] = [sys.argv[0]]
+    from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
+    from .test_real_actor_tp2cp4_offline_ppo_npu import _sanitize_mindspeed_repatch_args
+    from verl.workers.engine.megatron.tpr.executor import SegmentExecutor
+    from verl.workers.engine.megatron.tpr.ring import make_ring_sequence_shard
+    from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
+finally:
+    sys.argv[:] = _original_argv
 
 pytestmark = pytest.mark.skipif(
     os.getenv("TPR_RUN_TP2_SP_CP2") != "1",
