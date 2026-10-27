@@ -461,6 +461,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size="${TRAIN_PP}" \
     actor_rollout_ref.actor.megatron.context_parallel_size="${TRAIN_CP}" \
     actor_rollout_ref.actor.megatron.sequence_parallel="${TRAIN_SP}" \
+    ++actor_rollout_ref.actor.megatron.override_transformer_config.sequence_parallel="${TRAIN_SP}" \
     actor_rollout_ref.actor.megatron.use_remove_padding=True \
     "${RECOMPUTE_ARGS[@]}" \
     +actor_rollout_ref.actor.megatron.tpr_enabled="${TPR_ENABLED}" \
