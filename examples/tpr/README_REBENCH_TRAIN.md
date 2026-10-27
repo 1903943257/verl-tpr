@@ -13,11 +13,11 @@ It is intentionally small and does **not** duplicate the trainer implementation.
 ## Pinned experimental settings
 
 Qwen3-4B BF16; 8 healthy Ascend 910B4 NPUs with 32 GiB each;
-training TP2×CP4×DP1; vLLM rollout TP2;
+training TP2×CP4×DP1; vLLM rollout TP2; model Qwen3-4B-128K;
 one task `ASPP__pelita-875` with `rollout.n=2`;
 one PPO update; prompt budget 16,384 / response budget 8,192;
 activation full recomputation; CPU param/optimizer offloading;
-`max_concurrent_sessions=8`, `max_num_seqs=8` (the wrapper keeps `rollout.n=2`, so at most two sessions are created for its one prompt);
+`max_concurrent_sessions=8`, `max_num_seqs=8` (concurrency ceiling; the single prompt generates `REBENCH_N` sessions, default 2);
 online Claude Code + local ARM64 Docker sandbox + offline Reward.
 
 The default TRAIN_FILE is
@@ -47,6 +47,10 @@ MODE=tpr CHECK_ONLY=1 bash examples/tpr/run_train_rebench.sh
 MODE=tpr bash examples/tpr/run_train_rebench.sh
 ```
 
+Use `REBENCH_N=2 REBENCH_STEPS=1` for a quick actor-update check or
+`REBENCH_N=8 REBENCH_STEPS=10` for a longer run. Each setting still uses
+one input prompt (TP2 x CP4 x DP1).
+
 The wrapper deliberately ignores inherited `RUN_NAME` / `RUN_ROOT` from
 previous experiments. To choose explicit outputs, use `REBENCH_RUN_NAME` /
 `REBENCH_RUN_ROOT` instead; otherwise each mode receives its own timestamped
@@ -64,10 +68,10 @@ with `launcher.log` and `exit_code.txt`. Confirm
 - This is **online Full/TPR E2E smoke**, not identical-trajectory
   speed benchmarking. Each invocation samples different Claude Code
   trajectories and may have dramatically different lengths and rewards.
-- The ARM64 machine's current UniAgent checkout does not accept the old
-  strict Session Hard Cap patcher. `SESSION_HARD_CAP=False` is pinned;
-  Gateway trajectory **materialization** at 24,576 tokens remains active.
-  It is not a session-level time or token limit.
+- The strict 24,576-token session hard stop requires the vendored UniAgent
+  patcher. The launcher runs it before Ray starts and must fail early if the
+  pinned UniAgent version is incompatible. Confirm a capped session ends with
+  **one** trajectory and no further Claude Code generation.
 - One long-running or 24K-cap trajectory can dominate
   `timing_s/gen`, even when the other trajectory finishes fast.
 - `rollout.n=2` sessions use asynchronous gather under a concurrency
