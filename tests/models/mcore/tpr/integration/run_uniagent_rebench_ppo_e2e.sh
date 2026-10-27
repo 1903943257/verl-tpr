@@ -541,6 +541,36 @@ python -m verl.trainer.main_ppo \
     \
     skip.rollout_tq.enable=False
 echo
+# The hard-cap contract is per SESSION, not per trajectory segment. Fail the
+# completed E2E if the Gateway ever emits multiple segments for one session.
+if [[ "${SESSION_HARD_CAP}" == "True" || "${SESSION_HARD_CAP}" == "true" || "${SESSION_HARD_CAP}" == "1" ]]; then
+    AGENT_LOG_DIR="${AGENT_LOG_DIR}" MAX_MODEL_LEN="${MAX_MODEL_LEN}" python - <<'PY_CAP_VERIFY'
+import json
+import os
+from pathlib import Path
+
+root = Path(os.environ["AGENT_LOG_DIR"])
+limit = int(os.environ["MAX_MODEL_LEN"])
+paths = sorted(root.glob("step_*/session-*/trajectory.json"))
+if not paths:
+    raise SystemExit("ERROR: strict session cap: no trajectory.json files found")
+bad = []
+for path in paths:
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    tracks = meta.get("trajectories", [])
+    if len(tracks) != 1:
+        bad.append(f"{path}: trajectories={len(tracks)}")
+        continue
+    track = tracks[0]
+    used = int(track["prompt_len"]) + int(track["response_len"])
+    if used > limit:
+        bad.append(f"{path}: tokens={used} exceed hard cap={limit}")
+if bad:
+    raise SystemExit("ERROR: strict single-trajectory session check failed:\\n" + "\\n".join(bad[:20]))
+print(f"STRICT_SESSION_CAP_PASS sessions={len(paths)} max_tokens={limit} trajectories_per_session=1")
+PY_CAP_VERIFY
+fi
+
 echo "============================================================"
 echo "Trainer exited (online rollout + genuine Actor optimizer path)"
 echo "Outputs: ${RUN_ROOT}"
