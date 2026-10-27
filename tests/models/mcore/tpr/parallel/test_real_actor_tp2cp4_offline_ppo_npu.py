@@ -73,6 +73,13 @@ def _sanitize_mindspeed_repatch_args(args):
         raise RuntimeError(f"Invalid MindSpeed argument names after repatch: {malformed}")
 
 
+def _offline_sp_enabled() -> bool:
+    value = os.getenv("TPR_OFFLINE_SP", "0")
+    if value not in ("0", "1"):
+        raise ValueError("TPR_OFFLINE_SP must be 0 or 1")
+    return value == "1"
+
+
 def _runtime():
     if int(os.getenv("WORLD_SIZE", "1")) != 8:
         raise AssertionError("offline replay requires exactly TP2 x RingCP4 x DP1 (8 ranks)")
@@ -92,7 +99,7 @@ def _runtime():
         "context_parallel_size": 4,
         "pipeline_model_parallel_size": 1,
         "context_parallel_algo": "megatron_cp_algo",
-        "sequence_parallel": False,
+        "sequence_parallel": _offline_sp_enabled(),
         "use_flash_attn": True,
     })
     if not parallel_state.model_parallel_is_initialized():
@@ -105,6 +112,9 @@ def _runtime():
     args = get_full_args()
     _sanitize_mindspeed_repatch_args(args)
     assert args.context_parallel_algo == "megatron_cp_algo"
+    assert bool(args.sequence_parallel) == _offline_sp_enabled(), (
+        "MindSpeed repatch ignored TPR_OFFLINE_SP"
+    )
     tp_group = parallel_state.get_tensor_model_parallel_group()
     cp_group = parallel_state.get_context_parallel_group()
     dp_group = parallel_state.get_data_parallel_group()
@@ -320,7 +330,7 @@ def test_recorded_full_vs_tpr_one_step():
         # Construct the model before importing the PPO Engine adapter.
         model, hf = make_real_qwen3_tp_model(
             runtime, model_path=checkpoint, tp_size=2, cp_size=4,
-            sequence_parallel=False, profile="4b",
+            sequence_parallel=_offline_sp_enabled(), profile="4b",
         )
         from verl.workers.engine.megatron.tpr.adapter import (
             run_tpr_forward_backward_batch, _trajectory_keys_from_minibatch,
@@ -351,6 +361,16 @@ def test_recorded_full_vs_tpr_one_step():
         ring_impl = _install_offline_full_ring_backend(mode)
         if hf.num_hidden_layers != 36:
             raise AssertionError("Not the real Qwen3-4B")
+        if _offline_sp_enabled():
+            assert os.getenv("TPR_ENABLE_TP_SP_CP") == "1", (
+                "Opt-in SP+Ring acceptance requires TPR_ENABLE_TP_SP_CP=1"
+            )
+        if dist.get_rank() == 0:
+            print(
+                f"TPR_SP_RING_CONFIG mode={mode} TP=2 CP=4 "
+                f"SP={int(model.config.sequence_parallel)}",
+                flush=True,
+            )
         model.config.no_sync_func = None
         model.config.grad_scale_func = None
         model.config.calculate_per_token_loss = False
