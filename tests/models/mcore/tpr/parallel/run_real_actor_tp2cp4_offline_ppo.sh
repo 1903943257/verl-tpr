@@ -62,9 +62,8 @@ for mode in "${modes[@]}"; do
     echo "TPR_OFFLINE_START mode=$mode sp=$TPR_OFFLINE_SP recompute=$TPR_OFFLINE_RECOMPUTE rows=$TPR_OFFLINE_ROWS device=$ASCEND_RT_VISIBLE_DEVICES results=$TPR_OFFLINE_OUTPUT_DIR"
     # An OOM in Full must not prevent the independent TPR memory experiment.
     if torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29797 \
-       -m pytest -vv -s -x \
-       tests/models/mcore/tpr/parallel/test_real_actor_tp2cp4_offline_ppo_npu.py \
-       2>&1 | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_${mode}_recompute_${recompute_label}.log"; then
+       tests/models/mcore/tpr/parallel/run_cp4_pytest_argv_safe.py \
+       2>&1 | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_${mode}_sp${TPR_OFFLINE_SP}_recompute_${recompute_label}.log"; then
        echo "TPR_OFFLINE mode=$mode completed"
     else
        errors+=("$mode")
@@ -83,7 +82,7 @@ if [[ "${#errors[@]}" == 0 ]] && \
     fi
     python tests/models/mcore/tpr/parallel/compare_real_actor_tp2cp4_offline_ppo.py \
       "$TPR_OFFLINE_OUTPUT_DIR" "${compare_args[@]}" \
-      2>&1 | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_comparison_recompute_${recompute_label}.log"
+      2>&1 | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_comparison_sp${TPR_OFFLINE_SP}_recompute_${recompute_label}.log"
 fi
 # CP4 three-arm numerical attribution can reuse an existing full/tpr run.
 # The split_no_share mode runs ONLY the missing third arm (8 NPUs once).
