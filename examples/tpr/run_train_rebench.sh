@@ -130,7 +130,7 @@ esac
 # dedicated container and do not run Full and TPR concurrently.
 mkdir -p "$RUN_ROOT"
 set +e
-bash "$E2E" 2>&1 | tee "$RUN_ROOT/launcher.log"
+TPR_E2E_EXTERNAL_LOG=1 bash "$E2E" 2>&1 | tee "$RUN_ROOT/launcher.log"
 rc="${PIPESTATUS[0]}"
 set -e
 printf '%s\n' "$rc" > "$RUN_ROOT/exit_code.txt"
