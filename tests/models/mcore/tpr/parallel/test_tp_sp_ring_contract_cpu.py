@@ -66,7 +66,9 @@ def test_sp_ring_only_opens_with_explicit_acceptance_opt_in(monkeypatch, cp_size
     with pytest.raises(NotImplementedError, match="TPR_ENABLE_TP_SP_CP"):
         _validate_tpr_cp_combination(2, runtime, config, ppo=True)
     monkeypatch.setenv("TPR_ENABLE_TP_SP_CP", "1")
-    _validate_tpr_cp_combination(2, runtime, config, ppo=True)
+    _validate_tpr_cp_combination(2, runtime, config, ppo=True, dp_size=1)
+    with pytest.raises(NotImplementedError, match="limited to DP1"):
+        _validate_tpr_cp_combination(2, runtime, config, ppo=True, dp_size=2)
     with pytest.raises(NotImplementedError, match="Ring backend"):
         _validate_tpr_cp_combination(
             2, SimpleNamespace(size=cp_size, backend_name="allgather"),
