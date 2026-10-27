@@ -312,11 +312,11 @@ def patch_framework(src: str) -> str:
         if src.count(old_guard) != 1:
             raise PatchError("framework old hardcap guard appears multiple times")
         src = src.replace(old_guard, new_guard, 1)
-    src = replace_exact(
-        src,
-        '                session_trajectories = await self.gateway_manager.finalize_session(session_id)\n'
-        '                session_trajectories = _select_session_trajectories(\n',
-        '                session_trajectories = await self.gateway_manager.finalize_session(session_id)\n'
+    # The next patch below inserts hardcap_multi_chain_count immediately before
+    # _select_session_trajectories. On a second invocation, the full replacement
+    # text from this step is no longer contiguous. Recognize the actual
+    # installed guard rather than attempting to patch an already-patched file.
+    installed_guard = (
         '                if self._hard_stop_on_trajectory_capacity and hit_capacity:\n'
         '                    if (\n'
         '                        not session_trajectories\n'
@@ -328,9 +328,20 @@ def patch_framework(src: str) -> str:
         '                        raise RuntimeError(\n'
         '                            f"Session hard cap expected one truncated trajectory; got {len(session_trajectories)}"\n'
         '                        )\n'
-        '                session_trajectories = _select_session_trajectories(\n',
-        "framework.avoid_multiplying_rollouts",
     )
+    if installed_guard in src:
+        if src.count(installed_guard) != 1:
+            raise PatchError("framework.avoid_multiplying_rollouts: duplicate installed guard")
+    else:
+        src = replace_exact(
+            src,
+            '                session_trajectories = await self.gateway_manager.finalize_session(session_id)\n'
+            '                session_trajectories = _select_session_trajectories(\n',
+            '                session_trajectories = await self.gateway_manager.finalize_session(session_id)\n'
+            + installed_guard
+            + '                session_trajectories = _select_session_trajectories(\n',
+            "framework.avoid_multiplying_rollouts",
+        )
     # Even with a 24K hard cap, a Gateway Session may have already
     # materialized an earlier chain before the stop takes effect. Preserve
     # exactly the FIRST chain, discard later materializations, and force a
