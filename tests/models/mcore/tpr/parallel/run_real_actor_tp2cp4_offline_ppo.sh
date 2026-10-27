@@ -27,12 +27,12 @@ esac
 export TPR_OFFLINE_ROWS="${TPR_OFFLINE_ROWS:-4,6}"
 # OFF and ON must not overwrite one another's saved gradients / witnesses.
 export TPR_OFFLINE_OUTPUT_DIR="${TPR_OFFLINE_OUTPUT_DIR:-/workspace/tpr_sp${TPR_OFFLINE_SP}_recompute_${recompute_label}_v1}"
-: "${ASCEND_RT_VISIBLE_DEVICES:=8,9,10,11,12,13,14,15}"
+: "${ASCEND_RT_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"
 export ASCEND_RT_VISIBLE_DEVICES
-if [[ "$ASCEND_RT_VISIBLE_DEVICES" != "8,9,10,11,12,13,14,15" ]]; then
-    echo "ERROR: expected physical NPU 8-15; got $ASCEND_RT_VISIBLE_DEVICES" >&2
-    exit 2
-fi
+case "$ASCEND_RT_VISIBLE_DEVICES" in
+    0,1,2,3,4,5,6,7|8,9,10,11,12,13,14,15) ;;
+    *) echo "ERROR: CP4 replay expects eight physical NPUs (0-7 or 8-15), got $ASCEND_RT_VISIBLE_DEVICES" >&2; exit 2 ;;
+esac
 [[ -f "$TPR_REAL_ACTOR_MINIBATCH" ]] || { echo "Missing actor capture" >&2; exit 2; }
 [[ -d "$TPR_QWEN_4B_PATH" ]] || { echo "Missing Qwen3-4B checkpoint" >&2; exit 2; }
 mkdir -p "$TPR_OFFLINE_OUTPUT_DIR"
