@@ -6,15 +6,27 @@ These tests check the executable shape contract and opt-in gate. They do not
 certify distributed collectives, numerical gradients, or E2E PPO behavior.
 """
 
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from verl.workers.engine.megatron.tpr.adapter import _validate_tpr_cp_combination
-from verl.workers.engine.megatron.tpr.executor import validate_replay_plan
-from verl.workers.engine.megatron.tpr.ring import make_ring_sequence_shard
-from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
+# Importing a submodule under verl.workers.engine executes engine/__init__.py,
+# which imports MindSpeed and parses process argv at import time. pytest's
+# positional test path / flags can produce an empty MindSpeed config key, later
+# breaking Megatron-Bridge TransformerConfig's generated dataclass __init__.
+# pytest has already parsed its CLI, so temporarily hide those args only while
+# the first engine/MindSpeed import is being performed.
+_original_argv = sys.argv[:]
+try:
+    sys.argv[:] = [sys.argv[0]]
+    from verl.workers.engine.megatron.tpr.adapter import _validate_tpr_cp_combination
+    from verl.workers.engine.megatron.tpr.executor import validate_replay_plan
+    from verl.workers.engine.megatron.tpr.ring import make_ring_sequence_shard
+    from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
+finally:
+    sys.argv[:] = _original_argv
 
 
 def _plan(length: int) -> SegmentPlan:
