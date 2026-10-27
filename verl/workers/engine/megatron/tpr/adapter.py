@@ -198,11 +198,9 @@ def _validate_tpr_cp_combination(
             "TPR TP+CP PPO requires the tested Ring backend; "
             f"got {cp_runtime.backend_name!r}"
         )
-    if tp_size > 1 and getattr(config, "sequence_parallel", False):
-        # Megatron's QKV column projection restores the CP-local sequence
-        # across TP ranks; TPR Ring must receive complete CP-local Q/K/V.
-        # DP topology is constrained separately by _validate_tpr_parallel_sizes:
-        # DP2 is supported only for TP2 x CP2 PPO; other DP>1 layouts remain gated.
+    # Sequence-parallel layout is handled by Megatron's QKV projection and
+    # Ring CP-local shard preparation. DP support is checked independently by
+    # _validate_tpr_parallel_sizes (currently DP2 only for TP2 x CP2 PPO).
 
 
 def _trajectory_keys_from_minibatch(data: Any) -> tuple[str, ...]:
