@@ -199,10 +199,15 @@ def _validate_tpr_cp_combination(
             f"got {cp_runtime.backend_name!r}"
         )
     if tp_size > 1 and getattr(config, "sequence_parallel", False):
-        raise NotImplementedError(
-            "TP2+CP requires sequence_parallel=False; combined TP+SP+CP "
-            "has not been validated"
-        )
+        # Megatron's QKV column projection restores the CP-local sequence
+        # across TP ranks; TPR Ring must receive complete CP-local Q/K/V.
+        # Enable only for explicit NPU acceptance until SP+Ring gradients
+        # and the PPO update have been compared against the SP-off baseline.
+        if os.getenv("TPR_ENABLE_TP_SP_CP") != "1":
+            raise NotImplementedError(
+                "TP2+SP+RingCP is experimental: set "
+                "TPR_ENABLE_TP_SP_CP=1 to run the SP+Ring acceptance tests"
+            )
 
 
 def _trajectory_keys_from_minibatch(data: Any) -> tuple[str, ...]:
@@ -275,7 +280,7 @@ def run_tpr_forward_backward_batch(
     with native VERL dispatch and Megatron gradient finalization; other
     DP>1 combinations remain explicitly gated.
     Ring required for CP>1,
-    and native SP is restricted to CP=1 at TP2.
+    and native TP2+SP+RingCP requires TPR_ENABLE_TP_SP_CP=1 until validated.
     Vanilla token-mean PPO; no native /M schedule
     scaling is applied because SegmentExecutor performs autograd itself.
     """
