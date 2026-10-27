@@ -18,6 +18,7 @@ class Gate:
     required_env: tuple[str, ...] = ()
     expected_failure: bool = False
     note: str = ""
+    bootstrap: bool = False
 
 
 GATES: dict[str, Gate] = {
@@ -27,10 +28,12 @@ GATES: dict[str, Gate] = {
     ),
     "cpu-recompute": Gate(
         "tests/models/mcore/tpr/unit/test_tpr_full_recompute_cpu.py",
+        bootstrap=True,
         note="Requires a real Megatron import plus PyTorch; tests a fake block.",
     ),
     "cpu-parallel-report": Gate(
         "tests/models/mcore/tpr/parallel/test_cp_padding_contract.py",
+        bootstrap=True,
         note="CPU contract; run under the actual project environment.",
     ),
     "npu-attention": Gate(

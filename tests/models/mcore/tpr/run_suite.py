@@ -128,13 +128,17 @@ def check() -> list[str]:
 def command(gate: Gate) -> list[str]:
     if gate.kind == "isolated":
         return [sys.executable, gate.path]
-    pytest_args = ["-m", "pytest", "-q", "-s", "-ra", gate.path]
+    pytest_args = ["-q", "-s", "-ra", gate.path]
+    bootstrap = "tests/models/mcore/tpr/_mindspeed_first_pytest.py"
     if gate.kind == "pytest":
-        return [sys.executable, *pytest_args]
+        if gate.bootstrap:
+            return [sys.executable, bootstrap, *pytest_args]
+        return [sys.executable, "-m", "pytest", *pytest_args]
     return [
         "torchrun", f"--nproc_per_node={gate.ranks}",
-        "--master_addr=127.0.0.1", "--master_port=29631",
-        *pytest_args,
+        "--master_addr=localhost",
+        f"--master_port={os.environ.get('TPR_TEST_MASTER_PORT', '29541')}",
+        bootstrap, *pytest_args,
     ]
 
 
