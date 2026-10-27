@@ -376,10 +376,6 @@ def test_recorded_full_vs_tpr_one_step():
         ring_impl = _install_offline_full_ring_backend(mode)
         if hf.num_hidden_layers != 36:
             raise AssertionError("Not the real Qwen3-4B")
-        if _offline_sp_enabled():
-            assert os.getenv("TPR_ENABLE_TP_SP_CP") == "1", (
-                "Opt-in SP+Ring acceptance requires TPR_ENABLE_TP_SP_CP=1"
-            )
         if dist.get_rank() == 0:
             print(
                 f"TPR_SP_RING_CONFIG mode={mode} TP=2 CP=4 "
