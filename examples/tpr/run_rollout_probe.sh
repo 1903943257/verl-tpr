@@ -21,6 +21,8 @@ CONCURRENCY=4
 PROMPT=16384
 RESPONSE=8192
 PROBE_TIMEOUT_S="${PROBE_TIMEOUT_S:-1200}"
+PROBE_ENFORCE_EAGER="${PROBE_ENFORCE_EAGER:-0}"
+case "$PROBE_ENFORCE_EAGER" in 0) EAGER_FLAGS=() ;; 1) EAGER_FLAGS=(--enforce-eager) ;; *) echo "ERROR: PROBE_ENFORCE_EAGER must be 0 or 1" >&2; exit 2;; esac
 
 export UNIAGENT_ROOT
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
@@ -73,7 +75,7 @@ print("ROLLOUT_PROBE_DATA_OK: one local-image Pelita-875 task", flush=True)
 PY_CHECK
 
 echo "ROLLOUT_PROBE_START n=$N concurrency=$CONCURRENCY TP=2 model=$MODEL_PATH output=$RUN"
-echo "max_total_tokens=$((PROMPT + RESPONSE)) hard_stop=1 timeout_s=$PROBE_TIMEOUT_S"
+echo "max_total_tokens=$((PROMPT + RESPONSE)) hard_stop=1 timeout_s=$PROBE_TIMEOUT_S enforce_eager=$PROBE_ENFORCE_EAGER"
 
 # The standalone inference launcher calls ray.init, and should own a clean
 # Ray runtime. Do not use on a host shared with an active PPO run.
@@ -88,7 +90,7 @@ timeout --signal=TERM --kill-after=30s "$PROBE_TIMEOUT_S" \
   --task-config "$TASK_CONFIG" \
   --limit 1 --n "$N" --concurrency "$CONCURRENCY" \
   --nnodes 1 --n-gpus-per-node 8 --tp 2 \
-  --engine vllm --gateway-count 1 --enforce-eager \
+  --engine vllm --gateway-count 1 "${EAGER_FLAGS[@]}" \
   --gpu-memory-utilization 0.60 \
   --tool-parser hermes \
   --temperature 0.6 --top-p 0.95 --top-k 20 \
