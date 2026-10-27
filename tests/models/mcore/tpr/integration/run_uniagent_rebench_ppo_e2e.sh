@@ -39,19 +39,19 @@ GATEWAY_COUNT=${GATEWAY_COUNT:-1}
 CONCURRENCY=${CONCURRENCY:-8}
 # 一个 prompt group 即可。
 NUM_AGENT_WORKERS=${NUM_AGENT_WORKERS:-1}
-# Keep all materialized trajectory segments. The strict session hard-cap patcher
-# is incompatible with the current UniAgent checkout, so default it off.
+# Default to strict per-session capacity stop: keep ONE trajectory at 16K+8K.
+# The vendored patcher must pass --check and apply before launching Ray.
 TRAJECTORY_SELECTION=${TRAJECTORY_SELECTION:-all}
-SESSION_HARD_CAP=${SESSION_HARD_CAP:-False}
+SESSION_HARD_CAP=${SESSION_HARD_CAP:-True}
 MASK_UNFINISHED_EPISODE=False
 # ------------------------------------------------------------
-# Training side: production Megatron Full/TPR with TP2 x CP2 by default
+# Training side: single-prompt acceptance uses TP2 x CP4 x DP1 by default
 # ------------------------------------------------------------
 NNODES=1
 N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 TRAIN_TP=${TRAIN_TP:-2}
 TRAIN_PP=1
-TRAIN_CP=${TRAIN_CP:-2}
+TRAIN_CP=${TRAIN_CP:-4}
 # VERL's native MCore default is SP=True for TP>1. Keep it explicit in E2E.
 TRAIN_SP=${TRAIN_SP:-True}
 case "${TRAIN_SP}" in
