@@ -53,6 +53,20 @@ N_GPUS_PER_NODE=${N_GPUS_PER_NODE:-8}
 TRAIN_TP=${TRAIN_TP:-2}
 TRAIN_PP=1
 TRAIN_CP=${TRAIN_CP:-2}
+# VERL's native MCore default is SP=True for TP>1. Keep it explicit in E2E.
+TRAIN_SP=${TRAIN_SP:-True}
+case "${TRAIN_SP}" in
+  True|true|1) TRAIN_SP=True ;;
+  False|false|0) TRAIN_SP=False ;;
+  *) echo "TRAIN_SP must be True or False" >&2; exit 2 ;;
+esac
+# Only the TP2+SP+Ring CP TPR path is experimental. Keep normal Full unaffected.
+export TPR_ENABLE_TP_SP_CP=${TPR_ENABLE_TP_SP_CP:-0}
+if [[ "${TPR_ENABLED,,}" == "true" && "${TRAIN_SP}" == "True" && ${TRAIN_CP} -gt 1 &&
+      "${TPR_ENABLE_TP_SP_CP}" != "1" ]]; then
+  echo "ERROR: TP2+SP+RingCP TPR is experimental; set TPR_ENABLE_TP_SP_CP=1 for acceptance" >&2
+  exit 2
+fi
 TPR_CP_BACKEND=${TPR_CP_BACKEND:-ring}
 TRAIN_DP=$((N_GPUS_PER_NODE / (TRAIN_TP * TRAIN_PP * TRAIN_CP)))
 TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-$TRAIN_DP}
@@ -315,6 +329,8 @@ echo "ROLLOUT_TP        = ${ROLLOUT_TP}"
 echo "TRAIN_TP          = ${TRAIN_TP}"
 echo "TRAIN_PP          = ${TRAIN_PP}"
 echo "TRAIN_CP          = ${TRAIN_CP}"
+echo "TRAIN_SP          = ${TRAIN_SP}"
+echo "TPR_ENABLE_TP_SP_CP = ${TPR_ENABLE_TP_SP_CP}"
 echo "TPR_CP_BACKEND    = ${TPR_CP_BACKEND}"
 echo
 echo "NNODES            = ${NNODES}"
@@ -444,6 +460,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size="${TRAIN_TP}" \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size="${TRAIN_PP}" \
     actor_rollout_ref.actor.megatron.context_parallel_size="${TRAIN_CP}" \
+    actor_rollout_ref.actor.megatron.sequence_parallel="${TRAIN_SP}" \
     actor_rollout_ref.actor.megatron.use_remove_padding=True \
     "${RECOMPUTE_ARGS[@]}" \
     +actor_rollout_ref.actor.megatron.tpr_enabled="${TPR_ENABLED}" \
