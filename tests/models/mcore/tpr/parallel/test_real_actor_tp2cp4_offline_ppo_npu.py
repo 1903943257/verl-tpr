@@ -90,18 +90,27 @@ def _runtime():
     dist.init_process_group(backend="hccl")
     old_argv = sys.argv[:]
     try:
+        # MindSpeed parses sys.argv during repatch/get_full_args. Keep pytest
+        # and torchrun flags out until its argument state is normalized.
         sys.argv[:] = [sys.argv[0]]
         from mindspeed.megatron_adaptor import repatch
+
+        repatch({
+            "tensor_model_parallel_size": 2,
+            "context_parallel_size": 4,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_algo": "megatron_cp_algo",
+            "sequence_parallel": _offline_sp_enabled(),
+            "use_flash_attn": True,
+        })
+        args = get_full_args()
+        _sanitize_mindspeed_repatch_args(args)
+        assert args.context_parallel_algo == "megatron_cp_algo"
+        assert bool(args.sequence_parallel) == _offline_sp_enabled(), (
+            "MindSpeed repatch ignored TPR_OFFLINE_SP"
+        )
     finally:
         sys.argv[:] = old_argv
-    repatch({
-        "tensor_model_parallel_size": 2,
-        "context_parallel_size": 4,
-        "pipeline_model_parallel_size": 1,
-        "context_parallel_algo": "megatron_cp_algo",
-        "sequence_parallel": _offline_sp_enabled(),
-        "use_flash_attn": True,
-    })
     if not parallel_state.model_parallel_is_initialized():
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=2,
@@ -109,12 +118,6 @@ def _runtime():
             pipeline_model_parallel_size=1,
             expert_model_parallel_size=1,
         )
-    args = get_full_args()
-    _sanitize_mindspeed_repatch_args(args)
-    assert args.context_parallel_algo == "megatron_cp_algo"
-    assert bool(args.sequence_parallel) == _offline_sp_enabled(), (
-        "MindSpeed repatch ignored TPR_OFFLINE_SP"
-    )
     tp_group = parallel_state.get_tensor_model_parallel_group()
     cp_group = parallel_state.get_context_parallel_group()
     dp_group = parallel_state.get_data_parallel_group()
