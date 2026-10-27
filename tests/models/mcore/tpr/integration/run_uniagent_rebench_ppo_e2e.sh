@@ -60,20 +60,11 @@ case "${TRAIN_SP}" in
   False|false|0) TRAIN_SP=False ;;
   *) echo "TRAIN_SP must be True or False" >&2; exit 2 ;;
 esac
-# Only the TP2+SP+Ring CP TPR path is experimental. Keep normal Full unaffected.
-export TPR_ENABLE_TP_SP_CP=${TPR_ENABLE_TP_SP_CP:-0}
-if [[ "${TPR_ENABLED,,}" == "true" && "${TRAIN_SP}" == "True" && ${TRAIN_CP} -gt 1 &&
-      "${TPR_ENABLE_TP_SP_CP}" != "1" ]]; then
-  echo "ERROR: TP2+SP+RingCP TPR is experimental; set TPR_ENABLE_TP_SP_CP=1 for acceptance" >&2
-  exit 2
-fi
+# SP is passed explicitly to both Engine and TransformerConfig below.
+# _validate_tpr_parallel_sizes remains the source of truth for supported DP
+# layouts: current PPO support includes TP2 x CP2 x DP2, but not arbitrary DP>1.
 TPR_CP_BACKEND=${TPR_CP_BACKEND:-ring}
 TRAIN_DP=$((N_GPUS_PER_NODE / (TRAIN_TP * TRAIN_PP * TRAIN_CP)))
-if [[ "${TPR_ENABLED,,}" == "true" && "${TRAIN_SP}" == "True" &&
-      ${TRAIN_CP} -gt 1 && ${TRAIN_DP} -gt 1 ]]; then
-  echo "ERROR: Experimental TPR TP+SP+Ring CP acceptance is DP1-only; use TP2 CP4 on 8 NPUs" >&2
-  exit 2
-fi
 TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-$TRAIN_DP}
 GEN_BATCH_SIZE=${GEN_BATCH_SIZE:-$TRAIN_DP}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$TRAIN_DP}
@@ -335,7 +326,6 @@ echo "TRAIN_TP          = ${TRAIN_TP}"
 echo "TRAIN_PP          = ${TRAIN_PP}"
 echo "TRAIN_CP          = ${TRAIN_CP}"
 echo "TRAIN_SP          = ${TRAIN_SP}"
-echo "TPR_ENABLE_TP_SP_CP = ${TPR_ENABLE_TP_SP_CP}"
 echo "TPR_CP_BACKEND    = ${TPR_CP_BACKEND}"
 echo
 echo "NNODES            = ${NNODES}"
