@@ -27,7 +27,7 @@ case "$MODE" in
   *) echo "ERROR: MODE must be full or tpr (got '$MODE')" >&2; exit 2 ;;
 esac
 
-# Same hardware/topology/optimization as the successfully completed Full step.
+# Fast TPR step uses the existing Full experiment's TP2 CP4 DP1 topology.
 # NPU_IDS is a physical device mask, not TP/CP rank order on a multi-node run.
 export ASCEND_RT_VISIBLE_DEVICES="${NPU_IDS:-0,1,2,3,4,5,6,7}"
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
@@ -35,13 +35,13 @@ export RAY_DEDUP_LOGS=0
 export HYDRA_FULL_ERROR=1
 export ROOT="${UNIAGENT_ROOT:-/workspace/uni-agent}"
 export TPR_VERL_ROOT="$CHECKOUT"
-export MODEL_PATH="${MODEL_PATH:-/workspace/hf_models/Qwen3-4B}"
+export MODEL_PATH="${MODEL_PATH:-/workspace/hf_models/Qwen3-4B-128K}"
 export MODEL_NAME=Qwen3-4B
 export TRAIN_FILE="${TRAIN_FILE:-/workspace/tpr_experiments/shortfix/pelita875_hint_h2_arm64_train.parquet}"
 export TEST_FILE="$TRAIN_FILE"
 export TASK_CONFIG="${TASK_CONFIG:-/workspace/tpr_experiments/shortfix/task_config_claude_code_pelita_docker.yaml}"
 
-export N=2
+export N=${REBENCH_N:-2}
 export N_GPUS_PER_NODE=8
 export TRAIN_TP=2
 export TRAIN_CP=4
@@ -49,8 +49,8 @@ export ROLLOUT_TP=2
 export TRAIN_PROMPT_BSZ=1
 export GEN_BATCH_SIZE=1
 export PPO_MINI_BATCH_SIZE=1
-export TOTAL_TRAINING_STEPS=1
-export TOTAL_EPOCHS=1
+export TOTAL_TRAINING_STEPS=${REBENCH_STEPS:-1}
+export TOTAL_EPOCHS=${REBENCH_STEPS:-1}
 export MAX_PROMPT_LENGTH=16384
 export MAX_RESPONSE_LENGTH=8192
 export ACTOR_RECOMPUTE=True
@@ -61,17 +61,15 @@ export NUM_AGENT_WORKERS=1
 export CAPTURE_ACTOR=False
 export TPR_TREE_POLICY=qwen_turn
 
-# The strict hard-cap patcher does not match the UniAgent checkout on the
-# current ARM64 host. Preserve the validated Full configuration, but do not
-# misrepresent this as a strict session-level cap. Gateway trajectory
-# materialization at 24576 tokens remains active.
-export SESSION_HARD_CAP=False
+# The strict 24K session stop must be applied by the canonical launcher.
+# Fail early if its pinned UniAgent source differs; do not silently continue.
+export SESSION_HARD_CAP=True
 
 # No global PID reuse or log overwrites across runs.
 # Ignore inherited RUN_NAME/RUN_ROOT from a previous Full/TPR run. Only
 # REBENCH_RUN_NAME / REBENCH_RUN_ROOT are explicit overrides for this wrapper.
 # Always create a fresh mode-specific output directory by default.
-RUN_NAME="${REBENCH_RUN_NAME:-rebench-4b-16k8k-${MODE}-tp2cp4-n2-step1-$(date +%Y%m%d_%H%M%S)-$$}"
+RUN_NAME="${REBENCH_RUN_NAME:-rebench-4b-16k8k-${MODE}-tp2cp4-n${N}-step${TOTAL_TRAINING_STEPS}-$(date +%Y%m%d_%H%M%S)-$}"
 RUN_ROOT="${REBENCH_RUN_ROOT:-/workspace/tpr_experiments/e2e/$RUN_NAME}"
 export RUN_NAME RUN_ROOT
 if [[ -e "$RUN_ROOT/launcher.log" ]]; then
@@ -114,9 +112,9 @@ echo "================================================================"
 echo "UniAgent SWE-reBench 4B Full/TPR 1-step training example"
 echo "Mode=$MODE | NPU=$ASCEND_RT_VISIBLE_DEVICES | TP2 CP4 DP1"
 echo "Model=$MODEL_PATH | Dataset=$TRAIN_FILE"
-echo "Prompt=16384 Response=8192 | Rollout TP2 n=2 concurrency_cap=8 (at most 2 sessions from n=2)"
+echo "Prompt=16384 Response=8192 | Rollout TP2 n=${N} concurrency_cap=8"
 echo "Recompute=True | param/optimizer CPU offload=True | step=1"
-echo "Session hard cap disabled (patcher not compatible); trajectory cap=24576"
+echo "Strict session stop=enabled at 24576 tokens; one trajectory per session"
 echo "Output=$RUN_ROOT"
 echo "================================================================"
 
