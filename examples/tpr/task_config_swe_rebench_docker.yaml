@@ -12,10 +12,9 @@
     name: claude_code
     max_turns: 200
     run_timeout: 4800
-    model:
-      temperature: 1.0
-      top_p: 1.0
-      max_total_tokens: 49152
+    # Model endpoint/sampling are supplied by the runtime; ClaudeCodeConfig.model
+    # only accepts base_url, api_key and model_name. Session token limits are
+    # enforced by the rollout configuration, not this task's ModelConfig.
   prompt_template:
     - role: user
       content: |-
