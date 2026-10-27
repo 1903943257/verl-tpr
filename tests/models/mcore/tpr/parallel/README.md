@@ -12,3 +12,7 @@ Key real 8-NPU launchers:
 - `run_tpr_fixed_shape_40k_benchmark.sh` — fixed-shape 40K F/B benchmark.
 
 These shell scripts require a real capture and model checkpoint and will not create synthetic substitute data. General device gates use `../run_correctness.sh`. Do not treat passing CPU shape contracts as distributed gradient parity.
+
+## Cleanup boundary
+
+The maintained parallel tree keeps native Ring/CP, real Actor PPO, DP2, recompute, full-engine and 30K/40K comparisons. Auxiliary one-off ratio sweeps, CP4 Level1 trace launchers, and historical K1/K2 microbench wrappers were removed; their source remains in git history. Keep importing shared fixtures from existing retained modules, and route maintained smoke/performance workflows via `../run_correctness.sh`, `../run_recompute.sh`, and `../run_performance.sh`.
