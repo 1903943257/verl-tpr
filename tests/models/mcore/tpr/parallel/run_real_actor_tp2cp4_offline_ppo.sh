@@ -15,8 +15,7 @@ mkdir -p "$TPR_RECOMPUTE_LOG_DIR"
 export TPR_OFFLINE_RECOMPUTE="${TPR_OFFLINE_RECOMPUTE:-0}"
 export TPR_OFFLINE_SP="${TPR_OFFLINE_SP:-0}"
 case "$TPR_OFFLINE_SP" in
-    0) ;;
-    1) export TPR_ENABLE_TP_SP_CP=1 ;;
+    0|1) ;;
     *) echo "TPR_OFFLINE_SP must be 0 or 1" >&2; exit 2 ;;
 esac
 case "$TPR_OFFLINE_RECOMPUTE" in
