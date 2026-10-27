@@ -48,7 +48,7 @@ MODES = ("full", "full_batch2", "one_node", "split_no_share", "shared")
 def _initial_weight_fingerprint(model) -> str:
     """Small deterministic identity witness; not a full parameter checksum."""
     digest = hashlib.sha256()
-    from ..correctness._qwen17_weak_e2e_sampling import exact_sample_indices
+    from ._sample_indices import exact_sample_indices
 
     for name, param in model.named_parameters():
         digest.update(name.encode())

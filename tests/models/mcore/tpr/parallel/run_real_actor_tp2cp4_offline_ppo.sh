@@ -49,7 +49,7 @@ if [[ "${TPR_OFFLINE_RUN_MODES:-both}" == "split_no_share" ]]; then
         exit 2
     }
     python -m pytest -q \
-      tests/models/mcore/tpr/parallel/test_cp4_three_arm_comparison_cpu.py
+      tests/models/mcore/tpr/parallel/test_cp4_multistep_replica_audit_cpu.py
 fi
 errors=()
 for mode in "${modes[@]}"; do

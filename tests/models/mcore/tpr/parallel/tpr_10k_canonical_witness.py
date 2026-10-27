@@ -12,7 +12,7 @@ from collections import OrderedDict
 import torch
 import torch.distributed as dist
 
-from ..correctness._qwen17_weak_e2e_sampling import exact_sample_indices
+from ._sample_indices import exact_sample_indices
 
 SAMPLES = 64
 
