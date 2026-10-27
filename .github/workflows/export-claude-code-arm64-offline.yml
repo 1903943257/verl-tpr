@@ -1,0 +1,78 @@
+name: Export Claude Code ARM64 offline bundle
+
+run-name: Export Claude Code Linux ARM64 CLI for SWE-ReBench
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    name: Download and verify ARM64 Claude CLI
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Fetch official Claude Code native installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --show-error --silent \
+            --retry 3 --retry-delay 3 \
+            https://claude.ai/install.sh \
+            --output install-claude.sh
+          test -s install-claude.sh
+          bash install-claude.sh stable
+
+      - name: Package the standalone ARM64 CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cli="$HOME/.local/bin/claude"
+          test -x "$cli"
+
+          resolved="$(readlink -f "$cli")"
+          test -x "$resolved"
+
+          mkdir -p package dist
+          install -m 0755 "$resolved" package/claude
+
+          # Prevent exporting an x86_64 binary or a broken symlink.
+          file package/claude
+          readelf -h package/claude | grep 'Machine:'
+          readelf -h package/claude | grep -q 'Machine:.*AArch64'
+
+          package/claude --version | tee package/CLAUDE_VERSION.txt
+          sha256sum package/claude | tee package/claude.sha256
+          printf '%s\n' "linux/arm64" > package/PLATFORM.txt
+
+          tar -C package -czf dist/claude-linux-arm64.tar.gz \
+            claude CLAUDE_VERSION.txt PLATFORM.txt
+          (cd dist && sha256sum claude-linux-arm64.tar.gz > claude-linux-arm64.tar.gz.sha256)
+          cp package/CLAUDE_VERSION.txt dist/
+          cp package/PLATFORM.txt dist/
+
+          ls -lh dist/
+
+      - name: Upload offline Claude Code bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-code-linux-arm64-offline
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Explain local image overlay
+        shell: bash
+        run: |
+          {
+            echo "## Claude Code ARM64 CLI exported"
+            echo
+            echo "Download claude-code-linux-arm64-offline from this run's Artifacts section."
+            echo "Transfer the ZIP to the ARM64 machine and extract it."
+            echo "This is only the Claude Code CLI, not the whole SWE-ReBench sandbox."
+            echo "After importing into the sandbox image, command -v claude will succeed,"
+            echo "so UniAgent will skip its native installer and will not curl claude.ai."
+          } >> "$GITHUB_STEP_SUMMARY"
