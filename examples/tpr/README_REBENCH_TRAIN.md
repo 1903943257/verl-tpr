@@ -66,8 +66,8 @@ with `launcher.log` and `exit_code.txt`. Confirm
 - One long-running or 24K-cap trajectory can dominate
   `timing_s/gen`, even when the other trajectory finishes fast.
 - `rollout.n=2` sessions use asynchronous gather under a concurrency
-  semaphore. Running them on one TP2 vLLM engine still shares inference
-  capacity. `NUM_AGENT_WORKERS=1` does not imply serial task execution.
+  semaphore. Their actual vLLM replica placement and effective parallelism must be
+  verified from Ray/vLLM logs. `NUM_AGENT_WORKERS=1` does not imply serial task execution.
 - For a rigorous TPR speedup comparison, collect one trajectory batch,
   replay **that same batch** through Full and TPR, and separately report
   inference/reward/Actor F/B/weight sync times.
