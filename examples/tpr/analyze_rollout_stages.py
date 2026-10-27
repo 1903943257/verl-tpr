@@ -144,7 +144,7 @@ def main():
         print(
             f"{entry['name']:<11s}{fmt(entry['elapsed']):>6s} "
             f"{fmt(entry['queue']):>6s} {fmt(entry['prep']):>5s} "
-            f"{fmt(entry['agent']):>5s} 
+            f"{fmt(entry['agent']):>5s} "
             f"{fmt(entry['reward']):>6s} {entry['tracks']:>6d} "
             f"{entry['turns']:>5d} {entry['tokens']:>12d} {entry['rewards']}"
         )
