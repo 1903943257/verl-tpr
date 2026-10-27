@@ -20,7 +20,7 @@ RUN="$PROBE_BASE/n$N"
 CONCURRENCY=4
 PROMPT=16384
 RESPONSE=8192
-PROBE_TIMEOUT_S="${PROBE_TIMEOUT_S:-1800}"
+PROBE_TIMEOUT_S="${PROBE_TIMEOUT_S:-1200}"
 
 export UNIAGENT_ROOT
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
@@ -97,6 +97,33 @@ timeout --signal=TERM --kill-after=30s "$PROBE_TIMEOUT_S" \
   2>&1 | tee "$RUN/launcher.log"
 rc="${PIPESTATUS[0]}"
 set -e
+
+# Explicitly reject a "successful" inference run that still materializes
+# multiple trajectories per Session or exceeds the 24K capacity.
+if (( rc == 0 )); then
+  if ! RUN="$RUN" N="$N" python - <<'PY_CAP_AUDIT'
+import json
+import os
+from pathlib import Path
+
+run = Path(os.environ["RUN"])
+n = int(os.environ["N"])
+paths = sorted((run / "agent").glob("session-*/trajectory.json"))
+if len(paths) != n:
+    raise SystemExit(f"STRICT_CAP_FAIL expected {n} session results; found {len(paths)}")
+for path in paths:
+    rows = json.loads(path.read_text())["trajectories"]
+    if len(rows) != 1:
+        raise SystemExit(f"STRICT_CAP_FAIL {path}: trajectories={len(rows)}")
+    tokens = int(rows[0]["prompt_len"]) + int(rows[0]["response_len"])
+    if tokens > 24576:
+        raise SystemExit(f"STRICT_CAP_FAIL {path}: tokens={tokens}>24576")
+print(f"STRICT_CAP_PASS sessions={n} max_tokens=24576", flush=True)
+PY_CAP_AUDIT
+  then
+    rc=3
+  fi
+fi
 echo "$rc" > "$RUN/exit_code.txt"
 
 # Preserve engine stats before ray stop / next test replaces session_latest.
