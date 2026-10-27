@@ -28,16 +28,15 @@ TEMPERATURE=0.6
 TOP_P=0.95
 TOP_K=20
 TOOL_PARSER=hermes
-# Model checkpoint supports 128K, but ONE AGENT SESSION is capped at 48K
-# total training tokens (prompt + response + intermediate tool/context tokens).
-# Gateway enforcement uses rollout.prompt_length + rollout.response_length.
+# Default session budget is prompt 16K + response 8K = 24K tokens.
+# Gateway trajectory materialization uses rollout.prompt_length + response_length.
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-16384}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-32768}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
 MAX_MODEL_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 ROLLOUT_TP=${ROLLOUT_TP:-2}
 ROLLOUT_GPU_MEMORY_UTILIZATION=${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.60}
 GATEWAY_COUNT=${GATEWAY_COUNT:-1}
-CONCURRENCY=${CONCURRENCY:-2}
+CONCURRENCY=${CONCURRENCY:-8}
 # 一个 prompt group 即可。
 NUM_AGENT_WORKERS=${NUM_AGENT_WORKERS:-1}
 # Session-level hard stop prevents split materializations; keep ALL to avoid
