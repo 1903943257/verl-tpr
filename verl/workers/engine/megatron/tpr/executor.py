@@ -28,7 +28,7 @@ from torch import Tensor, nn
 
 from verl.models.mcore.tpr.context import KVPair, TPRAttentionContext, use_tpr_attention_context
 
-from .ring import RingCPBackend, SequenceShard, resolve_cp_group
+from .ring import RingCPBackend, SequenceShard, make_ring_sequence_shard, resolve_cp_group
 from .state import KVStack, PastKVAnchors
 from .tree import SegmentId, SegmentPlan, SegmentSpec
 
@@ -219,22 +219,31 @@ def validate_replay_plan(
     plan: SegmentPlan, prepared_model: PreparedReplayModel, *, cp_size: int = 1,
     active_segment_ids: frozenset[SegmentId] | None = None,
 ) -> None:
-    """Fail before model execution when native TP+SP cannot split a segment.
+    """Check native SP's divisibility before any model/CP collectives run.
 
-    Unlike Ring CP's virtual padding, this path must not change native GEMM
-    shapes by silently padding an odd local sequence.
+    Ring pads every segment to 2*CP equal global chunks. Each CP rank owns
+    two chunks; this *physical CP-local* sequence, not the unpadded logical
+    segment length, is what Megatron's TP sequence parallelism partitions.
     """
     config = getattr(prepared_model.model, "config", None)
     tp_size = getattr(config, "tensor_model_parallel_size", 1)
-    if cp_size == 1 and tp_size > 1 and getattr(config, "sequence_parallel", False):
-        for segment in plan.segments.values():
-            if active_segment_ids is not None and segment.segment_id not in active_segment_ids:
-                continue
-            if segment.length % tp_size:
-                raise ValueError(
-                    f"segment {segment.segment_id} length={segment.length} must be divisible by "
-                    f"TP={tp_size} for sequence_parallel=True with CP=1; native GEMM shapes are not padded"
-                )
+    if tp_size <= 1 or not getattr(config, "sequence_parallel", False):
+        return
+    for segment in plan.segments.values():
+        if active_segment_ids is not None and segment.segment_id not in active_segment_ids:
+            continue
+        physical_length = (
+            make_ring_sequence_shard(
+                segment.length, cp_rank=0, cp_size=cp_size,
+            ).local_length
+            if cp_size > 1 else segment.length
+        )
+        if physical_length % tp_size:
+            raise ValueError(
+                f"segment {segment.segment_id} logical_length={segment.length} "
+                f"CP-local physical_length={physical_length} must be divisible "
+                f"by TP={tp_size} for sequence_parallel=True with CP={cp_size}"
+            )
 
 
 class SegmentExecutor:
