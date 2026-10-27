@@ -331,11 +331,11 @@ def patch_framework(src: str) -> str:
         '                session_trajectories = _select_session_trajectories(\n',
         "framework.avoid_multiplying_rollouts",
     )
-    # Even with a 48K hard cap, a Gateway Session may have already
+    # Even with a 24K hard cap, a Gateway Session may have already
     # materialized an earlier chain before the stop takes effect. Preserve
     # exactly the FIRST chain, discard later materializations, and force a
-    # failure reward so a late successful chain never rewards the truncated
-    # episode. This policy is OPT-IN with hard_stop_on_trajectory_capacity.
+    # failure reward through the capped TaskResult so a late successful chain
+    # cannot reward the truncated episode. Opt-in only.
     src = replace_exact(
         src,
         '                session_trajectories = _select_session_trajectories(\n',
@@ -352,38 +352,12 @@ def patch_framework(src: str) -> str:
         '                session_trajectories = _select_session_trajectories(\n',
         "framework.select_first_chain_after_hardcap",
     )
-    src = replace_exact(
-        src,
-        '            annotations = self._score_from_reward_info(session_trajectories)\n',
-        '            annotations = (\n'
-        '                [(0.0, {"multi_chain_session": True,\n'
-        '                        "original_session_chain_count": hardcap_multi_chain_count})]\n'
-        '                if hardcap_multi_chain_count > 1\n'
-        '                else self._score_from_reward_info(session_trajectories)\n'
-        '            )\n',
-        "framework.zero_reward_without_running_reward_worker",
-    )
-    src = replace_exact(
-        src,
-        '            self._log_trajectory_summary(session_id, result_trajectories)\n',
-        '            if hardcap_multi_chain_count > 1:\n'
-        '                if len(result_trajectories) != 1:\n'
-        '                    raise RuntimeError("multi-chain hard-cap must retain exactly one first trajectory")\n'
-        '                result_trajectories = [\n'
-        '                    replace(\n'
-        '                        result_trajectories[0],\n'
-        '                        reward_score=0.0,\n'
-        '                        reward_info={**dict(result_trajectories[0].reward_info or {}), "reward": 0.0},\n'
-        '                        extra_fields={\n'
-        '                            **dict(result_trajectories[0].extra_fields or {}),\n'
-        '                            "multi_chain_session": True,\n'
-        '                            "original_session_chain_count": hardcap_multi_chain_count,\n'
-        '                        },\n'
-        '                    )\n'
-        '                ]\n'
-        '            self._log_trajectory_summary(session_id, result_trajectories)\n',
-        "framework.first_chain_zero_reward_metadata",
-    )
+    # Current UniAgent Framework copies TaskResult.reward onto every trajectory.
+    # The cap watcher returns TaskResult(reward=0, accuracy=0, finished=False).
+    # Do not patch legacy _score_from_reward_info (absent in current UniAgent).
+    # If more than one chain was materialized, the first-chain selector above
+    # preserves only one training sample; the capped TaskResult already forces
+    # its reward to zero.
     return src
 
 
@@ -440,7 +414,7 @@ def apply(root: Path, *, check: bool) -> dict[str, str]:
         for target in reversed(updated):
             target.write_text(before[target], encoding="utf-8")
         raise
-    print("APPLIED: strict 48K session cap available (opt-in config)")
+    print("APPLIED: strict rollout prompt_length+response_length session cap available (opt-in config)")
     return {str(p): "patched" for p in before}
 
 
