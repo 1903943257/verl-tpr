@@ -69,6 +69,11 @@ if [[ "${TPR_ENABLED,,}" == "true" && "${TRAIN_SP}" == "True" && ${TRAIN_CP} -gt
 fi
 TPR_CP_BACKEND=${TPR_CP_BACKEND:-ring}
 TRAIN_DP=$((N_GPUS_PER_NODE / (TRAIN_TP * TRAIN_PP * TRAIN_CP)))
+if [[ "${TPR_ENABLED,,}" == "true" && "${TRAIN_SP}" == "True" &&
+      ${TRAIN_CP} -gt 1 && ${TRAIN_DP} -gt 1 ]]; then
+  echo "ERROR: Experimental TPR TP+SP+Ring CP acceptance is DP1-only; use TP2 CP4 on 8 NPUs" >&2
+  exit 2
+fi
 TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-$TRAIN_DP}
 GEN_BATCH_SIZE=${GEN_BATCH_SIZE:-$TRAIN_DP}
 PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE:-$TRAIN_DP}
