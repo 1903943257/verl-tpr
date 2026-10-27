@@ -21,17 +21,27 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
-from megatron.core import parallel_state
 
-from verl.utils import tensordict_utils as tu
+# pytest imports this module during collection, BEFORE _runtime() executes.
+# _qwen3_tp_checkpoint imports legacy profiling/correctness tests, which
+# transitively import verl.workers.engine and MindSpeed. MindSpeed's adaptor
+# may parse sys.argv and construct TransformerConfig during those imports.
+# Therefore sanitize argv around the ENTIRE transitive import chain, not just
+# around repatch() in _runtime().
+_import_argv = sys.argv[:]
+try:
+    sys.argv[:] = [sys.argv[0]]
+    from megatron.core import parallel_state
+    from verl.utils import tensordict_utils as tu
 
-# The checkpoint helper imports legacy NPU-gated test utilities at module
-# collection time. For an explicitly requested eight-NPU replay, register
-# torch.npu before their module-level availability check runs.
-if os.getenv("TPR_RUN_REAL_ACTOR_TP2CP4") == "1":
-    import torch_npu  # noqa: F401
+    # Register torch.npu before imported helper modules perform their
+    # module-level NPU availability checks.
+    if os.getenv("TPR_RUN_REAL_ACTOR_TP2CP4") == "1":
+        import torch_npu  # noqa: F401
 
-from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
+    from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
+finally:
+    sys.argv[:] = _import_argv
 
 pytestmark = pytest.mark.skipif(
     os.getenv("TPR_RUN_REAL_ACTOR_TP2CP4") != "1",
