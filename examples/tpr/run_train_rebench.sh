@@ -55,7 +55,7 @@ export MAX_PROMPT_LENGTH=16384
 export MAX_RESPONSE_LENGTH=8192
 export ACTOR_RECOMPUTE=True
 export ROLLOUT_GPU_MEMORY_UTILIZATION=0.45
-export CONCURRENCY=2
+export CONCURRENCY=8
 export GATEWAY_COUNT=1
 export NUM_AGENT_WORKERS=1
 export CAPTURE_ACTOR=False
@@ -114,7 +114,7 @@ echo "================================================================"
 echo "UniAgent SWE-reBench 4B Full/TPR 1-step training example"
 echo "Mode=$MODE | NPU=$ASCEND_RT_VISIBLE_DEVICES | TP2 CP4 DP1"
 echo "Model=$MODEL_PATH | Dataset=$TRAIN_FILE"
-echo "Prompt=16384 Response=8192 | Rollout TP2 n=2 concurrency=2"
+echo "Prompt=16384 Response=8192 | Rollout TP2 n=2 concurrency_cap=8 (at most 2 sessions from n=2)"
 echo "Recompute=True | param/optimizer CPU offload=True | step=1"
 echo "Session hard cap disabled (patcher not compatible); trajectory cap=24576"
 echo "Output=$RUN_ROOT"
