@@ -47,21 +47,24 @@ def runtime():
 
     argv = sys.argv[:]
     try:
+        # MindSpeed parses sys.argv while patching; keep pytest/torchrun flags
+        # out until repatch and argument normalization have both completed.
         sys.argv[:] = [sys.argv[0]]
         from mindspeed.megatron_adaptor import repatch
+
+        repatch({
+            "tensor_model_parallel_size": 2,
+            "context_parallel_size": 2,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_algo": "megatron_cp_algo",
+            "sequence_parallel": True,
+            "use_flash_attn": True,
+        })
+        args = get_full_args()
+        _sanitize_mindspeed_repatch_args(args)
+        assert args.sequence_parallel and args.context_parallel_algo == "megatron_cp_algo"
     finally:
         sys.argv[:] = argv
-    repatch({
-        "tensor_model_parallel_size": 2,
-        "context_parallel_size": 2,
-        "pipeline_model_parallel_size": 1,
-        "context_parallel_algo": "megatron_cp_algo",
-        "sequence_parallel": True,
-        "use_flash_attn": True,
-    })
-    args = get_full_args()
-    _sanitize_mindspeed_repatch_args(args)
-    assert args.sequence_parallel and args.context_parallel_algo == "megatron_cp_algo"
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size=2,
         context_parallel_size=2,
