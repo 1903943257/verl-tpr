@@ -71,7 +71,7 @@ export SESSION_HARD_CAP=False
 # Ignore inherited RUN_NAME/RUN_ROOT from a previous Full/TPR run. Only
 # REBENCH_RUN_NAME / REBENCH_RUN_ROOT are explicit overrides for this wrapper.
 # Always create a fresh mode-specific output directory by default.
-RUN_NAME="${REBENCH_RUN_NAME:-rebench-4b-16k8k-${MODE}-tp2cp4-n2-step1-$(date +%Y%m%d_%H%M%S)-$}"
+RUN_NAME="${REBENCH_RUN_NAME:-rebench-4b-16k8k-${MODE}-tp2cp4-n2-step1-$(date +%Y%m%d_%H%M%S)-$$}"
 RUN_ROOT="${REBENCH_RUN_ROOT:-/workspace/tpr_experiments/e2e/$RUN_NAME}"
 export RUN_NAME RUN_ROOT
 if [[ -e "$RUN_ROOT/launcher.log" ]]; then
