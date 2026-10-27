@@ -189,7 +189,7 @@ def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
 
 
 def _validate_tpr_cp_combination(
-    tp_size: int, cp_runtime: Any, config: Any, *, ppo: bool
+    tp_size: int, cp_runtime: Any, config: Any, *, ppo: bool, dp_size: int = 1
 ) -> None:
     if cp_runtime.size <= 1:
         return
@@ -199,6 +199,11 @@ def _validate_tpr_cp_combination(
             f"got {cp_runtime.backend_name!r}"
         )
     if tp_size > 1 and getattr(config, "sequence_parallel", False):
+        if dp_size != 1:
+            raise NotImplementedError(
+                "Experimental TP2+SP+RingCP is limited to DP1; "
+                "SP+CP+DP2 needs a separate gradient-sync acceptance"
+            )
         # Megatron's QKV column projection restores the CP-local sequence
         # across TP ranks; TPR Ring must receive complete CP-local Q/K/V.
         # Enable only for explicit NPU acceptance until SP+Ring gradients
@@ -372,7 +377,9 @@ def run_tpr_forward_backward_batch(
         assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size, cp_size=sizes["CP"])
     record_stage("tp_plan_collective_ms", tp_check_start)
     cp_runtime = resolve_engine_cp_runtime(engine, config)
-    _validate_tpr_cp_combination(tp_size, cp_runtime, config, ppo=True)
+    _validate_tpr_cp_combination(
+        tp_size, cp_runtime, config, ppo=True, dp_size=sizes["DP"],
+    )
     # Reject unsupported physical shapes for the whole forest before any
     # forward/backward can leave the mini-batch with partial gradients.
     for tree_plan in forest.trees:
