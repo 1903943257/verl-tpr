@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU-only preflight for Megatron TP2+SP with TPR Ring CP2/CP4.
 
-These tests check the executable shape contract and opt-in gate. They do not
-certify distributed collectives, numerical gradients, or E2E PPO behavior.
+These tests check physical shape contracts and the supported TP2 x CP2 x DP2
+topology. They do not certify distributed collectives, numerical gradients,
+or E2E PPO behavior.
 """
 
 import sys
@@ -21,7 +22,10 @@ import torch
 _original_argv = sys.argv[:]
 try:
     sys.argv[:] = [sys.argv[0]]
-    from verl.workers.engine.megatron.tpr.adapter import _validate_tpr_cp_combination
+    from verl.workers.engine.megatron.tpr.adapter import (
+        _validate_tpr_cp_combination,
+        _validate_tpr_parallel_sizes,
+    )
     from verl.workers.engine.megatron.tpr.executor import validate_replay_plan
     from verl.workers.engine.megatron.tpr.ring import make_ring_sequence_shard
     from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
@@ -71,18 +75,21 @@ def test_sp_cp1_odd_segment_remains_rejected():
 
 
 @pytest.mark.parametrize("cp_size", [2, 4])
-def test_sp_ring_only_opens_with_explicit_acceptance_opt_in(monkeypatch, cp_size):
+def test_sp_ring_accepts_without_experimental_opt_in(cp_size):
     runtime = SimpleNamespace(size=cp_size, backend_name="ring")
     config = SimpleNamespace(sequence_parallel=True)
-    monkeypatch.delenv("TPR_ENABLE_TP_SP_CP", raising=False)
-    with pytest.raises(NotImplementedError, match="TPR_ENABLE_TP_SP_CP"):
-        _validate_tpr_cp_combination(2, runtime, config, ppo=True)
-    monkeypatch.setenv("TPR_ENABLE_TP_SP_CP", "1")
-    _validate_tpr_cp_combination(2, runtime, config, ppo=True, dp_size=1)
-    with pytest.raises(NotImplementedError, match="limited to DP1"):
-        _validate_tpr_cp_combination(2, runtime, config, ppo=True, dp_size=2)
+    _validate_tpr_cp_combination(2, runtime, config, ppo=True)
     with pytest.raises(NotImplementedError, match="Ring backend"):
         _validate_tpr_cp_combination(
             2, SimpleNamespace(size=cp_size, backend_name="allgather"),
             config, ppo=True,
         )
+
+
+def test_tp2_sp_ring_cp2_dp2_is_supported_by_topology_gate():
+    sizes = {"TP": 2, "CP": 2, "DP": 2, "PP": 1, "EP": 1}
+    assert _validate_tpr_parallel_sizes(sizes, ppo=True) == 2
+    _validate_tpr_cp_combination(
+        2, SimpleNamespace(size=2, backend_name="ring"),
+        SimpleNamespace(sequence_parallel=True), ppo=True,
+    )
