@@ -5,7 +5,7 @@
 This is a layout/autograd smoke gate, not Full-vs-TPR gradient parity or PPO E2E.
 
 Run with four visible Ascend NPUs:
-  TPR_RUN_TP2_SP_CP2=1 TPR_ENABLE_TP_SP_CP=1 \
+  TPR_RUN_TP2_SP_CP2=1 \
     torchrun --nproc_per_node=4 --master_port=29861 -m pytest -s -x \
     tests/models/mcore/tpr/parallel/test_tpr_tp2_sp_cp2_npu.py
 """
@@ -99,7 +99,6 @@ def runtime():
 
 
 def test_tp2_sp_cp2_push_visit_pop_layout_and_backward(runtime):
-    assert os.getenv("TPR_ENABLE_TP_SP_CP") == "1"
     checkpoint = Path(os.getenv(
         "TPR_QWEN_1_7B_PATH", "/workspace/hf_models/Qwen3-1.7B",
     ))
