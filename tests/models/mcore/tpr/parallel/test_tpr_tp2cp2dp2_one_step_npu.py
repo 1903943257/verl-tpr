@@ -22,7 +22,7 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
 
-from verl.workers.engine.megatron.tpr.placement import plan_tpr_dta_dp
+from verl.experimental.tpr.placement import plan_tpr_dta_dp
 from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
 from verl.utils import tensordict_utils as tu
 

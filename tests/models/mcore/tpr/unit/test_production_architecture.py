@@ -15,7 +15,12 @@ from typing import TypeVar
 ROOT = Path(__file__).resolve().parents[5]
 ENGINE = ROOT / "verl/workers/engine/megatron/tpr"
 MODEL = ROOT / "verl/models/mcore/tpr"
-PRODUCTION = ("adapter", "tree", "objective", "executor", "state", "ring", "ring_layout", "ring_attention", "placement")
+PRODUCTION = ("adapter", "tree", "objective", "executor", "state", "ring", "ring_layout", "ring_attention")
+
+
+def test_experimental_placement_is_not_production() -> None:
+    assert not (ENGINE / "placement.py").exists()
+    assert (ROOT / "verl/experimental/tpr/placement.py").is_file()
 
 
 def _source(name: str) -> str:

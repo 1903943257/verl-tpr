@@ -273,7 +273,7 @@ def plan_tpr_dta_dp(
     Costs count physical topology tokens, before any zero-objective pruning.
     The flat exact-token DTA reference remains separately available above.
     """
-    from .tree import _parse_key, _turn_units
+    from verl.workers.engine.megatron.tpr.tree import _parse_key, _turn_units
 
     if type(dp_size) is not int or dp_size <= 0:
         raise ValueError("dp_size must be a positive integer")
