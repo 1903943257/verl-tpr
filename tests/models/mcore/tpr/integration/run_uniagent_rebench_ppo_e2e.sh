@@ -495,6 +495,7 @@ python -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_MODEL_LEN}" \
     actor_rollout_ref.rollout.max_num_seqs="${CONCURRENCY}" \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
+    actor_rollout_ref.rollout.disable_log_stats=False \
     +actor_rollout_ref.rollout.enable_sleep_mode=True \
     \
     actor_rollout_ref.rollout.temperature="${TEMPERATURE}" \
