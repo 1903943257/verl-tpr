@@ -17,7 +17,7 @@ training TP2×CP4×DP1; vLLM rollout TP2;
 one task `ASPP__pelita-875` with `rollout.n=2`;
 one PPO update; prompt budget 16,384 / response budget 8,192;
 activation full recomputation; CPU param/optimizer offloading;
-`max_concurrent_sessions=2`, `max_num_seqs=2`;
+`max_concurrent_sessions=8`, `max_num_seqs=8` (the wrapper keeps `rollout.n=2`, so at most two sessions are created for its one prompt);
 online Claude Code + local ARM64 Docker sandbox + offline Reward.
 
 The default TRAIN_FILE is
