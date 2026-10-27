@@ -18,8 +18,12 @@ PROBE_GROUP="${PROBE_GROUP:-$(date +%Y%m%d_%H%M%S)}"
 PROBE_BASE="${PROBE_BASE:-/workspace/tpr_experiments/rollout_probes/${PROBE_GROUP}}"
 RUN="$PROBE_BASE/n$N"
 CONCURRENCY=4
-PROMPT=16384
-RESPONSE=8192
+PROMPT="${PROBE_PROMPT_LENGTH:-16384}"
+RESPONSE="${PROBE_RESPONSE_LENGTH:-8192}"
+if [[ ! "$PROMPT" =~ ^[0-9]+$ || ! "$RESPONSE" =~ ^[0-9]+$ ]] || ((PROMPT < 1 || RESPONSE < 1)); then
+  echo "ERROR: PROBE_PROMPT_LENGTH and PROBE_RESPONSE_LENGTH must be positive integers" >&2
+  exit 2
+fi
 PROBE_TIMEOUT_S="${PROBE_TIMEOUT_S:-1200}"
 PROBE_ENFORCE_EAGER="${PROBE_ENFORCE_EAGER:-0}"
 case "$PROBE_ENFORCE_EAGER" in 0) EAGER_FLAGS=() ;; 1) EAGER_FLAGS=(--enforce-eager) ;; *) echo "ERROR: PROBE_ENFORCE_EAGER must be 0 or 1" >&2; exit 2;; esac
@@ -103,13 +107,14 @@ set -e
 # Explicitly reject a "successful" inference run that still materializes
 # multiple trajectories per Session or exceeds the 24K capacity.
 if (( rc == 0 )); then
-  if ! RUN="$RUN" N="$N" python - <<'PY_CAP_AUDIT'
+  if ! RUN="$RUN" N="$N" CAP="$((PROMPT + RESPONSE))" python - <<'PY_CAP_AUDIT'
 import json
 import os
 from pathlib import Path
 
 run = Path(os.environ["RUN"])
 n = int(os.environ["N"])
+cap = int(os.environ["CAP"])
 paths = sorted((run / "agent").glob("session-*/trajectory.json"))
 if len(paths) != n:
     raise SystemExit(f"STRICT_CAP_FAIL expected {n} session results; found {len(paths)}")
@@ -118,9 +123,9 @@ for path in paths:
     if len(rows) != 1:
         raise SystemExit(f"STRICT_CAP_FAIL {path}: trajectories={len(rows)}")
     tokens = int(rows[0]["prompt_len"]) + int(rows[0]["response_len"])
-    if tokens > 24576:
-        raise SystemExit(f"STRICT_CAP_FAIL {path}: tokens={tokens}>24576")
-print(f"STRICT_CAP_PASS sessions={n} max_tokens=24576", flush=True)
+    if tokens > cap:
+        raise SystemExit(f"STRICT_CAP_FAIL {path}: tokens={tokens}>{cap}")
+print(f"STRICT_CAP_PASS sessions={n} max_tokens={cap}", flush=True)
 PY_CAP_AUDIT
   then
     rc=3
