@@ -389,6 +389,10 @@ def apply(root: Path, *, check: bool) -> dict[str, str]:
         source = target.read_text(encoding="utf-8")
         modified = transform(source)
         ast.parse(modified, filename=str(target))
+        # Enforce repeat safety BEFORE touching any live UniAgent file.
+        again = transform(modified)
+        if again != modified:
+            raise PatchError(f"{rel}: patch is not idempotent on the installed form")
         before[target] = source
         after[target] = modified
     for target, original in before.items():
