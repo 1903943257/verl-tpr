@@ -57,8 +57,8 @@ These are **source-level changes, not CPU/NPU acceptance evidence**. Re-run `run
 - Only keep stable numerical contracts, production integration, real Actor capture comparators and reproducible benchmarks in the core area.
 - Keep reusable synthetic **tensor** micro-tests for Ring/Attention/Mask/DP logic; synthetic **model** end-to-end test suites were removed. Real Qwen3 fixtures live in non-`test_` modules.
 - Avoid adding another launcher to reproduce an existing `run_*.sh`; add a mode to an existing maintained script instead.
-- A subsequent parallel-runner prune removed 19 historical scripts/helpers/docs (extra CP2 ratio sweeps, per-case analysis, old Ring Level1 trace harness and small-K leaf diagnostics). Retained: CP1 N8 Full/TPR K sweeps, Ring merge validation, CP4 real Actor replay, TP2×CP2×DP2, Recompute OFF/ON and fixed40K benchmarks. No registered gate, core pytest module or its assertions were deleted.
-- The `parallel` inventory is now 78 tracked files, including 25 pytest modules. Old exploratory runner recipes remain available in git history.
+- A subsequent parallel-runner prune removed 16 historical scripts/helpers/docs (extra CP2 ratio sweeps, per-case analysis, old Ring Level1 trace harness and small-K leaf diagnostics). Retained: CP1 N8 Full/TPR K sweeps, Ring merge validation, CP4 real Actor replay, TP2×CP2×DP2, Recompute OFF/ON and fixed40K benchmarks. No registered gate, core pytest module or its assertions were deleted.
+- The `parallel` inventory is now 81 tracked files, including 25 pytest modules. Old exploratory runner recipes remain available in git history.
 - Historical result descriptions are retained where useful under `profiling/*.md`, but references to the deleted old scripts there are historical, not executable instructions.
 - Review [TEST_MATRIX.md](TEST_MATRIX.md) for active numerical acceptance boundaries.
 
