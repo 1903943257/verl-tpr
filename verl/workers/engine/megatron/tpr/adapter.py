@@ -189,7 +189,7 @@ def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
 
 
 def _validate_tpr_cp_combination(
-    tp_size: int, cp_runtime: Any, config: Any, *, ppo: bool, dp_size: int = 1
+    tp_size: int, cp_runtime: Any, config: Any, *, ppo: bool
 ) -> None:
     if cp_runtime.size <= 1:
         return
@@ -199,20 +199,10 @@ def _validate_tpr_cp_combination(
             f"got {cp_runtime.backend_name!r}"
         )
     if tp_size > 1 and getattr(config, "sequence_parallel", False):
-        if dp_size != 1:
-            raise NotImplementedError(
-                "Experimental TP2+SP+RingCP is limited to DP1; "
-                "SP+CP+DP2 needs a separate gradient-sync acceptance"
-            )
         # Megatron's QKV column projection restores the CP-local sequence
         # across TP ranks; TPR Ring must receive complete CP-local Q/K/V.
-        # Enable only for explicit NPU acceptance until SP+Ring gradients
-        # and the PPO update have been compared against the SP-off baseline.
-        if os.getenv("TPR_ENABLE_TP_SP_CP") != "1":
-            raise NotImplementedError(
-                "TP2+SP+RingCP is experimental: set "
-                "TPR_ENABLE_TP_SP_CP=1 to run the SP+Ring acceptance tests"
-            )
+        # DP topology is constrained separately by _validate_tpr_parallel_sizes:
+        # DP2 is supported only for TP2 x CP2 PPO; other DP>1 layouts remain gated.
 
 
 def _trajectory_keys_from_minibatch(data: Any) -> tuple[str, ...]:
@@ -284,8 +274,8 @@ def run_tpr_forward_backward_batch(
     TP=1/2, CP=1/2/4, PP=EP=1. Production DP2 supports TP2/CP2
     with native VERL dispatch and Megatron gradient finalization; other
     DP>1 combinations remain explicitly gated.
-    Ring required for CP>1,
-    and native TP2+SP+RingCP requires TPR_ENABLE_TP_SP_CP=1 until validated.
+    Ring required for CP>1. Native TP2+SP+RingCP uses Megatron's sequence
+    parallel layout; supported DP placements are enforced by the topology gate.
     Vanilla token-mean PPO; no native /M schedule
     scaling is applied because SegmentExecutor performs autograd itself.
     """
@@ -378,7 +368,7 @@ def run_tpr_forward_backward_batch(
     record_stage("tp_plan_collective_ms", tp_check_start)
     cp_runtime = resolve_engine_cp_runtime(engine, config)
     _validate_tpr_cp_combination(
-        tp_size, cp_runtime, config, ppo=True, dp_size=sizes["DP"],
+        tp_size, cp_runtime, config, ppo=True,
     )
     # Reject unsupported physical shapes for the whole forest before any
     # forward/backward can leave the mini-batch with partial gradients.
