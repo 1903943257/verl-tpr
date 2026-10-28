@@ -5,7 +5,7 @@ fingerprint, fixed PPO labels, Qwen3-4B initial weights and TPR backend are
 used. 'unshared' uses one complete trajectory per tree via the existing
 loader's synthetic nonsharing keys, NOT the native Megatron Full schedule.
 
-No optimizer, no performance claim, no repaired PPO labels.
+No optimizer. Synchronized F/B timings are controlled replay measurements, not a production throughput claim. PPO labels are unchanged.
 """
 from __future__ import annotations
 
