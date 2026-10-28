@@ -181,6 +181,7 @@ def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
         cp == 1 if tp == 4 else False
     )
     if (tp not in (1, 2, 4) or not supported_cp
+            or (tp == 4 and not (ppo and parity_10k_dp2))
             or any(sizes[k] != 1 for k in ("PP", "EP"))
             or (dp != 1 and not (production_dp2 or parity_10k_dp2))):
         raise NotImplementedError(
