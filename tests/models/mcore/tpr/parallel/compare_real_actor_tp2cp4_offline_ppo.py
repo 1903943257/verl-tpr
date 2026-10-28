@@ -200,10 +200,24 @@ def compare(root, *, diagnostic_only=False, require_recompute=False, require_ful
 
     def perf(mode):
         xs = snapshots[mode]
+        # The recorded F/B timer encloses the finalizer callback; subtract
+        # the separately measured finalizer interval to estimate pure F/B.
+        # Training-side one-step time includes F/B, finalization and the
+        # diagnostic SGD update (not production AdamW).
         return {
-            "fwd_bwd_seconds_critical": max(x["time_forward_backward_finalize_s"] for x in xs),
+            "fwd_bwd_seconds_critical": max(
+                max(0.0, x["time_forward_backward_finalize_s"] - x["time_finalize_s"])
+                for x in xs
+            ),
+            "fwd_bwd_finalize_seconds_critical": max(
+                x["time_forward_backward_finalize_s"] for x in xs
+            ),
             "finalize_seconds_critical": max(x["time_finalize_s"] for x in xs),
             "sgd_seconds_critical": max(x["time_sgd_s"] for x in xs),
+            "training_side_seconds_critical": max(
+                x["time_forward_backward_finalize_s"] + x["time_sgd_s"]
+                for x in xs
+            ),
             "peak_allocated_gib_worst": max(x["peak_allocated_bytes"] for x in xs)/2**30,
             "peak_reserved_gib_worst": max(x["peak_reserved_bytes"] for x in xs)/2**30,
             "allocated_before_gib_worst": max(x["allocated_before_bytes"] for x in xs)/2**30,
@@ -212,6 +226,14 @@ def compare(root, *, diagnostic_only=False, require_recompute=False, require_ful
         }
     fp, tp = perf("full"), perf("tpr")
     ratio = fp["fwd_bwd_seconds_critical"]/max(tp["fwd_bwd_seconds_critical"], 1e-12)
+    fb_finalize_ratio = (
+        fp["fwd_bwd_finalize_seconds_critical"]
+        / max(tp["fwd_bwd_finalize_seconds_critical"], 1e-12)
+    )
+    training_side_ratio = (
+        fp["training_side_seconds_critical"]
+        / max(tp["training_side_seconds_critical"], 1e-12)
+    )
     # Provisional 1.7B-level thresholds, not already-passed 4B gates.
     gates = {
         "initial_weights_exact": before_gap == 0,
@@ -221,7 +243,8 @@ def compare(root, *, diagnostic_only=False, require_recompute=False, require_ful
         **({"complete_grad_rel_l2_lt_0.05": complete_grad["relative_l2"] < 0.05}
            if complete_grad is not None else {}),
         "finite": all(math.isfinite(v) for v in
-                      (loss_gap, logprob_rel, grad_rel, step_rel, ratio)),
+                      (loss_gap, logprob_rel, grad_rel, step_rel, ratio,
+                       fb_finalize_ratio, training_side_ratio)),
     }
     print(
         f"TPR_OFFLINE_COMPARISON rows={full[0]['source_rows']} "
@@ -230,7 +253,10 @@ def compare(root, *, diagnostic_only=False, require_recompute=False, require_ful
         f"logprob_rel_l2={logprob_rel:.9g} logprob_max_abs={logprob_max:.9g} "
         f"sampled_grad_rel_l2={grad_rel:.9g} "
         f"sampled_post_sgd_weight_rel_l2={step_rel:.9g} "
-        f"fwd_bwd_speedup={ratio:.3f}x gates={gates} "
+        f"fwd_bwd_speedup={ratio:.3f}x "
+        f"fwd_bwd_finalize_speedup={fb_finalize_ratio:.3f}x "
+        f"training_side_speedup={training_side_ratio:.3f}x "
+        f"training_side_scope=F/B+finalize+diagnostic_SGD gates={gates} "
         f"gate_pass={all(gates.values())}",
         flush=True,
     )
