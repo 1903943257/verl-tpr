@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run two isolated 8-NPU TPR topology checks on the same captured N8 PPO batch:
-#   1) TP2 x RingCP2 x native DP2, recompute OFF
-#   2) TP4 x CP1 x native DP2, TPR-aware full/uniform/1 recompute ON
+#   1) TP2 x RingCP2 x DP2, recompute OFF
+#   2) TP4 x CP1 x DP2, TPR-aware full/uniform/1 recompute ON
 #
 # Usage:
 #   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
@@ -10,7 +10,7 @@
 #     PATH_TO_N8_ACTOR_CAPTURE.pt \
 #     /workspace/tpr_experiments/tp4dp2_vs_tp2cp2dp2_10k
 #
-# This is an isolated repeated F/B timing + gradient/logprob witness, not online E2E or a production benchmark.
+# This is an offline topology/F/B comparison using Megatron process groups and a test-local finalizer; it is not native VERL dispatch or online E2E.
 set -euo pipefail
 cd "$(dirname "$0")/../../../../.."
 
