@@ -105,13 +105,28 @@ for recompute in 0 1; do
   args=()
   if [[ "$recompute" == "1" ]]; then args+=(--require-recompute); fi
   for step in 01 02 03 04 05; do
-    step_root="$ROOT/recompute_${recompute}/step_${step}"
-    if [[ -f "$step_root/full_rank0.pt" && -f "$step_root/tpr_rank0.pt" ]]; then
+    # Snapshot layout has changed across early runs; stage each rank from any
+    # matching step directory so the comparator sees a flat full/tpr pair.
+    compare_dir="$ROOT/logs/recompute_${recompute}_step_${step}_inputs"
+    mkdir -p "$compare_dir"
+    missing=0
+    for mode in full tpr; do
+      for rank in 0 1 2 3 4 5 6 7; do
+        src="$(find "$ROOT/recompute_${recompute}" -type f \
+          -path "*/step_${step}/*" -name "${mode}_rank${rank}.pt" -print -quit)"
+        if [[ -z "$src" ]]; then
+          echo "TPR_REAL_ACTOR_TP8_COMPARISON_MISSING recompute=$recompute step=$step mode=$mode rank=$rank"
+          missing=1
+        else
+          ln -sf "$src" "$compare_dir/${mode}_rank${rank}.pt"
+        fi
+      done
+    done
+    if (( missing == 0 )); then
       python tests/models/mcore/tpr/parallel/compare_real_actor_tp2cp4_offline_ppo.py \
-        "$step_root" --diagnostic-only "${args[@]}" 2>&1 | \
+        "$compare_dir" --diagnostic-only --sequential-replay "${args[@]}" 2>&1 | \
         tee "$ROOT/logs/recompute_${recompute}_step_${step}_comparison.log" || failures=$((failures + 1))
     else
-      echo "TPR_REAL_ACTOR_TP8_COMPARISON_SKIPPED recompute=$recompute step=$step missing full/tpr snapshots"
       failures=$((failures + 1))
     fi
   done
@@ -124,30 +139,43 @@ import json, sys, torch
 from pathlib import Path
 root = Path(sys.argv[1])
 for rec in (0, 1):
-    sums = {}
+    summaries = {}
     peak = {}
     for mode in ("full", "tpr"):
         per_step = []
-        peaks = []
+        all_peaks = []
         for step in range(1, 6):
-            folder = root / f"recompute_{rec}" / f"step_{step:02d}"
-            files = sorted(folder.glob(f"{mode}_rank*.pt"))
-            if len(files) != 8:
-                raise SystemExit(f"Expected 8 rank snapshots, got {len(files)}: {folder}/{mode}")
-            rows = [torch.load(p, map_location="cpu", weights_only=False) for p in files]
+            found = {}
+            for path in (root / f"recompute_{rec}").rglob(f"{mode}_rank*.pt"):
+                try:
+                    item = torch.load(path, map_location="cpu", weights_only=False)
+                except Exception:
+                    continue
+                if item.get("mode") != mode or item.get("step_index") != step:
+                    continue
+                found.setdefault(int(item["rank"]), item)
+            if sorted(found) != list(range(8)):
+                raise SystemExit(
+                    f"Expected ranks 0..7 for recompute={rec} mode={mode} step={step}; "
+                    f"found={sorted(found)}"
+                )
+            rows = [found[r] for r in range(8)]
+            # Critical path is the maximum rank-local interval, not max(A)-max(B).
+            pure_fb = max(max(0.0, float(x["time_forward_backward_finalize_s"]) -
+                              float(x["time_finalize_s"])) for x in rows)
             fbfin = max(float(x["time_forward_backward_finalize_s"]) for x in rows)
-            fin = max(float(x["time_finalize_s"]) for x in rows)
-            sgd = max(float(x["time_sgd_s"]) for x in rows)
-            pure_fb = max(0.0, fbfin - fin)
+            side = max(float(x["time_forward_backward_finalize_s"]) +
+                       float(x["time_sgd_s"]) for x in rows)
             per_step.append({"fwd_bwd": pure_fb, "fwd_bwd_finalize": fbfin,
-                             "training_side_diag_sgd": fbfin + sgd})
-            peaks.append(max(float(x["peak_allocated_bytes"]) for x in rows) / 2**30)
-        sums[mode] = {key: sum(x[key] for x in per_step) for key in per_step[0]}
-        peak[mode] = max(peaks)
-    print(f"TPR_5STEP_SUMMARY recompute={rec} full={json.dumps(sums['full'],sort_keys=True)} "
-          f"tpr={json.dumps(sums['tpr'],sort_keys=True)} "
-          f"pure_fb_speedup={sums['full']['fwd_bwd']/sums['tpr']['fwd_bwd']:.4f}x "
-          f"training_side_diag_sgd_speedup={sums['full']['training_side_diag_sgd']/sums['tpr']['training_side_diag_sgd']:.4f}x "
+                             "training_side_diag_sgd": side})
+            all_peaks.extend(float(x["peak_allocated_bytes"]) / 2**30 for x in rows)
+        summaries[mode] = {key: sum(x[key] for x in per_step) for key in per_step[0]}
+        peak[mode] = max(all_peaks)
+    f, t = summaries["full"], summaries["tpr"]
+    print(f"TPR_5STEP_SUMMARY recompute={rec} full={json.dumps(f,sort_keys=True)} "
+          f"tpr={json.dumps(t,sort_keys=True)} "
+          f"pure_fb_speedup={f['fwd_bwd']/max(t['fwd_bwd'],1e-12):.4f}x "
+          f"training_side_diag_sgd_speedup={f['training_side_diag_sgd']/max(t['training_side_diag_sgd'],1e-12):.4f}x "
           f"peak_alloc_gib_full={peak['full']:.3f} peak_alloc_gib_tpr={peak['tpr']:.3f} "
           f"memory_saved_gib={peak['full']-peak['tpr']:.3f}")
 PY
