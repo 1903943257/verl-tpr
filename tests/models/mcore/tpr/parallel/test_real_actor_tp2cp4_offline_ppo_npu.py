@@ -505,6 +505,8 @@ def test_recorded_full_vs_tpr_one_step():
                 destination / f"step_{step_index:02d}"
                 if len(capture_paths) > 1 else destination
             )
+            # Report per-step finalize time, not a cumulative value across the replay.
+            finalize_sec[0] = 0.0
             model.zero_grad(set_to_none=True)
             dist.barrier()
             torch.npu.synchronize()
