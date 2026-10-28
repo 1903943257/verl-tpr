@@ -163,7 +163,8 @@ def _runtime():
         tp_rank=parallel_state.get_tensor_model_parallel_rank(),
         cp_rank=parallel_state.get_context_parallel_rank(),
         dp_rank=parallel_state.get_data_parallel_rank(),
-        rank=dist.get_rank(), tp_size=tp, cp_size=cp, dp_size=dp,
+        rank=parallel_state.get_tensor_model_parallel_rank(),
+        global_rank=dist.get_rank(), tp_size=tp, cp_size=cp, dp_size=dp,
         device=torch.device("npu", local_rank),
     )
 
