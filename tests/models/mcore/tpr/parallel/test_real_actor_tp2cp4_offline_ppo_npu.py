@@ -36,7 +36,10 @@ try:
 
     # Register torch.npu before imported helper modules perform their
     # module-level NPU availability checks.
-    if os.getenv("TPR_RUN_REAL_ACTOR_TP2CP4") == "1":
+    if (
+        os.getenv("TPR_RUN_REAL_ACTOR_TP2CP4") == "1"
+        or os.getenv("TPR_RUN_REAL_ACTOR_TP8") == "1"
+    ):
         import torch_npu  # noqa: F401
 
     from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
@@ -44,8 +47,9 @@ finally:
     sys.argv[:] = _import_argv
 
 pytestmark = pytest.mark.skipif(
-    os.getenv("TPR_RUN_REAL_ACTOR_TP2CP4") != "1",
-    reason="Set TPR_RUN_REAL_ACTOR_TP2CP4=1 under torchrun with 8 NPUs",
+    os.getenv("TPR_RUN_REAL_ACTOR_TP2CP4") != "1"
+    and os.getenv("TPR_RUN_REAL_ACTOR_TP8") != "1",
+    reason="Set TPR_RUN_REAL_ACTOR_TP2CP4=1 or TPR_RUN_REAL_ACTOR_TP8=1 under torchrun",
 )
 
 
@@ -92,24 +96,35 @@ def _offline_sp_enabled() -> bool:
 
 def _runtime():
     if int(os.getenv("WORLD_SIZE", "1")) != 8:
-        raise AssertionError("offline replay requires exactly TP2 x RingCP4 x DP1 (8 ranks)")
+        raise AssertionError("offline replay requires exactly eight NPU ranks")
+    tp = int(os.getenv("TPR_OFFLINE_TP", "2"))
+    cp = int(os.getenv("TPR_OFFLINE_CP", "4"))
+    dp = int(os.getenv("TPR_OFFLINE_DP", "1"))
+    if tp * cp * dp != 8 or dp != 1:
+        raise AssertionError(
+            f"this recorded-actor harness currently requires TP*CP=8 and DP=1, got {(tp, cp, dp)}"
+        )
+    if (tp, cp, dp) not in ((2, 4, 1), (8, 1, 1)):
+        raise AssertionError(f"supported real-actor offline layouts are TP2xCP4xDP1 and TP8xCP1xDP1, got {(tp, cp, dp)}")
+    if tp == 8 and (
+        os.getenv("TPR_RUN_REAL_ACTOR_TP8") != "1"
+        or os.getenv("TPR_EXPERIMENTAL_OFFLINE_TP8_REAL_ACTOR") != "1"
+    ):
+        raise AssertionError("TP8 real-actor replay requires explicit offline TP8 opt-in")
     import torch_npu  # noqa: F401
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(local_rank)
     dist.init_process_group(backend="hccl")
     old_argv = sys.argv[:]
     try:
-        # Importing mindspeed.args_utils can trigger MindSpeed's argument
-        # setup too. Hide pytest/torchrun arguments before importing ANY
-        # MindSpeed argument/adaptor modules, and keep them hidden through
-        # repatch and get_full_args.
+        # Keep MindSpeed argument parsing isolated from pytest/torchrun argv.
         sys.argv[:] = [sys.argv[0]]
         from mindspeed.args_utils import get_full_args
         from mindspeed.megatron_adaptor import repatch
 
         repatch({
-            "tensor_model_parallel_size": 2,
-            "context_parallel_size": 4,
+            "tensor_model_parallel_size": tp,
+            "context_parallel_size": cp,
             "pipeline_model_parallel_size": 1,
             "context_parallel_algo": "megatron_cp_algo",
             "sequence_parallel": _offline_sp_enabled(),
@@ -125,17 +140,21 @@ def _runtime():
         sys.argv[:] = old_argv
     if not parallel_state.model_parallel_is_initialized():
         parallel_state.initialize_model_parallel(
-            tensor_model_parallel_size=2,
-            context_parallel_size=4,
+            tensor_model_parallel_size=tp,
+            context_parallel_size=cp,
             pipeline_model_parallel_size=1,
             expert_model_parallel_size=1,
         )
     tp_group = parallel_state.get_tensor_model_parallel_group()
     cp_group = parallel_state.get_context_parallel_group()
     dp_group = parallel_state.get_data_parallel_group()
-    assert dist.get_world_size(tp_group) == 2
-    assert dist.get_world_size(cp_group) == 4
-    assert dist.get_world_size(dp_group) == 1
+    actual = (
+        dist.get_world_size(tp_group),
+        dist.get_world_size(cp_group),
+        dist.get_world_size(dp_group),
+    )
+    if actual != (tp, cp, dp):
+        raise AssertionError(f"Wrong Megatron group sizes {actual}; expected {(tp, cp, dp)}")
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     model_parallel_cuda_manual_seed(261013)
     return SimpleNamespace(
@@ -143,10 +162,10 @@ def _runtime():
         pp_group=parallel_state.get_pipeline_model_parallel_group(),
         tp_rank=parallel_state.get_tensor_model_parallel_rank(),
         cp_rank=parallel_state.get_context_parallel_rank(),
-        rank=parallel_state.get_tensor_model_parallel_rank(),
+        dp_rank=parallel_state.get_data_parallel_rank(),
+        rank=dist.get_rank(), tp_size=tp, cp_size=cp, dp_size=dp,
         device=torch.device("npu", local_rank),
     )
-
 
 def _load_real_pair(path: Path, rows: tuple[int, ...], mode: str):
     if not path.is_file():
@@ -344,7 +363,8 @@ def test_recorded_full_vs_tpr_one_step():
         batch, real_keys, count, data_sha = _load_real_pair(source, rows, mode)
         # Construct the model before importing the PPO Engine adapter.
         model, hf = make_real_qwen3_tp_model(
-            runtime, model_path=checkpoint, tp_size=2, cp_size=4,
+            runtime, model_path=checkpoint, tp_size=runtime.tp_size,
+            cp_size=runtime.cp_size,
             sequence_parallel=_offline_sp_enabled(), profile="4b",
         )
         from verl.workers.engine.megatron.tpr.adapter import (
@@ -378,7 +398,7 @@ def test_recorded_full_vs_tpr_one_step():
             raise AssertionError("Not the real Qwen3-4B")
         if dist.get_rank() == 0:
             print(
-                f"TPR_SP_RING_CONFIG mode={mode} TP=2 CP=4 "
+                f"TPR_SP_RING_CONFIG mode={mode} TP={runtime.tp_size} CP={runtime.cp_size} "
                 f"SP={int(model.config.sequence_parallel)}",
                 flush=True,
             )
@@ -432,7 +452,7 @@ def test_recorded_full_vs_tpr_one_step():
                 # Megatron CP gradient semantics: SegmentExecutor uses CP size
                 # scaling locally, then CP-average across replicated weights.
                 dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=runtime.cp_group)
-                p.grad.div_(4)
+                p.grad.div_(runtime.cp_size)
             torch.npu.synchronize()
             finalize_sec[0] += time.perf_counter() - start
 
@@ -441,7 +461,7 @@ def test_recorded_full_vs_tpr_one_step():
             module=[model],
             engine_config=SimpleNamespace(
                 tpr_enabled=True,
-                tensor_model_parallel_size=2, context_parallel_size=4,
+                tensor_model_parallel_size=runtime.tp_size, context_parallel_size=runtime.cp_size,
                 pipeline_model_parallel_size=1, expert_model_parallel_size=1,
                 virtual_pipeline_model_parallel_size=None,
                 dynamic_context_parallel=False, tpr_cp_backend="ring",
@@ -514,7 +534,7 @@ def test_recorded_full_vs_tpr_one_step():
             "recompute_num_layers": model.config.recompute_num_layers,
             "recompute_installed_blocks": installed_blocks,
             "tp_rank": runtime.tp_rank, "cp_rank": runtime.cp_rank,
-            "world": 8, "tp": 2, "cp": 4, "dp": 1,
+            "world": 8, "tp": runtime.tp_size, "cp": runtime.cp_size, "dp": runtime.dp_size,
             "model": "Qwen3-4B", "checkpoint": str(checkpoint),
             "source_capture": str(source), "source_rows": rows,
             "source_keys": real_keys, "data_sha256": data_sha,
