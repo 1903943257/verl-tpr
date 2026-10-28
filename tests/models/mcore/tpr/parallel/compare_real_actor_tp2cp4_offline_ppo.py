@@ -247,8 +247,9 @@ def compare(root, *, diagnostic_only=False, require_recompute=False, require_ful
                        fb_finalize_ratio, training_side_ratio)),
     }
     print(
-        f"TPR_OFFLINE_COMPARISON rows={full[0]['source_rows']} "
-        f"ppo_tokens={len(keys)} loss_full={losses[0][0]:.9g} "
+        f"TPR_OFFLINE_COMPARISON topology=TP{full[0]['tp']}xCP{full[0]['cp']}xDP{full[0]['dp']} "
+        f"rows={full[0]['source_rows']} ppo_tokens={len(keys)} "
+        f"loss_full={losses[0][0]:.9g} "
         f"loss_tpr={losses[0][1]:.9g} loss_gap={loss_gap:.9g} "
         f"logprob_rel_l2={logprob_rel:.9g} logprob_max_abs={logprob_max:.9g} "
         f"sampled_grad_rel_l2={grad_rel:.9g} "
