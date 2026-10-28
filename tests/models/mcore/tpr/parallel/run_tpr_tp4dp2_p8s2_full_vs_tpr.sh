@@ -94,7 +94,7 @@ for mode, label in (("unshared", "Unshared control (Full-like)"), ("tpr", "TPR")
         "recompute": data.get("recompute"),
         "summary_only": data.get("summary_only"),
     })
-print("LABEL\\tMEDIAN_F_B_S\\tPEAK_ALLOC_GIB\\tPPO_TOKENS\\tEXEC_LOGICAL\\tEXEC_UNIQUE\\tEXEC_REUSE\\tEXEC_SEGMENTS\\tEXEC_FORWARD_CALLS")
+print("LABEL\\tMEDIAN_F_B_S\\tPEAK_ALLOC_GIB\\tPPO_TOKENS\\tEXEC_LOGICAL\\tEXEC_UNIQUE\\tEXEC_REUSE\\tPUSH_TOKENS\\tPOP_TOKENS\\tLEAF_TOKENS\\tEXEC_SEGMENTS\\tEXEC_FORWARD_CALLS")
 for row in rows:
     by_dp = row.get("execution_metrics_by_dp") or []
     exec_logical = sum(x["logical_input_tokens"] for x in by_dp)
@@ -102,6 +102,13 @@ for row in rows:
     exec_reuse = exec_logical / exec_unique if exec_unique else None
     exec_segments = sum(x["physical_segments"] for x in by_dp)
     exec_calls = sum(x["model_forward_calls"] for x in by_dp)
+    push_tokens = sum(x["push_forward_tokens"] for x in by_dp)
+    pop_tokens = sum(x["pop_forward_tokens"] for x in by_dp)
+    leaf_tokens = sum(x["leaf_forward_tokens"] + x["grouped_leaf_forward_tokens"] for x in by_dp)
+    row["executed_push_tokens"] = push_tokens
+    row["executed_pop_tokens"] = pop_tokens
+    row["executed_leaf_tokens"] = leaf_tokens
+    row["executed_forward_query_tokens"] = push_tokens + pop_tokens + leaf_tokens
     row["executed_logical_tokens"] = exec_logical
     row["executed_unique_tree_tokens"] = exec_unique
     row["executed_reuse_ratio"] = exec_reuse
@@ -111,7 +118,7 @@ for row in rows:
         row["label"], row["median_s"], row["peak_gib"], row["ppo_tokens"],
         exec_logical, exec_unique,
         f"{exec_reuse:.4f}" if exec_reuse is not None else None,
-        exec_segments, exec_calls,
+        push_tokens, pop_tokens, leaf_tokens, exec_segments, exec_calls,
     )))
 print("NOTE=EXEC_REUSE is computed from actual mode-specific per-DP forests. The legacy global reuse audit is over all 8 rows before DP partitioning and is not the executed-work ratio.")
 if rows[0]["input_sha256"] != rows[1]["input_sha256"]:
@@ -125,6 +132,8 @@ for row in rows:
     print(f"EXECUTED_REUSE_{row['mode'].upper()}={row['executed_reuse_ratio']}")
     print(f"EXECUTED_SEGMENTS_{row['mode'].upper()}={row['executed_physical_segments']}")
     print(f"EXECUTED_FORWARD_CALLS_{row['mode'].upper()}={row['executed_model_forward_calls']}")
+    print(f"EXECUTED_PUSH_POP_LEAF_TOKENS_{row['mode'].upper()}={row['executed_push_tokens']}/{row['executed_pop_tokens']}/{row['executed_leaf_tokens']}")
+    print(f"EXECUTED_FORWARD_QUERY_TOKENS_{row['mode'].upper()}={row['executed_forward_query_tokens']}")
 print(f"INPUT_SHA256={rows[0]['input_sha256']}")
 print("NOTE=Unshared control uses TPR executor without shared-prefix reuse; it is not native Megatron Full scheduling. Both modes use the same TPR-aware full/uniform/1 recompute setting.")
 PY
