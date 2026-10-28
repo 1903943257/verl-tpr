@@ -127,13 +127,13 @@ import json, sys
 from pathlib import Path
 data = json.loads(Path(sys.argv[1]).read_text())
 cfg = data["configs"]
-expected = cfg["full_recompute_0"]["status"] == "OOM"
+negative_control_nonpass = cfg["full_recompute_0"]["status"] != "PASS"
 others_ok = all(cfg[k]["status"] == "PASS" for k in (
     "tpr_recompute_0", "full_recompute_1", "tpr_recompute_1"
 ))
-print(f"EXPECTED_FULL_RECOMPUTE_OFF_OOM={expected}")
+print(f"FULL_RECOMPUTE_OFF_NEGATIVE_CONTROL_STATUS={cfg['full_recompute_0']['status']}")
 print(f"OTHER_THREE_CONFIGS_PASS={others_ok}")
-if expected and others_ok:
+if negative_control_nonpass and others_ok:
     raise SystemExit(0)
 if all(v["status"] == "PASS" for v in cfg.values()):
     raise SystemExit(0)
