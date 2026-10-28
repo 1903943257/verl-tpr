@@ -24,7 +24,7 @@ from verl.models.mcore.config_converter import (
     get_hf_rope_theta,
     hf_to_mcore_config_dense,
 )
-from ..profiling.test_tpr_engine_profile_npu import _ProfileFusedCausalAttention
+from ..profiling._engine_profile_fixture import _ProfileFusedCausalAttention
 
 from ..correctness.test_tpr_qwen3_compatibility_npu import (
     _load_hf_state_dict,

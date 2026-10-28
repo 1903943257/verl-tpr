@@ -169,7 +169,7 @@ flowchart TB
 | [`ring.py`](../../verl/workers/engine/megatron/tpr/ring.py) | Ring CP 公共 API、Backend、Engine CP runtime、CP loss 聚合、可选原生 Root Ring | `RingCPBackend`、`RingCPAttentionBackend`、`resolve_engine_cp_runtime()`、`aggregate_cp_loss()` |
 | [`ring_layout.py`](../../verl/workers/engine/megatron/tpr/ring_layout.py) | SequenceShard、Zigzag 逻辑/物理位置、Padding、Ring block 分类与输入形状校验 | `SequenceShard`、`make_ring_sequence_shard()`、`classify_ring_block()` |
 | [`ring_attention.py`](../../verl/workers/engine/megatron/tpr/ring_attention.py) | Prefix-aware Ring 通信、FA 前反向、Padding Mask、FP32 online Softmax、远端 dKV 归还 | `_RingTPRAttention`、`_circulate_kv()`、`_reduce_ring_gradients_to_owner()` |
-| [`placement.py`](../../verl/workers/engine/megatron/tpr/placement.py) | 可选 Tree 代价与 DP 放置规划工具；原生 mini-batch 分发由 VERL 管理 | `DPPlacementPlan`、`plan_tpr_dta_dp()` |
+| [`placement.py`](../../verl/experimental/tpr/placement.py) | 可选 Tree 代价与 DP 放置规划工具；原生 mini-batch 分发由 VERL 管理 | `DPPlacementPlan`、`plan_tpr_dta_dp()` |
 | [`recompute.py`](../../verl/workers/engine/megatron/tpr/recompute.py) | 可选 TPR-aware TransformerBlock checkpoint，保留外部 KV graph roots；**实验性** | `install_tpr_full_recompute()`、`assert_tpr_full_recompute_installed()` |
 | [`__init__.py`](../../verl/workers/engine/megatron/tpr/__init__.py) | 子包入口 | — |
 

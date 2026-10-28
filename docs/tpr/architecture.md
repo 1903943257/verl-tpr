@@ -22,7 +22,6 @@ workers.engine.megatron.tpr.adapter
     +-- executor.py   : DFS Push / Visit / Pop, recompute, Prefix dKV relay
     +-- state.py      : detached KV path stack and sharded gradient anchors
     +-- ring.py       : Prefix-aware MindSpeed RingP2P, online softmax, CP runtime
-    +-- placement.py  : optional DP forest planning (not trainer dispatch)
     |
 models.mcore.tpr.attention / context / rectangular_attention
     | native Megatron QKV, GQA, TP, RoPE; CANN rectangular CP1 or Ring CP>1
@@ -88,7 +87,7 @@ Padding numerical correctness still needs the NPU CP2/CP4 parity gate.
 
 ### Optional experiments
 
-`verl/experimental/tpr/` contains AllGather, Ulysses, Hybrid, GDN and activation
+`verl/experimental/tpr/` contains optional DP placement planning (`placement.py`), AllGather, Ulysses, Hybrid, GDN and activation
 offload experiments. Historical CE/Exact reference implementations are held only under
 `experimental/tpr/legacy/`, and their tests now import them explicitly.
 **Production PPO must never import these experimental backends.** The

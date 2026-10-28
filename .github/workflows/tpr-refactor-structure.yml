@@ -35,26 +35,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Compile refactored Python source without NPU dependencies
+      - name: Compile TPR Python source without NPU dependencies
         run: |
-          python3 -m compileall -q             verl/models/mcore/tpr             verl/workers/engine/megatron/tpr             verl/experimental/tpr             tests/models/mcore/tpr/unit/test_production_architecture.py \
-            tests/models/mcore/tpr/parallel/compare_old_new_tpr_tp2cp4_ppo.py
-      - name: Check old/new replay shell syntax
+          python3 -m compileall -q verl/models/mcore/tpr verl/workers/engine/megatron/tpr tests/models/mcore/tpr
+      - name: Verify curated test registry and local references
+        run: python3 tests/models/mcore/tpr/run_suite.py check
+      - name: Check retained shell script syntax
         run: |
-          bash -n tests/models/mcore/tpr/parallel/run_old_new_tpr_tp2cp4_ppo.sh
-          bash -n tests/models/mcore/tpr/parallel/run_old_new_tpr_tp2cp2dp2_ppo.sh
-      - name: Check embedded DP2 old/new comparator syntax
-        run: |
-          python3 - <<'PY'
-          import ast
-          from pathlib import Path
-          path = Path("tests/models/mcore/tpr/parallel/run_old_new_tpr_tp2cp2dp2_ppo.sh")
-          source = path.read_text(encoding="utf-8")
-          assert source.count("<<'PY'") == 1
-          embedded = source.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
-          ast.parse(embedded, filename=str(path) + ":comparator")
-          print("PASS DP2 old/new inline Python comparator syntax")
-          PY
+          find tests/models/mcore/tpr -type f -name '*.sh' -print0 | xargs -0 -r -n1 bash -n
       - name: Run stdlib-only structural tests
         run: |
           python3 - <<'PY'
@@ -75,40 +63,4 @@ jobs:
                   total += 1
           assert total >= 7, f"Expected architecture tests, found {total}"
           print(f"PASS all {total} TPR refactor structural checks")
-          PY
-      - name: Run dependency-free Ring and Offload regressions
-        run: |
-          python3 -m unittest -v \
-            tests.models.mcore.tpr.unit.test_ring_coalescing_schedule \
-            tests.models.mcore.tpr.unit.test_ring_streaming_transport \
-            tests.models.mcore.tpr.unit.test_offload_b_gate \
-            tests.models.mcore.tpr.unit.test_activation_offload_adapter
-      - name: Audit legacy model imports
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          import ast, collections
-          old_names = {'activation_offload','actor_capture','dp_placement','engine_adapter','fixed_topology_scheduler','gated_delta_net','kv_stack','megatron_adapter','module_spec','objective_adapter','prefix_state','rope','segment_event_profiler','segment_executor','segment_plan','shard','tp_validation','tpr_batch_runner','trajectory_tree','trajectory_tree_turn','tree_plan_builder','parallel'}
-          for scope in ('verl', 'tests/models/mcore/tpr', 'tests/workers'):
-              counts = collections.defaultdict(list)
-              for f in Path(scope).rglob('*.py') if Path(scope).exists() else []:
-                  try: tree=ast.parse(f.read_text())
-                  except (SyntaxError,UnicodeError): continue
-                  for node in ast.walk(tree):
-                      if isinstance(node, ast.ImportFrom) and node.module:
-                          m=node.module
-                          if m=='verl.models.mcore.tpr':
-                              for alias in node.names:
-                                  if alias.name in old_names: counts[alias.name].append(str(f))
-                          elif m.startswith('verl.models.mcore.tpr.'):
-                              first=m.split('.')[4]
-                              if first in old_names: counts[first].append(str(f))
-                      elif isinstance(node, ast.Import):
-                          for alias in node.names:
-                              if alias.name.startswith('verl.models.mcore.tpr.'):
-                                  first=alias.name.split('.')[4]
-                                  if first in old_names: counts[first].append(str(f))
-              print('TPR_IMPORT_AUDIT_SCOPE='+scope)
-              for k,v in sorted(counts.items()):
-                  print(k, 'imports='+str(len(v)), 'files='+str(len(set(v))), 'ALL_FILES='+repr(sorted(set(v))))
           PY

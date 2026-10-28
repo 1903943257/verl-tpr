@@ -58,7 +58,7 @@ class _CPLeaderCpuMasterAdamW:
 
     def sample_master(self):
         """Bounded FP32-master witness, only on CP group leader."""
-        from ..correctness._qwen17_weak_e2e_sampling import exact_sample_indices
+        from ._sample_indices import exact_sample_indices
         if self.runtime.cp_rank != 0:
             return {}
         result = {}

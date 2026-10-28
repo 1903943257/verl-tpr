@@ -32,12 +32,12 @@ from megatron.core import parallel_state as mpu
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.transformer.spec_utils import ModuleSpec
-from ..profiling.test_tpr_engine_profile_npu import (
+from ..profiling._engine_profile_fixture import (
     _ProfileFusedCausalAttention,
     _profile_reference_loss_function,
     _verify_fused_adapter_path,
 )
-from ..equivalence.test_tpr_engine_reference_equivalence_npu import (
+from ..equivalence._engine_reference_fixture import (
     _configure_model_runtime,
     _install_reference_forward,
     _make_engine,

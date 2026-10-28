@@ -10,7 +10,7 @@ import types
 import pytest
 import torch
 
-from verl.workers.engine.megatron.tpr.placement import (
+from verl.experimental.tpr.placement import (
     _tree_token_cost,
     plan_dta_dfs,
     plan_tpr_dta_dp,

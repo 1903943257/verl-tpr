@@ -78,9 +78,19 @@ def _sanitize_mindspeed_repatch_args(args):
     This helper is shared by TP2CP4 and TP2CP2DP2 offline replay runtimes.
     """
     full_args = vars(args)
+    # MindSpeed parser_unknown_args() does key[2:] on unknown options.
+    # Pytest -q/-s/-x therefore becomes the invalid dataclass field name "".
+    # Values from pytest's short flags may be bool, str, None or a list of
+    # strings. Do not silently discard unexpected values (e.g. int=12).
     if "" in full_args:
-        if not isinstance(full_args[""], str):
-            raise RuntimeError("Unexpected MindSpeed empty argument value type")
+        value = full_args[""]
+        expected = (
+            value is None
+            or isinstance(value, (bool, str))
+            or (isinstance(value, list) and all(isinstance(v, str) for v in value))
+        )
+        if not expected:
+            raise RuntimeError(f"Unexpected MindSpeed empty argument value type: {type(value).__name__}")
         del full_args[""]
     malformed = [repr(key) for key in full_args if not isinstance(key, str) or not key.isidentifier()]
     if malformed:
@@ -119,7 +129,7 @@ def _runtime():
     try:
         # Keep MindSpeed argument parsing isolated from pytest/torchrun argv.
         sys.argv[:] = [sys.argv[0]]
-        from mindspeed.args_utils import get_full_args
+        from mindspeed.args_utils import get_full_args, get_mindspeed_args
         from mindspeed.megatron_adaptor import repatch
 
         repatch({
@@ -138,6 +148,7 @@ def _runtime():
         )
     finally:
         sys.argv[:] = old_argv
+    _sanitize_mindspeed_repatch_args(get_mindspeed_args())
     if not parallel_state.model_parallel_is_initialized():
         parallel_state.initialize_model_parallel(
             tensor_model_parallel_size=tp,
@@ -215,7 +226,7 @@ def _load_real_pair(path: Path, rows: tuple[int, ...], mode: str):
 
 
 def _witness(model, *, grads: bool):
-    from ..correctness._qwen17_weak_e2e_sampling import exact_sample_indices
+    from ._sample_indices import exact_sample_indices
     result = {}
     for name, p in model.named_parameters():
         x = p.grad if grads else p.detach()

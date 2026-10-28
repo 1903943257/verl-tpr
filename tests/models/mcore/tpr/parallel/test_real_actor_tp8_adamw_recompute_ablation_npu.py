@@ -214,7 +214,7 @@ def _load_real_pair(path: Path, rows: tuple[int, ...], mode: str):
 
 
 def _witness(model, *, grads: bool):
-    from ..correctness._qwen17_weak_e2e_sampling import exact_sample_indices
+    from ._sample_indices import exact_sample_indices
     result = {}
     for name, p in model.named_parameters():
         x = p.grad if grads else p.detach()

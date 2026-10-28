@@ -22,7 +22,7 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
 
-from verl.workers.engine.megatron.tpr.placement import plan_tpr_dta_dp
+from verl.experimental.tpr.placement import plan_tpr_dta_dp
 from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
 from verl.utils import tensordict_utils as tu
 
@@ -48,7 +48,7 @@ def _runtime():
     if int(os.getenv("WORLD_SIZE", "1")) != 8:
         raise AssertionError("TP2 x RingCP2 x DP2 requires exactly 8 ranks")
     import torch_npu  # noqa: F401
-    from mindspeed.args_utils import get_full_args
+    from mindspeed.args_utils import get_full_args, get_mindspeed_args
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.npu.set_device(local_rank)
@@ -76,6 +76,9 @@ def _runtime():
         )
     args = get_full_args()
     _sanitize_mindspeed_repatch_args(args)
+    # The fallback MindSpeed parser and Megatron global arguments may differ.
+    # Both must be valid before TransformerConfig dynamic dataclass creation.
+    _sanitize_mindspeed_repatch_args(get_mindspeed_args())
     assert args.context_parallel_algo == "megatron_cp_algo"
     tp = parallel_state.get_tensor_model_parallel_group()
     cp = parallel_state.get_context_parallel_group()

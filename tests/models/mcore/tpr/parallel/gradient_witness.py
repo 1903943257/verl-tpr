@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
 
-from ..correctness._qwen17_weak_e2e_sampling import exact_sample_indices
+from ._sample_indices import exact_sample_indices
 
 
 @torch.no_grad()
