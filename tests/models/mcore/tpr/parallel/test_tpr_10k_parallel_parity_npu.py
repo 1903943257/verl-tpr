@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import statistics
+import time
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +23,6 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
 
-from verl.workers.engine.megatron.tpr.placement import plan_tpr_dta_dp
 from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
 from verl.utils import tensordict_utils as tu
 
@@ -193,16 +194,15 @@ def _load(capture: Path,runtime,mode: str,dp:int):
             f"logical={logical_full} unique={unique_full}. "
             "Do not treat a no-sharing dataset as a TPR correctness gate."
         )
-    if dp==1:
-        partitions=[list(range(8))]
+    if dp == 1:
+        partitions = [list(range(8))]
+    elif dp == 2:
+        # Deterministic equal-row DP sharding. This deliberately avoids the
+        # DTA minimax placement planner so the experiment isolates TP/CP/DP
+        # topology and native Megatron process-group behavior.
+        partitions = [list(range(4)), list(range(4, 8))]
     else:
-        seqs=[list(map(int,x.tolist())) for x in all_batch["input_ids"].unbind()]
-        plan=plan_tpr_dta_dp(
-            seqs,all_keys,dp_size=dp,enforce_equal_rows=False,
-            prompt_lengths=[int(x.numel()) for x in all_batch["prompts"].unbind()],
-            turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
-        )
-        partitions=[list(p) for p in plan.partitions]
+        raise ValueError(f"10K topology gate supports DP1/DP2, got DP={dp}")
     if sorted(row for part in partitions for row in part)!=list(range(8)):
         raise AssertionError("DP forest placement lost/duplicated tokens")
     local_rows=partitions[runtime.dp_rank]
@@ -323,19 +323,53 @@ def test_10k_parallel_factorial_one_topology():
                 flush=True,
             )
 
-        model.zero_grad(set_to_none=True)
-        dist.barrier()
-        torch.npu.synchronize()
-        torch.npu.reset_peak_memory_stats()
-        result=run_tpr_forward_backward_batch(
-            engine,batch,partial(ppo_loss,config=_PPO()),
-            forward_only=False,
-        )
-        torch.npu.synchronize()
+        warmups = int(os.getenv("TPR_10K_WARMUPS", "0"))
+        repeats = int(os.getenv("TPR_10K_REPEATS", "1"))
+        if warmups < 0 or repeats < 1:
+            raise ValueError("TPR_10K_WARMUPS must be >=0 and TPR_10K_REPEATS must be >=1")
+        measured_seconds = []
+        local_peak_bytes = 0
+        result = None
+        for iteration in range(warmups + repeats):
+            model.zero_grad(set_to_none=True)
+            dist.barrier()
+            torch.npu.synchronize()
+            if iteration >= warmups:
+                torch.npu.reset_peak_memory_stats()
+            start = time.perf_counter()
+            result = run_tpr_forward_backward_batch(
+                engine,batch,partial(ppo_loss,config=_PPO()),
+                forward_only=False,
+            )
+            torch.npu.synchronize()
+            elapsed = time.perf_counter() - start
+            elapsed_tensor = torch.tensor(
+                elapsed, device=runtime.device, dtype=torch.float32
+            )
+            dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
+            if iteration >= warmups:
+                measured_seconds.append(float(elapsed_tensor.item()))
+                local_peak_bytes = max(
+                    local_peak_bytes, int(torch.npu.max_memory_allocated())
+                )
+            if dist.get_rank() == 0:
+                print(
+                    f"TPR_10K_FB mode={mode} tp={tp} cp={cp} dp={dp} "
+                    f"iteration={iteration} warmup={int(iteration < warmups)} "
+                    f"max_rank_seconds={elapsed_tensor.item():.6f}",
+                    flush=True,
+                )
+        assert result is not None
         loss_local=float(result["loss"][0])
         loss=torch.tensor(loss_local,device=runtime.device,dtype=torch.float32)
         dist.all_reduce(loss,op=dist.ReduceOp.SUM)
         loss.div_(dist.get_world_size())
+        peak_tensor = torch.tensor(
+            local_peak_bytes, device=runtime.device, dtype=torch.int64
+        )
+        dist.all_reduce(peak_tensor, op=dist.ReduceOp.MAX)
+        peak_allocated_gib_worst = float(peak_tensor.item()) / (2**30)
+        median_fwd_bwd_seconds = statistics.median(measured_seconds)
         # All ranks participate; audits gradients before selecting one TP
         # shard and one CP/DP representative for canonical comparison.
         grads=canonical_grad_witness(
@@ -370,7 +404,12 @@ def test_10k_parallel_factorial_one_topology():
                 "memory_peak_allocated_gib_rank0": (
                     torch.npu.max_memory_allocated()/2**30
                 ),
-                "timed_scope":"not_benchmarked",
+                "memory_peak_allocated_gib_worst": peak_allocated_gib_worst,
+                "fwd_bwd_seconds_max_rank_samples": measured_seconds,
+                "median_fwd_bwd_seconds_max_rank": median_fwd_bwd_seconds,
+                "warmups": warmups,
+                "repeats": repeats,
+                "timed_scope":"synchronized TPR F/B plus gradient finalize; no optimizer; not online E2E",
                 "updated_weights":False,
                 "capture_logprobs":True,
                 "note":(
@@ -384,6 +423,8 @@ def test_10k_parallel_factorial_one_topology():
                 f"TPR_10K_PARITY_RESULT mode={mode} tp={tp} cp={cp} dp={dp} "
                 f"ppo_tokens={global_tokens} global_loss={loss.item():.9g} "
                 f"replica_grad_max_abs={grads['replica_max_abs']} "
+                f"median_fwd_bwd_max_rank_s={median_fwd_bwd_seconds:.6f} "
+                f"peak_allocated_gib_worst={peak_allocated_gib_worst:.3f} "
                 f"gradient_samples={len(grads['values'])} "
                 f"logprob_tokens={len(tokens)} output={dest}",
                 flush=True,
