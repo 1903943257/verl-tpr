@@ -375,6 +375,10 @@ def test_10k_parallel_factorial_one_topology():
             "tpr/model_forward_calls",
             "tpr/grouped_leaf_calls",
             "tpr/grouped_leaf_segments",
+            "tpr/push_forward_tokens",
+            "tpr/pop_forward_tokens",
+            "tpr/leaf_forward_tokens",
+            "tpr/grouped_leaf_forward_tokens",
         )
         raw_metrics = result.get("metrics", {})
         metric_values = []
