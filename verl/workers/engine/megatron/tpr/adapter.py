@@ -417,7 +417,15 @@ def run_tpr_forward_backward_batch(
     metrics = _PPOMetrics()
     event_profiler = SegmentEventProfiler() if detailed_profile else None
     tree_number = 0
-    leaf_batch_stats = {"model_forward_calls": 0, "grouped_leaf_calls": 0, "grouped_leaf_segments": 0}
+    leaf_batch_stats = {
+        "model_forward_calls": 0,
+        "grouped_leaf_calls": 0,
+        "grouped_leaf_segments": 0,
+        "push_forward_tokens": 0,
+        "pop_forward_tokens": 0,
+        "leaf_forward_tokens": 0,
+        "grouped_leaf_forward_tokens": 0,
+    }
 
     def run_one_tree(tree_plan):
         nonlocal tree_number
@@ -517,6 +525,10 @@ def run_tpr_forward_backward_batch(
         "tpr/model_forward_calls": leaf_batch_stats["model_forward_calls"],
         "tpr/grouped_leaf_calls": leaf_batch_stats["grouped_leaf_calls"],
         "tpr/grouped_leaf_segments": leaf_batch_stats["grouped_leaf_segments"],
+        "tpr/push_forward_tokens": leaf_batch_stats["push_forward_tokens"],
+        "tpr/pop_forward_tokens": leaf_batch_stats["pop_forward_tokens"],
+        "tpr/leaf_forward_tokens": leaf_batch_stats["leaf_forward_tokens"],
+        "tpr/grouped_leaf_forward_tokens": leaf_batch_stats["grouped_leaf_forward_tokens"],
     }
     metric_lists = metrics.scalar_lists(cp_runtime)
     metric_lists.update({name: [float(value)] for name, value in diagnostics.items()})
