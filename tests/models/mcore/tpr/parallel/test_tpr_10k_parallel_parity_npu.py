@@ -199,7 +199,7 @@ def _load(capture: Path,runtime,mode: str,dp:int):
     elif dp == 2:
         # Deterministic equal-row DP sharding. This deliberately avoids the
         # DTA minimax placement planner so the experiment isolates TP/CP/DP
-        # topology and native Megatron process-group behavior.
+        # topology and Megatron process-group membership/reduction behavior.
         partitions = [list(range(4)), list(range(4, 8))]
     else:
         raise ValueError(f"10K topology gate supports DP1/DP2, got DP={dp}")
