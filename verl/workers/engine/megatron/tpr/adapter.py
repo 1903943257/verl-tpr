@@ -159,35 +159,29 @@ def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None
 
 
 def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
-    """Support native VERL DP=2 in the tested TP2×RingCP2 PPO topology.
+    """Validate structural TPR constraints without allowlisting TP/CP/DP layouts.
 
-    DP replicas retain independent TPR forests: no cross-DP Prefix KV.
-    Standard VERL equal-cardinality dispatch and Megatron optimizer finalize
-    remain responsible for grouping and gradient synchronization.
+    Megatron owns legality checks for the configured parallel topology. TPR
+    must not maintain a second, stale whitelist of TP × CP × DP combinations:
+    every positive TP/CP/DP layout that Megatron can initialize may enter this
+    adapter. The current TPR PPO schedule still requires PP=EP=1.
     """
-    tp, cp, dp = sizes["TP"], sizes["CP"], sizes["DP"]
-    production_dp2 = ppo and (tp, cp, dp) == (2, 2, 2)
-    # Keep the isolated 10K parity matrix opt-in; do not broaden production.
-    parity_10k_dp2 = (
-        ppo and dp == 2 and tp in (1, 2) and cp in (1, 2)
-        and os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") == "1"
-        and os.getenv("TPR_RUN_10K_PARALLEL_PARITY") == "1"
-        and os.getenv("TPR_10K_PARITY_ONLY") == "1"
-    )
-    supported_cp = (
-        (cp in (1, 2) if tp == 1 else cp in (1, 2, 4))
-        if ppo else (cp >= 1 if tp == 1 else cp in (1, 2, 4))
-    )
-    if (tp not in (1, 2) or not supported_cp
-            or any(sizes[k] != 1 for k in ("PP", "EP"))
-            or (dp != 1 and not (production_dp2 or parity_10k_dp2))):
+    required = ("TP", "PP", "EP", "CP", "DP")
+    missing = [name for name in required if name not in sizes]
+    if missing:
+        raise ValueError(f"Missing Megatron parallel sizes: {missing}")
+
+    for name in required:
+        value = sizes[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"Megatron parallel size {name} must be a positive integer, got {value!r}")
+
+    if sizes["PP"] != 1 or sizes["EP"] != 1:
         raise NotImplementedError(
-            "TPR PPO supports TP1 CP1/2 DP1, TP2 CP1/2/4 DP1 and TP2 CP2 DP2; "
-            f"PP=EP=1; other DP topologies and non-PPO DP2 are gated, got {sizes}"
+            "TPR PPO currently requires PP=EP=1; "
+            f"TP/CP/DP are not allowlisted, got {sizes}"
         )
-    return tp
-
-
+    return sizes["TP"]
 def _validate_tpr_cp_combination(
     tp_size: int, cp_runtime: Any, config: Any, *, ppo: bool
 ) -> None:
@@ -269,11 +263,10 @@ def run_tpr_forward_backward_batch(
     The Engine MUST compute batch_num_tokens / dp_size first. It MUST invoke
     this function BEFORE prepare_micro_batches, so shared trajectories remain
     in the same logical mini-batch. Current training scope: dense Qwen/GPT,
-    TP=1/2, CP=1/2/4, PP=EP=1. Production DP2 supports TP2/CP2
-    with native VERL dispatch and Megatron gradient finalization; other
-    DP>1 combinations remain explicitly gated.
-    Ring required for CP>1. Native TP2+SP+RingCP uses Megatron's sequence
-    parallel layout; supported DP placements are enforced by the topology gate.
+    TP/CP/DP use any legal Megatron topology; this adapter does not maintain
+    a separate topology allowlist. The current TPR PPO schedule requires
+    PP=EP=1. Ring is required for CP>1; native TP+SP+RingCP uses Megatron's
+    sequence-parallel layout.
     Vanilla token-mean PPO; no native /M schedule
     scaling is applied because SegmentExecutor performs autograd itself.
     """
