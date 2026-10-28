@@ -10,7 +10,7 @@
 #     /workspace/tpr_experiments/n8_short_shapes/n8_p8192_s2048.pt \
 #     /workspace/tpr_experiments/tp4dp2_vs_tp2cp2dp2_10k
 #
-# This is an isolated F/B + gradient/logprob witness, not a throughput benchmark.
+# This is an isolated repeated F/B timing + gradient/logprob witness, not online E2E or a production benchmark.
 set -euo pipefail
 cd "$(dirname "$0")/../../../../.."
 
