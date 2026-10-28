@@ -41,7 +41,7 @@ try:
     ):
         import torch_npu  # noqa: F401
 
-    from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
+    from ._qwen3_tp8_adamw_checkpoint import make_real_qwen3_tp_model
 finally:
     sys.argv[:] = _import_argv
 
