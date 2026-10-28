@@ -176,9 +176,16 @@ def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
         and os.getenv("TPR_10K_PARITY_ONLY") == "1"
     )
     supported_cp = (
-        cp in (1, 2) if tp == 1 else
-        cp in (1, 2, 4) if tp == 2 else
-        cp == 1 if tp == 4 else False
+        (
+            cp in (1, 2) if tp == 1 else
+            cp in (1, 2, 4) if tp == 2 else
+            cp == 1 if tp == 4 else False
+        )
+        if ppo else
+        (
+            cp >= 1 if tp == 1 else
+            cp in (1, 2, 4) if tp == 2 else False
+        )
     )
     if (tp not in (1, 2, 4) or not supported_cp
             or (tp == 4 and not (ppo and parity_10k_dp2))
