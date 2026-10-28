@@ -334,10 +334,17 @@ def test_recorded_full_vs_tpr_one_step():
     # ON supports both unshared Full (same TPR Ring/Executor without
     # cross-trajectory sharing) and shared TPR. It does not turn this
     # controlled Full comparator into a native Megatron Full run.
+    capture_list_value = os.getenv("TPR_OFFLINE_CAPTURE_LIST", "").strip()
+    capture_paths = (
+        [Path(item) for item in capture_list_value.split(os.pathsep) if item]
+        if capture_list_value else [Path(os.environ["TPR_REAL_ACTOR_MINIBATCH"])]
+    )
+    if not capture_paths or any(not path.is_file() for path in capture_paths):
+        raise FileNotFoundError(f"Invalid TPR_OFFLINE_CAPTURE_LIST: {capture_paths}")
+    source = capture_paths[0]
     rows_value = os.getenv("TPR_OFFLINE_ROWS", "4,6")
     if rows_value == "all":
-        raw = torch.load(os.environ["TPR_REAL_ACTOR_MINIBATCH"],
-                         map_location="cpu", weights_only=False)
+        raw = torch.load(source, map_location="cpu", weights_only=False)
         rows = tuple(range(len(raw["keys"])))
         del raw
     else:
@@ -347,7 +354,6 @@ def test_recorded_full_vs_tpr_one_step():
     checkpoint = Path(os.environ.get(
         "TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"
     ))
-    source = Path(os.environ["TPR_REAL_ACTOR_MINIBATCH"])
     destination = Path(os.getenv(
         "TPR_OFFLINE_OUTPUT_DIR", "/workspace/tpr_offline_qwen4b_tp2cp4"
     ))
@@ -474,115 +480,140 @@ def test_recorded_full_vs_tpr_one_step():
             get_data_parallel_size=lambda: 1,
             get_data_parallel_group=lambda: runtime.dp_group,
         )
-        model.zero_grad(set_to_none=True)
-        dist.barrier()
-        torch.npu.synchronize()
-        torch.npu.reset_peak_memory_stats()
-        start_alloc = torch.npu.memory_allocated()
-        start_reserved = torch.npu.memory_reserved()
-        before = _witness(model, grads=False)
-        before_time = time.perf_counter()
-        if mode == "split_no_share":
-            # run_tpr_forward_backward_batch builds its forest internally.
-            # Substitute ONLY its diagnostic forest builder during this call.
-            # Do not change the production adapter, Attention or PPO Loss.
-            from unittest.mock import patch
-            from verl.workers.engine.megatron.tpr import tree as tree_module
-            with patch.object(
-                tree_module, "build_tree_execution_plans", return_value=forest,
-            ) as builder:
+        for step_index, step_source in enumerate(capture_paths, 1):
+            if step_index > 1:
+                source = step_source
+                batch, real_keys, count, data_sha = _load_real_pair(source, rows, mode)
+                forest = build_tree_execution_plans(
+                    _trajectory_keys_from_minibatch(batch), batch,
+                    tree_policy=tree_policy,
+                    turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
+                )
+                if mode == "full" and (
+                    len(forest.trees) != len(rows)
+                    or any(len(tree.member_rows) != 1 for tree in forest.trees)
+                ):
+                    raise AssertionError("Full control accidentally reused tokens across rows")
+                if mode == "split_no_share":
+                    from .test_real_actor_cp1_short_full_tpr_npu import _make_unshared_split
+                    if len(forest.trees) != 1 or forest.segment_count != 3:
+                        raise AssertionError("Split-no-share needs one Root and two Leaves")
+                    forest = _make_unshared_split(forest, batch)
+                    if len(forest.trees) != 2 or forest.segment_count != 4:
+                        raise AssertionError("Split-no-share needs two independent chains")
+            step_destination = (
+                destination / f"step_{step_index:02d}"
+                if len(capture_paths) > 1 else destination
+            )
+            model.zero_grad(set_to_none=True)
+            dist.barrier()
+            torch.npu.synchronize()
+            torch.npu.reset_peak_memory_stats()
+            start_alloc = torch.npu.memory_allocated()
+            start_reserved = torch.npu.memory_reserved()
+            before = _witness(model, grads=False)
+            before_time = time.perf_counter()
+            if mode == "split_no_share":
+                # run_tpr_forward_backward_batch builds its forest internally.
+                # Substitute ONLY its diagnostic forest builder during this call.
+                # Do not change the production adapter, Attention or PPO Loss.
+                from unittest.mock import patch
+                from verl.workers.engine.megatron.tpr import tree as tree_module
+                with patch.object(
+                    tree_module, "build_tree_execution_plans", return_value=forest,
+                ) as builder:
+                    out = run_tpr_forward_backward_batch(
+                        engine, batch, partial(ppo_loss, config=_PPO()),
+                        forward_only=False,
+                    )
+                    if builder.call_count != 1:
+                        raise AssertionError(
+                            "Unexpected production forest reconstruction count"
+                        )
+            else:
                 out = run_tpr_forward_backward_batch(
                     engine, batch, partial(ppo_loss, config=_PPO()),
                     forward_only=False,
                 )
-                if builder.call_count != 1:
-                    raise AssertionError(
-                        "Unexpected production forest reconstruction count"
-                    )
-        else:
-            out = run_tpr_forward_backward_batch(
-                engine, batch, partial(ppo_loss, config=_PPO()),
-                forward_only=False,
+            torch.npu.synchronize()
+            fwd_bwd_sec = time.perf_counter() - before_time
+            grad = _witness(model, grads=True)
+            grad_norm = _global_bf16_gradient_norm(model, runtime)
+            full_grad_dir = None
+            if os.getenv("TPR_OFFLINE_SAVE_FULL_GRADS", "0") == "1":
+                full_grad_dir = _save_complete_grads(
+                    model, runtime, step_destination, mode, step=step_index
+                )
+            peak_alloc = torch.npu.max_memory_allocated()
+            peak_reserved = torch.npu.max_memory_reserved()
+            # Optional controlled single SGD step: no extra AdamW FP32 states.
+            lr = float(os.getenv("TPR_OFFLINE_SGD_LR", "1e-5"))
+            if lr < 0:
+                raise ValueError("SGD LR must be >= 0")
+            start_step = time.perf_counter()
+            with torch.no_grad():
+                if lr:
+                    for param in model.parameters():
+                        param.add_(param.grad, alpha=-lr)
+            torch.npu.synchronize()
+            step_sec = time.perf_counter() - start_step
+            after = _witness(model, grads=False)
+            payload = {
+                "mode": mode, "rank": dist.get_rank(), "step_index": step_index,
+                "recompute_enabled": recompute_enabled,
+                "recompute_granularity": model.config.recompute_granularity,
+                "recompute_method": model.config.recompute_method,
+                "recompute_num_layers": model.config.recompute_num_layers,
+                "recompute_installed_blocks": installed_blocks,
+                "tp_rank": runtime.tp_rank, "cp_rank": runtime.cp_rank,
+                "world": 8, "tp": runtime.tp_size, "cp": runtime.cp_size, "dp": runtime.dp_size,
+                "model": "Qwen3-4B", "checkpoint": str(checkpoint),
+                "source_capture": str(source), "source_rows": rows,
+                "source_keys": real_keys, "data_sha256": data_sha,
+                "objective": "original_captured_vanilla_PPO_token_mean",
+                "reference": (
+                    "full_unshared_MindSpeed_native_Ring"
+                    if mode == "full" and ring_impl.startswith("mindspeed_")
+                    else "full_unshared_same_Ring_backend" if mode == "full"
+                    else "TPR_split_no_share_same_Ring_backend"
+                    if mode == "split_no_share" else "TPR_shared_Ring"
+                ),
+                "ring_attention_impl":ring_impl,
+                "optimizer": f"diagnostic_bf16_sgd_lr_{lr}",
+                "logical_ppo_tokens": count, "forest_trees": len(forest.trees),
+                "forest_segments": forest.segment_count,
+                "loss": float(out["loss"][0]),
+                "metrics": out["metrics"],
+                "logprobs": engine._tpr_captured_log_probs,
+                "gradient_samples": grad,
+                "global_bf16_grad_norm": grad_norm,
+                "full_grad_dir": full_grad_dir,
+                "param_before": before, "param_after": after,
+                "time_forward_backward_finalize_s": fwd_bwd_sec,
+                "time_finalize_s": finalize_sec[0],
+                "time_sgd_s": step_sec,
+                "allocated_before_bytes": start_alloc,
+                "reserved_before_bytes": start_reserved,
+                "peak_allocated_bytes": peak_alloc,
+                "peak_reserved_bytes": peak_reserved,
+            }
+            step_destination.mkdir(parents=True, exist_ok=True)
+            output_path = step_destination / f"{mode}_rank{dist.get_rank()}.pt"
+            if output_path.exists():
+                raise FileExistsError(output_path)
+            torch.save(payload, output_path)
+            print(
+                f"TPR_OFFLINE_REPLAY mode={mode} step={step_index}/{len(capture_paths)} recompute={int(recompute_enabled)} "
+                f"installed_blocks={installed_blocks} rank={dist.get_rank()} "
+                f"rows={rows} loss={payload['loss']:.9g} "
+                f"global_grad_norm={grad_norm:.9g} "
+                f"fwd_bwd_sec={fwd_bwd_sec:.3f} "
+                f"peak_alloc_gib={peak_alloc / 2**30:.3f} "
+                f"peak_reserved_gib={peak_reserved / 2**30:.3f} "
+                f"source={source} saved={output_path}",
+                flush=True,
             )
-        torch.npu.synchronize()
-        fwd_bwd_sec = time.perf_counter() - before_time
-        grad = _witness(model, grads=True)
-        grad_norm = _global_bf16_gradient_norm(model, runtime)
-        full_grad_dir = None
-        if os.getenv("TPR_OFFLINE_SAVE_FULL_GRADS", "0") == "1":
-            full_grad_dir = _save_complete_grads(
-                model, runtime, destination, mode, step=1
-            )
-        peak_alloc = torch.npu.max_memory_allocated()
-        peak_reserved = torch.npu.max_memory_reserved()
-        # Optional controlled single SGD step: no extra AdamW FP32 states.
-        lr = float(os.getenv("TPR_OFFLINE_SGD_LR", "1e-5"))
-        if lr < 0:
-            raise ValueError("SGD LR must be >= 0")
-        start_step = time.perf_counter()
-        with torch.no_grad():
-            if lr:
-                for param in model.parameters():
-                    param.add_(param.grad, alpha=-lr)
-        torch.npu.synchronize()
-        step_sec = time.perf_counter() - start_step
-        after = _witness(model, grads=False)
-        payload = {
-            "mode": mode, "rank": dist.get_rank(),
-            "recompute_enabled": recompute_enabled,
-            "recompute_granularity": model.config.recompute_granularity,
-            "recompute_method": model.config.recompute_method,
-            "recompute_num_layers": model.config.recompute_num_layers,
-            "recompute_installed_blocks": installed_blocks,
-            "tp_rank": runtime.tp_rank, "cp_rank": runtime.cp_rank,
-            "world": 8, "tp": runtime.tp_size, "cp": runtime.cp_size, "dp": runtime.dp_size,
-            "model": "Qwen3-4B", "checkpoint": str(checkpoint),
-            "source_capture": str(source), "source_rows": rows,
-            "source_keys": real_keys, "data_sha256": data_sha,
-            "objective": "original_captured_vanilla_PPO_token_mean",
-            "reference": (
-                "full_unshared_MindSpeed_native_Ring"
-                if mode == "full" and ring_impl.startswith("mindspeed_")
-                else "full_unshared_same_Ring_backend" if mode == "full"
-                else "TPR_split_no_share_same_Ring_backend"
-                if mode == "split_no_share" else "TPR_shared_Ring"
-            ),
-            "ring_attention_impl":ring_impl,
-            "optimizer": f"diagnostic_bf16_sgd_lr_{lr}",
-            "logical_ppo_tokens": count, "forest_trees": len(forest.trees),
-            "forest_segments": forest.segment_count,
-            "loss": float(out["loss"][0]),
-            "metrics": out["metrics"],
-            "logprobs": engine._tpr_captured_log_probs,
-            "gradient_samples": grad,
-            "global_bf16_grad_norm": grad_norm,
-            "full_grad_dir": full_grad_dir,
-            "param_before": before, "param_after": after,
-            "time_forward_backward_finalize_s": fwd_bwd_sec,
-            "time_finalize_s": finalize_sec[0],
-            "time_sgd_s": step_sec,
-            "allocated_before_bytes": start_alloc,
-            "reserved_before_bytes": start_reserved,
-            "peak_allocated_bytes": peak_alloc,
-            "peak_reserved_bytes": peak_reserved,
-        }
-        destination.mkdir(parents=True, exist_ok=True)
-        output_path = destination / f"{mode}_rank{dist.get_rank()}.pt"
-        if output_path.exists():
-            raise FileExistsError(output_path)
-        torch.save(payload, output_path)
-        print(
-            f"TPR_OFFLINE_REPLAY mode={mode} recompute={int(recompute_enabled)} "
-            f"installed_blocks={installed_blocks} rank={dist.get_rank()} "
-            f"rows={rows} loss={payload['loss']:.9g} "
-            f"global_grad_norm={grad_norm:.9g} "
-            f"fwd_bwd_sec={fwd_bwd_sec:.3f} "
-            f"peak_alloc_gib={peak_alloc / 2**30:.3f} "
-            f"peak_reserved_gib={peak_reserved / 2**30:.3f} "
-            f"saved={output_path}",
-            flush=True,
-        )
-        dist.barrier()
+            dist.barrier()
     finally:
         if parallel_state.model_parallel_is_initialized():
             parallel_state.destroy_model_parallel()
