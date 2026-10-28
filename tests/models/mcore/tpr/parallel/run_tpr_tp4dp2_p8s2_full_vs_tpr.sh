@@ -2,12 +2,12 @@
 # Controlled TP4 x CP1 x DP2 replay for the N8 P8K/S2K Actor capture.
 # "unshared" is the Full-like no-prefix-sharing control through the same
 # isolated TPR executor; it is NOT native Megatron Full scheduling.
-# Both cases use the same capture, TP/CP/DP, checkpoint, and recompute=OFF.
+# Both cases use the same capture, TP/CP/DP, checkpoint, and recompute=ON (full/uniform/1).
 set -euo pipefail
 cd "$(dirname "$0")/../../../../.."
 
 CAPTURE="${1:-/workspace/tpr_experiments/n8_short_shapes/n8_p8192_s2048.pt}"
-ROOT="${2:-/workspace/tpr_experiments/tp4dp2_p8k_s2k_full_vs_tpr_20261028}"
+ROOT="${2:-/workspace/tpr_experiments/tp4dp2_p8k_s2k_full_vs_tpr_recompute_20261028}"
 CAPTURE="$(realpath "$CAPTURE")"
 [[ -f "$CAPTURE" ]] || { echo "Missing N8 Actor Capture: $CAPTURE" >&2; exit 2; }
 [[ ! -e "$ROOT" ]] || { echo "Refusing existing output root: $ROOT" >&2; exit 2; }
@@ -35,7 +35,7 @@ export TPR_EXEC_PROFILE=0
 export TPR_10K_WARMUPS="${TPR_10K_WARMUPS:-1}"
 export TPR_10K_REPEATS="${TPR_10K_REPEATS:-3}"
 export TPR_10K_SUMMARY_ONLY=1
-export TPR_10K_RECOMPUTE=0
+export TPR_10K_RECOMPUTE="${TPR_10K_RECOMPUTE:-1}"
 export PYTHONUNBUFFERED=1
 unset TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
 
@@ -56,7 +56,7 @@ run_mode() {
   local mode="$1"
   export TPR_10K_MODE="$mode"
   export TPR_10K_OUTPUT="$ROOT/$mode"
-  echo "TPR_P8S2_CASE_START mode=$mode tp=4 cp=1 dp=2 recompute=0 capture=$CAPTURE"
+  echo "TPR_P8S2_CASE_START mode=$mode tp=4 cp=1 dp=2 recompute=$TPR_10K_RECOMPUTE capture=$CAPTURE"
   torchrun --nproc_per_node=8 \
     --master_addr=127.0.0.1 \
     --master_port="${TPR_BENCH_MASTER_PORT:-29872}" \
@@ -106,5 +106,5 @@ if rows[0]["median_s"] and rows[1]["median_s"]:
 if rows[0]["peak_gib"] is not None and rows[1]["peak_gib"] is not None:
     print(f"TPR_PEAK_MEMORY_DELTA_GIB={rows[0]['peak_gib'] - rows[1]['peak_gib']:.3f}")
 print(f"INPUT_SHA256={rows[0]['input_sha256']}")
-print("NOTE=Unshared control uses TPR executor without shared-prefix reuse; it is not native Megatron Full scheduling.")
+print("NOTE=Unshared control uses TPR executor without shared-prefix reuse; it is not native Megatron Full scheduling. Both modes use the same TPR-aware full/uniform/1 recompute setting.")
 PY
