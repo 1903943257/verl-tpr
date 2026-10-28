@@ -89,6 +89,7 @@ for mode, label in (("unshared", "Unshared control (Full-like)"), ("tpr", "TPR")
         "logical_tokens": audit.get("global_logical_tokens"),
         "unique_tree_tokens": audit.get("global_unique_tree_tokens"),
         "reuse_ratio": audit.get("global_reuse_ratio"),
+        "execution_metrics_by_dp": data.get("execution_metrics_by_dp"),
         "input_sha256": data.get("input_sha256"),
         "recompute": data.get("recompute"),
         "summary_only": data.get("summary_only"),
@@ -105,6 +106,8 @@ if rows[0]["median_s"] and rows[1]["median_s"]:
     print(f"UNSHARED_OVER_TPR_SPEEDUP={rows[0]['median_s'] / rows[1]['median_s']:.4f}x")
 if rows[0]["peak_gib"] is not None and rows[1]["peak_gib"] is not None:
     print(f"TPR_PEAK_MEMORY_DELTA_GIB={rows[0]['peak_gib'] - rows[1]['peak_gib']:.3f}")
+for row in rows:
+    print(f"EXECUTION_METRICS_{row['mode'].upper()}={json.dumps(row['execution_metrics_by_dp'], separators=(',', ':'))}")
 print(f"INPUT_SHA256={rows[0]['input_sha256']}")
 print("NOTE=Unshared control uses TPR executor without shared-prefix reuse; it is not native Megatron Full scheduling. Both modes use the same TPR-aware full/uniform/1 recompute setting.")
 PY
