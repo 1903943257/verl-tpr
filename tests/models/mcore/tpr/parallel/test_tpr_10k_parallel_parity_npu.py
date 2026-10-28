@@ -258,7 +258,7 @@ def test_10k_parallel_factorial_one_topology():
     if os.getenv("TPR_10K_PARITY_ONLY")!="1":
         raise RuntimeError(
             "10K parity-only gate not enabled; use the checked-in "
-            "run_tpr_tp4dp2_tp2cp2dp2.sh wrapper or export TPR_10K_PARITY_ONLY=1"
+            "topology wrapper or export TPR_10K_PARITY_ONLY=1"
         )
     if os.getenv("HCCL_DETERMINISTIC")!="true":
         raise RuntimeError("HCCL_DETERMINISTIC=true required for BF16 replica validity")
