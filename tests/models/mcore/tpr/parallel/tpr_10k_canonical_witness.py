@@ -1,7 +1,7 @@
 """Topology-independent Qwen3 parameter-gradient and PPO token witnesses.
 
 Canonical gradient coordinates are logical full parameter coordinates, not
-8 per *local TP shard*. Exposes TP1/TP2/TP4 comparisons while de-duplicating
+8 per *local TP shard*. Exposes TP1/TP2/TP4/TP8 comparisons while de-duplicating
 TP-replicated params and CP/DP replicas. Still sparse: not full-model rel-L2.
 """
 from __future__ import annotations
@@ -83,8 +83,8 @@ def owner_and_local_flat(
 def canonical_grad_witness(model, *, tp_size: int, tp_rank: int,
                            cp_rank: int, dp_rank: int, device) -> dict | None:
     """All TP shards contribute once, all other replicas must match exactly."""
-    if tp_size not in (1, 2, 4):
-        raise ValueError("10K parity supports TP=1/2/4 only")
+    if tp_size not in (1, 2, 4, 8):
+        raise ValueError("10K parity supports TP=1/2/4/8 only")
     names=[]; shapes=[]; offsets=[]; counts=[]
     pieces=[]
     norm_pieces=[]
@@ -210,7 +210,7 @@ def canonical_grad_witness(model, *, tp_size: int, tp_rank: int,
         "qk_norm_tp_sum_applied_to_model_grads":False,
         "sampling":(
             "64 integer-strided logical full-parameter positions per parameter; "
-            "TP-sharded weights are mapped to canonical TP1 coordinates across TP1/TP2/TP4, "
+            "TP-sharded weights are mapped to canonical TP1 coordinates across TP1/TP2/TP4/TP8, "
             "TP-replicated parameters counted once except Q/K RMSNorm, "
             "whose per-head TP contributions are summed in the witness only. "
             "Actual model .grad is unmodified. NOT a full-gradient metric."
