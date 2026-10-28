@@ -7,7 +7,7 @@
 #   ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 #   TPR_QWEN_4B_PATH=/workspace/hf_models/Qwen3-4B \
 #   bash tests/models/mcore/tpr/parallel/run_tpr_tp4dp2_tp2cp2dp2.sh \
-#     /workspace/tpr_experiments/n8_short_shapes/n8_p8192_s2048.pt \
+#     PATH_TO_N8_ACTOR_CAPTURE.pt \
 #     /workspace/tpr_experiments/tp4dp2_vs_tp2cp2dp2_10k
 #
 # This is an isolated repeated F/B timing + gradient/logprob witness, not online E2E or a production benchmark.
@@ -50,6 +50,7 @@ export TPR_EXEC_PROFILE=0
 export TPR_10K_WARMUPS="${TPR_10K_WARMUPS:-1}"
 export TPR_10K_REPEATS="${TPR_10K_REPEATS:-3}"
 export PYTHONUNBUFFERED=1
+unset TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
 export TPR_10K_CAPTURE="$CAPTURE"
 
 mkdir -p "$ROOT"
