@@ -9,6 +9,7 @@ No optimizer. Synchronized F/B timings are controlled replay measurements, not a
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -385,6 +386,27 @@ def test_10k_parallel_factorial_one_topology():
         if dist.get_rank()==0:
             if grads is None or tokens is None:
                 raise AssertionError("Rank0 missing canonical witness")
+            summary_only = os.getenv("TPR_10K_SUMMARY_ONLY", "0") == "1"
+            if summary_only:
+                gradient_payload = {
+                    "replica_max_abs": grads["replica_max_abs"],
+                    "qk_norm_tp_local_gradient_max_abs": grads["qk_norm_tp_local_gradient_max_abs"],
+                    "sampled_parameter_count": len(grads["names"]),
+                    "sampled_gradient_value_count": len(grads["values"]),
+                    "complete_norm_gradient_elements": grads["complete_norm_gradients"]["elements"],
+                    "sampling": grads["sampling"],
+                }
+                token_bytes = json.dumps(
+                    tokens, separators=(",", ":"), allow_nan=False
+                ).encode("utf-8")
+                token_payload = {
+                    "count": len(tokens),
+                    "sha256": hashlib.sha256(token_bytes).hexdigest(),
+                    "note": "Raw token logprobs omitted in summary-only mode; finite/count checks ran in-process.",
+                }
+            else:
+                gradient_payload = grads
+                token_payload = tokens
             if output_dir.exists():
                 raise FileExistsError(f"Refusing overwrite {output_dir}")
             output_dir.mkdir(parents=True)
@@ -397,10 +419,11 @@ def test_10k_parallel_factorial_one_topology():
                 "global_tpr_reuse_audit":reuse,
                 "global_ppo_tokens":global_tokens,
                 "global_loss":float(loss.item()),
+                "summary_only":summary_only,
                 "gradient_sync_reduce_dtype":offline_grad_sync_dtype(),
                 "hccl_deterministic":"true",
-                "gradient_witness":grads,
-                "token_logprobs":tokens,
+                "gradient_witness":gradient_payload,
+                "token_logprobs":token_payload,
                 "memory_peak_allocated_gib_rank0": (
                     torch.npu.max_memory_allocated()/2**30
                 ),
