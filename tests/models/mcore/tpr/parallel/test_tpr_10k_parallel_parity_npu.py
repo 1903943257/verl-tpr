@@ -5,13 +5,16 @@ fingerprint, fixed PPO labels, Qwen3-4B initial weights and TPR backend are
 used. 'unshared' uses one complete trajectory per tree via the existing
 loader's synthetic nonsharing keys, NOT the native Megatron Full schedule.
 
-No optimizer, no performance claim, no repaired PPO labels.
+No optimizer. Synchronized F/B timings are controlled replay measurements, not a production throughput claim. PPO labels are unchanged.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
+import statistics
+import time
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +24,6 @@ import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
 
-from verl.experimental.tpr.placement import plan_tpr_dta_dp
 from verl.workers.engine.megatron.tpr.adapter import run_tpr_forward_backward_batch
 from verl.utils import tensordict_utils as tu
 
@@ -193,16 +195,15 @@ def _load(capture: Path,runtime,mode: str,dp:int):
             f"logical={logical_full} unique={unique_full}. "
             "Do not treat a no-sharing dataset as a TPR correctness gate."
         )
-    if dp==1:
-        partitions=[list(range(8))]
+    if dp == 1:
+        partitions = [list(range(8))]
+    elif dp == 2:
+        # Deterministic equal-row DP sharding. This deliberately avoids the
+        # DTA minimax placement planner so the experiment isolates TP/CP/DP
+        # topology and Megatron process-group membership/reduction behavior.
+        partitions = [list(range(4)), list(range(4, 8))]
     else:
-        seqs=[list(map(int,x.tolist())) for x in all_batch["input_ids"].unbind()]
-        plan=plan_tpr_dta_dp(
-            seqs,all_keys,dp_size=dp,enforce_equal_rows=False,
-            prompt_lengths=[int(x.numel()) for x in all_batch["prompts"].unbind()],
-            turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
-        )
-        partitions=[list(p) for p in plan.partitions]
+        raise ValueError(f"10K topology gate supports DP1/DP2, got DP={dp}")
     if sorted(row for part in partitions for row in part)!=list(range(8)):
         raise AssertionError("DP forest placement lost/duplicated tokens")
     local_rows=partitions[runtime.dp_rank]
@@ -249,13 +250,16 @@ def test_10k_parallel_factorial_one_topology():
     dp=int(os.getenv("TPR_10K_DP","1"))
     mode=os.getenv("TPR_10K_MODE","tpr")
     if (tp,cp,dp) not in (
-        (2,1,1),(2,2,1),(2,1,2),(2,2,2)
+        (2,1,1),(2,2,1),(2,1,2),(2,2,2),(4,1,2),(8,1,1)
     ):
         raise ValueError("Unsupported isolated 10K parity topology")
     if mode not in ("tpr","unshared"):
         raise ValueError("TPR_10K_MODE must be tpr or unshared")
     if os.getenv("TPR_10K_PARITY_ONLY")!="1":
-        raise RuntimeError("10K parity-only gate not enabled")
+        raise RuntimeError(
+            "10K parity-only gate not enabled; use the checked-in "
+            "topology wrapper or export TPR_10K_PARITY_ONLY=1"
+        )
     if os.getenv("HCCL_DETERMINISTIC")!="true":
         raise RuntimeError("HCCL_DETERMINISTIC=true required for BF16 replica validity")
     cap=Path(os.environ["TPR_10K_CAPTURE"]).resolve()
@@ -278,19 +282,152 @@ def test_10k_parallel_factorial_one_topology():
         if hf.num_hidden_layers!=36:
             raise AssertionError("Must use Qwen3-4B 36-layer checkpoint")
         engine=_engine(model,runtime,tp,cp,dp)
-        model.zero_grad(set_to_none=True)
-        dist.barrier()
-        torch.npu.synchronize()
-        torch.npu.reset_peak_memory_stats()
-        result=run_tpr_forward_backward_batch(
-            engine,batch,partial(ppo_loss,config=_PPO()),
-            forward_only=False,
+
+        recompute_enabled = os.getenv("TPR_10K_RECOMPUTE", "0") == "1"
+        installed_blocks = 0
+        if recompute_enabled:
+            # Both TPR and the unshared control use the same TPR-aware model
+            # implementation in this isolated executor. Applying the same
+            # recompute policy to both keeps the performance comparison fair.
+            from megatron.core.transformer.transformer_block import TransformerBlock
+            from verl.workers.engine.megatron.tpr.recompute import (
+                assert_tpr_full_recompute_installed,
+                install_tpr_full_recompute,
+            )
+
+            model.config.recompute_granularity = "full"
+            model.config.recompute_method = "uniform"
+            model.config.recompute_num_layers = 1
+            blocks = [
+                module for module in model.modules()
+                if isinstance(module, TransformerBlock)
+            ]
+            if not blocks or any(module.config is not model.config for module in blocks):
+                raise AssertionError("TPR recompute requires matching TransformerBlock config")
+            installed_blocks = install_tpr_full_recompute(model, model.config)
+            if installed_blocks != len(blocks):
+                raise AssertionError(
+                    f"TPR recompute installed {installed_blocks}/{len(blocks)} TransformerBlocks"
+                )
+            assert_tpr_full_recompute_installed(model, model.config)
+        else:
+            model.config.recompute_granularity = None
+            model.config.recompute_method = None
+            model.config.recompute_num_layers = None
+
+        if dist.get_rank() == 0:
+            print(
+                f"TPR_10K_RECOMPUTE mode={mode} enabled={int(recompute_enabled)} "
+                f"granularity={model.config.recompute_granularity} "
+                f"method={model.config.recompute_method} "
+                f"num_layers={model.config.recompute_num_layers} "
+                f"installed_blocks={installed_blocks}",
+                flush=True,
+            )
+
+        warmups = int(os.getenv("TPR_10K_WARMUPS", "0"))
+        repeats = int(os.getenv("TPR_10K_REPEATS", "1"))
+        if warmups < 0 or repeats < 1:
+            raise ValueError("TPR_10K_WARMUPS must be >=0 and TPR_10K_REPEATS must be >=1")
+        measured_seconds = []
+        local_peak_bytes = 0
+        result = None
+        for iteration in range(warmups + repeats):
+            model.zero_grad(set_to_none=True)
+            dist.barrier()
+            torch.npu.synchronize()
+            if iteration >= warmups:
+                torch.npu.reset_peak_memory_stats()
+            start = time.perf_counter()
+            result = run_tpr_forward_backward_batch(
+                engine,batch,partial(ppo_loss,config=_PPO()),
+                forward_only=False,
+            )
+            torch.npu.synchronize()
+            elapsed = time.perf_counter() - start
+            elapsed_tensor = torch.tensor(
+                elapsed, device=runtime.device, dtype=torch.float32
+            )
+            dist.all_reduce(elapsed_tensor, op=dist.ReduceOp.MAX)
+            if iteration >= warmups:
+                measured_seconds.append(float(elapsed_tensor.item()))
+                local_peak_bytes = max(
+                    local_peak_bytes, int(torch.npu.max_memory_allocated())
+                )
+            if dist.get_rank() == 0:
+                print(
+                    f"TPR_10K_FB mode={mode} tp={tp} cp={cp} dp={dp} "
+                    f"iteration={iteration} warmup={int(iteration < warmups)} "
+                    f"max_rank_seconds={elapsed_tensor.item():.6f}",
+                    flush=True,
+                )
+        assert result is not None
+        # Persist actual executor metrics. The precomputed 8-row topology audit
+        # is intentionally mode-independent and must not be mistaken for the
+        # per-DP forest that was actually executed.
+        metric_names = (
+            "tpr/forest_trees",
+            "tpr/physical_segments",
+            "tpr/logical_input_tokens",
+            "tpr/unique_tree_tokens",
+            "tpr/active_tree_tokens",
+            "tpr/active_physical_segments",
+            "tpr/model_forward_calls",
+            "tpr/grouped_leaf_calls",
+            "tpr/grouped_leaf_segments",
+            "tpr/push_forward_tokens",
+            "tpr/pop_forward_tokens",
+            "tpr/leaf_forward_tokens",
+            "tpr/grouped_leaf_forward_tokens",
         )
-        torch.npu.synchronize()
+        raw_metrics = result.get("metrics", {})
+        metric_values = []
+        for name in metric_names:
+            values = raw_metrics.get(name)
+            if values is None:
+                raise AssertionError(f"TPR executor did not return diagnostic metric {name}")
+            value = values[-1] if isinstance(values, (list, tuple)) else values
+            metric_values.append(int(round(float(value))))
+        # Tensor collective only (not all_gather_object); one row per rank.
+        local_audit = torch.tensor(
+            [runtime.tp_rank, runtime.dp_rank, *metric_values],
+            dtype=torch.int64, device=runtime.device,
+        )
+        gathered_audits = [torch.empty_like(local_audit) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered_audits, local_audit)
+        execution_metric_names = tuple(name.removeprefix("tpr/") for name in metric_names)
+        execution_metrics_by_rank = [
+            {
+                "tp_rank": int(values[0].item()),
+                "dp_rank": int(values[1].item()),
+                **{
+                    name: int(values[index + 2].item())
+                    for index, name in enumerate(execution_metric_names)
+                },
+            }
+            for values in gathered_audits
+        ]
+        execution_metrics_by_dp = [
+            next(item for item in execution_metrics_by_rank
+                 if item["dp_rank"] == dp_rank and item["tp_rank"] == 0)
+            for dp_rank in range(dp)
+        ]
+        if dist.get_rank() == 0:
+            print(
+                "TPR_10K_EXECUTION_AUDIT "
+                + json.dumps(execution_metrics_by_dp, separators=(",", ":")),
+                flush=True,
+            )
         loss_local=float(result["loss"][0])
         loss=torch.tensor(loss_local,device=runtime.device,dtype=torch.float32)
         dist.all_reduce(loss,op=dist.ReduceOp.SUM)
         loss.div_(dist.get_world_size())
+        peak_tensor = torch.tensor(
+            local_peak_bytes, device=runtime.device, dtype=torch.int64
+        )
+        dist.all_reduce(peak_tensor, op=dist.ReduceOp.MAX)
+        peak_allocated_gib_worst = float(peak_tensor.item()) / (2**30)
+        median_fwd_bwd_seconds = statistics.median(measured_seconds)
         # All ranks participate; audits gradients before selecting one TP
         # shard and one CP/DP representative for canonical comparison.
         grads=canonical_grad_witness(
@@ -306,25 +443,55 @@ def test_10k_parallel_factorial_one_topology():
         if dist.get_rank()==0:
             if grads is None or tokens is None:
                 raise AssertionError("Rank0 missing canonical witness")
+            summary_only = os.getenv("TPR_10K_SUMMARY_ONLY", "0") == "1"
+            if summary_only:
+                gradient_payload = {
+                    "replica_max_abs": grads["replica_max_abs"],
+                    "qk_norm_tp_local_gradient_max_abs": grads["qk_norm_tp_local_gradient_max_abs"],
+                    "sampled_parameter_count": len(grads["names"]),
+                    "sampled_gradient_value_count": len(grads["values"]),
+                    "complete_norm_gradient_elements": grads["complete_norm_gradients"]["elements"],
+                    "sampling": grads["sampling"],
+                }
+                token_bytes = json.dumps(
+                    tokens, separators=(",", ":"), allow_nan=False
+                ).encode("utf-8")
+                token_payload = {
+                    "count": len(tokens),
+                    "sha256": hashlib.sha256(token_bytes).hexdigest(),
+                    "note": "Raw token logprobs omitted in summary-only mode; finite/count checks ran in-process.",
+                }
+            else:
+                gradient_payload = grads
+                token_payload = tokens
             if output_dir.exists():
                 raise FileExistsError(f"Refusing overwrite {output_dir}")
             output_dir.mkdir(parents=True)
             data={
                 "mode":mode,"source_capture":str(cap),
+                "recompute":{"enabled":recompute_enabled,"granularity":model.config.recompute_granularity,"method":model.config.recompute_method,"num_layers":model.config.recompute_num_layers,"installed_blocks":installed_blocks},
                 "input_sha256":sha,"checkpoint":str(checkpoint),
                 "topology":{"tp":tp,"cp":cp,"dp":dp,"world":tp*cp*dp},
                 "dp_partitions":partitions,
                 "global_tpr_reuse_audit":reuse,
+                "global_tpr_reuse_audit_scope":"all 8 rows before DP partition; mode-independent topology potential, not executed per-DP work",
+                "execution_metrics_by_dp":execution_metrics_by_dp,
                 "global_ppo_tokens":global_tokens,
                 "global_loss":float(loss.item()),
+                "summary_only":summary_only,
                 "gradient_sync_reduce_dtype":offline_grad_sync_dtype(),
                 "hccl_deterministic":"true",
-                "gradient_witness":grads,
-                "token_logprobs":tokens,
+                "gradient_witness":gradient_payload,
+                "token_logprobs":token_payload,
                 "memory_peak_allocated_gib_rank0": (
                     torch.npu.max_memory_allocated()/2**30
                 ),
-                "timed_scope":"not_benchmarked",
+                "memory_peak_allocated_gib_worst": peak_allocated_gib_worst,
+                "fwd_bwd_seconds_max_rank_samples": measured_seconds,
+                "median_fwd_bwd_seconds_max_rank": median_fwd_bwd_seconds,
+                "warmups": warmups,
+                "repeats": repeats,
+                "timed_scope":"synchronized TPR F/B plus gradient finalize; no optimizer; not online E2E",
                 "updated_weights":False,
                 "capture_logprobs":True,
                 "note":(
@@ -338,6 +505,8 @@ def test_10k_parallel_factorial_one_topology():
                 f"TPR_10K_PARITY_RESULT mode={mode} tp={tp} cp={cp} dp={dp} "
                 f"ppo_tokens={global_tokens} global_loss={loss.item():.9g} "
                 f"replica_grad_max_abs={grads['replica_max_abs']} "
+                f"median_fwd_bwd_max_rank_s={median_fwd_bwd_seconds:.6f} "
+                f"peak_allocated_gib_worst={peak_allocated_gib_worst:.3f} "
                 f"gradient_samples={len(grads['values'])} "
                 f"logprob_tokens={len(tokens)} output={dest}",
                 flush=True,

@@ -159,35 +159,29 @@ def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None
 
 
 def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
-    """Support native VERL DP=2 in the tested TP2×RingCP2 PPO topology.
+    """Validate structural TPR constraints without allowlisting TP/CP/DP layouts.
 
-    DP replicas retain independent TPR forests: no cross-DP Prefix KV.
-    Standard VERL equal-cardinality dispatch and Megatron optimizer finalize
-    remain responsible for grouping and gradient synchronization.
+    Megatron owns legality checks for the configured parallel topology. TPR
+    must not maintain a second, stale whitelist of TP × CP × DP combinations:
+    every positive TP/CP/DP layout that Megatron can initialize may enter this
+    adapter. The current TPR PPO schedule still requires PP=EP=1.
     """
-    tp, cp, dp = sizes["TP"], sizes["CP"], sizes["DP"]
-    production_dp2 = ppo and (tp, cp, dp) == (2, 2, 2)
-    # Keep the isolated 10K parity matrix opt-in; do not broaden production.
-    parity_10k_dp2 = (
-        ppo and dp == 2 and tp in (1, 2) and cp in (1, 2)
-        and os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") == "1"
-        and os.getenv("TPR_RUN_10K_PARALLEL_PARITY") == "1"
-        and os.getenv("TPR_10K_PARITY_ONLY") == "1"
-    )
-    supported_cp = (
-        (cp in (1, 2) if tp == 1 else cp in (1, 2, 4))
-        if ppo else (cp >= 1 if tp == 1 else cp in (1, 2, 4))
-    )
-    if (tp not in (1, 2) or not supported_cp
-            or any(sizes[k] != 1 for k in ("PP", "EP"))
-            or (dp != 1 and not (production_dp2 or parity_10k_dp2))):
+    required = ("TP", "PP", "EP", "CP", "DP")
+    missing = [name for name in required if name not in sizes]
+    if missing:
+        raise ValueError(f"Missing Megatron parallel sizes: {missing}")
+
+    for name in required:
+        value = sizes[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"Megatron parallel size {name} must be a positive integer, got {value!r}")
+
+    if sizes["PP"] != 1 or sizes["EP"] != 1:
         raise NotImplementedError(
-            "TPR PPO supports TP1 CP1/2 DP1, TP2 CP1/2/4 DP1 and TP2 CP2 DP2; "
-            f"PP=EP=1; other DP topologies and non-PPO DP2 are gated, got {sizes}"
+            "TPR PPO currently requires PP=EP=1; "
+            f"TP/CP/DP are not allowlisted, got {sizes}"
         )
-    return tp
-
-
+    return sizes["TP"]
 def _validate_tpr_cp_combination(
     tp_size: int, cp_runtime: Any, config: Any, *, ppo: bool
 ) -> None:
@@ -198,11 +192,8 @@ def _validate_tpr_cp_combination(
             "TPR TP+CP PPO requires the tested Ring backend; "
             f"got {cp_runtime.backend_name!r}"
         )
-    if tp_size > 1 and getattr(config, "sequence_parallel", False):
-        raise NotImplementedError(
-            "TP2+CP requires sequence_parallel=False; combined TP+SP+CP "
-            "has not been validated"
-        )
+    # Sequence-parallel layout is handled by Megatron's QKV projection and
+    # Ring CP-local shard preparation. TP/CP/DP topology legality is owned by Megatron.
 
 
 def _trajectory_keys_from_minibatch(data: Any) -> tuple[str, ...]:
@@ -271,11 +262,10 @@ def run_tpr_forward_backward_batch(
     The Engine MUST compute batch_num_tokens / dp_size first. It MUST invoke
     this function BEFORE prepare_micro_batches, so shared trajectories remain
     in the same logical mini-batch. Current training scope: dense Qwen/GPT,
-    TP=1/2, CP=1/2/4, PP=EP=1. Production DP2 supports TP2/CP2
-    with native VERL dispatch and Megatron gradient finalization; other
-    DP>1 combinations remain explicitly gated.
-    Ring required for CP>1,
-    and native SP is restricted to CP=1 at TP2.
+    TP/CP/DP use any legal Megatron topology; this adapter does not maintain
+    a separate topology allowlist. The current TPR PPO schedule requires
+    PP=EP=1. Ring is required for CP>1; native TP+SP+RingCP uses Megatron's
+    sequence-parallel layout.
     Vanilla token-mean PPO; no native /M schedule
     scaling is applied because SegmentExecutor performs autograd itself.
     """
@@ -367,7 +357,9 @@ def run_tpr_forward_backward_batch(
         assert_tp_plan_agreement(digest_forest_plan(forest), tp_size=tp_size, cp_size=sizes["CP"])
     record_stage("tp_plan_collective_ms", tp_check_start)
     cp_runtime = resolve_engine_cp_runtime(engine, config)
-    _validate_tpr_cp_combination(tp_size, cp_runtime, config, ppo=True)
+    _validate_tpr_cp_combination(
+        tp_size, cp_runtime, config, ppo=True,
+    )
     # Reject unsupported physical shapes for the whole forest before any
     # forward/backward can leave the mini-batch with partial gradients.
     for tree_plan in forest.trees:
@@ -404,7 +396,15 @@ def run_tpr_forward_backward_batch(
     metrics = _PPOMetrics()
     event_profiler = SegmentEventProfiler() if detailed_profile else None
     tree_number = 0
-    leaf_batch_stats = {"model_forward_calls": 0, "grouped_leaf_calls": 0, "grouped_leaf_segments": 0}
+    leaf_batch_stats = {
+        "model_forward_calls": 0,
+        "grouped_leaf_calls": 0,
+        "grouped_leaf_segments": 0,
+        "push_forward_tokens": 0,
+        "pop_forward_tokens": 0,
+        "leaf_forward_tokens": 0,
+        "grouped_leaf_forward_tokens": 0,
+    }
 
     def run_one_tree(tree_plan):
         nonlocal tree_number
@@ -504,6 +504,10 @@ def run_tpr_forward_backward_batch(
         "tpr/model_forward_calls": leaf_batch_stats["model_forward_calls"],
         "tpr/grouped_leaf_calls": leaf_batch_stats["grouped_leaf_calls"],
         "tpr/grouped_leaf_segments": leaf_batch_stats["grouped_leaf_segments"],
+        "tpr/push_forward_tokens": leaf_batch_stats["push_forward_tokens"],
+        "tpr/pop_forward_tokens": leaf_batch_stats["pop_forward_tokens"],
+        "tpr/leaf_forward_tokens": leaf_batch_stats["leaf_forward_tokens"],
+        "tpr/grouped_leaf_forward_tokens": leaf_batch_stats["grouped_leaf_forward_tokens"],
     }
     metric_lists = metrics.scalar_lists(cp_runtime)
     metric_lists.update({name: [float(value)] for name, value in diagnostics.items()})

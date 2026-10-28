@@ -1,0 +1,702 @@
+"""Five-step P16S2 Actor replay on TP8 x CP1 with persistent FP32-master AdamW.
+
+Each mode/recompute combination starts from the same Qwen3-4B checkpoint and
+replays the same five captured Actor minibatches on one evolving model.
+Full means independent trajectories through the same TPR-capable Ring executor;
+TPR enables shared-prefix execution. Rollout is excluded. The optimizer update
+uses persistent CPU FP32 master weights and FP32 Adam moments (weight decay 0).
+"""
+from __future__ import annotations
+
+import hashlib
+import math
+import os
+import sys
+import time
+from functools import partial
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.distributed as dist
+
+# pytest imports this module during collection, BEFORE _runtime() executes.
+# _qwen3_tp_checkpoint imports legacy profiling/correctness tests, which
+# transitively import verl.workers.engine and MindSpeed. MindSpeed's adaptor
+# may parse sys.argv and construct TransformerConfig during those imports.
+# Therefore sanitize argv around the ENTIRE transitive import chain, not just
+# around repatch() in _runtime().
+_import_argv = sys.argv[:]
+try:
+    sys.argv[:] = [sys.argv[0]]
+    from megatron.core import parallel_state
+    from verl.utils import tensordict_utils as tu
+
+    # Register torch.npu before imported helper modules perform their
+    # module-level NPU availability checks.
+    if (
+        os.getenv("TPR_RUN_REAL_ACTOR_TP2CP4") == "1"
+        or os.getenv("TPR_RUN_REAL_ACTOR_TP8") == "1"
+    ):
+        import torch_npu  # noqa: F401
+
+    from ._qwen3_tp8_adamw_checkpoint import make_real_qwen3_tp_model
+finally:
+    sys.argv[:] = _import_argv
+
+pytestmark = pytest.mark.skipif(
+    os.getenv("TPR_RUN_REAL_ACTOR_TP2CP4") != "1"
+    and os.getenv("TPR_RUN_REAL_ACTOR_TP8") != "1",
+    reason="Set TPR_RUN_REAL_ACTOR_TP2CP4=1 or TPR_RUN_REAL_ACTOR_TP8=1 under torchrun",
+)
+
+
+class _PPO:
+    policy_loss = {"loss_mode": "vanilla"}
+    loss_agg_mode = "token-mean"
+    clip_ratio = 0.2
+    clip_ratio_low = None
+    clip_ratio_high = None
+    entropy_coeff = 0.0
+    use_kl_loss = False
+    loss_scale_factor = None
+
+    def __init__(self):
+        self.global_batch_info = {}
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
+
+
+def _sanitize_mindspeed_repatch_args(args):
+    """Remove only the pytest/torchrun empty-key artifact before TransformerConfig.
+
+    MindSpeed turns unknown get_full_args() keys into dataclass fields.
+    A key named "" cannot be a field. Never silently discard other keys.
+    This helper is shared by TP2CP4 and TP2CP2DP2 offline replay runtimes.
+    """
+    full_args = vars(args)
+    if "" in full_args:
+        if not isinstance(full_args[""], str):
+            raise RuntimeError("Unexpected MindSpeed empty argument value type")
+        del full_args[""]
+    malformed = [repr(key) for key in full_args if not isinstance(key, str) or not key.isidentifier()]
+    if malformed:
+        raise RuntimeError(f"Invalid MindSpeed argument names after repatch: {malformed}")
+
+
+def _offline_sp_enabled() -> bool:
+    value = os.getenv("TPR_OFFLINE_SP", "0")
+    if value not in ("0", "1"):
+        raise ValueError("TPR_OFFLINE_SP must be 0 or 1")
+    return value == "1"
+
+
+def _runtime():
+    if int(os.getenv("WORLD_SIZE", "1")) != 8:
+        raise AssertionError("offline replay requires exactly eight NPU ranks")
+    tp = int(os.getenv("TPR_OFFLINE_TP", "2"))
+    cp = int(os.getenv("TPR_OFFLINE_CP", "4"))
+    dp = int(os.getenv("TPR_OFFLINE_DP", "1"))
+    if tp * cp * dp != 8 or dp != 1:
+        raise AssertionError(
+            f"this recorded-actor harness currently requires TP*CP=8 and DP=1, got {(tp, cp, dp)}"
+        )
+    if (tp, cp, dp) not in ((2, 4, 1), (8, 1, 1)):
+        raise AssertionError(f"supported real-actor offline layouts are TP2xCP4xDP1 and TP8xCP1xDP1, got {(tp, cp, dp)}")
+    if tp == 8 and (
+        os.getenv("TPR_RUN_REAL_ACTOR_TP8") != "1"
+        or os.getenv("TPR_EXPERIMENTAL_OFFLINE_TP8_REAL_ACTOR") != "1"
+    ):
+        raise AssertionError("TP8 real-actor replay requires explicit offline TP8 opt-in")
+    import torch_npu  # noqa: F401
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.npu.set_device(local_rank)
+    dist.init_process_group(backend="hccl")
+    old_argv = sys.argv[:]
+    try:
+        # Keep MindSpeed argument parsing isolated from pytest/torchrun argv.
+        sys.argv[:] = [sys.argv[0]]
+        from mindspeed.args_utils import get_full_args
+        from mindspeed.megatron_adaptor import repatch
+
+        repatch({
+            "tensor_model_parallel_size": tp,
+            "context_parallel_size": cp,
+            "pipeline_model_parallel_size": 1,
+            "context_parallel_algo": "megatron_cp_algo",
+            "sequence_parallel": _offline_sp_enabled(),
+            "use_flash_attn": True,
+        })
+        args = get_full_args()
+        _sanitize_mindspeed_repatch_args(args)
+        assert args.context_parallel_algo == "megatron_cp_algo"
+        assert bool(args.sequence_parallel) == _offline_sp_enabled(), (
+            "MindSpeed repatch ignored TPR_OFFLINE_SP"
+        )
+    finally:
+        sys.argv[:] = old_argv
+    if not parallel_state.model_parallel_is_initialized():
+        parallel_state.initialize_model_parallel(
+            tensor_model_parallel_size=tp,
+            context_parallel_size=cp,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+        )
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+    cp_group = parallel_state.get_context_parallel_group()
+    dp_group = parallel_state.get_data_parallel_group()
+    actual = (
+        dist.get_world_size(tp_group),
+        dist.get_world_size(cp_group),
+        dist.get_world_size(dp_group),
+    )
+    if actual != (tp, cp, dp):
+        raise AssertionError(f"Wrong Megatron group sizes {actual}; expected {(tp, cp, dp)}")
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    model_parallel_cuda_manual_seed(261013)
+    return SimpleNamespace(
+        tp_group=tp_group, cp_group=cp_group, dp_group=dp_group,
+        pp_group=parallel_state.get_pipeline_model_parallel_group(),
+        tp_rank=parallel_state.get_tensor_model_parallel_rank(),
+        cp_rank=parallel_state.get_context_parallel_rank(),
+        dp_rank=parallel_state.get_data_parallel_rank(),
+        rank=parallel_state.get_tensor_model_parallel_rank(),
+        global_rank=dist.get_rank(), tp_size=tp, cp_size=cp, dp_size=dp,
+        device=torch.device("npu", local_rank),
+    )
+
+def _load_real_pair(path: Path, rows: tuple[int, ...], mode: str):
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    raw = torch.load(path, map_location="cpu", weights_only=False)
+    if raw.get("capture_stage") != "actor_update_mini_batch":
+        raise AssertionError("Real PPO requires original actor-update capture, not TQ rollout")
+    if any(name not in raw["tensordict"] for name in (
+        "input_ids", "prompts", "responses", "response_mask", "loss_mask",
+        "advantages", "old_log_probs", "temperature"
+    )):
+        raise AssertionError("Missing original PPO input")
+    if (len(rows) < 1 or len(set(rows)) != len(rows)
+            or min(rows) < 0 or max(rows) >= len(raw["keys"])):
+        raise ValueError("Select at least one valid original captured row")
+    data = tu.index_select_tensor_dict(raw["tensordict"], list(rows))
+    original_keys = tuple(raw["keys"][i] for i in rows)
+    if mode in ("tpr", "split_no_share"):
+        keys = original_keys
+    else:
+        # Force independent one-root forests: physically complete trajectories,
+        # with no shared cached Prefix KV. Preserve original PPO tensor values.
+        keys = tuple(f"offline_full_{i}_tpr_0" for i in range(len(rows)))
+    token_count = sum(int(m.bool().sum()) for m in data["response_mask"].unbind(0))
+    assert token_count > 0
+    for ids, p, r, mask, adv, old in zip(
+        data["input_ids"].unbind(0), data["prompts"].unbind(0),
+        data["responses"].unbind(0), data["response_mask"].unbind(0),
+        data["advantages"].unbind(0), data["old_log_probs"].unbind(0),
+        strict=True,
+    ):
+        if not torch.equal(ids, torch.cat((p, r))) or mask.numel() != r.numel():
+            raise AssertionError("Captured full trajectory does not match prompt + response")
+        if adv.numel() != r.numel() or old.numel() != r.numel():
+            raise AssertionError("Original PPO fields do not align")
+    tu.assign_non_tensor(
+        data, tpr_trajectory_keys=keys, dp_size=1,
+        batch_num_tokens=token_count, global_batch_size=len(rows),
+        tpr_capture_log_probs=True,
+    )
+    digest = hashlib.sha256()
+    for key in ("input_ids", "response_mask", "old_log_probs", "advantages"):
+        for row in data[key].unbind(0):
+            digest.update(row.contiguous().view(torch.uint8).numpy().tobytes())
+    return data, original_keys, token_count, digest.hexdigest()
+
+
+def _witness(model, *, grads: bool):
+    from ._sample_indices import exact_sample_indices
+    result = {}
+    for name, p in model.named_parameters():
+        x = p.grad if grads else p.detach()
+        if x is None:
+            raise RuntimeError(f"Missing gradient for {name}")
+        flat = x.detach().reshape(-1)
+        indices = torch.tensor(
+            exact_sample_indices(flat.numel(), 32),
+            dtype=torch.long, device=flat.device
+        )
+        result[name] = {
+            "numel": flat.numel(),
+            "shape": tuple(x.shape),
+            "indices": indices.cpu(),
+            "values": flat.index_select(0, indices).float().cpu(),
+        }
+    return result
+
+
+
+def _global_bf16_gradient_norm(model, runtime):
+    """Exact global L2 of finalized BF16 grads, TP shards counted once.
+
+    CP-finalized replicas are identical, so only CP0 participates in local
+    squared sum. TP-replicated norm parameters are counted only on TP rank0.
+    Each rank participates in the WORLD scalar all-reduce.
+    """
+    local = torch.zeros((), dtype=torch.float32, device=runtime.device)
+    if runtime.cp_rank == 0:
+        for name, param in model.named_parameters():
+            grad = param.grad
+            if grad is None:
+                raise RuntimeError(f"missing global gradient norm tensor: {name}")
+            tp_shard = bool(getattr(param, "tensor_model_parallel", False))
+            if tp_shard or runtime.tp_rank == 0:
+                v = grad.detach().float()
+                local += (v * v).sum()
+                del v
+    dist.all_reduce(local, op=dist.ReduceOp.SUM)
+    return float(torch.sqrt(local).item())
+
+
+def _save_complete_grads(model, runtime, destination: Path, mode: str, step: int):
+    """Opt-in exact BF16 gradient shards, CP rank0 only, streamed to disk.
+
+    Full-gradient relative L2 cannot be reconstructed from scalar norms alone.
+    Persist one TP-shard gradient per tensor and preserve the original dtype.
+    """
+    if runtime.cp_rank != 0:
+        return None
+    target = destination / f"{mode}_step{step}_tp{runtime.tp_rank}_full_grads"
+    if target.exists():
+        raise FileExistsError(target)
+    target.mkdir(parents=True)
+    entries = []
+    for index, (name, param) in enumerate(model.named_parameters()):
+        if param.grad is None:
+            raise RuntimeError(f"Cannot save missing full gradient {name}")
+        filename = f"grad_{index:04d}.pt"
+        torch.save(param.grad.detach().cpu().contiguous(), target / filename)
+        entries.append({
+            "name": name, "shape": tuple(param.grad.shape),
+            "filename": filename,
+            "tp_sharded": bool(getattr(param, "tensor_model_parallel", False)),
+        })
+    torch.save(entries, target / "manifest.pt")
+    return str(target)
+
+
+
+def _install_offline_full_ring_backend(mode: str) -> str:
+    """Native MindSpeed whole Ring core attention, never a Prefix path.
+
+    SegmentExecutor still handles full-sequence sharding/RoPE/PPO/gradients.
+    This is not full production Native Engine or optimizer.
+    """
+    chosen = os.getenv("TPR_OFFLINE_FULL_RING_BACKEND", "custom")
+    if chosen not in ("custom", "native"):
+        raise ValueError("TPR_OFFLINE_FULL_RING_BACKEND must be custom or native")
+    if mode != "full" or chosen == "custom":
+        return "tpr_custom_ring"
+    from verl.experimental.tpr import ring_attention as ring
+
+    def native_full_attention(query, current_key, current_value, *,
+                              prefix_blocks=(), **kwargs):
+        if prefix_blocks:
+            raise AssertionError("Native Full Ring cannot receive shared Prefix KV")
+        result = ring.ordinary_ring_cp_attention(
+            query, current_key, current_value,
+            allow_trailing_padding=True, **kwargs
+        )
+        # The TPR Ring returns [S, B, H*D], NOT the input Q [S,B,H,D].
+        # Megatron RowParallelLinear expects K=H*D; returning four dims
+        # leaks K=D (e.g. 128 vs 2048) and fails aclnnMatmul.
+        if result.numel() != query.numel():
+            raise AssertionError("native Ring output size mismatch")
+        if query.ndim != 4 or query.shape[1] != 1:
+            raise AssertionError(f"unexpected Q shape {tuple(query.shape)}")
+        output = result.reshape(query.shape[0], query.shape[1], -1)
+        if output.shape[-1] != query.shape[2] * query.shape[3]:
+            raise AssertionError("native Ring hidden size mismatch")
+        return output
+
+    ring.ring_cp_attention = native_full_attention
+    return "mindspeed_native_whole_ring_virtual_right_padding"
+
+
+
+class _TP8CpuMasterAdamW:
+    """Persistent FP32 master weights and Adam moments, local TP shard per rank.
+
+    CP leader only owns optimizer state. This experiment uses CP=1, so every TP
+    rank owns the state for its local tensor-parallel shard. Weight decay is 0.
+    """
+
+    def __init__(self, model, runtime, lr: float, clip_norm: float):
+        if not (math.isfinite(lr) and 0.0 < lr < 0.1):
+            raise ValueError(f"Invalid AdamW learning rate: {lr}")
+        if not (math.isfinite(clip_norm) and clip_norm > 0):
+            raise ValueError(f"Invalid AdamW clip norm: {clip_norm}")
+        self.runtime = runtime
+        self.lr = lr
+        self.clip_norm = clip_norm
+        self.names = list(model.named_parameters())
+        self.state = {}
+        if runtime.cp_rank == 0:
+            for name, param in self.names:
+                master = param.detach().to(device="cpu", dtype=torch.float32).clone()
+                self.state[name] = (
+                    master, torch.zeros_like(master), torch.zeros_like(master)
+                )
+
+    def step(self, step: int, global_grad_norm: float) -> float:
+        if not math.isfinite(global_grad_norm) or global_grad_norm < 0:
+            raise FloatingPointError(
+                f"Invalid global gradient norm: {global_grad_norm}"
+            )
+        scale = (
+            1.0 if global_grad_norm == 0
+            else min(1.0, self.clip_norm / global_grad_norm)
+        )
+        beta1, beta2, eps = 0.9, 0.95, 1e-8
+
+        with torch.no_grad():
+            if self.runtime.cp_rank == 0:
+                for name, param in self.names:
+                    if param.grad is None:
+                        raise RuntimeError(f"Missing gradient for {name}")
+                    weight, m, v = self.state[name]
+                    grad = param.grad.detach().to(
+                        device="cpu", dtype=torch.float32
+                    )
+                    grad.mul_(scale)
+                    m.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                    v.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+                    denom = (v / (1.0 - beta2 ** step)).sqrt_().add_(eps)
+                    weight.addcdiv_(
+                        m, denom, value=-self.lr / (1.0 - beta1 ** step)
+                    )
+                    param.copy_(weight.to(device=param.device, dtype=param.dtype))
+                    del grad, denom
+
+            if self.runtime.cp_size > 1:
+                leader = dist.get_global_rank(self.runtime.cp_group, 0)
+                for _, param in self.names:
+                    dist.broadcast(param.data, src=leader, group=self.runtime.cp_group)
+
+        return scale
+
+
+def test_recorded_full_vs_tpr_multistep_adamw():
+    mode = os.environ.get("TPR_OFFLINE_MODE")
+    if mode not in ("full", "tpr", "split_no_share"):
+        raise AssertionError("Set TPR_OFFLINE_MODE=full, tpr, or split_no_share")
+    recompute_setting = os.getenv("TPR_OFFLINE_RECOMPUTE", "0")
+    if recompute_setting not in ("0", "1"):
+        raise ValueError("TPR_OFFLINE_RECOMPUTE must be 0 or 1")
+    recompute_enabled = recompute_setting == "1"
+    # ON supports both unshared Full (same TPR Ring/Executor without
+    # cross-trajectory sharing) and shared TPR. It does not turn this
+    # controlled Full comparator into a native Megatron Full run.
+    capture_list_value = os.getenv("TPR_OFFLINE_CAPTURE_LIST", "").strip()
+    capture_paths = (
+        [Path(item) for item in capture_list_value.split(os.pathsep) if item]
+        if capture_list_value else [Path(os.environ["TPR_REAL_ACTOR_MINIBATCH"])]
+    )
+    if not capture_paths or any(not path.is_file() for path in capture_paths):
+        raise FileNotFoundError(f"Invalid TPR_OFFLINE_CAPTURE_LIST: {capture_paths}")
+    source = capture_paths[0]
+    rows_value = os.getenv("TPR_OFFLINE_ROWS", "4,6")
+    if rows_value == "all":
+        raw = torch.load(source, map_location="cpu", weights_only=False)
+        rows = tuple(range(len(raw["keys"])))
+        del raw
+    else:
+        rows = tuple(int(z) for z in rows_value.split(","))
+    if len(rows) < 1:
+        raise ValueError("TPR_OFFLINE_ROWS must select >=1 original row IDs")
+    checkpoint = Path(os.environ.get(
+        "TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K"
+    ))
+    destination = Path(os.getenv(
+        "TPR_OFFLINE_OUTPUT_DIR", "/workspace/tpr_offline_qwen4b_tp2cp4"
+    ))
+    # Reject stale topology flags before initializing HCCL or loading 4B.
+    tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
+    if tree_policy != "qwen_turn":
+        raise ValueError(f"offline Actor replay requires qwen_turn, got {tree_policy!r}")
+    tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
+    if tree_policy != "qwen_turn":
+        raise ValueError(f"Offline Actor replay requires qwen_turn, got {tree_policy!r}")
+    runtime = _runtime()
+    try:
+        from verl.workers.utils.losses import ppo_loss
+        batch, real_keys, count, data_sha = _load_real_pair(source, rows, mode)
+        # Construct the model before importing the PPO Engine adapter.
+        model, hf = make_real_qwen3_tp_model(
+            runtime, model_path=checkpoint, tp_size=runtime.tp_size,
+            cp_size=runtime.cp_size,
+            sequence_parallel=_offline_sp_enabled(), profile="4b",
+        )
+        from verl.workers.engine.megatron.tpr.adapter import (
+            run_tpr_forward_backward_batch, _trajectory_keys_from_minibatch,
+        )
+        from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans
+        # Production TPR supports only complete Qwen/ChatML Turn sharing.
+        forest = build_tree_execution_plans(
+            _trajectory_keys_from_minibatch(batch), batch,
+            tree_policy=tree_policy,
+            turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
+        )
+        if mode == "full" and (
+            len(forest.trees) != len(rows)
+            or any(len(tree.member_rows) != 1 for tree in forest.trees)
+        ):
+            # Qwen turn-only builds multiple Segments even for an unshared
+            # trajectory.  Isolation is about row ownership, not Segments.
+            raise AssertionError("Full control accidentally reused tokens across rows")
+        if mode == "split_no_share":
+            # Experimental isolation only: preserve Main's replay/recompute path.
+            from .test_real_actor_cp1_short_full_tpr_npu import _make_unshared_split
+            if len(forest.trees) != 1 or forest.segment_count != 3:
+                raise AssertionError("Split-no-share needs one Root and two Leaves")
+            forest = _make_unshared_split(forest, batch)
+            if len(forest.trees) != 2 or forest.segment_count != 4:
+                raise AssertionError("Split-no-share needs two independent chains")
+        # Turn-only TPR may yield multiple trees if complete turns are not shared.
+        ring_impl = _install_offline_full_ring_backend(mode)
+        if hf.num_hidden_layers != 36:
+            raise AssertionError("Not the real Qwen3-4B")
+        if dist.get_rank() == 0:
+            print(
+                f"TPR_SP_RING_CONFIG mode={mode} TP={runtime.tp_size} CP={runtime.cp_size} "
+                f"SP={int(model.config.sequence_parallel)}",
+                flush=True,
+            )
+        model.config.no_sync_func = None
+        model.config.grad_scale_func = None
+        model.config.calculate_per_token_loss = False
+        # Match the OFF baseline's model, checkpoint, tree and PPO exactly;
+        # only the per-layer activation checkpoint behavior may differ.
+        if recompute_enabled:
+            from megatron.core.transformer.transformer_block import TransformerBlock
+            from verl.workers.engine.megatron.tpr.recompute import (
+                assert_tpr_full_recompute_installed,
+                install_tpr_full_recompute,
+            )
+
+            model.config.recompute_granularity = "full"
+            model.config.recompute_method = "uniform"
+            model.config.recompute_num_layers = 1
+            blocks = [module for module in model.modules() if isinstance(module, TransformerBlock)]
+            if not blocks or any(block.config is not model.config for block in blocks):
+                raise AssertionError("Real Qwen TransformerBlock config is not the model config")
+            installed_blocks = install_tpr_full_recompute(model, model.config)
+            if installed_blocks != len(blocks):
+                raise AssertionError(
+                    f"Recompute installed on {installed_blocks} of {len(blocks)} TransformerBlocks"
+                )
+            assert_tpr_full_recompute_installed(model, model.config)
+        else:
+            model.config.recompute_granularity = None
+            model.config.recompute_method = None
+            model.config.recompute_num_layers = None
+            installed_blocks = 0
+        if os.environ.get("RANK", "0") == "0":
+            print(
+                f"TPR_RECOMPUTE_CONFIG mode={mode} enabled={recompute_enabled} "
+                f"granularity={model.config.recompute_granularity} "
+                f"method={model.config.recompute_method} "
+                f"num_layers={model.config.recompute_num_layers} "
+                f"installed_blocks={installed_blocks}",
+                flush=True,
+            )
+        finalize_sec = [0.0]
+
+        def finalize(chunks, num_tokens, *, force_all_reduce=False, **kwargs):
+            assert chunks == [model] and num_tokens is None and force_all_reduce
+            torch.npu.synchronize()
+            start = time.perf_counter()
+            for name, p in model.named_parameters():
+                if p.grad is None:
+                    raise RuntimeError(f"No gradient for {name}")
+                # Megatron CP gradient semantics: SegmentExecutor uses CP size
+                # scaling locally, then CP-average across replicated weights.
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=runtime.cp_group)
+                p.grad.div_(runtime.cp_size)
+            torch.npu.synchronize()
+            finalize_sec[0] += time.perf_counter() - start
+
+        model.config.finalize_model_grads_func = finalize
+        engine = SimpleNamespace(
+            module=[model],
+            engine_config=SimpleNamespace(
+                tpr_enabled=True,
+                tensor_model_parallel_size=runtime.tp_size, context_parallel_size=runtime.cp_size,
+                pipeline_model_parallel_size=1, expert_model_parallel_size=1,
+                virtual_pipeline_model_parallel_size=None,
+                dynamic_context_parallel=False,
+                tpr_cp_backend="ring" if runtime.cp_size > 1 else None,
+                use_fused_kernels=False,
+                override_transformer_config={},
+            ),
+            model_config=SimpleNamespace(mtp=SimpleNamespace(enable=False)),
+            enable_routing_replay=False,
+            get_data_parallel_size=lambda: 1,
+            get_data_parallel_group=lambda: runtime.dp_group,
+        )
+        adamw_lr = float(os.getenv("TPR_OFFLINE_ADAMW_LR", "1e-6"))
+        adamw_clip_norm = float(os.getenv("TPR_OFFLINE_ADAMW_CLIP_NORM", "1.0"))
+        adamw = _TP8CpuMasterAdamW(
+            model, runtime, lr=adamw_lr, clip_norm=adamw_clip_norm
+        )
+        if dist.get_rank() == 0:
+            print(
+                f"TPR_ADAMW_CONFIG optimizer=cpu_fp32_master_adamw "
+                f"lr={adamw_lr} betas=(0.9,0.95) eps=1e-8 "
+                f"weight_decay=0 clip_norm={adamw_clip_norm} "
+                f"state_persists_steps={len(capture_paths)}",
+                flush=True,
+            )
+
+        for step_index, step_source in enumerate(capture_paths, 1):
+            if step_index > 1:
+                source = step_source
+                batch, real_keys, count, data_sha = _load_real_pair(source, rows, mode)
+                forest = build_tree_execution_plans(
+                    _trajectory_keys_from_minibatch(batch), batch,
+                    tree_policy=tree_policy,
+                    turn_min_segment_tokens=int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128")),
+                )
+                if mode == "full" and (
+                    len(forest.trees) != len(rows)
+                    or any(len(tree.member_rows) != 1 for tree in forest.trees)
+                ):
+                    raise AssertionError("Full control accidentally reused tokens across rows")
+                if mode == "split_no_share":
+                    from .test_real_actor_cp1_short_full_tpr_npu import _make_unshared_split
+                    if len(forest.trees) != 1 or forest.segment_count != 3:
+                        raise AssertionError("Split-no-share needs one Root and two Leaves")
+                    forest = _make_unshared_split(forest, batch)
+                    if len(forest.trees) != 2 or forest.segment_count != 4:
+                        raise AssertionError("Split-no-share needs two independent chains")
+            step_destination = (
+                destination / f"step_{step_index:02d}"
+                if len(capture_paths) > 1 else destination
+            )
+            # Report per-step finalize time, not a cumulative value across the replay.
+            finalize_sec[0] = 0.0
+            model.zero_grad(set_to_none=True)
+            dist.barrier()
+            torch.npu.synchronize()
+            torch.npu.reset_peak_memory_stats()
+            start_alloc = torch.npu.memory_allocated()
+            start_reserved = torch.npu.memory_reserved()
+            before = _witness(model, grads=False)
+            before_time = time.perf_counter()
+            if mode == "split_no_share":
+                # run_tpr_forward_backward_batch builds its forest internally.
+                # Substitute ONLY its diagnostic forest builder during this call.
+                # Do not change the production adapter, Attention or PPO Loss.
+                from unittest.mock import patch
+                from verl.workers.engine.megatron.tpr import tree as tree_module
+                with patch.object(
+                    tree_module, "build_tree_execution_plans", return_value=forest,
+                ) as builder:
+                    out = run_tpr_forward_backward_batch(
+                        engine, batch, partial(ppo_loss, config=_PPO()),
+                        forward_only=False,
+                    )
+                    if builder.call_count != 1:
+                        raise AssertionError(
+                            "Unexpected production forest reconstruction count"
+                        )
+            else:
+                out = run_tpr_forward_backward_batch(
+                    engine, batch, partial(ppo_loss, config=_PPO()),
+                    forward_only=False,
+                )
+            torch.npu.synchronize()
+            fwd_bwd_sec = time.perf_counter() - before_time
+            grad = _witness(model, grads=True)
+            torch.npu.synchronize()
+            grad_norm_start = time.perf_counter()
+            grad_norm = _global_bf16_gradient_norm(model, runtime)
+            torch.npu.synchronize()
+            grad_norm_sec = time.perf_counter() - grad_norm_start
+            full_grad_dir = None
+            if os.getenv("TPR_OFFLINE_SAVE_FULL_GRADS", "0") == "1":
+                full_grad_dir = _save_complete_grads(
+                    model, runtime, step_destination, mode, step=step_index
+                )
+            start_step = time.perf_counter()
+            clip_scale = adamw.step(step_index, grad_norm)
+            torch.npu.synchronize()
+            step_sec = time.perf_counter() - start_step
+            peak_alloc = torch.npu.max_memory_allocated()
+            peak_reserved = torch.npu.max_memory_reserved()
+            after = _witness(model, grads=False)
+            payload = {
+                "mode": mode, "rank": dist.get_rank(), "step_index": step_index,
+                "recompute_enabled": recompute_enabled,
+                "recompute_granularity": model.config.recompute_granularity,
+                "recompute_method": model.config.recompute_method,
+                "recompute_num_layers": model.config.recompute_num_layers,
+                "recompute_installed_blocks": installed_blocks,
+                "tp_rank": runtime.tp_rank, "cp_rank": runtime.cp_rank,
+                "world": 8, "tp": runtime.tp_size, "cp": runtime.cp_size, "dp": runtime.dp_size,
+                "model": "Qwen3-4B", "checkpoint": str(checkpoint),
+                "source_capture": str(source), "source_rows": rows,
+                "source_keys": real_keys, "data_sha256": data_sha,
+                "objective": "original_captured_vanilla_PPO_token_mean",
+                "reference": (
+                    "full_unshared_MindSpeed_native_Ring"
+                    if mode == "full" and ring_impl.startswith("mindspeed_")
+                    else "full_unshared_same_Ring_backend" if mode == "full"
+                    else "TPR_split_no_share_same_Ring_backend"
+                    if mode == "split_no_share" else "TPR_shared_Ring"
+                ),
+                "ring_attention_impl":ring_impl,
+                "optimizer": "cpu_fp32_master_adamw_beta1_0.9_beta2_0.95_eps_1e-8_wd_0",
+                "optimizer_lr": adamw.lr,
+                "optimizer_clip_norm": adamw.clip_norm,
+                "optimizer_clip_scale": clip_scale,
+                "logical_ppo_tokens": count, "forest_trees": len(forest.trees),
+                "forest_segments": forest.segment_count,
+                "loss": float(out["loss"][0]),
+                "metrics": out["metrics"],
+                "logprobs": engine._tpr_captured_log_probs,
+                "gradient_samples": grad,
+                "global_bf16_grad_norm": grad_norm,
+                "full_grad_dir": full_grad_dir,
+                "param_before": before, "param_after": after,
+                "time_forward_backward_finalize_s": fwd_bwd_sec,
+                "time_finalize_s": finalize_sec[0],
+                "time_grad_norm_s": grad_norm_sec,
+                "time_adamw_s": step_sec,
+                "allocated_before_bytes": start_alloc,
+                "reserved_before_bytes": start_reserved,
+                "peak_allocated_bytes": peak_alloc,
+                "peak_reserved_bytes": peak_reserved,
+            }
+            step_destination.mkdir(parents=True, exist_ok=True)
+            output_path = step_destination / f"{mode}_rank{dist.get_rank()}.pt"
+            if output_path.exists():
+                raise FileExistsError(output_path)
+            torch.save(payload, output_path)
+            print(
+                f"TPR_OFFLINE_REPLAY mode={mode} step={step_index}/{len(capture_paths)} recompute={int(recompute_enabled)} "
+                f"installed_blocks={installed_blocks} rank={dist.get_rank()} "
+                f"rows={rows} loss={payload['loss']:.9g} "
+                f"global_grad_norm={grad_norm:.9g} "
+                f"fwd_bwd_sec={fwd_bwd_sec:.3f} "
+                f"grad_norm_sec={grad_norm_sec:.3f} adamw_sec={step_sec:.3f} "
+                f"peak_alloc_gib={peak_alloc / 2**30:.3f} "
+                f"peak_reserved_gib={peak_reserved / 2**30:.3f} "
+                f"source={source} saved={output_path}",
+                flush=True,
+            )
+            dist.barrier()
+    finally:
+        if parallel_state.model_parallel_is_initialized():
+            parallel_state.destroy_model_parallel()
+        if dist.is_initialized():
+            dist.destroy_process_group()

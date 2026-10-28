@@ -1,0 +1,28 @@
+# UniAgent SWE-reBench task config for the local Docker sandbox.
+# Copied from the public UniAgent task-config schema and scoped to swe_rebench.
+# The sandbox image is supplied by each normalized Parquet task row.
+# The sandbox backend creates sibling Docker containers through docker.sock.
+- name: swe_rebench
+  sandbox:
+    provider: docker
+    runtime_timeout: 7200
+    sandbox_kwargs:
+      pull_policy: never
+  agent:
+    name: claude_code
+    max_turns: 200
+    run_timeout: 4800
+    # Model endpoint/sampling are supplied by the runtime; ClaudeCodeConfig.model
+    # only accepts base_url, api_key and model_name. Session token limits are
+    # enforced by the rollout configuration, not this task's ModelConfig.
+  prompt_template:
+    - role: user
+      content: |-
+        Read the following task description and resolve the issue in the current directory.
+
+        Task description:
+        {problem_statement}
+
+        Inspect the relevant code, make the minimal correct changes, and verify
+        the result with appropriate tests or checks. Do not modify tests or
+        commit changes. Briefly summarize the fix and verification.

@@ -13,6 +13,11 @@ export TPR_TREE_POLICY=qwen_turn
 export TPR_RECOMPUTE_LOG_DIR="${TPR_RECOMPUTE_LOG_DIR:-/workspace/tpr_log/recompute}"
 mkdir -p "$TPR_RECOMPUTE_LOG_DIR"
 export TPR_OFFLINE_RECOMPUTE="${TPR_OFFLINE_RECOMPUTE:-0}"
+export TPR_OFFLINE_SP="${TPR_OFFLINE_SP:-0}"
+case "$TPR_OFFLINE_SP" in
+    0|1) ;;
+    *) echo "TPR_OFFLINE_SP must be 0 or 1" >&2; exit 2 ;;
+esac
 case "$TPR_OFFLINE_RECOMPUTE" in
     0) recompute_label=off ;;
     1) recompute_label=on ;;
@@ -20,13 +25,13 @@ case "$TPR_OFFLINE_RECOMPUTE" in
 esac
 export TPR_OFFLINE_ROWS="${TPR_OFFLINE_ROWS:-4,6}"
 # OFF and ON must not overwrite one another's saved gradients / witnesses.
-export TPR_OFFLINE_OUTPUT_DIR="${TPR_OFFLINE_OUTPUT_DIR:-/workspace/tpr_recompute_${recompute_label}_v1}"
-: "${ASCEND_RT_VISIBLE_DEVICES:=8,9,10,11,12,13,14,15}"
+export TPR_OFFLINE_OUTPUT_DIR="${TPR_OFFLINE_OUTPUT_DIR:-/workspace/tpr_sp${TPR_OFFLINE_SP}_recompute_${recompute_label}_v1}"
+: "${ASCEND_RT_VISIBLE_DEVICES:=0,1,2,3,4,5,6,7}"
 export ASCEND_RT_VISIBLE_DEVICES
-if [[ "$ASCEND_RT_VISIBLE_DEVICES" != "8,9,10,11,12,13,14,15" ]]; then
-    echo "ERROR: expected physical NPU 8-15; got $ASCEND_RT_VISIBLE_DEVICES" >&2
-    exit 2
-fi
+case "$ASCEND_RT_VISIBLE_DEVICES" in
+    0,1,2,3,4,5,6,7|8,9,10,11,12,13,14,15) ;;
+    *) echo "ERROR: CP4 replay expects eight physical NPUs (0-7 or 8-15), got $ASCEND_RT_VISIBLE_DEVICES" >&2; exit 2 ;;
+esac
 [[ -f "$TPR_REAL_ACTOR_MINIBATCH" ]] || { echo "Missing actor capture" >&2; exit 2; }
 [[ -d "$TPR_QWEN_4B_PATH" ]] || { echo "Missing Qwen3-4B checkpoint" >&2; exit 2; }
 mkdir -p "$TPR_OFFLINE_OUTPUT_DIR"
@@ -54,12 +59,11 @@ fi
 errors=()
 for mode in "${modes[@]}"; do
     export TPR_OFFLINE_MODE="$mode"
-    echo "TPR_OFFLINE_START mode=$mode recompute=$TPR_OFFLINE_RECOMPUTE rows=$TPR_OFFLINE_ROWS device=$ASCEND_RT_VISIBLE_DEVICES results=$TPR_OFFLINE_OUTPUT_DIR"
+    echo "TPR_OFFLINE_START mode=$mode sp=$TPR_OFFLINE_SP recompute=$TPR_OFFLINE_RECOMPUTE rows=$TPR_OFFLINE_ROWS device=$ASCEND_RT_VISIBLE_DEVICES results=$TPR_OFFLINE_OUTPUT_DIR"
     # An OOM in Full must not prevent the independent TPR memory experiment.
     if torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29797 \
-       -m pytest -vv -s -x \
-       tests/models/mcore/tpr/parallel/test_real_actor_tp2cp4_offline_ppo_npu.py \
-       2>&1 | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_${mode}_recompute_${recompute_label}.log"; then
+       tests/models/mcore/tpr/parallel/run_cp4_pytest_argv_safe.py \
+       2>&1 | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_${mode}_sp${TPR_OFFLINE_SP}_recompute_${recompute_label}.log"; then
        echo "TPR_OFFLINE mode=$mode completed"
     else
        errors+=("$mode")
@@ -78,7 +82,7 @@ if [[ "${#errors[@]}" == 0 ]] && \
     fi
     python tests/models/mcore/tpr/parallel/compare_real_actor_tp2cp4_offline_ppo.py \
       "$TPR_OFFLINE_OUTPUT_DIR" "${compare_args[@]}" \
-      2>&1 | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_comparison_recompute_${recompute_label}.log"
+      2>&1 | tee "$TPR_RECOMPUTE_LOG_DIR/offline_tp2cp4_comparison_sp${TPR_OFFLINE_SP}_recompute_${recompute_label}.log"
 fi
 # CP4 three-arm numerical attribution can reuse an existing full/tpr run.
 # The split_no_share mode runs ONLY the missing third arm (8 NPUs once).
