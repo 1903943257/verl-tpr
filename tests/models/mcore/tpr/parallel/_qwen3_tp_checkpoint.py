@@ -1,6 +1,6 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: Apache-2.0
-"""Load the *real* HF Qwen3-1.7B checkpoint into native Megatron TP2 shards.
+"""Load the *real* HF Qwen3-1.7B checkpoint into native Megatron TP1/TP2/TP4 shards.
 
 The existing CP checkpoint loader is TP1-only. For TP>1 its full QKV,
 MLP and embedding tensors MUST be partitioned according to Megatron's
@@ -108,8 +108,8 @@ def load_qwen3_1_7b_config(path: Path):
 def load_hf_qwen3_tp_shards(model, hf, path: Path, *, tp_rank: int, tp_size: int = 2):
     """Load every parameter from checkpoint; assert shape and full coverage."""
     state = _load_hf_state_dict(path)
-    if tp_size not in (1, 2) or not 0 <= tp_rank < tp_size:
-        raise ValueError("Qwen3 dense isolated parallel tests require TP=1 or TP=2")
+    if tp_size not in (1, 2, 4) or not 0 <= tp_rank < tp_size:
+        raise ValueError("Qwen3 dense isolated parallel tests require TP=1, TP=2, or TP=4")
     if hf.num_key_value_heads % tp_size or hf.vocab_size % tp_size:
         raise AssertionError("invalid Qwen TP group or vocab divisibility")
 
@@ -204,7 +204,7 @@ def load_hf_qwen3_tp_shards(model, hf, path: Path, *, tp_rank: int, tp_size: int
         if id(param) not in loaded_ids
     ]
     if missing:
-        raise RuntimeError(f"TP2 Qwen checkpoint loader missed: {missing}")
+        raise RuntimeError(f"Qwen TP checkpoint loader missed: {missing}")
     # Important: tied lm_head does NOT introduce a second trainable weight.
     if model.output_layer.weight is not None:
         raise RuntimeError("Qwen3-1.7B tied embedding expected output_layer.weight=None")
