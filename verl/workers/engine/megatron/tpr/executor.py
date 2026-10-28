@@ -352,6 +352,12 @@ class SegmentExecutor:
         self.model_forward_calls = 0
         self.grouped_leaf_calls = 0
         self.grouped_leaf_segments = 0
+        # Actual forward query-token work, including repeated Push and Pop
+        # executions. These intentionally differ from unique topology tokens.
+        self.push_forward_tokens = 0
+        self.pop_forward_tokens = 0
+        self.leaf_forward_tokens = 0
+        self.grouped_leaf_forward_tokens = 0
         self._failed = False
         self._ran = False
         self._operation_depth = 0
@@ -442,6 +448,7 @@ class SegmentExecutor:
 
         with self._operation():
             segment = self.plan.get(segment_id)
+            self.push_forward_tokens += segment.length
             context, logits = self._forward(
                 segment,
                 past_key_values={} if self.cp_enabled else self.kv_stack.build_past_key_values(),
@@ -518,6 +525,7 @@ class SegmentExecutor:
                 raise ValueError("leaf group exceeds configured size/token budget")
 
             anchors = self.kv_stack.build_past_anchors()
+            self.grouped_leaf_forward_tokens += sum(segment.length for segment in segments)
             context, logits = self._forward(
                 segments[0], past_key_values=anchors.key_values,
                 no_grad=False, leaf_group=segments,
@@ -547,6 +555,10 @@ class SegmentExecutor:
     ) -> Tensor:
         """Replay against independent ancestor anchors, then return their dKV."""
         relayed_gradients = relayed_gradients or {}
+        if leaf:
+            self.leaf_forward_tokens += segment.length
+        else:
+            self.pop_forward_tokens += segment.length
         anchors = self.kv_stack.build_past_anchors()
         context, logits = self._forward(
             segment, no_grad=False,
