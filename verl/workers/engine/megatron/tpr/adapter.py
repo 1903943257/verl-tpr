@@ -159,15 +159,17 @@ def install_tpr_module_spec(provider: Any, *, bridge: Any | None = None) -> None
 
 
 def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
-    """Support native VERL DP=2 in the tested TP2×RingCP2 PPO topology.
+    """Support native VERL DP=2 for TP2×CP2 and TP4×CP1 PPO topologies.
 
     DP replicas retain independent TPR forests: no cross-DP Prefix KV.
     Standard VERL equal-cardinality dispatch and Megatron optimizer finalize
     remain responsible for grouping and gradient synchronization.
+    TP4×CP1×DP2 is enabled for the normal production dispatch path.
     """
     tp, cp, dp = sizes["TP"], sizes["CP"], sizes["DP"]
-    production_dp2 = ppo and (tp, cp, dp) == (2, 2, 2)
-    # Keep the isolated 10K parity matrix opt-in; do not broaden production.
+    production_dp2 = ppo and (tp, cp, dp) in ((2, 2, 2), (4, 1, 2))
+    # Isolated offline parity topologies remain opt-in. Production TP4 is
+    # deliberately limited to TP4×CP1×DP2; no other TP4 topology is enabled.
     parity_10k_dp2 = (
         ppo and dp == 2
         and ((tp in (1, 2) and cp in (1, 2)) or (tp == 4 and cp == 1))
@@ -188,12 +190,12 @@ def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
         )
     )
     if (tp not in (1, 2, 4) or not supported_cp
-            or (tp == 4 and not (ppo and parity_10k_dp2))
+            or (tp == 4 and not production_dp2 and not parity_10k_dp2)
             or any(sizes[k] != 1 for k in ("PP", "EP"))
             or (dp != 1 and not (production_dp2 or parity_10k_dp2))):
         raise NotImplementedError(
-            "TPR PPO supports TP1 CP1/2 DP1, TP2 CP1/2/4 DP1 and TP2 CP2 DP2; "
-            "TP4 CP1 DP2 is experimental-only; "
+            "TPR PPO supports TP1 CP1/2 DP1, TP2 CP1/2/4 DP1, "
+            "TP2 CP2 DP2 and TP4 CP1 DP2; "
             f"PP=EP=1; other DP topologies and non-PPO DP2 are gated, got {sizes}"
         )
     return tp
@@ -211,7 +213,7 @@ def _validate_tpr_cp_combination(
         )
     # Sequence-parallel layout is handled by Megatron's QKV projection and
     # Ring CP-local shard preparation. DP support is checked independently by
-    # _validate_tpr_parallel_sizes (production DP2 is TP2 x CP2; TP4 x CP1 is experimental-only).
+    # _validate_tpr_parallel_sizes (production DP2 supports TP2 x CP2 and TP4 x CP1).
 
 
 def _trajectory_keys_from_minibatch(data: Any) -> tuple[str, ...]:
@@ -280,7 +282,7 @@ def run_tpr_forward_backward_batch(
     The Engine MUST compute batch_num_tokens / dp_size first. It MUST invoke
     this function BEFORE prepare_micro_batches, so shared trajectories remain
     in the same logical mini-batch. Current training scope: dense Qwen/GPT,
-    TP=1/2 in production (TP4 CP1 is experimental-gated), CP=1/2/4 for TP2, PP=EP=1. Production DP2 supports TP2/CP2
+    TP=1/2 and TP4×CP1, CP=1/2/4 for TP2, PP=EP=1. Production DP2 supports TP2×CP2 and TP4×CP1
     with native VERL dispatch and Megatron gradient finalization; other
     DP>1 combinations remain explicitly gated.
     Ring required for CP>1. Native TP2+SP+RingCP uses Megatron's sequence
