@@ -362,6 +362,58 @@ def test_10k_parallel_factorial_one_topology():
                     flush=True,
                 )
         assert result is not None
+        # Persist actual executor metrics. The precomputed 8-row topology audit
+        # is intentionally mode-independent and must not be mistaken for the
+        # per-DP forest that was actually executed.
+        metric_names = (
+            "tpr/forest_trees",
+            "tpr/physical_segments",
+            "tpr/logical_input_tokens",
+            "tpr/unique_tree_tokens",
+            "tpr/active_tree_tokens",
+            "tpr/active_physical_segments",
+            "tpr/model_forward_calls",
+            "tpr/grouped_leaf_calls",
+            "tpr/grouped_leaf_segments",
+        )
+        raw_metrics = result.get("metrics", {})
+        metric_values = []
+        for name in metric_names:
+            values = raw_metrics.get(name)
+            if values is None:
+                raise AssertionError(f"TPR executor did not return diagnostic metric {name}")
+            value = values[-1] if isinstance(values, (list, tuple)) else values
+            metric_values.append(int(round(float(value))))
+        # Tensor collective only (not all_gather_object); one row per rank.
+        local_audit = torch.tensor(
+            [runtime.tp_rank, runtime.dp_rank, *metric_values],
+            dtype=torch.int64, device=runtime.device,
+        )
+        gathered_audits = [torch.empty_like(local_audit) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered_audits, local_audit)
+        execution_metric_names = tuple(name.removeprefix("tpr/") for name in metric_names)
+        execution_metrics_by_rank = [
+            {
+                "tp_rank": int(values[0].item()),
+                "dp_rank": int(values[1].item()),
+                **{
+                    name: int(values[index + 2].item())
+                    for index, name in enumerate(execution_metric_names)
+                },
+            }
+            for values in gathered_audits
+        ]
+        execution_metrics_by_dp = [
+            next(item for item in execution_metrics_by_rank
+                 if item["dp_rank"] == dp_rank and item["tp_rank"] == 0)
+            for dp_rank in range(dp)
+        ]
+        if dist.get_rank() == 0:
+            print(
+                "TPR_10K_EXECUTION_AUDIT "
+                + json.dumps(execution_metrics_by_dp, separators=(",", ":")),
+                flush=True,
+            )
         loss_local=float(result["loss"][0])
         loss=torch.tensor(loss_local,device=runtime.device,dtype=torch.float32)
         dist.all_reduce(loss,op=dist.ReduceOp.SUM)
@@ -418,6 +470,8 @@ def test_10k_parallel_factorial_one_topology():
                 "topology":{"tp":tp,"cp":cp,"dp":dp,"world":tp*cp*dp},
                 "dp_partitions":partitions,
                 "global_tpr_reuse_audit":reuse,
+                "global_tpr_reuse_audit_scope":"all 8 rows before DP partition; mode-independent topology potential, not executed per-DP work",
+                "execution_metrics_by_dp":execution_metrics_by_dp,
                 "global_ppo_tokens":global_tokens,
                 "global_loss":float(loss.item()),
                 "summary_only":summary_only,
