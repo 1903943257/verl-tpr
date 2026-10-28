@@ -185,6 +185,13 @@ def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
         and os.getenv("TPR_RUN_10K_PARALLEL_PARITY") == "1"
         and os.getenv("TPR_10K_PARITY_ONLY") == "1"
     )
+    # Separate opt-in for the recorded real-Actor one-step replay. This is
+    # not a production topology enablement and requires the dedicated test.
+    real_actor_offline_tp8 = (
+        ppo and (tp, cp, dp) == (8, 1, 1)
+        and os.getenv("TPR_EXPERIMENTAL_OFFLINE_TP8_REAL_ACTOR") == "1"
+        and os.getenv("TPR_RUN_REAL_ACTOR_TP8") == "1"
+    )
     supported_cp = (
         (
             cp in (1, 2) if tp == 1 else
@@ -199,13 +206,13 @@ def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
     )
     if (tp not in (1, 2, 4, 8) or not supported_cp
             or (tp == 4 and not production_dp2 and not parity_10k_dp2)
-            or (tp == 8 and not parity_10k_tp8)
+            or (tp == 8 and not (parity_10k_tp8 or real_actor_offline_tp8))
             or any(sizes[k] != 1 for k in ("PP", "EP"))
             or (dp != 1 and not (production_dp2 or parity_10k_dp2))):
         raise NotImplementedError(
             "TPR PPO supports TP1 CP1/2 DP1, TP2 CP1/2/4 DP1, "
-            "TP2 CP2 DP2 and TP4 CP1 DP2; TP8 CP1 DP1 is gated to "
-            "TPR_EXPERIMENTAL_OFFLINE_TP8=1 plus 10K parity-only mode; "
+            "TP2 CP2 DP2 and TP4 CP1 DP2; TP8 CP1 DP1 requires an "
+            "explicit fixed-capture offline parity or real-Actor opt-in; "
             f"PP=EP=1; other DP topologies and non-PPO DP2 are gated, got {sizes}"
         )
     return tp
