@@ -255,7 +255,7 @@ def compare(root, *, diagnostic_only=False, require_recompute=False, require_ful
         f"rows={full[0]['source_rows']} ppo_tokens={len(keys)} "
         f"loss_full={losses[0][0]:.9g} "
         f"loss_tpr={losses[0][1]:.9g} loss_gap={loss_gap:.9g} "
-        f"initial_weight_rel_l2={before_gap:.9g} 
+        f"initial_weight_rel_l2={before_gap:.9g} "
         f"logprob_rel_l2={logprob_rel:.9g} logprob_max_abs={logprob_max:.9g} "
         f"sampled_grad_rel_l2={grad_rel:.9g} "
         f"sampled_post_sgd_weight_rel_l2={step_rel:.9g} "
