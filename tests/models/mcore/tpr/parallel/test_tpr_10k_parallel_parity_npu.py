@@ -286,8 +286,9 @@ def test_10k_parallel_factorial_one_topology():
         recompute_enabled = os.getenv("TPR_10K_RECOMPUTE", "0") == "1"
         installed_blocks = 0
         if recompute_enabled:
-            if mode != "tpr":
-                raise ValueError("TPR_10K_RECOMPUTE=1 requires TPR_10K_MODE=tpr")
+            # Both TPR and the unshared control use the same TPR-aware model
+            # implementation in this isolated executor. Applying the same
+            # recompute policy to both keeps the performance comparison fair.
             from megatron.core.transformer.transformer_block import TransformerBlock
             from verl.workers.engine.megatron.tpr.recompute import (
                 assert_tpr_full_recompute_installed,
