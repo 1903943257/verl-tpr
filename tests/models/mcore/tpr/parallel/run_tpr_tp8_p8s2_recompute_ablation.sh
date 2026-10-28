@@ -146,7 +146,7 @@ for mode in ("unshared", "tpr"):
     off = next(r for r in rows if r["recompute"] == 0 and r["mode"] == mode)
     on = next(r for r in rows if r["recompute"] == 1 and r["mode"] == mode)
     if off.get("median_s") and on.get("median_s"):
-        print(f"{mode.upper()}_RECOMPUTE_OFF_OVER_ON_SPEEDUP={on['median_s'] / off['median_s']:.4f}x")
+        print(f"{mode.upper()}_RECOMPUTE_OFF_BASELINE_TO_ON_SPEEDUP={off['median_s'] / on['median_s']:.4f}x")
         if off.get("peak_gib") is not None and on.get("peak_gib") is not None:
             print(f"{mode.upper()}_RECOMPUTE_MEMORY_SAVED_GIB={off['peak_gib'] - on['peak_gib']:.3f}")
 
