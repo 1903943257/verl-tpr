@@ -169,20 +169,23 @@ def _validate_tpr_parallel_sizes(sizes: dict[str, int], *, ppo: bool) -> int:
     production_dp2 = ppo and (tp, cp, dp) == (2, 2, 2)
     # Keep the isolated 10K parity matrix opt-in; do not broaden production.
     parity_10k_dp2 = (
-        ppo and dp == 2 and tp in (1, 2) and cp in (1, 2)
+        ppo and dp == 2
+        and ((tp in (1, 2) and cp in (1, 2)) or (tp == 4 and cp == 1))
         and os.getenv("TPR_EXPERIMENTAL_OFFLINE_DP2") == "1"
         and os.getenv("TPR_RUN_10K_PARALLEL_PARITY") == "1"
         and os.getenv("TPR_10K_PARITY_ONLY") == "1"
     )
     supported_cp = (
-        (cp in (1, 2) if tp == 1 else cp in (1, 2, 4))
-        if ppo else (cp >= 1 if tp == 1 else cp in (1, 2, 4))
+        cp in (1, 2) if tp == 1 else
+        cp in (1, 2, 4) if tp == 2 else
+        cp == 1 if tp == 4 else False
     )
-    if (tp not in (1, 2) or not supported_cp
+    if (tp not in (1, 2, 4) or not supported_cp
             or any(sizes[k] != 1 for k in ("PP", "EP"))
             or (dp != 1 and not (production_dp2 or parity_10k_dp2))):
         raise NotImplementedError(
             "TPR PPO supports TP1 CP1/2 DP1, TP2 CP1/2/4 DP1 and TP2 CP2 DP2; "
+            "TP4 CP1 DP2 is experimental-only; "
             f"PP=EP=1; other DP topologies and non-PPO DP2 are gated, got {sizes}"
         )
     return tp
@@ -200,7 +203,7 @@ def _validate_tpr_cp_combination(
         )
     # Sequence-parallel layout is handled by Megatron's QKV projection and
     # Ring CP-local shard preparation. DP support is checked independently by
-    # _validate_tpr_parallel_sizes (currently DP2 only for TP2 x CP2 PPO).
+    # _validate_tpr_parallel_sizes (production DP2 is TP2 x CP2; TP4 x CP1 is experimental-only).
 
 
 def _trajectory_keys_from_minibatch(data: Any) -> tuple[str, ...]:
@@ -269,7 +272,7 @@ def run_tpr_forward_backward_batch(
     The Engine MUST compute batch_num_tokens / dp_size first. It MUST invoke
     this function BEFORE prepare_micro_batches, so shared trajectories remain
     in the same logical mini-batch. Current training scope: dense Qwen/GPT,
-    TP=1/2, CP=1/2/4, PP=EP=1. Production DP2 supports TP2/CP2
+    TP=1/2 in production (TP4 CP1 is experimental-gated), CP=1/2/4 for TP2, PP=EP=1. Production DP2 supports TP2/CP2
     with native VERL dispatch and Megatron gradient finalization; other
     DP>1 combinations remain explicitly gated.
     Ring required for CP>1. Native TP2+SP+RingCP uses Megatron's sequence
