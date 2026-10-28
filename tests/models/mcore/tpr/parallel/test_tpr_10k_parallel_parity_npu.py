@@ -249,13 +249,16 @@ def test_10k_parallel_factorial_one_topology():
     dp=int(os.getenv("TPR_10K_DP","1"))
     mode=os.getenv("TPR_10K_MODE","tpr")
     if (tp,cp,dp) not in (
-        (2,1,1),(2,2,1),(2,1,2),(2,2,2)
+        (2,1,1),(2,2,1),(2,1,2),(2,2,2),(4,1,2)
     ):
         raise ValueError("Unsupported isolated 10K parity topology")
     if mode not in ("tpr","unshared"):
         raise ValueError("TPR_10K_MODE must be tpr or unshared")
     if os.getenv("TPR_10K_PARITY_ONLY")!="1":
-        raise RuntimeError("10K parity-only gate not enabled")
+        raise RuntimeError(
+            "10K parity-only gate not enabled; use the checked-in "
+            "run_tpr_tp4dp2_tp2cp2dp2.sh wrapper or export TPR_10K_PARITY_ONLY=1"
+        )
     if os.getenv("HCCL_DETERMINISTIC")!="true":
         raise RuntimeError("HCCL_DETERMINISTIC=true required for BF16 replica validity")
     cap=Path(os.environ["TPR_10K_CAPTURE"]).resolve()
@@ -278,6 +281,48 @@ def test_10k_parallel_factorial_one_topology():
         if hf.num_hidden_layers!=36:
             raise AssertionError("Must use Qwen3-4B 36-layer checkpoint")
         engine=_engine(model,runtime,tp,cp,dp)
+
+        recompute_enabled = os.getenv("TPR_10K_RECOMPUTE", "0") == "1"
+        installed_blocks = 0
+        if recompute_enabled:
+            if mode != "tpr":
+                raise ValueError("TPR_10K_RECOMPUTE=1 requires TPR_10K_MODE=tpr")
+            from megatron.core.transformer.transformer_block import TransformerBlock
+            from verl.workers.engine.megatron.tpr.recompute import (
+                assert_tpr_full_recompute_installed,
+                install_tpr_full_recompute,
+            )
+
+            model.config.recompute_granularity = "full"
+            model.config.recompute_method = "uniform"
+            model.config.recompute_num_layers = 1
+            blocks = [
+                module for module in model.modules()
+                if isinstance(module, TransformerBlock)
+            ]
+            if not blocks or any(module.config is not model.config for module in blocks):
+                raise AssertionError("TPR recompute requires matching TransformerBlock config")
+            installed_blocks = install_tpr_full_recompute(model, model.config)
+            if installed_blocks != len(blocks):
+                raise AssertionError(
+                    f"TPR recompute installed {installed_blocks}/{len(blocks)} TransformerBlocks"
+                )
+            assert_tpr_full_recompute_installed(model, model.config)
+        else:
+            model.config.recompute_granularity = None
+            model.config.recompute_method = None
+            model.config.recompute_num_layers = None
+
+        if dist.get_rank() == 0:
+            print(
+                f"TPR_10K_RECOMPUTE mode={mode} enabled={int(recompute_enabled)} "
+                f"granularity={model.config.recompute_granularity} "
+                f"method={model.config.recompute_method} "
+                f"num_layers={model.config.recompute_num_layers} "
+                f"installed_blocks={installed_blocks}",
+                flush=True,
+            )
+
         model.zero_grad(set_to_none=True)
         dist.barrier()
         torch.npu.synchronize()
@@ -311,6 +356,7 @@ def test_10k_parallel_factorial_one_topology():
             output_dir.mkdir(parents=True)
             data={
                 "mode":mode,"source_capture":str(cap),
+                "recompute":{"enabled":recompute_enabled,"granularity":model.config.recompute_granularity,"method":model.config.recompute_method,"num_layers":model.config.recompute_num_layers,"installed_blocks":installed_blocks},
                 "input_sha256":sha,"checkpoint":str(checkpoint),
                 "topology":{"tp":tp,"cp":cp,"dp":dp,"world":tp*cp*dp},
                 "dp_partitions":partitions,
