@@ -94,12 +94,26 @@ for mode, label in (("unshared", "Unshared control (Full-like)"), ("tpr", "TPR")
         "recompute": data.get("recompute"),
         "summary_only": data.get("summary_only"),
     })
-print("LABEL\tMEDIAN_F_B_S\tPEAK_ALLOC_GIB\tPPO_TOKENS\tLOGICAL\tUNIQUE\tREUSE_RATIO")
+print("LABEL\\tMEDIAN_F_B_S\\tPEAK_ALLOC_GIB\\tPPO_TOKENS\\tEXEC_LOGICAL\\tEXEC_UNIQUE\\tEXEC_REUSE\\tEXEC_SEGMENTS\\tEXEC_FORWARD_CALLS")
 for row in rows:
-    print("\t".join(str(row[k]) if row[k] is not None else "n/a" for k in (
-        "label", "median_s", "peak_gib", "ppo_tokens", "logical_tokens",
-        "unique_tree_tokens", "reuse_ratio",
+    by_dp = row.get("execution_metrics_by_dp") or []
+    exec_logical = sum(x["logical_input_tokens"] for x in by_dp)
+    exec_unique = sum(x["unique_tree_tokens"] for x in by_dp)
+    exec_reuse = exec_logical / exec_unique if exec_unique else None
+    exec_segments = sum(x["physical_segments"] for x in by_dp)
+    exec_calls = sum(x["model_forward_calls"] for x in by_dp)
+    row["executed_logical_tokens"] = exec_logical
+    row["executed_unique_tree_tokens"] = exec_unique
+    row["executed_reuse_ratio"] = exec_reuse
+    row["executed_physical_segments"] = exec_segments
+    row["executed_model_forward_calls"] = exec_calls
+    print("\\t".join(str(v) if v is not None else "n/a" for v in (
+        row["label"], row["median_s"], row["peak_gib"], row["ppo_tokens"],
+        exec_logical, exec_unique,
+        f"{exec_reuse:.4f}" if exec_reuse is not None else None,
+        exec_segments, exec_calls,
     )))
+print("NOTE=EXEC_REUSE is computed from actual mode-specific per-DP forests. The legacy global reuse audit is over all 8 rows before DP partitioning and is not the executed-work ratio.")
 if rows[0]["input_sha256"] != rows[1]["input_sha256"]:
     raise SystemExit("Input SHA mismatch between modes")
 if rows[0]["median_s"] and rows[1]["median_s"]:
@@ -108,6 +122,9 @@ if rows[0]["peak_gib"] is not None and rows[1]["peak_gib"] is not None:
     print(f"TPR_PEAK_MEMORY_DELTA_GIB={rows[0]['peak_gib'] - rows[1]['peak_gib']:.3f}")
 for row in rows:
     print(f"EXECUTION_METRICS_{row['mode'].upper()}={json.dumps(row['execution_metrics_by_dp'], separators=(',', ':'))}")
+    print(f"EXECUTED_REUSE_{row['mode'].upper()}={row['executed_reuse_ratio']}")
+    print(f"EXECUTED_SEGMENTS_{row['mode'].upper()}={row['executed_physical_segments']}")
+    print(f"EXECUTED_FORWARD_CALLS_{row['mode'].upper()}={row['executed_model_forward_calls']}")
 print(f"INPUT_SHA256={rows[0]['input_sha256']}")
 print("NOTE=Unshared control uses TPR executor without shared-prefix reuse; it is not native Megatron Full scheduling. Both modes use the same TPR-aware full/uniform/1 recompute setting.")
 PY
