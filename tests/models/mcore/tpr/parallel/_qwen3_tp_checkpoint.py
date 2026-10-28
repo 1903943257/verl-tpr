@@ -108,8 +108,8 @@ def load_qwen3_1_7b_config(path: Path):
 def load_hf_qwen3_tp_shards(model, hf, path: Path, *, tp_rank: int, tp_size: int = 2):
     """Load every parameter from checkpoint; assert shape and full coverage."""
     state = _load_hf_state_dict(path)
-    if tp_size not in (1, 2, 4) or not 0 <= tp_rank < tp_size:
-        raise ValueError("Qwen3 dense isolated parallel tests require TP=1, TP=2, or TP=4")
+    if tp_size not in (1, 2, 4, 8) or not 0 <= tp_rank < tp_size:
+        raise ValueError("Qwen3 dense isolated parallel tests require TP=1, TP=2, TP=4, or TP=8")
     if hf.num_key_value_heads % tp_size or hf.vocab_size % tp_size:
         raise AssertionError("invalid Qwen TP group or vocab divisibility")
 
