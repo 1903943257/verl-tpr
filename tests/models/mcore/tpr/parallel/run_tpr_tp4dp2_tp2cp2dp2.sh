@@ -47,6 +47,8 @@ export TPR_TREE_POLICY=qwen_turn
 export TPR_TURN_MIN_SEGMENT_TOKENS=128
 export TPR_PPO_LOGPROB_CHUNK_TOKENS=512
 export TPR_EXEC_PROFILE=0
+export TPR_10K_WARMUPS="${TPR_10K_WARMUPS:-1}"
+export TPR_10K_REPEATS="${TPR_10K_REPEATS:-3}"
 export PYTHONUNBUFFERED=1
 export TPR_10K_CAPTURE="$CAPTURE"
 
@@ -89,3 +91,33 @@ run_case tpr_tp2cp2dp2 2 2 2 0
 run_case tpr_tp4cp1dp2_recompute 4 1 2 1
 
 echo "TPR_TOPOLOGY_CASES_COMPLETE root=$ROOT"
+
+python - "$ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+cases = (
+    ("TP2xCP2xDP2", root / "tpr_tp2cp2dp2" / "result.json"),
+    ("TP4xCP1xDP2 + Recompute", root / "tpr_tp4cp1dp2_recompute" / "result.json"),
+)
+rows = []
+for name, path in cases:
+    if not path.is_file():
+        print(f"RESULT_MISSING {name}: {path}")
+        continue
+    data = json.loads(path.read_text())
+    rows.append((
+        name,
+        data.get("median_fwd_bwd_seconds_max_rank"),
+        data.get("memory_peak_allocated_gib_worst"),
+        data.get("global_ppo_tokens"),
+        data.get("global_tpr_reuse_audit", {}).get("global_reuse_ratio"),
+    ))
+print("TOPOLOGY\tMEDIAN_FWD_BWD_S\tWORST_PEAK_ALLOC_GIB\tPPO_TOKENS\tGLOBAL_REUSE_RATIO")
+for row in rows:
+    print("\t".join(str(x) if x is not None else "n/a" for x in row))
+if len(rows) == 2 and rows[0][1] and rows[1][1]:
+    print(f"TP4_VS_TP2CP2DP2_SPEEDUP={rows[0][1] / rows[1][1]:.4f}x")
+PY
