@@ -197,7 +197,7 @@ class _TurnNode:
     source_row: int
     member_rows: list[int] = field(default_factory=list)
     terminal_rows: list[int] = field(default_factory=list)
-    children: dict[tuple[int, ...], _TurnNode] = field(default_factory=dict)
+    children: dict[tuple[int, ...] | bytes, _TurnNode] = field(default_factory=dict)
 
 
 def _turn_units(tokens: list[int], prompt_length: int, minimum: int):
@@ -211,6 +211,99 @@ def _turn_units(tokens: list[int], prompt_length: int, minimum: int):
             continue
         yield tuple(tokens[previous:end]), end
         previous = end
+
+
+def _turn_units_bytes(tokens: Tensor, prompt_length: int, minimum: int) -> tuple[tuple[bytes, int], ...]:
+    """Extract the same Turn units as _turn_units, using compact exact byte signatures.
+
+    Token IDs are CPU int64 values, so their contiguous byte representation is
+    an exact equality/sort key. This avoids materializing one Python int object
+    per token in the LCP path and lets sorting/LCP comparisons run in C.
+    """
+    boundaries = {
+        int(position) + 1
+        for position in torch.nonzero(tokens == QWEN3_IM_END_TOKEN_ID, as_tuple=False).flatten().tolist()
+    }
+    if 0 < prompt_length < tokens.numel():
+        boundaries.add(prompt_length)
+    boundaries.add(tokens.numel())
+    previous = 0
+    units = []
+    for end in sorted(boundaries):
+        if end < tokens.numel() and end - previous < minimum:
+            continue
+        signature = tokens[previous:end].contiguous().numpy().tobytes()
+        units.append((signature, end))
+        previous = end
+    return tuple(units)
+
+
+def _unit_lcp(left: tuple[tuple[bytes, int], ...], right: tuple[tuple[bytes, int], ...]) -> int:
+    """Return the exact common prefix length in complete units, not raw tokens."""
+    limit = min(len(left), len(right))
+    shared = 0
+    while shared < limit and left[shared][0] == right[shared][0]:
+        shared += 1
+    return shared
+
+
+def _build_lcp_group(rows: list[tuple[int, tuple[tuple[bytes, int], ...]]]) -> _TurnNode:
+    """Build a Turn trie from sorted rows and adjacent LCPs.
+
+    This is deliberately unit-agnostic: the current caller supplies qwen_turn
+    spans, while a future message-role extractor can supply message spans
+    without changing the sorting/LCP construction.
+    """
+    if not rows:
+        raise ValueError("LCP tree group must contain at least one trajectory")
+
+    # Python's sort is stable; row is included explicitly to make duplicate
+    # sequence ordering independent of sort implementation details.
+    ordered = sorted(
+        rows,
+        key=lambda item: (tuple(signature for signature, _ in item[1]), item[0]),
+    )
+    root = _TurnNode(0, ordered[0][0])
+    nodes = [root]
+    previous_units = None
+    previous_path = [root]
+
+    for row, units in ordered:
+        if not units:
+            raise ValueError(f"LCP trajectory row {row} has no units")
+        shared = 0 if previous_units is None else _unit_lcp(previous_units, units)
+        path = previous_path[:shared + 1]
+        parent = path[-1]
+
+        # Adjacent-LCP construction guarantees that every suffix unit starts
+        # a new child at this parent. A collision indicates a broken ordering
+        # or LCP calculation, so fail rather than silently changing topology.
+        for signature, end in units[shared:]:
+            if signature in parent.children:
+                raise RuntimeError("LCP builder encountered an existing suffix child")
+            child = _TurnNode(end, row)
+            parent.children[signature] = child
+            nodes.append(child)
+            path.append(child)
+            parent = child
+
+        for prefix_node in path[1:]:
+            prefix_node.member_rows.append(row)
+        parent.terminal_rows.append(row)
+        previous_units = units
+        previous_path = path
+
+    # Restore the insertion-Trie's externally visible order: original row order
+    # for members/terminals and first-seen row order for sibling branches.
+    for node in nodes:
+        node.member_rows.sort()
+        node.terminal_rows.sort()
+        if node.member_rows:
+            node.source_row = node.member_rows[0]
+        node.children = dict(
+            sorted(node.children.items(), key=lambda item: item[1].member_rows[0])
+        )
+    return root
 
 
 def _compress(node: _TurnNode, parent_id: int | None, start: int, inputs: list[Tensor],
@@ -233,15 +326,18 @@ def build_tree_execution_plans(
     keys: list[str] | tuple[str, ...], batch: Any, *,
     require_loss_mask_alignment: bool = False,
     tree_policy: str = "qwen_turn", turn_min_segment_tokens: int = 128,
+    tree_builder: str = "trie",
 ) -> ForestExecutionPlan:
-    """Build the sole executable topology and retain one ref per masked response.
+    """Build the executable topology and retain one ref per masked response.
 
-    Turn signatures are token-exact, and only complete ChatML messages or the
-    captured prompt endpoint can create a shared internal node. Duplicate rows
-    share physical tokens but retain independent PPO references and weights.
+    tree_builder="trie" is the insertion-order reference implementation.
+    tree_builder="lcp_sort" sorts complete Turn-unit sequences and rebuilds
+    the same trie from adjacent longest-common-prefix lengths.
     """
     if tree_policy != "qwen_turn":
         raise ValueError("Production TPR only supports qwen_turn")
+    if tree_builder not in ("trie", "lcp_sort"):
+        raise ValueError(f"unknown TPR tree_builder: {tree_builder!r}")
     if (not isinstance(turn_min_segment_tokens, int) or isinstance(turn_min_segment_tokens, bool)
             or turn_min_segment_tokens < 1):
         raise ValueError("turn_min_segment_tokens must be a positive integer")
@@ -258,6 +354,7 @@ def build_tree_execution_plans(
             raise ValueError("optional batch field rows do not match keys")
 
     groups: dict[str, _TurnNode] = {}
+    lcp_rows: dict[str, list[tuple[int, tuple[tuple[bytes, int], ...]]]] = {}
     selected = []
     cpu_inputs = []
     for row, (key, tokens, mask) in enumerate(zip(keys, inputs, masks, strict=True)):
@@ -294,11 +391,18 @@ def build_tree_execution_plans(
             if prompt_length > tokens.numel() or not torch.equal(tokens[:prompt_length].cpu(), prompt.cpu()):
                 raise ValueError(f"turn builder prompt is not an exact input prefix for row={row}")
         uid, _, _ = _parse_key(key)
-        node = groups.setdefault(uid, _TurnNode(0, row))
-        for signature, end in _turn_units(cpu_tokens.tolist(), prompt_length, turn_min_segment_tokens):
-            node = node.children.setdefault(signature, _TurnNode(end, row))
-            node.member_rows.append(row)
-        node.terminal_rows.append(row)
+        if tree_builder == "lcp_sort":
+            units = _turn_units_bytes(cpu_tokens, prompt_length, turn_min_segment_tokens)
+            lcp_rows.setdefault(uid, []).append((row, units))
+        else:
+            node = groups.setdefault(uid, _TurnNode(0, row))
+            for signature, end in _turn_units(cpu_tokens.tolist(), prompt_length, turn_min_segment_tokens):
+                node = node.children.setdefault(signature, _TurnNode(end, row))
+                node.member_rows.append(row)
+            node.terminal_rows.append(row)
+
+    if tree_builder == "lcp_sort":
+        groups = {uid: _build_lcp_group(rows) for uid, rows in lcp_rows.items()}
 
     result = []
     for uid, root in groups.items():
