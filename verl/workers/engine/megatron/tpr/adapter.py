@@ -340,6 +340,9 @@ def run_tpr_forward_backward_batch(
             stage_ms[name] = stage_ms.get(name, 0.0) + (time.perf_counter() - start) * 1000
 
     tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
+    # Experimental alternative for A/B benchmarking; keep the insertion Trie
+    # as the default until CPU-scale and end-to-end parity/performance are proven.
+    tree_builder = os.getenv("TPR_TREE_BUILDER", "trie")
     try:
         turn_min_tokens = int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128"))
     except ValueError as exc:
@@ -348,6 +351,7 @@ def run_tpr_forward_backward_batch(
     forest = build_tree_execution_plans(
         keys, data, tree_policy=tree_policy,
         turn_min_segment_tokens=turn_min_tokens,
+        tree_builder=tree_builder,
     )
     if not forest.trees or not forest.logical_loss_tokens:
         raise ValueError("TPR PPO mini-batch has no supervised response tokens")
