@@ -57,13 +57,37 @@ def test_turn_forest_matches_reference_for_branches_duplicates_and_masks(seed, w
 
     expected = reference_plan(keys, batch, **options)
     actual = build_tree_execution_plans(keys, batch, **options)
+    lcp = build_tree_execution_plans(keys, batch, tree_builder="lcp_sort", **options)
 
     assert _records(actual) == _records(expected)
+    assert _records(lcp) == _records(expected)
     assert actual.logical_loss_tokens == sum(int(mask.sum()) for mask in masks)
+    assert digest_forest_plan(actual) == digest_forest_plan(lcp)
     assert digest_forest_plan(actual) == digest_forest_plan(build_tree_execution_plans(keys, batch, **options))
     # The persisted topology is unique; metadata access does not materialize a second tree.
     assert all(not hasattr(tree, "tree") for tree in actual.trees)
     assert all(not hasattr(tree, "nodes") for tree in actual.trees)
+
+
+def test_lcp_sort_preserves_prefix_termination_duplicate_rows_and_sibling_order():
+    sequences = [
+        [1, 2, 151645, 3, 151645],
+        [1, 2, 151645],
+        [1, 2, 151645, 4, 151645],
+        [1, 2, 151645, 3, 151645],
+        [9, 151645, 10],
+    ]
+    batch = {
+        "input_ids": [torch.tensor(tokens) for tokens in sequences],
+        "response_mask": [torch.ones(len(tokens) - 2, dtype=torch.bool) for tokens in sequences],
+    }
+    keys = ["same_tpr_0", "same_tpr_1", "same_tpr_2", "same_tpr_3", "other_tpr_4"]
+    trie = build_tree_execution_plans(keys, batch, turn_min_segment_tokens=1)
+    lcp = build_tree_execution_plans(keys, batch, turn_min_segment_tokens=1, tree_builder="lcp_sort")
+
+    assert _records(lcp) == _records(trie)
+    assert digest_forest_plan(lcp) == digest_forest_plan(trie)
+    assert [tree.member_rows for tree in lcp.trees] == [(0, 1, 2, 3), (4,)]
 
 
 def test_parent_query_ownership_and_internal_terminal_are_preserved():
