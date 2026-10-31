@@ -178,9 +178,13 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
         direct, rows, batch = _assert_direct_plan_matches_flat_reference(received)
         assert len(rows) == 8
         assert direct.logical_loss_tokens == summary["logical_loss_tokens"]
-        assert all(
-            len(tree.member_rows) == 8 for tree in direct.trees
-        ) if len(summary["source_uids"]) == 1 and summary["exact_common_prompt"] else True
+        all_member_rows = sorted(
+            row for tree in direct.trees for row in tree.member_rows
+        )
+        assert all_member_rows == list(range(8))
+        if len(summary["source_uids"]) == 1 and summary["exact_common_prompt"]:
+            assert len(direct.trees) == 1
+            assert direct.trees[0].member_rows == tuple(range(8))
 
         print(
             "SESSION_TREE_DIRECT_CONSUMER PASS",
