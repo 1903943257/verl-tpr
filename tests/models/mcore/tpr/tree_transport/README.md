@@ -1,79 +1,108 @@
-# Session Tree / NonTensorStack consumer prototype
+# Direct Session Tree consumption and cross-Session TPR construction
 
-This directory validates the training-side consumer for the proposed future TQ
-field:
+This directory validates the training-side consumer for the future TQ field:
 
 ```python
 fields = TensorDict(
-    {"trajectory_tree": NonTensorStack(*trees)},
-    batch_size=[len(trees)],
+    {"trajectory_tree": NonTensorStack(*session_trees)},
+    batch_size=[len(session_trees)],
 )
 ```
 
-The scope is deliberately narrow:
+## Required boundary
 
-- Use an existing flat TQ rollout capture as the source of real token and
-  response-level tensors.
-- Synthesize a Session Tree dictionary in memory from those source rows.
-- Pack one or more dictionaries into `NonTensorStack`.
-- Read the dictionaries back from that in-memory field.
-- Reconstruct each Leaf and compare it with the original TQ trajectory row.
-- Feed reconstructed rows and original rows into the existing LCP TPR planner
-  and require identical plan digests.
+TQ provides **one independent Session Tree per NonTensorStack element**.
+A Session Tree may contain:
 
-This does **not** call a TQ client and does not test TQ Put/Get, KV storage,
-serialization, networking, or TQ implementation internals. The current
-`tq_batch.pt` is a flat rollout TensorDict; the test synthesizes the future
-`trajectory_tree` field that the training-side consumer is expected to read.
+- A single Chain.
+- Multiple Chains / branches within that Session.
+- A mixture of terminal Leaves and deeper branches.
 
-## Real TQ fixture
+TQ does not merge Nodes or share topology across different Sessions. Node IDs
+are local to their Session Tree and may repeat in other elements.
 
-Default capture used by the current experiment:
+TPR consumes all Session Trees in the logical Actor Minibatch and constructs
+the cross-Session Forest. In particular, it merges exact shared prefixes
+across Session boundaries, while preserving each Session's local branches and
+each Leaf's objective ownership.
+
+## Direct consumer
+
+Production-side entry point:
+
+```python
+from verl.workers.engine.megatron.tpr.tree import (
+    build_tree_execution_plans_from_session_trees,
+)
+
+session_trees = fields["trajectory_tree"].tolist()
+forest = build_tree_execution_plans_from_session_trees(
+    session_trees,
+    require_loss_mask_alignment=True,
+    tree_policy="qwen_turn",
+    tree_builder="lcp_sort",
+)
+```
+
+The direct builder walks each Leaf's Node path as token chunks. It does not
+materialize complete `prompts`, `responses`, or `input_ids` rows before
+building the cross-Session topology. It preserves per-Leaf response/loss mask
+ownership and maps selected response tokens to `SegmentObjectiveRef` objects.
+
+The existing flat-row planner remains available as a test-only reference
+oracle. Tests compare its plan digest with the direct Session Tree planner;
+the flat-row path is not the consumer path being validated.
+
+## Real TQ source and synthetic topologies
+
+The available source capture is a flat TQ rollout batch:
 
 ```text
 /workspace/tq_dump/django11163/swe-django-11163-qwen3-8b-n8-train-tq_uniagent-tq-smoke/GBS1_N8_in16384_out114688/1/0/tq_batch.pt
 ```
 
-The inspected capture contains 8 rows. Its payload has top-level
-`tensordict`, `tags`, `keys`, and `global_steps`. The row keys are
-`<uid>_<session_index>_<trajectory_index>`; all 8 rows share one UID, their
-source session indexes are 0 through 7, and all 8 prompts are exactly equal
-(17,483 tokens).
+It contains 8 source trajectory rows. The test uses their real prompt,
+response, response mask, loss mask, rollout log-probabilities, RM scores and
+source keys to synthesize three *input topologies*:
 
-For this consumer test only, those 8 real rows are grouped under one synthetic
-Session Tree:
+| Case | Session Trees | Single-chain Sessions | Fork Sessions | Leaves |
+|---|---:|---:|---:|---:|
+| `all_chain` | 8 | 8 | 0 | 8 |
+| `mixed` | 6 | 4 | 2 | 8 |
+| `all_tree` | 4 | 0 | 4 | 8 |
 
-- Root Node: the exact shared 17,483-token prompt.
-- 8 child Nodes: one original response per branch.
-- 8 Leaves: each retains its original response mask, loss mask, rollout
-  log-probabilities, reward-model scores, and source key/session index.
+A fork Session is synthesized by placing two source trajectories under one
+Session-local root with their original branch responses and aligned metadata.
+This deliberately fabricates Session-local branching because the current
+capture has no such branching. It does **not** claim UniAgent emitted these
+synthetic Trees.
 
-The original source session indexes remain attached to their Leaves as
-provenance. This is a synthetic one-session topology assembled from existing
-same-UID TQ rows; it does not claim the original capture was emitted as one
-real UniAgent Session Tree.
+Every emitted Tree has its own `tree_id`, `session_id`, root and local Node
+namespace. No cross-Session Node is created by the fixture. In all three cases,
+the 8 Leaf payloads are then consumed together by TPR, which performs the
+cross-Session merge.
 
-## Data preserved
+The smaller deterministic fixture in `synthetic.py` additionally covers
+nested branches, Chain handoff, a shared ancestor with Leaf-specific masks,
+and `removed_prefix_token_count` rollback.
 
-The adapter consumes these actual TQ TensorDict fields:
+## What is checked
 
-- `prompts`, `responses`, `input_ids`
-- `response_mask`, `loss_mask`
-- `rollout_log_probs`, `rm_scores`
-- top-level `keys` for stable trajectory identity
+- The `NonTensorStack` contains one independent Tree per Session.
+- Repeated Node IDs across Sessions do not collide.
+- Single-chain, mixed and all-tree inputs are all consumable.
+- Internal Session branches remain valid while TPR merges prefixes across
+  Sessions.
+- Per-Leaf masks, Node log-probabilities and RM scores remain attached to the
+  correct payload.
+- Every supervised token has exactly one objective reference.
+- Direct Session Tree construction and the flat-row reference produce
+  identical Forest / SegmentPlan / ObjectiveRef digests.
 
-The response-level tensors are copied into the synthetic Tree payload without
-recomputing their values. The reconstruction test checks tensor values and
-dtypes, including the original int64 masks and float32 scores.
+This is an in-memory consumer test only. It does not call a TQ client and does
+not test TQ Put/Get, KV storage, serialization, or network transport.
 
-## Small synthetic unit fixtures
-
-`synthetic.py` retains small deterministic examples for nested branches,
-Chain handoff, Leaf-specific masks, and `removed_prefix_token_count` rollback.
-They are unit fixtures for path reconstruction edge cases; the primary
-integration fixture is the existing real TQ capture described above.
-
-## Run with the existing TQ capture
+## Run
 
 ```bash
 export TPR_TQ_BATCH=/workspace/tq_dump/django11163/swe-django-11163-qwen3-8b-n8-train-tq_uniagent-tq-smoke/GBS1_N8_in16384_out114688/1/0/tq_batch.pt
@@ -82,6 +111,7 @@ python -m pytest -q -s \
   tests/models/mcore/tpr/tree_transport/test_tree_transport_cpu.py
 ```
 
-Without `TPR_TQ_BATCH`, the small CPU unit tests run and the real-capture test
-is skipped. With it set, the test reports source rows, shared prompt length,
-logical tokens, node/leaf counts, LCP plan digest, and ObjectiveRef count.
+Without `TPR_TQ_BATCH`, the deterministic in-memory Session Tree tests run and
+the real-TQ fixture test is skipped. With it set, the test runs all three
+synthetic topologies and prints their Session counts, Leaf counts, global
+Forest sizes, ObjectiveRef counts and plan digests.
