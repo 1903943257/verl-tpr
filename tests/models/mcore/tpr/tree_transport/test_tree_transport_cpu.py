@@ -265,12 +265,12 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
         assert summary["chain_session_count"] == expected_chains
         assert summary["mixed_session_count"] == expected_mixed
         assert summary["fork_session_count"] == expected_forks
-        assert summary["leaf_count"] == 8
+        assert summary["leaf_count"] == expected_leaves
 
         direct, rows, _ = _assert_direct_plan_matches_flat_reference(
             received, fields=fields
         )
-        assert len(rows) == 8
+        assert len(rows) == expected_leaves
         assert direct.logical_loss_tokens == summary["logical_loss_tokens"]
         assert sum(int(row["input_ids"].numel()) for row in rows) == (
             summary["logical_input_tokens"]
@@ -278,7 +278,7 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
         all_member_rows = sorted(
             row for tree in direct.trees for row in tree.member_rows
         )
-        assert all_member_rows == list(range(8))
+        assert all_member_rows == list(range(expected_leaves))
         if len(summary["source_uids"]) == 1 and summary["exact_common_prompt"]:
             assert len(direct.trees) == 1
             assert direct.trees[0].member_rows == tuple(range(expected_leaves))
