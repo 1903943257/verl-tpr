@@ -259,6 +259,8 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
         # TQ input is strictly Session-local: one independent Tree per
         # Session. Node IDs are local and may repeat in different Trees.
         received = consume_tree_fields(fields)
+        for actual, expected in zip(received, trees, strict=True):
+            _assert_tree_equal(actual, expected)
         assert len({tree["tree_id"] for tree in received}) == expected_sessions
         assert len({
             (tree["uid"], tree["session_id"]) for tree in received
@@ -278,6 +280,14 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
             received, fields=fields
         )
         assert len(rows) == expected_leaves
+        for row in rows:
+            response_length = row["responses"].numel()
+            assert row["response_mask"].numel() == response_length
+            assert row["loss_mask"].numel() == response_length
+            assert row["rollout_log_probs"] is not None
+            assert row["rollout_log_probs"].numel() == response_length
+            assert row["rm_scores"] is not None
+            assert row["rm_scores"].numel() == response_length
         assert direct.logical_loss_tokens == summary["logical_loss_tokens"]
         assert sum(int(row["input_ids"].numel()) for row in rows) == (
             summary["logical_input_tokens"]
