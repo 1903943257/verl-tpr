@@ -32,12 +32,11 @@ Production-side entry point:
 
 ```python
 from verl.workers.engine.megatron.tpr.tree import (
-    build_tree_execution_plans_from_session_trees,
+    build_tree_execution_plans_from_tree_fields,
 )
 
-session_trees = fields["trajectory_tree"].tolist()
-forest = build_tree_execution_plans_from_session_trees(
-    session_trees,
+forest = build_tree_execution_plans_from_tree_fields(
+    fields,
     require_loss_mask_alignment=True,
     tree_policy="qwen_turn",
     tree_builder="lcp_sort",
