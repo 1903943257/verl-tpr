@@ -22,6 +22,7 @@ from torch import Tensor
 
 SegmentId = int
 QWEN3_IM_END_TOKEN_ID = 151645
+SESSION_TREE_SCHEMA_VERSION = 1
 
 
 def _validate_segment_id(value: int, *, field_name: str = "segment_id") -> None:
@@ -773,6 +774,10 @@ def build_tree_execution_plans_from_session_trees(
         tree_id, uid, session_id = tree.get("tree_id"), tree.get("uid"), tree.get("session_id")
         if not all(isinstance(value, str) and value for value in (tree_id, uid, session_id)):
             raise ValueError("each Session Tree needs non-empty tree_id, uid and session_id")
+        if tree.get("schema_version") != SESSION_TREE_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported Session Tree schema_version: {tree.get('schema_version')!r}"
+            )
         if tree_id in seen_trees or (uid, session_id) in seen_sessions:
             raise ValueError("NonTensorStack must contain one unique tree per Session")
         seen_trees.add(tree_id)
@@ -801,8 +806,23 @@ def build_tree_execution_plans_from_session_trees(
                 or node_id in node_by_id
             ):
                 raise ValueError("Session Tree Node IDs must be unique non-negative integers")
+            chain_id = node.get("chain_id")
+            if not isinstance(chain_id, int) or isinstance(chain_id, bool) or chain_id < 0:
+                raise ValueError("Session Tree Node chain_id must be a non-negative integer")
+            _session_tree_tokens(node.get("prompt_ids"), "node.prompt_ids")
+            response_ids = _session_tree_tokens(node.get("response_ids"), "node.response_ids")
+            _session_tree_logprobs(
+                node.get("response_logprobs"),
+                "node.response_logprobs",
+                response_ids.numel(),
+            )
+            removed = node.get("removed_prefix_token_count", 0)
+            if not isinstance(removed, int) or isinstance(removed, bool) or removed < 0:
+                raise ValueError("removed_prefix_token_count must be a non-negative integer")
             node_by_id[node_id] = node
         root_id = tree.get("root_node_id")
+        if not isinstance(root_id, int) or isinstance(root_id, bool) or root_id < 0:
+            raise ValueError("root_node_id must be a non-negative integer")
         roots = [node_id for node_id, node in node_by_id.items() if node.get("parent_id") is None]
         if roots != [root_id]:
             raise ValueError("each Session Tree must have exactly its declared root")
@@ -810,7 +830,11 @@ def build_tree_execution_plans_from_session_trees(
         for node_id, node in node_by_id.items():
             parent_id = node.get("parent_id")
             if parent_id is not None:
-                if not isinstance(parent_id, int) or isinstance(parent_id, bool):
+                if (
+                    not isinstance(parent_id, int)
+                    or isinstance(parent_id, bool)
+                    or parent_id < 0
+                ):
                     raise ValueError(f"Session Tree Node {node_id} has an invalid parent_id")
                 if parent_id not in node_by_id:
                     raise ValueError(f"Session Tree Node {node_id} references missing parent {parent_id}")
