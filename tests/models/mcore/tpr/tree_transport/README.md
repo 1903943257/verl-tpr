@@ -1,62 +1,87 @@
-# Session Tree transport correctness prototype
+# Session Tree / NonTensorStack consumer prototype
 
-This directory is a test-side schema and correctness prototype for the proposed
-UniAgent Gateway -> TQ -> TPR Session Tree path. It does not change the
-production TPR Executor or the production TQ schema.
+This directory validates the training-side consumer for the proposed future TQ
+field:
 
-## Contract under test
+```python
+fields = TensorDict(
+    {"trajectory_tree": NonTensorStack(*trees)},
+    batch_size=[len(trees)],
+)
+```
 
-- One dictionary represents one Session Tree.
-- Node prompt_ids are incremental prompt/context tokens added after the parent
-  path; response_ids are tokens generated at that node.
-- parent_id preserves the Session-local topology.
-- chain_id and removed_prefix_token_count reproduce the current UniAgent
-  TreeGatewaySession._linearize_path chain ownership and rollback semantics.
-- A Leaf is either a node-path Leaf (kind=node_path) or an already
-  materialized Trajectory Leaf (kind=trajectory), matching the Gateway's
-  MessageNode | Trajectory leaves union.
-- A Leaf stores its Chain identity and its own response/loss masks. The Leaf
-  response_mask is authoritative: one generated node token may be masked for
-  one Leaf while remaining present in the shared Node payload.
-- Node response_logprobs align with that Node response_ids. If a path contains
-  missing probabilities, reconstructed rollout logprobs are absent, matching
-  the current UniAgent linearizer's all-or-none behavior.
+The scope is deliberately narrow:
 
-The incremental prompt_ids meaning is an explicit prototype assumption.
-Before adopting this schema, UniAgent must confirm the exported Node fields use
-exactly these semantics, especially around Chain handoff and truncation.
+- Use an existing flat TQ rollout capture as the source of real token and
+  response-level tensors.
+- Synthesize a Session Tree dictionary in memory from those source rows.
+- Pack one or more dictionaries into `NonTensorStack`.
+- Read the dictionaries back from that in-memory field.
+- Reconstruct each Leaf and compare it with the original TQ trajectory row.
+- Feed reconstructed rows and original rows into the existing LCP TPR planner
+  and require identical plan digests.
 
-## TQ payload
+This does **not** call a TQ client and does not test TQ Put/Get, KV storage,
+serialization, networking, or TQ implementation internals. The current
+`tq_batch.pt` is a flat rollout TensorDict; the test synthesizes the future
+`trajectory_tree` field that the training-side consumer is expected to read.
 
-make_tq_fields(trees) builds the colleague's proposed TensorDict payload with
-trajectory_tree=NonTensorStack(*trees) and batch_size=[len(trees)]. The helper
-put_session_trees calls async_kv_batch_put(keys=tree_ids,
-partition_id='trajectory_trees', fields=fields).
+## Real TQ fixture
 
-Tests verify NonTensorStack packing, TensorDict shape, Python pickle
-serialization, and the async_kv_batch_put call contract using a fake TQ client.
-They do not claim a live TQ server Put/Get roundtrip: the concrete TQ read API
-and server endpoint are not configured in this repository test.
+Default capture used by the current experiment:
 
-## Correctness fixture
+```text
+/workspace/tq_dump/django11163/swe-django-11163-qwen3-8b-n8-train-tq_uniagent-tq-smoke/GBS1_N8_in16384_out114688/1/0/tq_batch.pt
+```
 
-The synthetic fixture contains two independent Session Trees, each with one
-root Leaf and two sibling branches. Both Sessions share the same exact System
-Prefix but have different User messages. One branch remains in the original
-Chain; the other starts a new Chain, so the ancestor generation moves from
-Response to Prompt for that Leaf.
+The inspected capture contains 8 rows. Its payload has top-level
+`tensordict`, `tags`, `keys`, and `global_steps`. The row keys are
+`<uid>_<session_index>_<trajectory_index>`; all 8 rows share one UID, their
+source session indexes are 0 through 7, and all 8 prompts are exactly equal
+(17,483 tokens).
 
-The tests compare reconstructed Leaf rows against an independently authored
-Full-Trajectory oracle, including input_ids, prompt/response split, response
-mask, loss mask, and rollout logprobs. They then feed both row sets into the
-existing LCP TPR planner and require identical plan digests and ObjectiveRef
-counts. This validates data/topology planning; it is not yet a numerical
-Full-vs-TPR model forward/backward or optimizer-update acceptance test.
+For this consumer test only, those 8 real rows are grouped under one synthetic
+Session Tree:
 
-## Run
+- Root Node: the exact shared 17,483-token prompt.
+- 8 child Nodes: one original response per branch.
+- 8 Leaves: each retains its original response mask, loss mask, rollout
+  log-probabilities, reward-model scores, and source key/session index.
 
-python -m pytest -q tests/models/mcore/tpr/tree_transport/test_tree_transport_cpu.py
+The original source session indexes remain attached to their Leaves as
+provenance. This is a synthetic one-session topology assembled from existing
+same-UID TQ rows; it does not claim the original capture was emitted as one
+real UniAgent Session Tree.
 
-After the CPU contract passes, run the reconstructed batch through an existing
-NPU Full-vs-TPR numerical witness. Add a live TQ KV Put/Get test only after the
-TQ read API is confirmed.
+## Data preserved
+
+The adapter consumes these actual TQ TensorDict fields:
+
+- `prompts`, `responses`, `input_ids`
+- `response_mask`, `loss_mask`
+- `rollout_log_probs`, `rm_scores`
+- top-level `keys` for stable trajectory identity
+
+The response-level tensors are copied into the synthetic Tree payload without
+recomputing their values. The reconstruction test checks tensor values and
+dtypes, including the original int64 masks and float32 scores.
+
+## Small synthetic unit fixtures
+
+`synthetic.py` retains small deterministic examples for nested branches,
+Chain handoff, Leaf-specific masks, and `removed_prefix_token_count` rollback.
+They are unit fixtures for path reconstruction edge cases; the primary
+integration fixture is the existing real TQ capture described above.
+
+## Run with the existing TQ capture
+
+```bash
+export TPR_TQ_BATCH=/workspace/tq_dump/django11163/swe-django-11163-qwen3-8b-n8-train-tq_uniagent-tq-smoke/GBS1_N8_in16384_out114688/1/0/tq_batch.pt
+
+python -m pytest -q -s \
+  tests/models/mcore/tpr/tree_transport/test_tree_transport_cpu.py
+```
+
+Without `TPR_TQ_BATCH`, the small CPU unit tests run and the real-capture test
+is skipped. With it set, the test reports source rows, shared prompt length,
+logical tokens, node/leaf counts, LCP plan digest, and ObjectiveRef count.
