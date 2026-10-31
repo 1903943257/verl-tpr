@@ -9,7 +9,6 @@ from torch import Tensor
 
 TREE_SCHEMA_VERSION = 1
 TREE_FIELD = "trajectory_tree"
-TREE_PARTITION = "trajectory_trees"
 
 
 def _integer(value: Any, name: str, minimum: int = 0) -> int:
@@ -172,10 +171,22 @@ def validate_session_tree(tree: Mapping[str, Any]) -> None:
         _mask(leaf["response_mask"], f"leaves[{index}].response_mask")
         if "loss_mask" in leaf:
             _mask(leaf["loss_mask"], f"leaves[{index}].loss_mask")
+        if "rm_scores" in leaf:
+            scores = leaf["rm_scores"]
+            if isinstance(scores, Tensor):
+                if scores.ndim != 1 or torch.is_complex(scores):
+                    raise ValueError(f"leaves[{index}].rm_scores must be a one-dimensional numeric tensor")
+                score_values = scores.detach().cpu().tolist()
+            elif isinstance(scores, Sequence) and not isinstance(scores, (str, bytes)):
+                score_values = list(scores)
+            else:
+                raise TypeError(f"leaves[{index}].rm_scores must be a sequence, tensor, or None")
+            if any(not isinstance(value, (int, float)) for value in score_values):
+                raise ValueError(f"leaves[{index}].rm_scores must contain numeric values")
 
 
 def pack_session_trees(trees: Sequence[Mapping[str, Any]]):
-    """Build TensorDict({trajectory_tree: NonTensorStack(*trees)}, batch_size=[N])."""
+    """Build an in-memory TensorDict with NonTensorStack(*trees), batch_size=[N]."""
     from tensordict import NonTensorStack, TensorDict
 
     if not trees:
@@ -184,12 +195,12 @@ def pack_session_trees(trees: Sequence[Mapping[str, Any]]):
         validate_session_tree(tree)
     tree_ids = [tree["tree_id"] for tree in trees]
     if len(set(tree_ids)) != len(tree_ids):
-        raise ValueError("tree_id values must be unique within a TQ write batch")
+        raise ValueError("tree_id values must be unique within a NonTensorStack batch")
     return TensorDict({TREE_FIELD: NonTensorStack(*trees)}, batch_size=[len(trees)])
 
 
 def unpack_session_trees(fields: Any) -> list[dict[str, Any]]:
-    """Read NonTensorStack values without converting nested tensors to lists."""
+    """Consume the in-memory NonTensorStack without flattening nested tensor payloads."""
     value = fields.get(TREE_FIELD)
     if value is None or not hasattr(value, "tolist"):
         raise TypeError(f"TQ fields must contain a NonTensorStack at {TREE_FIELD!r}")
