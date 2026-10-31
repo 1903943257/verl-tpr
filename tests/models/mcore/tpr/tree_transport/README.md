@@ -68,19 +68,23 @@ source keys to synthesize three *input topologies*:
 | Case | Session Trees | Single-chain Sessions | Fork Sessions | Leaves |
 |---|---:|---:|---:|---:|
 | `all_chain` | 8 | 8 | 0 | 8 |
-| `mixed` | 6 | 4 | 2 | 8 |
-| `all_tree` | 4 | 0 | 4 | 8 |
+| `mixed` | 8 | 4 | 4 | 12 |
+| `all_tree` | 8 | 0 | 8 | 16 |
 
-A fork Session is synthesized by placing two source trajectories under one
-Session-local root with their original branch responses and aligned metadata.
-This deliberately fabricates Session-local branching because the current
-capture has no such branching. It does **not** claim UniAgent emitted these
-synthetic Trees.
+A fork Session is synthesized from one source row without combining it with
+another source Session: the original response is split into a shared-prefix
+Node and one continuation; a second synthetic continuation drops the first
+token after that prefix. Its token-aligned mask, loss-mask, logprob and RM-score
+slices are cut at the same position. One shared-prefix supervision position is
+also masked in the synthetic Leaf when possible, exercising Leaf-specific
+ownership. This deliberately fabricates Session-local branching because the
+current capture has no such branching. It does **not** claim UniAgent emitted
+these synthetic Trees.
 
-Every emitted Tree has its own `tree_id`, `session_id`, root and local Node
-namespace. No cross-Session Node is created by the fixture. In all three cases,
-the 8 Leaf payloads are then consumed together by TPR, which performs the
-cross-Session merge.
+Every source row remains in its own Session Tree. All three cases contain 8
+independent Session Trees; Node IDs restart locally in each Tree. No
+cross-Session Node is created by the fixture. The 8, 12 or 16 Leaves are then
+consumed together by TPR, which performs the cross-Session merge.
 
 The smaller deterministic fixture in `synthetic.py` additionally covers
 nested branches, Chain handoff, a shared ancestor with Leaf-specific masks,
