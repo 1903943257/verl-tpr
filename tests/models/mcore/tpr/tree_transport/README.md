@@ -87,6 +87,12 @@ that one Session root. This deliberately fabricates Session-local branching
 because the current capture has no such branching. It does **not** claim
 UniAgent emitted these synthetic Trees.
 
+Important scope: Branch B's sliced logprobs remain position-aligned with the
+synthetic tokens, but dropping a token changes the autoregressive context, so
+those values are not valid sampled-policy logprobs for a real PPO update. The
+fixture validates payload shape, path ownership, mask alignment and topology;
+it is not a numerical PPO correctness or training-step test.
+
 Every source row remains in its own Session Tree. All three cases contain 8
 independent Session Trees; Node IDs restart locally in each Tree. No
 cross-Session Node is created by the fixture. The 8, 24 or 16 Leaves are then
