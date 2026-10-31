@@ -64,25 +64,29 @@ It contains 8 source trajectory rows. The test uses their real prompt,
 response, response mask, loss mask, rollout log-probabilities, RM scores and
 source keys to synthesize three *input topologies*:
 
-| Case | Session Trees | Single-chain Sessions | Fork Sessions | Leaves |
-|---|---:|---:|---:|---:|
-| `all_chain` | 8 | 8 | 0 | 8 |
-| `mixed` | 8 | 4 | 4 | 12 |
-| `all_tree` | 8 | 0 | 8 | 16 |
+| Case | Session Trees | Chain-only Sessions | Mixed Chain+Tree Sessions | Tree-only Sessions | Leaves |
+|---|---:|---:|---:|---:|---:|
+| `all_chain` | 8 | 8 | 0 | 0 | 8 |
+| `mixed` | 8 | 0 | 8 | 0 | 24 |
+| `all_tree` | 8 | 0 | 0 | 8 | 16 |
 
-A fork Session is synthesized from one source row without combining it with
-another source Session: the original response is split into a shared-prefix
+A tree-only Session is synthesized from one source row without combining it
+with another source Session: the original response is split into a shared-prefix
 Node and one continuation; a second synthetic continuation drops the first
 token after that prefix. Its token-aligned mask, loss-mask, logprob and RM-score
 slices are cut at the same position. One shared-prefix supervision position is
 also masked in the synthetic Leaf when possible, exercising Leaf-specific
-ownership. This deliberately fabricates Session-local branching because the
-current capture has no such branching. It does **not** claim UniAgent emitted
-these synthetic Trees.
+ownership.
+
+A mixed Session contains both a single-Chain Leaf and a separate two-branch
+subtree. Both structures are derived from the same source row and remain under
+that one Session root. This deliberately fabricates Session-local branching
+because the current capture has no such branching. It does **not** claim
+UniAgent emitted these synthetic Trees.
 
 Every source row remains in its own Session Tree. All three cases contain 8
 independent Session Trees; Node IDs restart locally in each Tree. No
-cross-Session Node is created by the fixture. The 8, 12 or 16 Leaves are then
+cross-Session Node is created by the fixture. The 8, 24 or 16 Leaves are then
 consumed together by TPR, which performs the cross-Session merge.
 
 The smaller deterministic fixture in `synthetic.py` additionally covers
