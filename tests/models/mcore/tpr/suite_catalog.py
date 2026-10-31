@@ -39,7 +39,7 @@ GATES: dict[str, Gate] = {
     "cpu-tree-transport": Gate(
         "tests/models/mcore/tpr/tree_transport/test_tree_transport_cpu.py",
         bootstrap=True,
-        note="Session Tree schema, NonTensorStack serialization, Leaf reconstruction and TPR plan parity.",
+        note="Session Tree schema, in-memory NonTensorStack consumption, Leaf reconstruction and TPR plan parity.",
     ),
     "npu-attention": Gate(
         "tests/models/mcore/tpr/equivalence/test_rectangular_attention_npu.py",
