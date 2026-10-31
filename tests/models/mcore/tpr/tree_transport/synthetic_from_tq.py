@@ -1,8 +1,8 @@
-"""Build one synthetic Session Tree from the existing flat TQ rollout batch.
+"""Synthesize independent Session-local Chain/Tree fixtures from flat TQ rows.
 
-The source TQ dump contains complete trajectory rows. This helper groups the
-rows that share one exact prompt into sibling response branches. It does not
-contact TQ or test its persistence/transport implementation.
+The source TQ dump contains complete trajectory rows but no Session-internal
+forks. This helper fabricates several per-Session topologies for consumer tests.
+It does not contact TQ or test its persistence/transport implementation.
 """
 from __future__ import annotations
 
@@ -72,7 +72,6 @@ def load_tq_rollout_payload(path: str | Path) -> dict[str, Any]:
     if missing:
         raise ValueError(f"TQ dump is missing top-level fields: {missing}")
     return payload
-
 
 
 def _make_chain_session(
