@@ -1,4 +1,4 @@
-"""CPU gates for the in-memory Session Tree / NonTensorStack consumer."""
+"""CPU gates for direct consumption of independent Session Trees."""
 from __future__ import annotations
 
 import os
@@ -7,14 +7,18 @@ import pytest
 import torch
 from tensordict import NonTensorStack
 
-from verl.workers.engine.megatron.tpr.tree import build_tree_execution_plans, digest_forest_plan
+from verl.workers.engine.megatron.tpr.tree import (
+    build_tree_execution_plans,
+    build_tree_execution_plans_from_session_trees,
+    digest_forest_plan,
+)
 
 from .nontensorstack import consume_tree_fields, make_tree_fields
 from .reconstruct import reconstruct_session_tree, rows_to_tpr_batch
 from .schema import pack_session_trees, unpack_session_trees, validate_session_tree
 from .synthetic import make_synthetic_batch
 from .synthetic_from_tq import (
-    build_synthetic_session_tree_from_tq,
+    build_synthetic_session_trees_from_tq,
     load_tq_rollout_payload,
 )
 
@@ -40,26 +44,41 @@ def _assert_tree_equal(left, right):
             assert a == b
 
 
-def _assert_row_equal(actual, expected):
-    tensor_fields = (
-        "prompts", "responses", "input_ids", "response_mask", "loss_mask",
-        "rollout_log_probs", "rm_scores",
+def _flat_reference_plan(trees):
+    """Test-only oracle: flatten Leaf paths and use the existing row builder."""
+    rows = [
+        row
+        for tree in trees
+        for row in reconstruct_session_tree(tree)
+    ]
+    keys, batch = rows_to_tpr_batch(rows)
+    plan = build_tree_execution_plans(
+        keys,
+        batch,
+        require_loss_mask_alignment=True,
+        turn_min_segment_tokens=1,
+        tree_builder="lcp_sort",
     )
-    for field in tensor_fields:
-        if field not in expected:
-            continue
-        a, b = actual.get(field), expected[field]
-        assert (a is None and b is None) or (
-            a is not None and b is not None and torch.equal(a, b)
-        ), field
-        if a is not None and b is not None:
-            assert a.dtype == b.dtype, field
-    for field in (
-        "key", "uid", "session_id", "source_session_id",
-        "source_trajectory_index", "leaf_id",
-    ):
-        if field in expected:
-            assert actual.get(field) == expected[field], field
+    return rows, batch, plan
+
+
+def _assert_direct_plan_matches_flat_reference(trees):
+    direct = build_tree_execution_plans_from_session_trees(
+        trees,
+        require_loss_mask_alignment=True,
+        turn_min_segment_tokens=1,
+        tree_builder="lcp_sort",
+    )
+    rows, batch, reference = _flat_reference_plan(trees)
+    assert digest_forest_plan(direct) == digest_forest_plan(reference)
+    assert direct.logical_loss_tokens == reference.logical_loss_tokens
+    assert direct.logical_loss_tokens == sum(
+        int(mask.bool().sum()) for mask in batch["response_mask"]
+    )
+    assert sum(len(tree.objective_refs) for tree in direct.trees) == sum(
+        int(mask.bool().sum()) for mask in batch["response_mask"]
+    )
+    return direct, rows, batch
 
 
 def test_nontensorstack_tensor_dict_in_memory_pack_and_consume():
@@ -70,72 +89,44 @@ def test_nontensorstack_tensor_dict_in_memory_pack_and_consume():
     assert list(fields.batch_size) == [2]
     assert len(stacked) == 2
 
-    # This is intentionally an in-memory consumer test: no pickle, TQ client,
-    # KV operation, persistence, or network transport.
     restored = unpack_session_trees(fields)
     assert len(restored) == len(trees)
     for actual, expected in zip(restored, trees, strict=True):
         _assert_tree_equal(actual, expected)
 
 
-def test_leaf_reconstruction_matches_independent_full_trajectory_oracle():
-    trees, expected_rows = make_synthetic_batch()
-    received = consume_tree_fields(make_tree_fields(trees))
-    actual_rows = [row for tree in received for row in reconstruct_session_tree(tree)]
-    assert len(actual_rows) == len(expected_rows) == 6
-    for actual, expected in zip(actual_rows, expected_rows, strict=True):
-        _assert_row_equal(actual, expected)
-
-
-def test_reconstructed_trees_build_same_lcp_plan_as_full_rows():
-    trees, expected_rows = make_synthetic_batch()
-    received = consume_tree_fields(make_tree_fields(trees))
-    actual_rows = [row for tree in received for row in reconstruct_session_tree(tree)]
-    actual_keys, actual_batch = rows_to_tpr_batch(actual_rows)
-    expected_keys, expected_batch = rows_to_tpr_batch(expected_rows)
-    options = {
-        "require_loss_mask_alignment": True,
-        "turn_min_segment_tokens": 1,
-        "tree_builder": "lcp_sort",
-    }
-    actual = build_tree_execution_plans(actual_keys, actual_batch, **options)
-    expected = build_tree_execution_plans(expected_keys, expected_batch, **options)
-    assert digest_forest_plan(actual) == digest_forest_plan(expected)
-    assert actual.logical_loss_tokens == sum(
-        int(mask.bool().sum()) for mask in actual_batch["response_mask"]
-    )
-    assert len(actual.trees) == 1
-    assert actual.trees[0].member_rows == tuple(range(6))
-
-
-def test_shared_ancestor_generation_has_leaf_specific_response_ownership():
+def test_direct_session_tree_planner_matches_flat_oracle_for_nested_branches():
     trees, _ = make_synthetic_batch()
-    rows = [row for tree in trees for row in reconstruct_session_tree(tree)]
-    root_leaf, nested_chain_leaf, sibling_chain_leaf = [
-        row for row in rows if row["session_id"] == "s0"
-    ]
-    root_response = root_leaf["responses"]
-    assert torch.equal(root_leaf["responses"], root_response)
-    assert torch.equal(
-        nested_chain_leaf["prompts"][-(root_response.numel() + 4):-4],
-        root_response,
+    received = consume_tree_fields(make_tree_fields(trees))
+    direct, rows, batch = _assert_direct_plan_matches_flat_reference(received)
+
+    assert len(received) == 2
+    assert len({tree["session_id"] for tree in received}) == 2
+    assert all(tree["root_node_id"] == 0 for tree in received)
+    # Node IDs intentionally overlap between Sessions; they are locally scoped.
+    assert set(node["node_id"] for node in received[0]["nodes"]) & set(
+        node["node_id"] for node in received[1]["nodes"]
     )
-    assert torch.equal(
-        sibling_chain_leaf["prompts"][-(root_response.numel() + 4):-4],
-        root_response,
-    )
-    assert bool(root_leaf["response_mask"].all())
-    assert not bool(nested_chain_leaf["response_mask"][0])
-    assert nested_chain_leaf["responses"].numel() > sibling_chain_leaf["responses"].numel()
-    keys, batch = rows_to_tpr_batch(rows)
-    plan = build_tree_execution_plans(
-        keys, batch, require_loss_mask_alignment=True,
-        turn_min_segment_tokens=1, tree_builder="lcp_sort",
-    )
-    assert plan.logical_loss_tokens == sum(
+    assert len(rows) == 6
+    assert direct.logical_loss_tokens == sum(
         int(mask.bool().sum()) for mask in batch["response_mask"]
     )
-    assert len(plan.trees[0].objective_refs) == plan.logical_loss_tokens
+    # The fixture contains a shared ancestor whose generated token is masked
+    # for one Leaf but remains present and trainable for another Leaf.
+    nested_rows = [row for row in rows if row["session_id"] == "s0"]
+    assert any(not bool(row["response_mask"][0]) for row in nested_rows)
+
+
+def test_direct_session_tree_planner_handles_removed_prefix_rollback():
+    trees, _ = make_synthetic_batch()
+    tree = trees[0]
+    tree["nodes"][3]["removed_prefix_token_count"] = 1
+    leaf = tree["leaves"][1]
+    original_mask = leaf["response_mask"]
+    leaf["response_mask"] = torch.cat((original_mask[:4], original_mask[5:]))
+    leaf["loss_mask"] = leaf["response_mask"].clone()
+
+    _assert_direct_plan_matches_flat_reference(trees)
 
 
 def test_schema_rejects_missing_parent_and_invalid_root_topology():
@@ -150,125 +141,63 @@ def test_schema_rejects_missing_parent_and_invalid_root_topology():
         validate_session_tree(cycle)
 
 
-def test_removed_prefix_count_trims_ancestor_response_and_aligned_metadata():
-    trees, expected_rows = make_synthetic_batch()
-    tree = trees[0]
-    tree["nodes"][3]["removed_prefix_token_count"] = 1
-    leaf = tree["leaves"][1]
-    original_mask = leaf["response_mask"]
-    leaf["response_mask"] = torch.cat((original_mask[:4], original_mask[5:]))
-    leaf["loss_mask"] = leaf["response_mask"].clone()
-
-    actual = reconstruct_session_tree(tree)[1]
-    original = expected_rows[1]
-    response_a = tree["nodes"][1]["response_ids"]
-    tool_a2 = tree["nodes"][3]["prompt_ids"]
-    response_a2 = tree["nodes"][3]["response_ids"]
-    expected_response = torch.cat((response_a[:-1], tool_a2, response_a2))
-    expected_mask = leaf["response_mask"]
-    expected_logprobs = torch.tensor(
-        tree["nodes"][1]["response_logprobs"][:-1]
-        + [0.0] * tool_a2.numel()
-        + tree["nodes"][3]["response_logprobs"]
-    )
-
-    assert torch.equal(actual["responses"], expected_response)
-    assert torch.equal(actual["response_mask"], expected_mask)
-    assert torch.equal(actual["loss_mask"], expected_mask)
-    assert torch.equal(actual["rollout_log_probs"], expected_logprobs)
-    assert torch.equal(actual["prompts"], original["prompts"])
-
-
-def test_existing_tq_batch_is_consumed_as_one_synthetic_session_tree():
+def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge():
     tq_batch_path = os.getenv("TPR_TQ_BATCH")
     if not tq_batch_path:
         pytest.skip("Set TPR_TQ_BATCH to the existing tq_batch.pt capture")
 
     payload = load_tq_rollout_payload(tq_batch_path)
-    tree, expected_rows, summary = build_synthetic_session_tree_from_tq(payload)
-
-    # The source capture is flat rows. We synthesize one Session Tree from
-    # those rows, then exercise exactly the TensorDict + NonTensorStack shape
-    # the future TQ payload is expected to expose.
-    fields = make_tree_fields([tree])
-    stacked = fields.get("trajectory_tree")
-    assert isinstance(stacked, NonTensorStack)
-    assert list(fields.batch_size) == [1]
-    assert len(stacked) == 1
-
-    received = consume_tree_fields(fields)
-    assert len(received) == 1
-    assert len(received[0]["nodes"]) == summary["node_count"]
-    assert len(received[0]["leaves"]) == summary["leaf_count"]
-
-    actual_rows = reconstruct_session_tree(received[0])
-    assert len(actual_rows) == len(expected_rows) == summary["source_rows"]
-    for actual, expected in zip(actual_rows, expected_rows, strict=True):
-        _assert_row_equal(actual, expected)
-
-    actual_keys, actual_batch = rows_to_tpr_batch(actual_rows)
-    expected_keys, expected_batch = rows_to_tpr_batch(expected_rows)
-    options = {
-        "require_loss_mask_alignment": True,
-        "turn_min_segment_tokens": 1,
-        "tree_builder": "lcp_sort",
+    expected_cases = {
+        "all_chain": (8, 8, 0),
+        "mixed": (6, 4, 2),
+        "all_tree": (4, 0, 4),
     }
-    actual_plan = build_tree_execution_plans(actual_keys, actual_batch, **options)
-    expected_plan = build_tree_execution_plans(expected_keys, expected_batch, **options)
-    assert digest_forest_plan(actual_plan) == digest_forest_plan(expected_plan)
-    assert len(actual_plan.trees) == 1
-    assert actual_plan.trees[0].member_rows == tuple(range(summary["source_rows"]))
-    assert actual_plan.logical_loss_tokens == summary["logical_loss_tokens"]
+    for topology, (expected_sessions, expected_chains, expected_forks) in expected_cases.items():
+        trees, summary = build_synthetic_session_trees_from_tq(
+            payload, topology=topology
+        )
+        fields = make_tree_fields(trees)
+        stacked = fields.get("trajectory_tree")
+        assert isinstance(stacked, NonTensorStack)
+        assert list(fields.batch_size) == [expected_sessions]
+        assert len(stacked) == expected_sessions
 
-    print(
-        "========== TQ SOURCE ==========",
-        f"payload_keys={list(payload.keys())}",
-        f"tensordict_fields={list(payload['tensordict'].keys())}",
-        f"source_keys={list(payload['keys'])}",
-        sep="\n",
-        flush=True,
-    )
-    print(
-        "========== SYNTHETIC TREE PAYLOAD ==========",
-        f"field_type={type(stacked).__name__}",
-        f"field_batch_size={list(fields.batch_size)}",
-        f"tree_keys={list(received[0].keys())}",
-        f"nodes={summary['node_count']} leaves={summary['leaf_count']}",
-        sep="\n",
-        flush=True,
-    )
-    for node in received[0]["nodes"]:
+        # TQ input is strictly Session-local: one independent Tree per
+        # Session, unique Session identity, and no cross-Session Node IDs.
+        received = consume_tree_fields(fields)
+        assert len({tree["tree_id"] for tree in received}) == expected_sessions
+        assert len({
+            (tree["uid"], tree["session_id"]) for tree in received
+        }) == expected_sessions
+        assert all(tree["root_node_id"] == 0 for tree in received)
+        assert len({id(tree["nodes"]) for tree in received}) == expected_sessions
+        assert summary["chain_session_count"] == expected_chains
+        assert summary["fork_session_count"] == expected_forks
+        assert summary["leaf_count"] == 8
+
+        direct, rows, batch = _assert_direct_plan_matches_flat_reference(received)
+        assert len(rows) == 8
+        assert direct.logical_loss_tokens == summary["logical_loss_tokens"]
+        assert all(
+            len(tree.member_rows) == 8 for tree in direct.trees
+        ) if len(summary["source_uids"]) == 1 and summary["exact_common_prompt"] else True
+
         print(
-            "NODE",
-            f"id={node['node_id']}",
-            f"parent={node['parent_id']}",
-            f"chain={node['chain_id']}",
-            f"prompt_tokens={node['prompt_ids'].numel()}",
-            f"response_tokens={node['response_ids'].numel()}",
-            f"logprob_tokens={node['response_logprobs'].numel()}",
+            "SESSION_TREE_DIRECT_CONSUMER PASS",
+            f"topology={topology}",
+            f"source_rows={summary['source_rows']}",
+            f"session_trees={summary['session_tree_count']}",
+            f"chain_sessions={summary['chain_session_count']}",
+            f"fork_sessions={summary['fork_session_count']}",
+            f"leaves={summary['leaf_count']}",
+            f"nodes={summary['node_count']}",
+            f"exact_common_prompt={summary['exact_common_prompt']}",
+            f"logical_input_tokens={summary['logical_input_tokens']}",
+            f"logical_loss_tokens={summary['logical_loss_tokens']}",
+            f"global_trees={len(direct.trees)}",
+            f"global_segments={direct.segment_count}",
+            f"objective_refs={direct.logical_loss_tokens}",
+            f"plan_digest={digest_forest_plan(direct)}",
+            sep="\\n",
+            flush=True,
         )
-    for leaf in received[0]["leaves"]:
-        print(
-            "LEAF",
-            f"id={leaf['leaf_id']}",
-            f"source_key={leaf['source_key']}",
-            f"source_session_id={leaf['source_session_id']}",
-            f"response_mask_tokens={leaf['response_mask'].numel()}",
-            f"loss_mask_tokens={leaf['loss_mask'].numel()}",
-            f"rm_score_tokens={leaf['rm_scores'].numel()}",
-        )
-    print(
-        "========== CONSUMER VALIDATION ==========",
-        "REAL_TQ_TO_SYNTHETIC_SESSION_TREE PASS",
-        f"source_rows={summary['source_rows']}",
-        f"source_uid={summary['source_uid']}",
-        f"prompt_tokens={summary['prompt_tokens']}",
-        f"logical_input_tokens={summary['logical_input_tokens']}",
-        f"logical_response_tokens={summary['logical_response_tokens']}",
-        f"logical_loss_tokens={summary['logical_loss_tokens']}",
-        f"trees={len(actual_plan.trees)} segments={actual_plan.segment_count}",
-        f"objective_refs={actual_plan.logical_loss_tokens}",
-        f"plan_digest={digest_forest_plan(actual_plan)}",
-        sep="\n",
-        flush=True,
-    )
