@@ -96,6 +96,13 @@ def test_nontensorstack_tensor_dict_in_memory_pack_and_consume():
         _assert_tree_equal(actual, expected)
 
 
+def test_nontensorstack_rejects_two_trees_for_one_session():
+    trees, _ = make_synthetic_batch()
+    duplicate = {**trees[0], "tree_id": "duplicate-tree-id"}
+    with pytest.raises(ValueError, match="one Tree per Session"):
+        pack_session_trees([trees[0], duplicate])
+
+
 def test_direct_session_tree_planner_matches_flat_oracle_for_nested_branches():
     trees, _ = make_synthetic_batch()
     fields = make_tree_fields(trees)
