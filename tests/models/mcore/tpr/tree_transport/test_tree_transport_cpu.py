@@ -10,6 +10,7 @@ from tensordict import NonTensorStack
 from verl.workers.engine.megatron.tpr.tree import (
     build_tree_execution_plans,
     build_tree_execution_plans_from_session_trees,
+    build_tree_execution_plans_from_tree_fields,
     digest_forest_plan,
 )
 
@@ -62,9 +63,10 @@ def _flat_reference_plan(trees):
     return rows, batch, plan
 
 
-def _assert_direct_plan_matches_flat_reference(trees):
-    direct = build_tree_execution_plans_from_session_trees(
-        trees,
+def _assert_direct_plan_matches_flat_reference(trees, fields=None):
+    fields = make_tree_fields(trees) if fields is None else fields
+    direct = build_tree_execution_plans_from_tree_fields(
+        fields,
         require_loss_mask_alignment=True,
         turn_min_segment_tokens=1,
         tree_builder="lcp_sort",
@@ -98,7 +100,9 @@ def test_nontensorstack_tensor_dict_in_memory_pack_and_consume():
 def test_direct_session_tree_planner_matches_flat_oracle_for_nested_branches():
     trees, _ = make_synthetic_batch()
     received = consume_tree_fields(make_tree_fields(trees))
-    direct, rows, batch = _assert_direct_plan_matches_flat_reference(received)
+    direct, rows, batch = _assert_direct_plan_matches_flat_reference(
+        received, fields=make_tree_fields(trees)
+    )
 
     assert len(received) == 2
     assert len({tree["session_id"] for tree in received}) == 2
@@ -111,8 +115,7 @@ def test_direct_session_tree_planner_matches_flat_oracle_for_nested_branches():
     assert direct.logical_loss_tokens == sum(
         int(mask.bool().sum()) for mask in batch["response_mask"]
     )
-    # The fixture contains a shared ancestor whose generated token is masked
-    # for one Leaf but remains present and trainable for another Leaf.
+    # The fixture also covers masked response positions on a nested Leaf path.
     nested_rows = [row for row in rows if row["session_id"] == "s0"]
     assert any(not bool(row["response_mask"][0]) for row in nested_rows)
 
@@ -184,7 +187,9 @@ def test_shared_prefix_tokens_keep_leaf_specific_objective_ownership():
     tree = _make_shared_prefix_mask_tree()
     fields = make_tree_fields([tree])
     received = consume_tree_fields(fields)
-    direct, rows, _ = _assert_direct_plan_matches_flat_reference(received)
+    direct, rows, _ = _assert_direct_plan_matches_flat_reference(
+        received, fields=fields
+    )
 
     assert len(rows) == 2
     assert direct.logical_loss_tokens == 7
@@ -254,7 +259,9 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
         assert summary["fork_session_count"] == expected_forks
         assert summary["leaf_count"] == 8
 
-        direct, rows, batch = _assert_direct_plan_matches_flat_reference(received)
+        direct, rows, batch = _assert_direct_plan_matches_flat_reference(
+            received, fields=fields
+        )
         assert len(rows) == 8
         assert direct.logical_loss_tokens == summary["logical_loss_tokens"]
         all_member_rows = sorted(
