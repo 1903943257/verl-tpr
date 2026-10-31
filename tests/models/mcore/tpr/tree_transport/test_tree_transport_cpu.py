@@ -232,12 +232,13 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
 
     payload = load_tq_rollout_payload(tq_batch_path)
     expected_cases = {
-        "all_chain": (8, 8, 0, 8),
-        "mixed": (8, 4, 4, 12),
-        "all_tree": (8, 0, 8, 16),
+        "all_chain": (8, 8, 0, 0, 8),
+        "mixed": (8, 0, 8, 0, 24),
+        "all_tree": (8, 0, 0, 8, 16),
     }
     for topology, (
-        expected_sessions, expected_chains, expected_forks, expected_leaves
+        expected_sessions, expected_chains, expected_mixed,
+        expected_forks, expected_leaves,
     ) in expected_cases.items():
         trees, summary = build_synthetic_session_trees_from_tq(
             payload, topology=topology
@@ -262,6 +263,7 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
         ]
         assert len(set(node_object_ids)) == len(node_object_ids)
         assert summary["chain_session_count"] == expected_chains
+        assert summary["mixed_session_count"] == expected_mixed
         assert summary["fork_session_count"] == expected_forks
         assert summary["leaf_count"] == 8
 
@@ -287,7 +289,8 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
             f"source_rows={summary['source_rows']}",
             f"session_trees={summary['session_tree_count']}",
             f"chain_sessions={summary['chain_session_count']}",
-            f"fork_sessions={summary['fork_session_count']}",
+            f"mixed_sessions={summary['mixed_session_count']}",
+            f"tree_only_sessions={summary['fork_session_count']}",
             f"leaves={summary['leaf_count']}",
             f"leaf_mask_overrides={summary['leaf_mask_override_count']}",
             f"nodes={summary['node_count']}",
