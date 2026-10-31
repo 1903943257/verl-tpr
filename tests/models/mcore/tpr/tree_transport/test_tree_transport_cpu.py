@@ -117,6 +117,85 @@ def test_direct_session_tree_planner_matches_flat_oracle_for_nested_branches():
     assert any(not bool(row["response_mask"][0]) for row in nested_rows)
 
 
+def _make_shared_prefix_mask_tree():
+    prompt = torch.tensor([101, 151645, 102, 151645], dtype=torch.long)
+    shared_response = torch.tensor([201, 151645], dtype=torch.long)
+    branch_a = torch.tensor([301, 151645], dtype=torch.long)
+    branch_b = torch.tensor([401, 151645], dtype=torch.long)
+    root_logprobs = torch.tensor([-0.1, -0.2])
+    leaves = []
+    for index, branch in enumerate((branch_a, branch_b)):
+        mask = torch.ones(
+            shared_response.numel() + branch.numel(), dtype=torch.bool
+        )
+        if index == 1:
+            mask[0] = False
+        leaves.append({
+            "leaf_id": f"mask-session-leaf-{index}",
+            "leaf_index": index,
+            "kind": "node_path",
+            "leaf_node_id": index + 1,
+            "chain_id": 0,
+            "source_key": f"uid_mask_mask-session_{index}",
+            "response_mask": mask,
+            "loss_mask": mask.clone(),
+            "rm_scores": torch.zeros(mask.numel()),
+        })
+    return {
+        "schema_version": 1,
+        "tree_id": "mask-session-tree",
+        "uid": "uid_mask",
+        "session_id": "mask-session",
+        "root_node_id": 0,
+        "nodes": [
+            {
+                "node_id": 0,
+                "parent_id": None,
+                "chain_id": 0,
+                "prompt_ids": prompt,
+                "response_ids": shared_response,
+                "response_logprobs": root_logprobs,
+                "removed_prefix_token_count": 0,
+            },
+            {
+                "node_id": 1,
+                "parent_id": 0,
+                "chain_id": 0,
+                "prompt_ids": torch.empty(0, dtype=torch.long),
+                "response_ids": branch_a,
+                "response_logprobs": torch.tensor([-0.3, -0.4]),
+                "removed_prefix_token_count": 0,
+            },
+            {
+                "node_id": 2,
+                "parent_id": 0,
+                "chain_id": 0,
+                "prompt_ids": torch.empty(0, dtype=torch.long),
+                "response_ids": branch_b,
+                "response_logprobs": torch.tensor([-0.5, -0.6]),
+                "removed_prefix_token_count": 0,
+            },
+        ],
+        "leaves": leaves,
+    }
+
+
+def test_shared_prefix_tokens_keep_leaf_specific_objective_ownership():
+    tree = _make_shared_prefix_mask_tree()
+    fields = make_tree_fields([tree])
+    received = consume_tree_fields(fields)
+    direct, rows, _ = _assert_direct_plan_matches_flat_reference(received)
+
+    assert len(rows) == 2
+    assert direct.logical_loss_tokens == 7
+    refs = direct.trees[0].objective_refs
+    # Response offset 0 is in the shared ancestor. Leaf 0 supervises it;
+    # Leaf 1 masks it. The shared Node is reused without sharing its mask.
+    assert any(ref.sample_row == 0 and ref.response_offset == 0 for ref in refs)
+    assert not any(ref.sample_row == 1 and ref.response_offset == 0 for ref in refs)
+    assert any(ref.sample_row == 1 and ref.response_offset == 1 for ref in refs)
+
+
 def test_direct_session_tree_planner_handles_removed_prefix_rollback():
     trees, _ = make_synthetic_batch()
     tree = trees[0]
