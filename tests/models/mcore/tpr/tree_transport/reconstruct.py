@@ -21,6 +21,31 @@ def _bool(value: Any) -> Tensor:
     return torch.tensor(list(value), dtype=torch.bool)
 
 
+def _mask_tensor(value: Any) -> Tensor:
+    """Preserve the source mask dtype (TQ captures commonly use int64)."""
+    if isinstance(value, Tensor):
+        result = value.detach().to(device="cpu").clone()
+    else:
+        result = torch.as_tensor(list(value))
+    if result.ndim != 1:
+        raise ValueError("trajectory masks must be one-dimensional")
+    if not bool(((result == 0) | (result == 1)).all()):
+        raise ValueError("trajectory masks must contain only 0/1 values")
+    return result
+
+
+def _float_tensor(value: Any) -> Tensor | None:
+    if value is None:
+        return None
+    if isinstance(value, Tensor):
+        result = value.detach().to(device="cpu").clone()
+    else:
+        result = torch.as_tensor(list(value), dtype=torch.float32)
+    if result.ndim != 1:
+        raise ValueError("response-aligned scores must be one-dimensional")
+    return result
+
+
 def _path(tree: dict[str, Any], leaf_node_id: int) -> list[dict[str, Any]]:
     nodes = {node["node_id"]: node for node in tree["nodes"]}
     result = []
@@ -43,11 +68,11 @@ def reconstruct_leaf(tree: dict[str, Any], leaf_id: str) -> dict[str, Any]:
         trajectory = leaf["trajectory"]
         prompt = _long(trajectory["prompt_ids"])
         response = _long(trajectory["response_ids"])
-        response_mask = _bool(leaf["response_mask"])
-        loss_mask = _bool(leaf.get("loss_mask", response_mask))
+        response_mask = _mask_tensor(leaf["response_mask"])
+        loss_mask = _mask_tensor(leaf.get("loss_mask", response_mask))
         if response_mask.numel() != response.numel() or loss_mask.numel() != response.numel():
             raise ValueError(f"materialized leaf {leaf_id!r} masks must align with response_ids")
-        if bool((loss_mask & ~response_mask).any()):
+        if bool((loss_mask.bool() & ~response_mask.bool()).any()):
             raise ValueError(f"materialized leaf {leaf_id!r} loss_mask exceeds response_mask")
         raw_logprobs = trajectory.get("response_logprobs")
         logprobs = None
@@ -58,9 +83,10 @@ def reconstruct_leaf(tree: dict[str, Any], leaf_id: str) -> dict[str, Any]:
             if all(value is not None for value in values):
                 logprobs = torch.tensor(values, dtype=torch.float32)
         return {
-            "key": f"{tree['uid']}_{tree['session_id']}_{leaf['leaf_index']}",
+            "key": leaf.get("source_key", f"{tree['uid']}_{tree['session_id']}_{leaf['leaf_index']}"),
             "uid": tree["uid"],
             "session_id": tree["session_id"],
+            "source_session_id": leaf.get("source_session_id"),
             "tree_id": tree["tree_id"],
             "leaf_id": leaf_id,
             "leaf_node_id": None,
@@ -71,6 +97,7 @@ def reconstruct_leaf(tree: dict[str, Any], leaf_id: str) -> dict[str, Any]:
             "response_mask": response_mask,
             "loss_mask": loss_mask,
             "rollout_log_probs": logprobs,
+            "rm_scores": _float_tensor(leaf.get("rm_scores")),
             "reward_score": leaf.get("reward_score"),
             "finished": leaf.get("finished"),
         }
@@ -84,7 +111,9 @@ def reconstruct_leaf(tree: dict[str, Any], leaf_id: str) -> dict[str, Any]:
     prompt_ids = _long(path[0]["prompt_ids"]).tolist()
     response_ids: list[int] = []
     response_mask: list[int] = []
-    response_logprobs: list[float | None] | None = [] if path[-1].get("response_logprobs") is not None else None
+    response_logprobs: list[float | None] | None = (
+        [] if any(node.get("response_logprobs") is not None for node in path) else None
+    )
 
     for index, node in enumerate(path):
         removed = int(node.get("removed_prefix_token_count", 0))
@@ -118,6 +147,8 @@ def reconstruct_leaf(tree: dict[str, Any], leaf_id: str) -> dict[str, Any]:
         response_mask.extend([1] * len(generated))
         if response_logprobs is not None:
             node_logprobs = node.get("response_logprobs")
+            if isinstance(node_logprobs, Tensor):
+                node_logprobs = node_logprobs.detach().cpu().tolist()
             response_logprobs.extend(
                 list(node_logprobs) if node_logprobs is not None else [None] * len(generated)
             )
@@ -127,13 +158,13 @@ def reconstruct_leaf(tree: dict[str, Any], leaf_id: str) -> dict[str, Any]:
     # one trajectory (e.g. an aborted/error suffix) while remaining present in
     # the shared node payload. Only alignment, not equality to a node-global
     # mask, is required.
-    reconstructed_mask = _bool(leaf.get("response_mask", derived_mask))
+    reconstructed_mask = _mask_tensor(leaf.get("response_mask", derived_mask))
     if reconstructed_mask.numel() != len(response_ids):
         raise ValueError(f"leaf {leaf_id!r} response_mask length does not match reconstructed response")
-    loss_mask = _bool(leaf.get("loss_mask", reconstructed_mask))
+    loss_mask = _mask_tensor(leaf.get("loss_mask", reconstructed_mask))
     if loss_mask.numel() != reconstructed_mask.numel():
         raise ValueError(f"leaf {leaf_id!r} loss_mask length does not match reconstructed response")
-    if bool((loss_mask & ~reconstructed_mask).any()):
+    if bool((loss_mask.bool() & ~reconstructed_mask.bool()).any()):
         raise ValueError(f"leaf {leaf_id!r} loss_mask supervises tokens excluded by response_mask")
 
     aligned_logprobs = None
@@ -143,9 +174,10 @@ def reconstruct_leaf(tree: dict[str, Any], leaf_id: str) -> dict[str, Any]:
     prompt = torch.tensor(prompt_ids, dtype=torch.long)
     response = torch.tensor(response_ids, dtype=torch.long)
     return {
-        "key": f"{tree['uid']}_{tree['session_id']}_{leaf['leaf_index']}",
+        "key": leaf.get("source_key", f"{tree['uid']}_{tree['session_id']}_{leaf['leaf_index']}"),
         "uid": tree["uid"],
         "session_id": tree["session_id"],
+        "source_session_id": leaf.get("source_session_id"),
         "tree_id": tree["tree_id"],
         "leaf_id": leaf_id,
         "leaf_node_id": leaf["leaf_node_id"],
@@ -156,6 +188,7 @@ def reconstruct_leaf(tree: dict[str, Any], leaf_id: str) -> dict[str, Any]:
         "response_mask": reconstructed_mask,
         "loss_mask": loss_mask,
         "rollout_log_probs": aligned_logprobs,
+        "rm_scores": _float_tensor(leaf.get("rm_scores")),
         "reward_score": leaf.get("reward_score"),
         "finished": leaf.get("finished"),
     }
