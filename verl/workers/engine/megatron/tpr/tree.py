@@ -865,6 +865,26 @@ def build_tree_execution_plans_from_session_trees(
 
     return ForestExecutionPlan(tuple(result), sum(map(len, selected_by_row)))
 
+
+def build_tree_execution_plans_from_tree_fields(
+    fields: Any,
+    *,
+    tree_field: str = "trajectory_tree",
+    **kwargs: Any,
+) -> ForestExecutionPlan:
+    """Consume the proposed TQ TensorDict / NonTensorStack field directly."""
+    getter = getattr(fields, "get", None)
+    if not callable(getter):
+        raise TypeError("TQ tree fields must be a TensorDict-like mapping")
+    stacked = getter(tree_field)
+    if stacked is None or not callable(getattr(stacked, "tolist", None)):
+        raise TypeError(f"TQ fields must contain NonTensorStack at {tree_field!r}")
+    session_trees = stacked.tolist()
+    if not isinstance(session_trees, list):
+        raise TypeError("trajectory_tree NonTensorStack.tolist() must return a list")
+    return build_tree_execution_plans_from_session_trees(session_trees, **kwargs)
+
+
 def _write_record(hasher, record) -> None:
     hasher.update(json.dumps(record, separators=(",", ":")).encode())
 
