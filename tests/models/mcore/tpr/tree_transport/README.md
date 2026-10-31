@@ -28,7 +28,7 @@ each Leaf's objective ownership.
 
 ## Direct consumer
 
-Production-side entry point:
+Direct planner entry point:
 
 ```python
 from verl.workers.engine.megatron.tpr.tree import (
