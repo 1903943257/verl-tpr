@@ -54,7 +54,10 @@ def _assert_row_equal(actual, expected):
         ), field
         if a is not None and b is not None:
             assert a.dtype == b.dtype, field
-    for field in ("key", "uid", "session_id", "source_session_id", "leaf_id"):
+    for field in (
+        "key", "uid", "session_id", "source_session_id",
+        "source_trajectory_index", "leaf_id",
+    ):
         if field in expected:
             assert actual.get(field) == expected[field], field
 
