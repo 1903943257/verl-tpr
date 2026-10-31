@@ -436,7 +436,12 @@ class _SessionTreeUnit:
 
 
 def _session_tree_tokens(value: Any, name: str) -> Tensor:
-    if not isinstance(value, Tensor) or value.ndim != 1:
+    if not isinstance(value, Tensor):
+        try:
+            value = torch.as_tensor(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a one-dimensional integer sequence") from exc
+    if value.ndim != 1:
         raise ValueError(f"{name} must be a one-dimensional tensor")
     if (value.dtype == torch.bool or torch.is_floating_point(value)
             or torch.is_complex(value) or bool((value < 0).any())):
@@ -445,7 +450,12 @@ def _session_tree_tokens(value: Any, name: str) -> Tensor:
 
 
 def _session_tree_mask(value: Any, name: str) -> Tensor:
-    if not isinstance(value, Tensor) or value.ndim != 1:
+    if not isinstance(value, Tensor):
+        try:
+            value = torch.as_tensor(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a one-dimensional 0/1 sequence") from exc
+    if value.ndim != 1:
         raise ValueError(f"{name} must be a one-dimensional tensor")
     result = value.detach().to(device="cpu")
     if not bool(((result == 0) | (result == 1)).all()):
@@ -502,8 +512,10 @@ def _session_leaf_chunks(
         raw_logprobs = trajectory.get("response_logprobs")
         logprobs = None
         if raw_logprobs is not None:
-            if not isinstance(raw_logprobs, Tensor) or raw_logprobs.ndim != 1:
-                raise ValueError("trajectory.response_logprobs must be a one-dimensional tensor")
+            if not isinstance(raw_logprobs, Tensor):
+                raw_logprobs = torch.as_tensor(raw_logprobs)
+            if raw_logprobs.ndim != 1 or torch.is_complex(raw_logprobs):
+                raise ValueError("trajectory.response_logprobs must be a one-dimensional numeric tensor")
             logprobs = raw_logprobs.detach().to(device="cpu", dtype=torch.float32).clone()
             if logprobs.numel() != response.numel():
                 raise ValueError("trajectory.response_logprobs must align with response_ids")
@@ -511,7 +523,12 @@ def _session_leaf_chunks(
         loss_mask = _session_tree_mask(leaf.get("loss_mask", leaf["response_mask"]), "leaf.loss_mask")
         if response_mask.numel() != response.numel() or loss_mask.numel() != response.numel():
             raise ValueError("trajectory Leaf masks must align with response_ids")
-        return [prompt], [(response, torch.ones_like(response, dtype=torch.bool), logprobs)], response_mask, loss_mask, prompt.numel()
+        response_chunk = (
+            response,
+            torch.ones_like(response, dtype=torch.bool),
+            logprobs,
+        )
+        return [prompt], [response_chunk], response_mask, loss_mask, prompt.numel()
 
     if kind != "node_path":
         raise ValueError(f"unsupported Session Tree Leaf kind: {kind!r}")
@@ -566,8 +583,10 @@ def _session_leaf_chunks(
         raw_logprobs = node.get("response_logprobs")
         logprobs = None
         if raw_logprobs is not None:
-            if not isinstance(raw_logprobs, Tensor) or raw_logprobs.ndim != 1:
-                raise ValueError("node.response_logprobs must be a one-dimensional tensor")
+            if not isinstance(raw_logprobs, Tensor):
+                raw_logprobs = torch.as_tensor(raw_logprobs)
+            if raw_logprobs.ndim != 1 or torch.is_complex(raw_logprobs):
+                raise ValueError("node.response_logprobs must be a one-dimensional numeric tensor")
             logprobs = raw_logprobs.detach().to(device="cpu", dtype=torch.float32).clone()
             if logprobs.numel() != generated.numel():
                 raise ValueError("node.response_logprobs must align with response_ids")
@@ -723,10 +742,19 @@ def build_tree_execution_plans_from_session_trees(
 
         nodes = tree.get("nodes")
         leaves = tree.get("leaves")
-        if not isinstance(nodes, Sequence) or not nodes or not isinstance(leaves, Sequence) or not leaves:
+        if (
+            not isinstance(nodes, Sequence)
+            or isinstance(nodes, (str, bytes))
+            or not nodes
+            or not isinstance(leaves, Sequence)
+            or isinstance(leaves, (str, bytes))
+            or not leaves
+        ):
             raise ValueError("each Session Tree must contain Nodes and Leaves")
         node_by_id = {}
         for node in nodes:
+            if not isinstance(node, Mapping):
+                raise TypeError("Session Tree Nodes must be mappings")
             node_id = node.get("node_id")
             if not isinstance(node_id, int) or isinstance(node_id, bool) or node_id in node_by_id:
                 raise ValueError("Session Tree Node IDs must be unique integers within a Session")
@@ -751,7 +779,10 @@ def build_tree_execution_plans_from_session_trees(
             chunks = [chunk for chunk in prompt_chunks if chunk.numel()]
             chunks.extend(tokens for tokens, _, _ in response_chunks if tokens.numel())
             total_length = sum(chunk.numel() for chunk in chunks)
-            if prompt_length > total_length or total_length - prompt_length != response_mask.numel():
+            if (
+                prompt_length > total_length
+                or total_length - prompt_length != response_mask.numel()
+            ):
                 raise ValueError("Leaf prompt/response boundary does not align with its response_mask")
             units = _session_tree_units(chunks, prompt_length, turn_min_segment_tokens)
             selected = torch.nonzero(response_mask, as_tuple=False).flatten().tolist()
