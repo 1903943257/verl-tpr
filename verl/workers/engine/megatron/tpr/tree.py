@@ -752,6 +752,8 @@ def build_tree_execution_plans_from_session_trees(
     trajectory rows are materialized. Leaves from different Sessions are then
     grouped by UID and their exact qwen_turn units are merged by the selected
     Trie/LCP builder. Node IDs are scoped to their containing Session Tree.
+    ObjectiveRef.sample_row indexes the stable traversal order: NonTensorStack
+    Session order, then each Session's Leaf sequence order.
     """
     if not session_trees:
         raise ValueError("cannot build a Forest from an empty Session Tree batch")
