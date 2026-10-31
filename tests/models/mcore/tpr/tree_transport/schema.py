@@ -194,8 +194,11 @@ def pack_session_trees(trees: Sequence[Mapping[str, Any]]):
     for tree in trees:
         validate_session_tree(tree)
     tree_ids = [tree["tree_id"] for tree in trees]
+    session_ids = [(tree["uid"], tree["session_id"]) for tree in trees]
     if len(set(tree_ids)) != len(tree_ids):
         raise ValueError("tree_id values must be unique within a NonTensorStack batch")
+    if len(set(session_ids)) != len(session_ids):
+        raise ValueError("NonTensorStack must contain exactly one Tree per Session")
     return TensorDict({TREE_FIELD: NonTensorStack(*trees)}, batch_size=[len(trees)])
 
 
@@ -209,4 +212,10 @@ def unpack_session_trees(fields: Any) -> list[dict[str, Any]]:
         raise TypeError("trajectory_tree NonTensorStack.tolist() must return a list")
     for tree in trees:
         validate_session_tree(tree)
+    tree_ids = [tree["tree_id"] for tree in trees]
+    session_ids = [(tree["uid"], tree["session_id"]) for tree in trees]
+    if len(set(tree_ids)) != len(tree_ids):
+        raise ValueError("duplicate tree_id in NonTensorStack")
+    if len(set(session_ids)) != len(session_ids):
+        raise ValueError("NonTensorStack contains multiple Trees for one Session")
     return trees
