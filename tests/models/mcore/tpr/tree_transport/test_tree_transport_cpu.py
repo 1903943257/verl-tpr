@@ -127,7 +127,7 @@ def _make_shared_prefix_mask_tree():
     branch_b = torch.tensor([401, 151645], dtype=torch.long)
     root_logprobs = torch.tensor([-0.1, -0.2])
     leaves = []
-    for index in range(2):
+    for index, branch in enumerate((branch_a, branch_b)):
         mask = torch.ones(
             shared_response.numel() + branch.numel(), dtype=torch.bool
         )
