@@ -9,7 +9,6 @@ from tensordict import NonTensorStack
 
 from verl.workers.engine.megatron.tpr.tree import (
     build_tree_execution_plans,
-    build_tree_execution_plans_from_session_trees,
     build_tree_execution_plans_from_tree_fields,
     digest_forest_plan,
 )
@@ -99,9 +98,10 @@ def test_nontensorstack_tensor_dict_in_memory_pack_and_consume():
 
 def test_direct_session_tree_planner_matches_flat_oracle_for_nested_branches():
     trees, _ = make_synthetic_batch()
-    received = consume_tree_fields(make_tree_fields(trees))
+    fields = make_tree_fields(trees)
+    received = consume_tree_fields(fields)
     direct, rows, batch = _assert_direct_plan_matches_flat_reference(
-        received, fields=make_tree_fields(trees)
+        received, fields=fields
     )
 
     assert len(received) == 2
@@ -127,7 +127,7 @@ def _make_shared_prefix_mask_tree():
     branch_b = torch.tensor([401, 151645], dtype=torch.long)
     root_logprobs = torch.tensor([-0.1, -0.2])
     leaves = []
-    for index, branch in enumerate((branch_a, branch_b)):
+    for index in range(2):
         mask = torch.ones(
             shared_response.numel() + branch.numel(), dtype=torch.bool
         )
@@ -247,7 +247,7 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
         assert len(stacked) == expected_sessions
 
         # TQ input is strictly Session-local: one independent Tree per
-        # Session, unique Session identity, and no cross-Session Node IDs.
+        # Session. Node IDs are local and may repeat in different Trees.
         received = consume_tree_fields(fields)
         assert len({tree["tree_id"] for tree in received}) == expected_sessions
         assert len({
@@ -255,11 +255,15 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
         }) == expected_sessions
         assert all(tree["root_node_id"] == 0 for tree in received)
         assert len({id(tree["nodes"]) for tree in received}) == expected_sessions
+        node_object_ids = [
+            id(node) for tree in received for node in tree["nodes"]
+        ]
+        assert len(set(node_object_ids)) == len(node_object_ids)
         assert summary["chain_session_count"] == expected_chains
         assert summary["fork_session_count"] == expected_forks
         assert summary["leaf_count"] == 8
 
-        direct, rows, batch = _assert_direct_plan_matches_flat_reference(
+        direct, rows, _ = _assert_direct_plan_matches_flat_reference(
             received, fields=fields
         )
         assert len(rows) == 8
