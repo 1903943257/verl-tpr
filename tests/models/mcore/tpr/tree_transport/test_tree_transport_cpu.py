@@ -70,7 +70,14 @@ def _assert_direct_plan_matches_flat_reference(trees, fields=None):
         turn_min_segment_tokens=1,
         tree_builder="lcp_sort",
     )
+    direct_trie = build_tree_execution_plans_from_tree_fields(
+        fields,
+        require_loss_mask_alignment=True,
+        turn_min_segment_tokens=1,
+        tree_builder="trie",
+    )
     rows, batch, reference = _flat_reference_plan(trees)
+    assert digest_forest_plan(direct_trie) == digest_forest_plan(direct)
     assert digest_forest_plan(direct) == digest_forest_plan(reference)
     assert direct.logical_loss_tokens == reference.logical_loss_tokens
     assert direct.logical_loss_tokens == sum(
