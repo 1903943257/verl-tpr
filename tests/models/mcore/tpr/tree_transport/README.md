@@ -112,6 +112,7 @@ and `removed_prefix_token_count` rollback.
 - Per-Leaf masks, Node log-probabilities and RM scores remain attached to the
   correct payload.
 - Every supervised token has exactly one objective reference.
+- Direct Session Tree Trie and LCP builders produce identical plans.
 - Direct Session Tree construction and the flat-row reference produce
   identical Forest / SegmentPlan / ObjectiveRef digests.
 
