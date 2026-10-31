@@ -114,54 +114,132 @@ def _make_chain_session(
     }
 
 
-def _make_fork_session(
-    *, uid: str, session_id: str, tree_id: str,
-    source_rows: list[dict[str, Any]],
-) -> dict[str, Any]:
-    if len(source_rows) < 2:
-        raise ValueError("a synthetic fork Session needs at least two source trajectories")
-    prompt = source_rows[0]["prompts"]
-    for row in source_rows[1:]:
-        if not torch.equal(row["prompts"], prompt):
-            raise ValueError("synthetic fork branches must share an exact prompt")
 
-    nodes = [{
-        "node_id": 0,
-        "parent_id": None,
-        "chain_id": 0,
-        "prompt_ids": prompt.clone(),
-        "response_ids": torch.empty(0, dtype=torch.long),
-        "response_logprobs": torch.empty(
-            0, dtype=source_rows[0]["rollout_log_probs"].dtype
-        ),
-        "removed_prefix_token_count": 0,
-    }]
-    leaves = []
-    for index, row in enumerate(source_rows):
-        node_id = index + 1
-        nodes.append({
-            "node_id": node_id,
+def _make_fork_session(
+    *,
+    uid: str,
+    session_id: str,
+    tree_id: str,
+    source_row: dict[str, Any],
+    shared_prefix_tokens: int = 16,
+) -> dict[str, Any]:
+    """Create two synthetic branches inside this one source Session.
+
+    Branch A preserves the source response. Branch B drops one token directly
+    after the shared prefix; all aligned per-token metadata is sliced at the
+    same position. A Leaf-specific mask override exercises shared-node
+    ownership without introducing another source Session into this Tree.
+    """
+    prompt = source_row["prompts"]
+    response = source_row["responses"]
+    response_mask = source_row["response_mask"]
+    loss_mask = source_row["loss_mask"]
+    logprobs = source_row["rollout_log_probs"]
+    rm_scores = source_row["rm_scores"]
+    if response.numel() < 2:
+        raise ValueError("cannot synthesize a fork from a response shorter than two tokens")
+    prefix_length = min(shared_prefix_tokens, response.numel() - 1)
+    shared_prefix = response[:prefix_length]
+    suffix_a = response[prefix_length:]
+    suffix_b = response[prefix_length + 1:]
+
+    mask_a = response_mask.clone()
+    loss_a = loss_mask.clone()
+    scores_a = rm_scores.clone()
+
+    mask_b = torch.cat((
+        response_mask[:prefix_length],
+        response_mask[prefix_length + 1:],
+    )).clone()
+    loss_b = torch.cat((
+        loss_mask[:prefix_length],
+        loss_mask[prefix_length + 1:],
+    )).clone()
+    scores_b = torch.cat((
+        rm_scores[:prefix_length],
+        rm_scores[prefix_length + 1:],
+    )).clone()
+
+    # The same shared Node can have different supervision ownership in
+    # different Leaves. Mask one shared-prefix target in Branch B when possible.
+    shared_supervised = torch.nonzero(
+        mask_b[:prefix_length].bool() & loss_b[:prefix_length].bool(),
+        as_tuple=False,
+    ).flatten()
+    mask_override_positions = []
+    if shared_supervised.numel():
+        override = int(shared_supervised[0])
+        mask_b[override] = 0
+        loss_b[override] = 0
+        mask_override_positions.append(override)
+
+    source_key = source_row["key"]
+    source_session_id = source_row["source_session_id"]
+    source_trajectory_index = source_row["source_trajectory_index"]
+    synthetic_branch_key = (
+        f"{uid}_{source_session_id}_{source_trajectory_index + 1000000}"
+    )
+    nodes = [
+        {
+            "node_id": 0,
+            "parent_id": None,
+            "chain_id": 0,
+            "prompt_ids": prompt.clone(),
+            "response_ids": shared_prefix.clone(),
+            "response_logprobs": logprobs[:prefix_length].clone(),
+            "removed_prefix_token_count": 0,
+        },
+        {
+            "node_id": 1,
             "parent_id": 0,
             "chain_id": 0,
             "prompt_ids": torch.empty(0, dtype=torch.long),
-            "response_ids": row["responses"].clone(),
-            "response_logprobs": row["rollout_log_probs"].clone(),
+            "response_ids": suffix_a.clone(),
+            "response_logprobs": logprobs[prefix_length:].clone(),
             "removed_prefix_token_count": 0,
-        })
-        leaves.append({
-            "leaf_id": f"{session_id}-leaf-{index}",
-            "leaf_index": index,
-            "kind": "node_path",
-            "leaf_node_id": node_id,
+        },
+        {
+            "node_id": 2,
+            "parent_id": 0,
             "chain_id": 0,
-            "source_key": row["key"],
-            "source_session_id": row["source_session_id"],
-            "source_trajectory_index": row["source_trajectory_index"],
-            "response_mask": row["response_mask"].clone(),
-            "loss_mask": row["loss_mask"].clone(),
-            "rm_scores": row["rm_scores"].clone(),
-        })
-
+            "prompt_ids": torch.empty(0, dtype=torch.long),
+            "response_ids": suffix_b.clone(),
+            "response_logprobs": logprobs[prefix_length + 1:].clone(),
+            "removed_prefix_token_count": 0,
+        },
+    ]
+    leaves = [
+        {
+            "leaf_id": f"{session_id}-leaf-0",
+            "leaf_index": 0,
+            "kind": "node_path",
+            "leaf_node_id": 1,
+            "chain_id": 0,
+            "source_key": source_key,
+            "source_tq_key": source_key,
+            "source_session_id": source_session_id,
+            "source_trajectory_index": source_trajectory_index,
+            "response_mask": mask_a,
+            "loss_mask": loss_a,
+            "rm_scores": scores_a,
+        },
+        {
+            "leaf_id": f"{session_id}-leaf-1",
+            "leaf_index": 1,
+            "kind": "node_path",
+            "leaf_node_id": 2,
+            "chain_id": 0,
+            "source_key": synthetic_branch_key,
+            "source_tq_key": source_key,
+            "source_session_id": source_session_id,
+            "source_trajectory_index": source_trajectory_index,
+            "response_mask": mask_b,
+            "loss_mask": loss_b,
+            "rm_scores": scores_b,
+            "synthetic_branch": "drop_first_suffix_token",
+            "mask_override_positions": mask_override_positions,
+        },
+    ]
     return {
         "schema_version": TREE_SCHEMA_VERSION,
         "tree_id": tree_id,
@@ -170,9 +248,10 @@ def _make_fork_session(
         "root_node_id": 0,
         "nodes": nodes,
         "leaves": leaves,
-        "synthetic_from": "flat_tq_rollout_batch",
+        "synthetic_from": "one_flat_tq_row",
         "synthetic_topology": "session_fork",
-        "source_tq_keys": [row["key"] for row in source_rows],
+        "source_tq_keys": [source_key],
+        "shared_prefix_tokens": prefix_length,
     }
 
 
@@ -183,15 +262,14 @@ def build_synthetic_session_trees_from_tq(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Synthesize independent per-Session Chain/Tree payloads from flat TQ rows.
 
-    topology:
-      - all_chain: one source TQ row becomes one single-chain Session.
-      - mixed: first half remain single-chain Sessions; the second half are
-        paired into synthetic fork Sessions.
-      - all_tree: source rows are paired into independent fork Sessions.
+    Each source TQ row remains in its own Session. For fork cases, a second
+    branch is fabricated from that same row by dropping one suffix token;
+    no rows from different Sessions are combined into one Session Tree.
 
-    Source rows are never combined across Session Tree boundaries. Pairing rows
-    is only a fixture-generation technique to fabricate an intra-Session fork;
-    each emitted Tree still contains exactly one synthetic Session.
+    topology:
+      - all_chain: all source Sessions remain single Chains.
+      - mixed: first half are single Chains, second half are per-Session Trees.
+      - all_tree: every source Session is converted into a two-Leaf Tree.
     """
     batch = payload["tensordict"]
     keys = list(payload["keys"])
@@ -257,30 +335,18 @@ def build_synthetic_session_trees_from_tq(
         })
 
     if topology == "all_chain":
-        groups = [[row] for row in source_rows]
+        fork_start = len(source_rows)
     elif topology == "mixed":
-        split = len(source_rows) // 2
-        groups = [[row] for row in source_rows[:split]]
-        groups.extend(
-            source_rows[index:index + 2]
-            for index in range(split, len(source_rows), 2)
-        )
+        fork_start = len(source_rows) // 2
     else:
-        groups = [
-            source_rows[index:index + 2]
-            for index in range(0, len(source_rows), 2)
-        ]
+        fork_start = 0
 
     trees = []
-    for session_index, group in enumerate(groups):
-        uids = {row["uid"] for row in group}
-        if len(uids) != 1:
-            raise ValueError("a synthetic Session Tree cannot combine different UIDs")
-        uid = next(iter(uids))
-        session_id = f"synthetic-session-{session_index}"
-        tree_id = f"synthetic-tree-{topology}-{session_index}"
-        if len(group) == 1:
-            row = group[0]
+    for index, row in enumerate(source_rows):
+        uid = row["uid"]
+        session_id = row["source_session_id"]
+        tree_id = f"synthetic-tree-{topology}-{index}"
+        if index < fork_start:
             tree = _make_chain_session(
                 uid=uid,
                 session_id=session_id,
@@ -300,7 +366,7 @@ def build_synthetic_session_trees_from_tq(
                 uid=uid,
                 session_id=session_id,
                 tree_id=tree_id,
-                source_rows=group,
+                source_row=row,
             )
         validate_session_tree(tree)
         trees.append(tree)
@@ -309,6 +375,37 @@ def build_synthetic_session_trees_from_tq(
     exact_common_prompt = bool(all_prompts) and all(
         torch.equal(all_prompts[0], prompt) for prompt in all_prompts[1:]
     )
+    logical_input_tokens = 0
+    logical_loss_tokens = 0
+    leaf_count = 0
+    for tree in trees:
+        prompt_length = int(tree["nodes"][0]["prompt_ids"].numel())
+        for leaf in tree["leaves"]:
+            if leaf.get("kind", "node_path") == "trajectory":
+                response_length = int(leaf["trajectory"]["response_ids"].numel())
+            else:
+                path = []
+                nodes_by_id = {node["node_id"]: node for node in tree["nodes"]}
+                current = leaf["leaf_node_id"]
+                while current is not None:
+                    path.append(nodes_by_id[current])
+                    current = nodes_by_id[current].get("parent_id")
+                path.reverse()
+                chain_start = next(
+                    i for i, node in enumerate(path)
+                    if node["chain_id"] == leaf["chain_id"]
+                )
+                response_length = sum(
+                    int(node["response_ids"].numel())
+                    for node in path[chain_start:]
+                ) + sum(
+                    int(node["prompt_ids"].numel())
+                    for node in path[chain_start + 1:]
+                )
+            logical_input_tokens += prompt_length + response_length
+            logical_loss_tokens += int(leaf["loss_mask"].bool().sum())
+            leaf_count += 1
+
     summary = {
         "topology": topology,
         "source_rows": len(source_rows),
@@ -319,18 +416,17 @@ def build_synthetic_session_trees_from_tq(
         "fork_session_count": sum(
             tree["synthetic_topology"] == "session_fork" for tree in trees
         ),
-        "leaf_count": sum(len(tree["leaves"]) for tree in trees),
+        "leaf_count": leaf_count,
         "node_count": sum(len(tree["nodes"]) for tree in trees),
         "source_uids": sorted({row["uid"] for row in source_rows}),
         "source_session_ids": [row["source_session_id"] for row in source_rows],
         "prompt_lengths": [int(row["prompts"].numel()) for row in source_rows],
         "exact_common_prompt": exact_common_prompt,
-        "logical_input_tokens": sum(
-            int(row["prompts"].numel() + row["responses"].numel())
-            for row in source_rows
-        ),
-        "logical_loss_tokens": sum(
-            int(row["loss_mask"].bool().sum()) for row in source_rows
+        "logical_input_tokens": logical_input_tokens,
+        "logical_loss_tokens": logical_loss_tokens,
+        "leaf_mask_override_count": sum(
+            len(leaf.get("mask_override_positions", []))
+            for tree in trees for leaf in tree["leaves"]
         ),
     }
     return trees, summary
