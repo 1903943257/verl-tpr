@@ -232,11 +232,13 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
 
     payload = load_tq_rollout_payload(tq_batch_path)
     expected_cases = {
-        "all_chain": (8, 8, 0),
-        "mixed": (6, 4, 2),
-        "all_tree": (4, 0, 4),
+        "all_chain": (8, 8, 0, 8),
+        "mixed": (8, 4, 4, 12),
+        "all_tree": (8, 0, 8, 16),
     }
-    for topology, (expected_sessions, expected_chains, expected_forks) in expected_cases.items():
+    for topology, (
+        expected_sessions, expected_chains, expected_forks, expected_leaves
+    ) in expected_cases.items():
         trees, summary = build_synthetic_session_trees_from_tq(
             payload, topology=topology
         )
@@ -268,13 +270,16 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
         )
         assert len(rows) == 8
         assert direct.logical_loss_tokens == summary["logical_loss_tokens"]
+        assert sum(int(row["input_ids"].numel()) for row in rows) == (
+            summary["logical_input_tokens"]
+        )
         all_member_rows = sorted(
             row for tree in direct.trees for row in tree.member_rows
         )
         assert all_member_rows == list(range(8))
         if len(summary["source_uids"]) == 1 and summary["exact_common_prompt"]:
             assert len(direct.trees) == 1
-            assert direct.trees[0].member_rows == tuple(range(8))
+            assert direct.trees[0].member_rows == tuple(range(expected_leaves))
 
         print(
             "SESSION_TREE_DIRECT_CONSUMER PASS",
@@ -284,6 +289,7 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
             f"chain_sessions={summary['chain_session_count']}",
             f"fork_sessions={summary['fork_session_count']}",
             f"leaves={summary['leaf_count']}",
+            f"leaf_mask_overrides={summary['leaf_mask_override_count']}",
             f"nodes={summary['node_count']}",
             f"exact_common_prompt={summary['exact_common_prompt']}",
             f"logical_input_tokens={summary['logical_input_tokens']}",
