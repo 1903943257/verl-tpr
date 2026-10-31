@@ -47,6 +47,9 @@ The direct builder walks each Leaf's Node path as token chunks. It does not
 materialize complete `prompts`, `responses`, or `input_ids` rows before
 building the cross-Session topology. It preserves per-Leaf response/loss mask
 ownership and maps selected response tokens to `SegmentObjectiveRef` objects.
+`sample_row` is assigned in stable order: NonTensorStack Session order, then
+each Session's Leaf sequence order. The caller must use the same order when
+building Leaf-aligned PPO metadata.
 
 The existing flat-row planner remains available as a test-only reference
 oracle. Tests compare its plan digest with the direct Session Tree planner;
