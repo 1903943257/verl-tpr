@@ -74,16 +74,125 @@ def load_tq_rollout_payload(path: str | Path) -> dict[str, Any]:
     return payload
 
 
-def build_synthetic_session_tree_from_tq(
+
+def _make_chain_session(
+    *, uid: str, session_id: str, tree_id: str, key: str,
+    source_session_id: str, source_trajectory_index: int,
+    prompt: Tensor, response: Tensor, response_mask: Tensor,
+    loss_mask: Tensor, logprobs: Tensor, rm_scores: Tensor,
+) -> dict[str, Any]:
+    return {
+        "schema_version": TREE_SCHEMA_VERSION,
+        "tree_id": tree_id,
+        "uid": uid,
+        "session_id": session_id,
+        "root_node_id": 0,
+        "nodes": [{
+            "node_id": 0,
+            "parent_id": None,
+            "chain_id": 0,
+            "prompt_ids": prompt.clone(),
+            "response_ids": response.clone(),
+            "response_logprobs": logprobs.clone(),
+            "removed_prefix_token_count": 0,
+        }],
+        "leaves": [{
+            "leaf_id": f"{session_id}-leaf-0",
+            "leaf_index": 0,
+            "kind": "node_path",
+            "leaf_node_id": 0,
+            "chain_id": 0,
+            "source_key": key,
+            "source_session_id": source_session_id,
+            "source_trajectory_index": source_trajectory_index,
+            "response_mask": response_mask.clone(),
+            "loss_mask": loss_mask.clone(),
+            "rm_scores": rm_scores.clone(),
+        }],
+        "synthetic_from": "flat_tq_rollout_batch",
+        "synthetic_topology": "single_chain",
+        "source_tq_keys": [key],
+    }
+
+
+def _make_fork_session(
+    *, uid: str, session_id: str, tree_id: str,
+    source_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if len(source_rows) < 2:
+        raise ValueError("a synthetic fork Session needs at least two source trajectories")
+    prompt = source_rows[0]["prompts"]
+    for row in source_rows[1:]:
+        if not torch.equal(row["prompts"], prompt):
+            raise ValueError("synthetic fork branches must share an exact prompt")
+
+    nodes = [{
+        "node_id": 0,
+        "parent_id": None,
+        "chain_id": 0,
+        "prompt_ids": prompt.clone(),
+        "response_ids": torch.empty(0, dtype=torch.long),
+        "response_logprobs": torch.empty(
+            0, dtype=source_rows[0]["rollout_log_probs"].dtype
+        ),
+        "removed_prefix_token_count": 0,
+    }]
+    leaves = []
+    for index, row in enumerate(source_rows):
+        node_id = index + 1
+        nodes.append({
+            "node_id": node_id,
+            "parent_id": 0,
+            "chain_id": 0,
+            "prompt_ids": torch.empty(0, dtype=torch.long),
+            "response_ids": row["responses"].clone(),
+            "response_logprobs": row["rollout_log_probs"].clone(),
+            "removed_prefix_token_count": 0,
+        })
+        leaves.append({
+            "leaf_id": f"{session_id}-leaf-{index}",
+            "leaf_index": index,
+            "kind": "node_path",
+            "leaf_node_id": node_id,
+            "chain_id": 0,
+            "source_key": row["key"],
+            "source_session_id": row["source_session_id"],
+            "source_trajectory_index": row["source_trajectory_index"],
+            "response_mask": row["response_mask"].clone(),
+            "loss_mask": row["loss_mask"].clone(),
+            "rm_scores": row["rm_scores"].clone(),
+        })
+
+    return {
+        "schema_version": TREE_SCHEMA_VERSION,
+        "tree_id": tree_id,
+        "uid": uid,
+        "session_id": session_id,
+        "root_node_id": 0,
+        "nodes": nodes,
+        "leaves": leaves,
+        "synthetic_from": "flat_tq_rollout_batch",
+        "synthetic_topology": "session_fork",
+        "source_tq_keys": [row["key"] for row in source_rows],
+    }
+
+
+def build_synthetic_session_trees_from_tq(
     payload: dict[str, Any],
     *,
-    session_id: str = "synthetic-session-from-tq",
-) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
-    """Turn same-prompt rows into one root plus N response branches.
+    topology: str = "all_chain",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Synthesize independent per-Session Chain/Tree payloads from flat TQ rows.
 
-    The current capture's source session indexes (0..7) are retained on each
-    Leaf as provenance. They are deliberately grouped into one *synthetic*
-    Session Tree for validating the future NonTensorStack consumer contract.
+    topology:
+      - all_chain: one source TQ row becomes one single-chain Session.
+      - mixed: first half remain single-chain Sessions; the second half are
+        paired into synthetic fork Sessions.
+      - all_tree: source rows are paired into independent fork Sessions.
+
+    Source rows are never combined across Session Tree boundaries. Pairing rows
+    is only a fixture-generation technique to fabricate an intra-Session fork;
+    each emitted Tree still contains exactly one synthetic Session.
     """
     batch = payload["tensordict"]
     keys = list(payload["keys"])
@@ -93,15 +202,10 @@ def build_synthetic_session_tree_from_tq(
         raise ValueError(
             f"TQ key/row mismatch: keys={len(keys)} batch_rows={batch.batch_size[0]}"
         )
-    parsed = [_parse_key(key) for key in keys]
-    uids = {item[0] for item in parsed}
-    if len(uids) != 1:
-        raise ValueError(
-            "one synthetic Session Tree requires one source UID; "
-            f"the selected TQ rows contain {len(uids)} UIDs"
-        )
-    uid = next(iter(uids))
+    if topology not in ("all_chain", "mixed", "all_tree"):
+        raise ValueError(f"unsupported synthetic topology: {topology!r}")
 
+    parsed = [_parse_key(key) for key in keys]
     rows_by_field = {}
     for field in _REQUIRED_FIELDS:
         if field not in batch.keys():
@@ -113,120 +217,121 @@ def build_synthetic_session_tree_from_tq(
                 f"expected {len(keys)}"
             )
 
-    prompts = rows_by_field["prompts"]
-    base_prompt = prompts[0]
-    if base_prompt.numel() == 0:
-        raise ValueError("cannot synthesize a prompt-root tree from an empty prompt")
-    for row, prompt in enumerate(prompts):
-        if not torch.equal(prompt, base_prompt):
-            raise ValueError(
-                f"source row {row} does not share the exact prompt; "
-                "cannot place it under this single synthetic root"
-            )
-
-    nodes = [{
-        "node_id": 0,
-        "parent_id": None,
-        "chain_id": 0,
-        "prompt_ids": base_prompt.clone(),
-        "response_ids": torch.empty(0, dtype=torch.long),
-        "response_logprobs": torch.empty(0, dtype=rows_by_field["rollout_log_probs"][0].dtype),
-        "removed_prefix_token_count": 0,
-    }]
-    leaves = []
-    expected_rows = []
-
-    for row, (key, (_, source_session_id, source_trajectory_index)) in enumerate(
-        zip(keys, parsed, strict=True)
-    ):
-        prompt = prompts[row]
-        response = rows_by_field["responses"][row]
-        input_ids = rows_by_field["input_ids"][row]
-        response_mask = rows_by_field["response_mask"][row]
-        loss_mask = rows_by_field["loss_mask"][row]
-        rollout_log_probs = rows_by_field["rollout_log_probs"][row]
-        rm_scores = rows_by_field["rm_scores"][row]
+    source_rows = []
+    for index, (key, parsed_key) in enumerate(zip(keys, parsed, strict=True)):
+        uid, source_session_id, source_trajectory_index = parsed_key
+        prompt = rows_by_field["prompts"][index]
+        response = rows_by_field["responses"][index]
+        input_ids = rows_by_field["input_ids"][index]
+        response_mask = rows_by_field["response_mask"][index]
+        loss_mask = rows_by_field["loss_mask"][index]
+        logprobs = rows_by_field["rollout_log_probs"][index]
+        rm_scores = rows_by_field["rm_scores"][index]
 
         if not torch.equal(input_ids, torch.cat((prompt, response))):
-            raise ValueError(f"source row {row}: input_ids != prompts + responses")
-        response_len = response.numel()
+            raise ValueError(f"source row {index}: input_ids != prompts + responses")
         aligned = {
             "response_mask": response_mask.numel(),
             "loss_mask": loss_mask.numel(),
-            "rollout_log_probs": rollout_log_probs.numel(),
+            "rollout_log_probs": logprobs.numel(),
             "rm_scores": rm_scores.numel(),
         }
-        if any(length != response_len for length in aligned.values()):
+        if any(length != response.numel() for length in aligned.values()):
             raise ValueError(
-                f"source row {row}: response-aligned field lengths differ; "
-                f"response={response_len}, fields={aligned}"
+                f"source row {index}: response-aligned fields differ; "
+                f"response={response.numel()}, fields={aligned}"
             )
         if bool((loss_mask.bool() & ~response_mask.bool()).any()):
-            raise ValueError(f"source row {row}: loss_mask selects a response_mask=0 token")
+            raise ValueError(f"source row {index}: loss_mask selects response_mask=0")
 
-        node_id = row + 1
-        chain_id = row + 1
-        nodes.append({
-            "node_id": node_id,
-            "parent_id": 0,
-            "chain_id": chain_id,
-            "prompt_ids": torch.empty(0, dtype=torch.long),
-            "response_ids": response.clone(),
-            "response_logprobs": rollout_log_probs.clone(),
-            "removed_prefix_token_count": 0,
-        })
-        leaf_id = f"leaf-{row}"
-        leaves.append({
-            "leaf_id": leaf_id,
-            "leaf_index": row,
-            "kind": "node_path",
-            "leaf_node_id": node_id,
-            "chain_id": chain_id,
-            "source_key": key,
-            "source_session_id": source_session_id,
-            "source_trajectory_index": source_trajectory_index,
-            "response_mask": response_mask.clone(),
-            "loss_mask": loss_mask.clone(),
-            "rm_scores": rm_scores.clone(),
-        })
-        expected_rows.append({
+        source_rows.append({
             "key": key,
             "uid": uid,
-            "session_id": session_id,
             "source_session_id": source_session_id,
             "source_trajectory_index": source_trajectory_index,
-            "leaf_id": leaf_id,
-            "prompts": prompt.clone(),
-            "responses": response.clone(),
-            "input_ids": input_ids.clone(),
-            "response_mask": response_mask.clone(),
-            "loss_mask": loss_mask.clone(),
-            "rollout_log_probs": rollout_log_probs.clone(),
-            "rm_scores": rm_scores.clone(),
+            "prompts": prompt,
+            "responses": response,
+            "response_mask": response_mask,
+            "loss_mask": loss_mask,
+            "rollout_log_probs": logprobs,
+            "rm_scores": rm_scores,
         })
 
-    tree = {
-        "schema_version": TREE_SCHEMA_VERSION,
-        "tree_id": f"synthetic-tree-{uid}",
-        "uid": uid,
-        "session_id": session_id,
-        "root_node_id": 0,
-        "nodes": nodes,
-        "leaves": leaves,
-        "synthetic_from": "flat_tq_rollout_batch",
-        "source_row_count": len(keys),
-    }
-    validate_session_tree(tree)
+    if topology == "all_chain":
+        groups = [[row] for row in source_rows]
+    elif topology == "mixed":
+        split = len(source_rows) // 2
+        groups = [[row] for row in source_rows[:split]]
+        groups.extend(
+            source_rows[index:index + 2]
+            for index in range(split, len(source_rows), 2)
+        )
+    else:
+        groups = [
+            source_rows[index:index + 2]
+            for index in range(0, len(source_rows), 2)
+        ]
+
+    trees = []
+    for session_index, group in enumerate(groups):
+        uids = {row["uid"] for row in group}
+        if len(uids) != 1:
+            raise ValueError("a synthetic Session Tree cannot combine different UIDs")
+        uid = next(iter(uids))
+        session_id = f"synthetic-session-{session_index}"
+        tree_id = f"synthetic-tree-{topology}-{session_index}"
+        if len(group) == 1:
+            row = group[0]
+            tree = _make_chain_session(
+                uid=uid,
+                session_id=session_id,
+                tree_id=tree_id,
+                key=row["key"],
+                source_session_id=row["source_session_id"],
+                source_trajectory_index=row["source_trajectory_index"],
+                prompt=row["prompts"],
+                response=row["responses"],
+                response_mask=row["response_mask"],
+                loss_mask=row["loss_mask"],
+                logprobs=row["rollout_log_probs"],
+                rm_scores=row["rm_scores"],
+            )
+        else:
+            tree = _make_fork_session(
+                uid=uid,
+                session_id=session_id,
+                tree_id=tree_id,
+                source_rows=group,
+            )
+        validate_session_tree(tree)
+        trees.append(tree)
+
+    all_prompts = [row["prompts"] for row in source_rows]
+    exact_common_prompt = bool(all_prompts) and all(
+        torch.equal(all_prompts[0], prompt) for prompt in all_prompts[1:]
+    )
     summary = {
-        "source_rows": len(keys),
-        "source_uid": uid,
-        "source_session_ids": [item[1] for item in parsed],
-        "source_trajectory_indices": [item[2] for item in parsed],
-        "prompt_tokens": int(base_prompt.numel()),
-        "logical_input_tokens": sum(int(x.numel()) for x in rows_by_field["input_ids"]),
-        "logical_response_tokens": sum(int(x.numel()) for x in rows_by_field["responses"]),
-        "logical_loss_tokens": sum(int(x.bool().sum()) for x in rows_by_field["loss_mask"]),
-        "node_count": len(nodes),
-        "leaf_count": len(leaves),
+        "topology": topology,
+        "source_rows": len(source_rows),
+        "session_tree_count": len(trees),
+        "chain_session_count": sum(
+            tree["synthetic_topology"] == "single_chain" for tree in trees
+        ),
+        "fork_session_count": sum(
+            tree["synthetic_topology"] == "session_fork" for tree in trees
+        ),
+        "leaf_count": sum(len(tree["leaves"]) for tree in trees),
+        "node_count": sum(len(tree["nodes"]) for tree in trees),
+        "source_uids": sorted({row["uid"] for row in source_rows}),
+        "source_session_ids": [row["source_session_id"] for row in source_rows],
+        "prompt_lengths": [int(row["prompts"].numel()) for row in source_rows],
+        "exact_common_prompt": exact_common_prompt,
+        "logical_input_tokens": sum(
+            int(row["prompts"].numel() + row["responses"].numel())
+            for row in source_rows
+        ),
+        "logical_loss_tokens": sum(
+            int(row["loss_mask"].bool().sum()) for row in source_rows
+        ),
     }
-    return tree, expected_rows, summary
+    return trees, summary
