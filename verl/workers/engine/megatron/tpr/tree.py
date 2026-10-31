@@ -517,8 +517,12 @@ def _session_leaf_chunks(
         raise ValueError(f"unsupported Session Tree Leaf kind: {kind!r}")
     nodes = {node["node_id"]: node for node in tree["nodes"]}
     path = []
+    visited = set()
     current = leaf.get("leaf_node_id")
     while current is not None:
+        if current in visited:
+            raise ValueError("cycle detected in Session Tree Node path")
+        visited.add(current)
         node = nodes.get(current)
         if node is None:
             raise ValueError(f"Leaf references missing node {current!r}")
@@ -532,7 +536,9 @@ def _session_leaf_chunks(
     if chain_start is None:
         raise ValueError(f"Leaf chain_id={chain_id!r} is absent from its Node path")
 
-    prompt_chunks: list[Tensor] = []
+    prompt_chunks: list[Tensor] = [
+        _session_tree_tokens(path[0].get("prompt_ids"), "root.prompt_ids")
+    ]
     response_chunks: list[tuple[Tensor, Tensor, Tensor | None]] = []
     for index, node in enumerate(path):
         removed = node.get("removed_prefix_token_count", 0)
