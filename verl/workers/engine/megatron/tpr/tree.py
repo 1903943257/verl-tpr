@@ -463,6 +463,27 @@ def _session_tree_mask(value: Any, name: str) -> Tensor:
     return result.to(torch.bool)
 
 
+def _session_tree_logprobs(value: Any, name: str, expected: int) -> Tensor | None:
+    if value is None:
+        return None
+    if isinstance(value, Tensor):
+        if value.ndim != 1 or torch.is_complex(value):
+            raise ValueError(f"{name} must be a one-dimensional numeric tensor")
+        if value.numel() != expected:
+            raise ValueError(f"{name} must align with its response token chunk")
+        return value.detach().to(device="cpu", dtype=torch.float32).clone()
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        values = list(value)
+        if len(values) != expected:
+            raise ValueError(f"{name} must align with its response token chunk")
+        if any(item is not None and not isinstance(item, (int, float)) for item in values):
+            raise ValueError(f"{name} must contain numbers or None")
+        if any(item is None for item in values):
+            return None
+        return torch.tensor(values, dtype=torch.float32)
+    raise TypeError(f"{name} must be a one-dimensional tensor, sequence, or None")
+
+
 def _trim_token_chunks(chunks: list[Tensor], count: int) -> int:
     """Trim count tokens from the right; return any count not present."""
     remaining = count
@@ -509,16 +530,11 @@ def _session_leaf_chunks(
             raise ValueError("materialized trajectory Leaf must contain a trajectory mapping")
         prompt = _session_tree_tokens(trajectory.get("prompt_ids"), "trajectory.prompt_ids")
         response = _session_tree_tokens(trajectory.get("response_ids"), "trajectory.response_ids")
-        raw_logprobs = trajectory.get("response_logprobs")
-        logprobs = None
-        if raw_logprobs is not None:
-            if not isinstance(raw_logprobs, Tensor):
-                raw_logprobs = torch.as_tensor(raw_logprobs)
-            if raw_logprobs.ndim != 1 or torch.is_complex(raw_logprobs):
-                raise ValueError("trajectory.response_logprobs must be a one-dimensional numeric tensor")
-            logprobs = raw_logprobs.detach().to(device="cpu", dtype=torch.float32).clone()
-            if logprobs.numel() != response.numel():
-                raise ValueError("trajectory.response_logprobs must align with response_ids")
+        logprobs = _session_tree_logprobs(
+            trajectory.get("response_logprobs"),
+            "trajectory.response_logprobs",
+            response.numel(),
+        )
         response_mask = _session_tree_mask(leaf.get("response_mask"), "leaf.response_mask")
         loss_mask = _session_tree_mask(leaf.get("loss_mask", leaf["response_mask"]), "leaf.loss_mask")
         if response_mask.numel() != response.numel() or loss_mask.numel() != response.numel():
@@ -582,16 +598,11 @@ def _session_leaf_chunks(
             response_chunks.clear()
 
         generated = _session_tree_tokens(node.get("response_ids"), "node.response_ids")
-        raw_logprobs = node.get("response_logprobs")
-        logprobs = None
-        if raw_logprobs is not None:
-            if not isinstance(raw_logprobs, Tensor):
-                raw_logprobs = torch.as_tensor(raw_logprobs)
-            if raw_logprobs.ndim != 1 or torch.is_complex(raw_logprobs):
-                raise ValueError("node.response_logprobs must be a one-dimensional numeric tensor")
-            logprobs = raw_logprobs.detach().to(device="cpu", dtype=torch.float32).clone()
-            if logprobs.numel() != generated.numel():
-                raise ValueError("node.response_logprobs must align with response_ids")
+        logprobs = _session_tree_logprobs(
+            node.get("response_logprobs"),
+            "node.response_logprobs",
+            generated.numel(),
+        )
         if generated.numel():
             response_chunks.append((
                 generated,
