@@ -218,15 +218,54 @@ def test_existing_tq_batch_is_consumed_as_one_synthetic_session_tree():
     assert actual_plan.logical_loss_tokens == summary["logical_loss_tokens"]
 
     print(
-        "REAL_TQ_TO_SYNTHETIC_SESSION_TREE PASS "
-        f"source_rows={summary['source_rows']} "
-        f"source_uid={summary['source_uid']} "
-        f"source_session_ids={summary['source_session_ids']} "
-        f"prompt_tokens={summary['prompt_tokens']} "
-        f"logical_input_tokens={summary['logical_input_tokens']} "
-        f"logical_loss_tokens={summary['logical_loss_tokens']} "
-        f"nodes={summary['node_count']} leaves={summary['leaf_count']} "
-        f"trees={len(actual_plan.trees)} segments={actual_plan.segment_count} "
+        "========== TQ SOURCE ==========",
+        f"payload_keys={list(payload.keys())}",
+        f"tensordict_fields={list(payload['tensordict'].keys())}",
+        f"source_keys={list(payload['keys'])}",
+        sep="\n",
+        flush=True,
+    )
+    print(
+        "========== SYNTHETIC TREE PAYLOAD ==========",
+        f"field_type={type(stacked).__name__}",
+        f"field_batch_size={list(fields.batch_size)}",
+        f"tree_keys={list(received[0].keys())}",
+        f"nodes={summary['node_count']} leaves={summary['leaf_count']}",
+        sep="\n",
+        flush=True,
+    )
+    for node in received[0]["nodes"]:
+        print(
+            "NODE",
+            f"id={node['node_id']}",
+            f"parent={node['parent_id']}",
+            f"chain={node['chain_id']}",
+            f"prompt_tokens={node['prompt_ids'].numel()}",
+            f"response_tokens={node['response_ids'].numel()}",
+            f"logprob_tokens={node['response_logprobs'].numel()}",
+        )
+    for leaf in received[0]["leaves"]:
+        print(
+            "LEAF",
+            f"id={leaf['leaf_id']}",
+            f"source_key={leaf['source_key']}",
+            f"source_session_id={leaf['source_session_id']}",
+            f"response_mask_tokens={leaf['response_mask'].numel()}",
+            f"loss_mask_tokens={leaf['loss_mask'].numel()}",
+            f"rm_score_tokens={leaf['rm_scores'].numel()}",
+        )
+    print(
+        "========== CONSUMER VALIDATION ==========",
+        "REAL_TQ_TO_SYNTHETIC_SESSION_TREE PASS",
+        f"source_rows={summary['source_rows']}",
+        f"source_uid={summary['source_uid']}",
+        f"prompt_tokens={summary['prompt_tokens']}",
+        f"logical_input_tokens={summary['logical_input_tokens']}",
+        f"logical_response_tokens={summary['logical_response_tokens']}",
+        f"logical_loss_tokens={summary['logical_loss_tokens']}",
+        f"trees={len(actual_plan.trees)} segments={actual_plan.segment_count}",
+        f"objective_refs={actual_plan.logical_loss_tokens}",
         f"plan_digest={digest_forest_plan(actual_plan)}",
+        sep="\n",
         flush=True,
     )
