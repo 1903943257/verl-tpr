@@ -758,21 +758,46 @@ def build_tree_execution_plans_from_session_trees(
             if not isinstance(node, Mapping):
                 raise TypeError("Session Tree Nodes must be mappings")
             node_id = node.get("node_id")
-            if not isinstance(node_id, int) or isinstance(node_id, bool) or node_id in node_by_id:
-                raise ValueError("Session Tree Node IDs must be unique integers within a Session")
+            if (
+                not isinstance(node_id, int)
+                or isinstance(node_id, bool)
+                or node_id < 0
+                or node_id in node_by_id
+            ):
+                raise ValueError("Session Tree Node IDs must be unique non-negative integers")
             node_by_id[node_id] = node
         root_id = tree.get("root_node_id")
         roots = [node_id for node_id, node in node_by_id.items() if node.get("parent_id") is None]
         if roots != [root_id]:
             raise ValueError("each Session Tree must have exactly its declared root")
+        children_by_parent = {node_id: [] for node_id in node_by_id}
         for node_id, node in node_by_id.items():
             parent_id = node.get("parent_id")
-            if parent_id is not None and parent_id not in node_by_id:
-                raise ValueError(f"Session Tree Node {node_id} references missing parent {parent_id}")
+            if parent_id is not None:
+                if not isinstance(parent_id, int) or isinstance(parent_id, bool):
+                    raise ValueError(f"Session Tree Node {node_id} has an invalid parent_id")
+                if parent_id not in node_by_id:
+                    raise ValueError(f"Session Tree Node {node_id} references missing parent {parent_id}")
+                children_by_parent[parent_id].append(node_id)
+        visited_nodes = set()
+        pending_nodes = [root_id]
+        while pending_nodes:
+            node_id = pending_nodes.pop()
+            if node_id in visited_nodes:
+                raise ValueError("cycle or duplicate child in Session Tree topology")
+            visited_nodes.add(node_id)
+            pending_nodes.extend(children_by_parent[node_id])
+        if visited_nodes != set(node_by_id):
+            raise ValueError("Session Tree contains unreachable Nodes")
 
+        leaf_ids = set()
         for leaf in leaves:
             if not isinstance(leaf, Mapping):
                 raise TypeError("Session Tree Leaves must be mappings")
+            leaf_id = leaf.get("leaf_id")
+            if not isinstance(leaf_id, str) or not leaf_id or leaf_id in leaf_ids:
+                raise ValueError("Session Tree Leaf IDs must be unique non-empty strings")
+            leaf_ids.add(leaf_id)
             prompt_chunks, response_chunks, response_mask, loss_mask, prompt_length = (
                 _session_leaf_chunks(tree, leaf)
             )
