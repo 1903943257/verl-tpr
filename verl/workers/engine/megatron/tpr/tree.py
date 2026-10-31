@@ -523,6 +523,8 @@ def _session_leaf_chunks(
         loss_mask = _session_tree_mask(leaf.get("loss_mask", leaf["response_mask"]), "leaf.loss_mask")
         if response_mask.numel() != response.numel() or loss_mask.numel() != response.numel():
             raise ValueError("trajectory Leaf masks must align with response_ids")
+        if bool((loss_mask & ~response_mask).any()):
+            raise ValueError("Leaf loss_mask cannot select response_mask=0 tokens")
         response_chunk = (
             response,
             torch.ones_like(response, dtype=torch.bool),
