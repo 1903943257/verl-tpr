@@ -577,6 +577,8 @@ def _session_leaf_chunks(
     path = []
     visited = set()
     current = leaf.get("leaf_node_id")
+    if not isinstance(current, int) or isinstance(current, bool) or current < 0:
+        raise ValueError("node_path Leaf leaf_node_id must be a non-negative integer")
     while current is not None:
         if current in visited:
             raise ValueError("cycle detected in Session Tree Node path")
@@ -858,6 +860,12 @@ def build_tree_execution_plans_from_session_trees(
             if not isinstance(leaf_id, str) or not leaf_id or leaf_id in leaf_ids:
                 raise ValueError("Session Tree Leaf IDs must be unique non-empty strings")
             leaf_ids.add(leaf_id)
+            leaf_index = leaf.get("leaf_index")
+            if not isinstance(leaf_index, int) or isinstance(leaf_index, bool) or leaf_index < 0:
+                raise ValueError("Session Tree Leaf leaf_index must be a non-negative integer")
+            chain_id = leaf.get("chain_id")
+            if not isinstance(chain_id, int) or isinstance(chain_id, bool) or chain_id < 0:
+                raise ValueError("Session Tree Leaf chain_id must be a non-negative integer")
             prompt_chunks, response_chunks, response_mask, loss_mask, prompt_length = (
                 _session_leaf_chunks(tree, leaf)
             )
