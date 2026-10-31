@@ -484,6 +484,25 @@ def _session_tree_logprobs(value: Any, name: str, expected: int) -> Tensor | Non
     raise TypeError(f"{name} must be a one-dimensional tensor, sequence, or None")
 
 
+def _validate_session_tree_scores(value: Any, name: str, expected: int) -> None:
+    if value is None:
+        return
+    if isinstance(value, Tensor):
+        if value.ndim != 1 or torch.is_complex(value):
+            raise ValueError(f"{name} must be a one-dimensional numeric tensor")
+        if value.numel() != expected:
+            raise ValueError(f"{name} must align with its Leaf response")
+        return
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        values = list(value)
+        if len(values) != expected or any(
+            not isinstance(item, (int, float)) for item in values
+        ):
+            raise ValueError(f"{name} must contain one numeric score per response token")
+        return
+    raise TypeError(f"{name} must be a one-dimensional tensor, sequence, or None")
+
+
 def _trim_token_chunks(chunks: list[Tensor], count: int) -> int:
     """Trim count tokens from the right; return any count not present."""
     remaining = count
@@ -541,6 +560,9 @@ def _session_leaf_chunks(
             raise ValueError("trajectory Leaf masks must align with response_ids")
         if bool((loss_mask & ~response_mask).any()):
             raise ValueError("Leaf loss_mask cannot select response_mask=0 tokens")
+        _validate_session_tree_scores(
+            leaf.get("rm_scores"), "leaf.rm_scores", response.numel()
+        )
         response_chunk = (
             response,
             torch.ones_like(response, dtype=torch.bool),
@@ -621,6 +643,9 @@ def _session_leaf_chunks(
         )
     if bool((loss_mask & ~response_mask).any()):
         raise ValueError("Leaf loss_mask cannot select response_mask=0 tokens")
+    _validate_session_tree_scores(
+        leaf.get("rm_scores"), "leaf.rm_scores", response_length
+    )
     prompt_length = sum(chunk.numel() for chunk in prompt_chunks)
     return prompt_chunks, response_chunks, response_mask, loss_mask, prompt_length
 
