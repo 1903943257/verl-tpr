@@ -144,6 +144,7 @@ def main():
         and tokenizer.convert_ids_to_tokens(reference_id) == "<|im_start|>"
     )
     match_count = reference_count = recovered_count = 0
+    role_label_checked = role_label_correct = 0
     role_counts = {}
     for tokens in _rows(batch, "input_ids"):
         cpu = tokens.detach().cpu().long()
@@ -153,9 +154,18 @@ def main():
             role_counts[role] = role_counts.get(role, 0) + 1
         if has_chatml_reference:
             real = set(torch.nonzero(cpu == reference_id, as_tuple=False).flatten().tolist())
-            estimated = {at for at, _role in anchors}
-            match_count += len(real & estimated)
+            estimated = dict(anchors)
+            match_count += len(real & set(estimated))
             reference_count += len(real)
+            for position in real & set(estimated):
+                rendered = tokenizer.decode(
+                    cpu[position + 1:min(len(cpu), position + 24)].tolist(),
+                    skip_special_tokens=False
+                )
+                label = rendered.split("\\n", 1)[0].strip()
+                if label in {"system", "developer", "user", "assistant", "tool"}:
+                    role_label_checked += 1
+                    role_label_correct += int(estimated[position] == label)
 
     output = {
         "role_template_init_ms": round((initialized - started) * 1000, 2),
@@ -168,6 +178,8 @@ def main():
             "matched": match_count if has_chatml_reference else None,
             "recall": round(match_count / reference_count, 5) if reference_count else None,
             "precision": round(match_count / recovered_count, 5) if recovered_count and has_chatml_reference else None,
+            "role_labels_compared": role_label_checked if has_chatml_reference else None,
+            "role_label_accuracy": round(role_label_correct / role_label_checked, 5) if role_label_checked else None,
             "note": "Only a Qwen tokenizer-specific offline reference; in-band markers can be ambiguous.",
         },
         "trie": variants["trie"][1],
