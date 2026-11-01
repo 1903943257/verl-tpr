@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from functools import lru_cache
+
+import numpy as np
 from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -239,6 +243,121 @@ def _turn_units_bytes(tokens: Tensor, prompt_length: int, minimum: int) -> tuple
     return tuple(units)
 
 
+
+@dataclass(frozen=True, slots=True)
+class _RoleProbe:
+    headers: tuple[tuple[str, bytes, bool], ...]
+    endings: tuple[bytes, ...]
+
+
+def _find_role_marker(sequence: list[int], marker: list[int], start: int) -> int:
+    return next(
+        (i for i in range(start, len(sequence) - len(marker) + 1)
+         if sequence[i:i + len(marker)] == marker), -1
+    )
+
+
+def _probe_role_template(tokenizer: Any) -> _RoleProbe:
+    """Probe exact role header token IDs from a tokenizer's chat template.
+
+    No Qwen token ID is used. Unstable templates/implicit roles are not
+    assumed to have recoverable message boundaries.
+    """
+    marker = "TPRRoleProbeContentQ7X9"
+    before = "TPRRoleProbePreviousB8Y6"
+    marker_ids = tokenizer.encode(marker, add_special_tokens=False)
+    if not marker_ids:
+        raise ValueError("empty role probe marker")
+    headers: list[tuple[str, bytes, bool]] = []
+    endings: list[bytes] = []
+    for role in ("system", "developer", "user", "assistant", "tool"):
+        for following in (False, True):
+            prefix_msgs = [{"role": "user", "content": before}] if following else []
+            msgs = [*prefix_msgs, {"role": role, "content": marker}]
+            try:
+                all_ids = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=False)
+                old_ids = tokenizer.apply_chat_template(
+                    prefix_msgs, tokenize=True, add_generation_prompt=False
+                ) if following else []
+            except (ValueError, TypeError, KeyError, RuntimeError):
+                continue
+            if isinstance(all_ids, Tensor):
+                all_ids = all_ids.flatten().tolist()
+            if isinstance(old_ids, Tensor):
+                old_ids = old_ids.flatten().tolist()
+            if not isinstance(all_ids, list) or not isinstance(old_ids, list):
+                continue
+            if all_ids[:len(old_ids)] != old_ids:
+                continue
+            body = _find_role_marker(all_ids, marker_ids, len(old_ids))
+            if body == -1:
+                continue
+            header = all_ids[len(old_ids):body]
+            ending = all_ids[body + len(marker_ids):]
+            if not header or not ending or role not in tokenizer.decode(header, skip_special_tokens=False):
+                continue
+            item = (role, np.asarray(header, dtype=np.int64).tobytes(), not following)
+            if item not in headers:
+                headers.append(item)
+            end_bytes = np.asarray(ending, dtype=np.int64).tobytes()
+            if end_bytes not in endings:
+                endings.append(end_bytes)
+    if not headers or not endings:
+        raise ValueError("chat template has no stable explicit role headers")
+    return _RoleProbe(tuple(headers), tuple(endings))
+
+
+@lru_cache(maxsize=4)
+def _role_probe_from_path(path: str) -> _RoleProbe:
+    from transformers import AutoTokenizer
+
+    return _probe_role_template(AutoTokenizer.from_pretrained(
+        path, local_files_only=True, trust_remote_code=False
+    ))
+
+
+def _role_anchors(tokens: Tensor, probe: _RoleProbe) -> tuple[tuple[int, str], ...]:
+    """Locate model-derived headers. Text-only reconstruction is not a role oracle."""
+    raw = tokens.contiguous().numpy().tobytes()
+    found: dict[int, str] = {}
+    for role, header, first_only in probe.headers:
+        seek = 0
+        while (offset := raw.find(header, seek)) >= 0:
+            seek = offset + 1
+            if offset % 8:
+                continue
+            if offset == 0:
+                if not first_only:
+                    continue
+            elif first_only or not any(raw.endswith(end, 0, offset) for end in probe.endings):
+                continue
+            pos = offset // 8
+            if pos in found and found[pos] != role:
+                raise ValueError(f"conflicting Role candidates at {pos}")
+            found[pos] = role
+    return tuple(sorted(found.items()))
+
+
+def _role_units_bytes(
+    tokens: Tensor, prompt_length: int, minimum: int, probe: _RoleProbe
+) -> tuple[tuple[bytes, int], ...]:
+    """Token-exact units at candidate role starts; never split inside a short unit."""
+    if not 0 <= prompt_length <= tokens.numel():
+        raise ValueError("invalid prompt length")
+    boundaries = {pos for pos, _ in _role_anchors(tokens, probe) if 0 < pos < tokens.numel()}
+    if 0 < prompt_length < tokens.numel():
+        boundaries.add(prompt_length)
+    boundaries.add(tokens.numel())
+    previous = 0
+    units = []
+    for end in sorted(boundaries):
+        if end < tokens.numel() and end - previous < minimum:
+            continue
+        units.append((tokens[previous:end].contiguous().numpy().tobytes(), end))
+        previous = end
+    return tuple(units)
+
+
 def _unit_lcp(left: tuple[tuple[bytes, int], ...], right: tuple[tuple[bytes, int], ...]) -> int:
     """Return the exact common prefix length in complete units, not raw tokens."""
     limit = min(len(left), len(right))
@@ -335,8 +454,14 @@ def build_tree_execution_plans(
     tree_builder="lcp_sort" sorts complete Turn-unit sequences and rebuilds
     the same trie from adjacent longest-common-prefix lengths.
     """
-    if tree_policy != "qwen_turn":
-        raise ValueError("Production TPR only supports qwen_turn")
+    if tree_policy not in ("qwen_turn", "role_probe"):
+        raise ValueError(f"unsupported TPR tree_policy: {tree_policy!r}")
+    role_probe = None
+    if tree_policy == "role_probe":
+        tokenizer_path = os.environ.get("TPR_ROLE_TOKENIZER_PATH")
+        if not tokenizer_path:
+            raise ValueError("role_probe requires TPR_ROLE_TOKENIZER_PATH")
+        role_probe = _role_probe_from_path(tokenizer_path)
     if tree_builder not in ("trie", "lcp_sort"):
         raise ValueError(f"unknown TPR tree_builder: {tree_builder!r}")
     if (not isinstance(turn_min_segment_tokens, int) or isinstance(turn_min_segment_tokens, bool)
@@ -392,12 +517,21 @@ def build_tree_execution_plans(
             if prompt_length > tokens.numel() or not torch.equal(tokens[:prompt_length].cpu(), prompt.cpu()):
                 raise ValueError(f"turn builder prompt is not an exact input prefix for row={row}")
         uid, _, _ = _parse_key(key)
-        if tree_builder == "lcp_sort":
+        if role_probe is not None:
+            units = _role_units_bytes(cpu_tokens, prompt_length, turn_min_segment_tokens, role_probe)
+        elif tree_builder == "lcp_sort":
             units = _turn_units_bytes(cpu_tokens, prompt_length, turn_min_segment_tokens)
+        else:
+            units = None
+        if tree_builder == "lcp_sort":
             lcp_rows.setdefault(uid, []).append((row, units))
         else:
             node = groups.setdefault(uid, _TurnNode(0, row))
-            for signature, end in _turn_units(cpu_tokens.tolist(), prompt_length, turn_min_segment_tokens):
+            row_units = (
+                iter(units) if units is not None else
+                _turn_units(cpu_tokens.tolist(), prompt_length, turn_min_segment_tokens)
+            )
+            for signature, end in row_units:
                 node = node.children.setdefault(signature, _TurnNode(end, row))
                 node.member_rows.append(row)
             node.terminal_rows.append(row)
