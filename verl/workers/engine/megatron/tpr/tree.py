@@ -257,6 +257,53 @@ def _find_role_marker(sequence: list[int], marker: list[int], start: int) -> int
     )
 
 
+def _find_marker_span_via_rendered_template(
+    tokenizer: Any, msgs: list[dict[str, str]], all_ids: list[int],
+    marker: str,
+) -> tuple[int, int] | None:
+    """Fallback when standalone marker tokenization differs in context.
+
+    Use the exact rendered chat template to locate a unique content sentinel.
+    The split is accepted ONLY if the surrounding token IDs match the actual
+    full-template encoding (or exact fast-tokenizer character offsets).
+    """
+    try:
+        rendered_text = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=False
+        )
+    except (ValueError, TypeError, KeyError, RuntimeError):
+        return None
+    if not isinstance(rendered_text, str) or rendered_text.count(marker) != 1:
+        return None
+    start_char = rendered_text.index(marker)
+    end_char = start_char + len(marker)
+    prefix = tokenizer.encode(rendered_text[:start_char], add_special_tokens=False)
+    suffix = tokenizer.encode(rendered_text[end_char:], add_special_tokens=False)
+    if (isinstance(prefix, list) and isinstance(suffix, list)
+            and all_ids[:len(prefix)] == prefix
+            and (not suffix or all_ids[-len(suffix):] == suffix)
+            and len(prefix) + len(suffix) <= len(all_ids)):
+        return len(prefix), len(all_ids) - len(suffix)
+
+    # Fast tokenizers expose offsets for every token in the rendered text.
+    # Refuse a split unless both character boundaries coincide with tokens.
+    try:
+        encoded = tokenizer(
+            rendered_text, add_special_tokens=False, return_offsets_mapping=True
+        )
+        ids = encoded["input_ids"]
+        offsets = encoded["offset_mapping"]
+    except (ValueError, TypeError, KeyError, RuntimeError, NotImplementedError):
+        return None
+    if ids != all_ids:
+        return None
+    starts = [i for i, (a, _b) in enumerate(offsets) if a == start_char]
+    ends = [i + 1 for i, (_a, b) in enumerate(offsets) if b == end_char]
+    if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+        return None
+    return starts[0], ends[0]
+
+
 def _probe_role_template(tokenizer: Any) -> _RoleProbe:
     """Probe exact role header token IDs from a tokenizer's chat template.
 
@@ -270,6 +317,10 @@ def _probe_role_template(tokenizer: Any) -> _RoleProbe:
         raise ValueError("empty role probe marker")
     headers: list[tuple[str, bytes, bool]] = []
     endings: list[bytes] = []
+    failures: dict[str, int] = {}
+    def reject(reason: str) -> None:
+        failures[reason] = failures.get(reason, 0) + 1
+
     for role in ("system", "developer", "user", "assistant", "tool"):
         for following in (False, True):
             prefix_msgs = [{"role": "user", "content": before}] if following else []
@@ -280,21 +331,38 @@ def _probe_role_template(tokenizer: Any) -> _RoleProbe:
                     prefix_msgs, tokenize=True, add_generation_prompt=False
                 ) if following else []
             except (ValueError, TypeError, KeyError, RuntimeError):
+                reject("template_render_error")
                 continue
             if isinstance(all_ids, Tensor):
                 all_ids = all_ids.flatten().tolist()
             if isinstance(old_ids, Tensor):
                 old_ids = old_ids.flatten().tolist()
             if not isinstance(all_ids, list) or not isinstance(old_ids, list):
+                reject("non_list_token_ids")
                 continue
             if all_ids[:len(old_ids)] != old_ids:
+                reject("previous_message_not_prefix")
                 continue
             body = _find_role_marker(all_ids, marker_ids, len(old_ids))
-            if body == -1:
+            body_end = body + len(marker_ids)
+            if body < 0:
+                span = _find_marker_span_via_rendered_template(
+                    tokenizer, msgs, all_ids, marker
+                )
+                if span is None:
+                    reject("marker_not_token_aligned")
+                    continue
+                body, body_end = span
+            if body < len(old_ids):
+                reject("marker_before_previous_message")
                 continue
             header = all_ids[len(old_ids):body]
-            ending = all_ids[body + len(marker_ids):]
-            if not header or not ending or role not in tokenizer.decode(header, skip_special_tokens=False):
+            ending = all_ids[body_end:]
+            if not header or not ending:
+                reject("empty_header_or_ending")
+                continue
+            if role not in tokenizer.decode(header, skip_special_tokens=False):
+                reject("role_not_in_header")
                 continue
             item = (role, np.asarray(header, dtype=np.int64).tobytes(), not following)
             if item not in headers:
@@ -303,7 +371,11 @@ def _probe_role_template(tokenizer: Any) -> _RoleProbe:
             if end_bytes not in endings:
                 endings.append(end_bytes)
     if not headers or not endings:
-        raise ValueError("chat template has no stable explicit role headers")
+        raise ValueError(
+            "chat template has no stable explicit role headers; "
+            f"probe_failures={failures}; "
+            "check tokenizer.chat_template and probe token alignment"
+        )
     return _RoleProbe(tuple(headers), tuple(endings))
 
 
