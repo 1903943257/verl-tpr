@@ -162,7 +162,7 @@ def main():
                     cpu[position + 1:min(len(cpu), position + 24)].tolist(),
                     skip_special_tokens=False
                 )
-                label = rendered.split("\\n", 1)[0].strip()
+                label = rendered.split("\n", 1)[0].strip()
                 if label in {"system", "developer", "user", "assistant", "tool"}:
                     role_label_checked += 1
                     role_label_correct += int(estimated[position] == label)
