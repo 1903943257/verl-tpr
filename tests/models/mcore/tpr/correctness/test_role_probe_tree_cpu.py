@@ -161,3 +161,41 @@ def test_role_units_preserve_every_token_with_minimum_length():
     for units in (many, few):
         assert b"".join(signature for signature, _ in units) == source.numpy().tobytes()
         assert units[-1][1] == len(source)
+
+
+class ContextSensitiveProbeTokenizer(FakeTokenizer):
+    """The content marker has different token IDs alone vs. in chat context."""
+
+    def encode(self, content, add_special_tokens=False):
+        if content == "TPRRoleProbeContentQ7X9":
+            return [987654, 987655]
+        return [ord(c) for c in content]
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+        rendered = "".join(
+            chr(6001) + message["role"] + chr(6003)
+            + message["content"] + chr(6002)
+            for message in messages
+        )
+        if not tokenize:
+            return rendered
+        # Real full-template tokenization need not equal standalone marker ids.
+        return [ord(c) for c in rendered]
+
+
+def test_role_probe_recovers_context_sensitive_marker_alignment():
+    tok = ContextSensitiveProbeTokenizer()
+    probe = tree._probe_role_template(tok)
+    sample = [
+        {"role": "system", "content": "A"},
+        {"role": "user", "content": "B"},
+        {"role": "assistant", "content": "C"},
+    ]
+    encoded = torch.tensor(tok.apply_chat_template(sample), dtype=torch.long)
+    anchors = tree._role_anchors(encoded, probe)
+    expected = (
+        (0, "system"),
+        (len(tok.apply_chat_template(sample[:1])), "user"),
+        (len(tok.apply_chat_template(sample[:2])), "assistant"),
+    )
+    assert anchors == expected
