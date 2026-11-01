@@ -277,3 +277,83 @@ def test_role_probe_real_qwen_tokenizer_when_configured():
     anchors = tree._role_anchors(torch.tensor(ids, dtype=torch.long), probe)
     assert (0, "user") in anchors
     assert any(role == "assistant" for _, role in anchors)
+
+
+class ToolWrappedAsUserTokenizer(FakeTokenizer):
+    """Model a chat template where tool has an overlapping user header."""
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+        ids = []
+        for message in messages:
+            role = message["role"]
+            if role == "tool":
+                ids.extend([6001, *self.encode("user"), 6003])
+                ids.extend(self.encode("<tool_response>\\n"))
+                ids.extend(self.encode(message["content"]))
+                ids.extend(self.encode("\\n</tool_response>"))
+            else:
+                ids.extend([6001, *self.encode(role), 6003])
+                ids.extend(self.encode(message["content"]))
+            ids.append(6002)
+        return ids
+
+
+def test_role_probe_prefers_complete_tool_header_over_user_prefix():
+    tok = ToolWrappedAsUserTokenizer()
+    probe = tree._probe_role_template(tok)
+    messages = [
+        {"role": "user", "content": "Run a test"},
+        {"role": "tool", "content": "3 passed"},
+        {"role": "assistant", "content": "Finished"},
+    ]
+    ids = tok.apply_chat_template(messages)
+    anchors = tree._role_anchors(torch.tensor(ids, dtype=torch.long), probe)
+    assert anchors == (
+        (0, "user"),
+        (len(tok.apply_chat_template(messages[:1])), "tool"),
+        (len(tok.apply_chat_template(messages[:2])), "assistant"),
+    )
+
+
+def test_role_probe_fails_on_equal_length_cross_role_ambiguity():
+    header = torch.tensor([6001, 42, 6003], dtype=torch.long).numpy().tobytes()
+    probe = tree._RoleProbe(
+        headers=(("user", header, True), ("tool", header, True)),
+        endings=(torch.tensor([6002], dtype=torch.long).numpy().tobytes(),),
+    )
+    with pytest.raises(ValueError, match="conflicting longest Role candidates at 0"):
+        tree._role_anchors(torch.tensor([6001, 42, 6003, 99], dtype=torch.long), probe)
+
+
+def test_role_probe_real_qwen_tool_header_when_configured():
+    """Verify actual ChatML tool wrapper in Qwen's installed template."""
+    import os
+    from transformers import AutoTokenizer
+
+    path = os.environ.get("TPR_ROLE_TOKENIZER_PATH")
+    if not path:
+        pytest.skip("set TPR_ROLE_TOKENIZER_PATH for real-tokenizer validation")
+    tok = AutoTokenizer.from_pretrained(
+        path, local_files_only=True, trust_remote_code=False
+    )
+    messages = [
+        {"role": "user", "content": "Call a tool"},
+        {"role": "tool", "content": "Tool output"},
+        {"role": "assistant", "content": "Tool processed"},
+    ]
+    rendered = tok.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=False
+    )
+    if "<|im_start|>user\\n<tool_response>" not in rendered:
+        pytest.skip("tokenizer does not wrap tool replies as ChatML user messages")
+    probe = tree._probe_role_template(tok)
+    ids = tree._coerce_probe_token_ids(
+        tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+    )
+    anchors = tree._role_anchors(torch.tensor(ids, dtype=torch.long), probe)
+    tool_start = len(tree._coerce_probe_token_ids(
+        tok.apply_chat_template(messages[:1], tokenize=True, add_generation_prompt=False)
+    ))
+    assert (tool_start, "tool") in anchors
+    assert (0, "user") in anchors
+    assert len(anchors) >= 3

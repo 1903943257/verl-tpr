@@ -15,6 +15,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import time
@@ -143,6 +144,21 @@ def main():
         isinstance(reference_id, int) and reference_id >= 0
         and tokenizer.convert_ids_to_tokens(reference_id) == "<|im_start|>"
     )
+    # A semantic tool role can be rendered on-wire as a ChatML user header.
+    # Match reference labels against the role emitted by the template, not
+    # necessarily the input message's semantic role.
+    rendered_role: dict[str, str] = {}
+    for semantic_role, header, _first_only in probe.headers:
+        rendered = tokenizer.decode(
+            torch.frombuffer(bytearray(header), dtype=torch.int64).tolist(),
+            skip_special_tokens=False,
+        )
+        match = re.match(r"<\\|im_start\\|>([a-zA-Z_]+)\\n", rendered)
+        if match:
+            wire_role = match.group(1)
+            if semantic_role in rendered_role and rendered_role[semantic_role] != wire_role:
+                raise ValueError(f"inconsistent rendered role for {semantic_role!r}")
+            rendered_role[semantic_role] = wire_role
     match_count = reference_count = recovered_count = 0
     role_label_checked = role_label_correct = 0
     role_counts = {}
@@ -165,13 +181,18 @@ def main():
                 label = rendered.split("\n", 1)[0].strip()
                 if label in {"system", "developer", "user", "assistant", "tool"}:
                     role_label_checked += 1
-                    role_label_correct += int(estimated[position] == label)
+                    role_label_correct += int(
+                        rendered_role.get(estimated[position], estimated[position]) == label
+                    )
 
     output = {
         "role_template_init_ms": round((initialized - started) * 1000, 2),
         "role_header_patterns": len(probe.headers),
         "recovered_role_headers": recovered_count,
         "recovered_role_counts": role_counts,
+        "rendered_role_aliases": {
+            role: wire for role, wire in rendered_role.items() if role != wire
+        },
         "qwen_chatml_reference": {
             "available": has_chatml_reference,
             "reference_message_starts": reference_count if has_chatml_reference else None,
@@ -180,6 +201,7 @@ def main():
             "precision": round(match_count / recovered_count, 5) if recovered_count and has_chatml_reference else None,
             "role_labels_compared": role_label_checked if has_chatml_reference else None,
             "role_label_accuracy": round(role_label_correct / role_label_checked, 5) if role_label_checked else None,
+            "role_label_metric": "on-wire ChatML labels (semantic aliases normalized)",
             "note": "Only a Qwen tokenizer-specific offline reference; in-band markers can be ambiguous.",
         },
         "trie": variants["trie"][1],

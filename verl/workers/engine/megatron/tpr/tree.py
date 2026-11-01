@@ -427,9 +427,16 @@ def _role_probe_from_path(path: str) -> _RoleProbe:
 
 
 def _role_anchors(tokens: Tensor, probe: _RoleProbe) -> tuple[tuple[int, str], ...]:
-    """Locate model-derived headers. Text-only reconstruction is not a role oracle."""
+    """Locate exact headers, preferring the most specific complete pattern.
+
+    Chat templates may wrap a semantic tool message as a user message with a
+    <tool_response> prefix. The short user header then matches the start of
+    the longer tool header at exactly the same position. This is not a
+    conflicting boundary. If equally specific headers imply different roles,
+    the actual token stream is ambiguous: fail rather than guess.
+    """
     raw = tokens.contiguous().numpy().tobytes()
-    found: dict[int, str] = {}
+    candidates: dict[int, list[tuple[int, str]]] = {}
     for role, header, first_only in probe.headers:
         seek = 0
         while (offset := raw.find(header, seek)) >= 0:
@@ -441,11 +448,18 @@ def _role_anchors(tokens: Tensor, probe: _RoleProbe) -> tuple[tuple[int, str], .
                     continue
             elif first_only or not any(raw.endswith(end, 0, offset) for end in probe.endings):
                 continue
-            pos = offset // 8
-            if pos in found and found[pos] != role:
-                raise ValueError(f"conflicting Role candidates at {pos}")
-            found[pos] = role
-    return tuple(sorted(found.items()))
+            candidates.setdefault(offset // 8, []).append((len(header), role))
+    found = []
+    for pos, matches in sorted(candidates.items()):
+        longest = max(length for length, _ in matches)
+        roles = {role for length, role in matches if length == longest}
+        if len(roles) != 1:
+            raise ValueError(
+                f"conflicting longest Role candidates at {pos}: "
+                f"roles={sorted(roles)}, header_bytes={longest}"
+            )
+        found.append((pos, next(iter(roles))))
+    return tuple(found)
 
 
 def _role_units_bytes(
