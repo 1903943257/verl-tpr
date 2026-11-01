@@ -250,6 +250,36 @@ class _RoleProbe:
     endings: tuple[bytes, ...]
 
 
+def _coerce_probe_token_ids(value: Any) -> list[int]:
+    """Unwrap one token sequence from supported HF tokenizer return formats.
+
+    Some tokenizer versions or wrappers return BatchEncoding/input_ids, a
+    singleton batch, tuple, ndarray, or Tensor rather than a plain list.
+    Reject multi-row batches and non-integer values instead of guessing.
+    """
+    origin_type = type(value).__name__
+    if isinstance(value, Mapping):
+        if "input_ids" not in value:
+            raise TypeError(f"{origin_type} has no input_ids")
+        value = value["input_ids"]
+    if isinstance(value, (Tensor, np.ndarray)):
+        if value.ndim == 2 and value.shape[0] == 1:
+            value = value[0]
+        elif value.ndim != 1:
+            raise ValueError(f"{origin_type} has unsupported shape {tuple(value.shape)}")
+        value = value.tolist()
+    if isinstance(value, (tuple, list)) and len(value) == 1 and isinstance(value[0], (tuple, list)):
+        value = value[0]
+    if not isinstance(value, (tuple, list)):
+        raise TypeError(f"{origin_type} produced {type(value).__name__}, not a token sequence")
+    if any(
+        not isinstance(token, (int, np.integer)) or isinstance(token, (bool, np.bool_))
+        for token in value
+    ):
+        raise TypeError(f"{origin_type} contains non-integer or multi-row token IDs")
+    return [int(token) for token in value]
+
+
 def _find_role_marker(sequence: list[int], marker: list[int], start: int) -> int:
     return next(
         (i for i in range(start, len(sequence) - len(marker) + 1)
@@ -277,9 +307,16 @@ def _find_marker_span_via_rendered_template(
         return None
     start_char = rendered_text.index(marker)
     end_char = start_char + len(marker)
-    prefix = tokenizer.encode(rendered_text[:start_char], add_special_tokens=False)
-    suffix = tokenizer.encode(rendered_text[end_char:], add_special_tokens=False)
-    if (isinstance(prefix, list) and isinstance(suffix, list)
+    try:
+        prefix = _coerce_probe_token_ids(
+            tokenizer.encode(rendered_text[:start_char], add_special_tokens=False)
+        )
+        suffix = _coerce_probe_token_ids(
+            tokenizer.encode(rendered_text[end_char:], add_special_tokens=False)
+        )
+    except (TypeError, ValueError):
+        prefix = suffix = None
+    if (prefix is not None and suffix is not None
             and all_ids[:len(prefix)] == prefix
             and (not suffix or all_ids[-len(suffix):] == suffix)
             and len(prefix) + len(suffix) <= len(all_ids)):
@@ -291,8 +328,10 @@ def _find_marker_span_via_rendered_template(
         encoded = tokenizer(
             rendered_text, add_special_tokens=False, return_offsets_mapping=True
         )
-        ids = encoded["input_ids"]
+        ids = _coerce_probe_token_ids(encoded)
         offsets = encoded["offset_mapping"]
+        if isinstance(offsets, (Tensor, np.ndarray)):
+            offsets = offsets.tolist()
     except (ValueError, TypeError, KeyError, RuntimeError, NotImplementedError):
         return None
     if ids != all_ids:
@@ -312,7 +351,7 @@ def _probe_role_template(tokenizer: Any) -> _RoleProbe:
     """
     marker = "TPRRoleProbeContentQ7X9"
     before = "TPRRoleProbePreviousB8Y6"
-    marker_ids = tokenizer.encode(marker, add_special_tokens=False)
+    marker_ids = _coerce_probe_token_ids(tokenizer.encode(marker, add_special_tokens=False))
     if not marker_ids:
         raise ValueError("empty role probe marker")
     headers: list[tuple[str, bytes, bool]] = []
@@ -333,12 +372,11 @@ def _probe_role_template(tokenizer: Any) -> _RoleProbe:
             except (ValueError, TypeError, KeyError, RuntimeError):
                 reject("template_render_error")
                 continue
-            if isinstance(all_ids, Tensor):
-                all_ids = all_ids.flatten().tolist()
-            if isinstance(old_ids, Tensor):
-                old_ids = old_ids.flatten().tolist()
-            if not isinstance(all_ids, list) or not isinstance(old_ids, list):
-                reject("non_list_token_ids")
+            try:
+                all_ids = _coerce_probe_token_ids(all_ids)
+                old_ids = _coerce_probe_token_ids(old_ids)
+            except (TypeError, ValueError) as exc:
+                reject(f"invalid_token_ids:{type(exc).__name__}:{exc}")
                 continue
             if all_ids[:len(old_ids)] != old_ids:
                 reject("previous_message_not_prefix")

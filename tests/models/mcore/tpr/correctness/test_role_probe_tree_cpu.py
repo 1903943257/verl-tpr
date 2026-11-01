@@ -199,3 +199,81 @@ def test_role_probe_recovers_context_sensitive_marker_alignment():
         (len(tok.apply_chat_template(sample[:2])), "assistant"),
     )
     assert anchors == expected
+
+
+class WrappedChatTemplateTokenizer(FakeTokenizer):
+    """Valid single-sequence token outputs that are not a flat Python list."""
+
+    def __init__(self, return_mode):
+        self.return_mode = return_mode
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+        ids = super().apply_chat_template(messages, tokenize, add_generation_prompt)
+        if self.return_mode == "batch_encoding":
+            return {"input_ids": [ids], "attention_mask": [[1] * len(ids)]}
+        if self.return_mode == "tuple":
+            return tuple(ids)
+        if self.return_mode == "numpy":
+            import numpy as np
+            return np.asarray([ids], dtype=np.int64)
+        if self.return_mode == "tensor":
+            return torch.tensor([ids], dtype=torch.long)
+        if self.return_mode == "singleton_batch":
+            return [ids]
+        raise AssertionError("unknown return mode")
+
+
+@pytest.mark.parametrize(
+    "return_mode",
+    ["batch_encoding", "tuple", "numpy", "tensor", "singleton_batch"],
+)
+def test_role_probe_accepts_single_sequence_tokenizer_wrappers(return_mode):
+    tok = WrappedChatTemplateTokenizer(return_mode)
+    probe = tree._probe_role_template(tok)
+    messages = [
+        {"role": "system", "content": "setup"},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    ids = FakeTokenizer().apply_chat_template(messages)
+    anchors = tree._role_anchors(torch.tensor(ids, dtype=torch.long), probe)
+    assert anchors == (
+        (0, "system"),
+        (len(FakeTokenizer().apply_chat_template(messages[:1])), "user"),
+        (len(FakeTokenizer().apply_chat_template(messages[:2])), "assistant"),
+    )
+
+
+def test_role_probe_rejects_multi_sequence_tokenizer_result():
+    class MultiSequenceTokenizer(FakeTokenizer):
+        def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+            ids = super().apply_chat_template(messages, tokenize, add_generation_prompt)
+            return {"input_ids": [ids, ids]}
+
+    with pytest.raises(ValueError, match="invalid_token_ids"):
+        tree._probe_role_template(MultiSequenceTokenizer())
+
+
+def test_role_probe_real_qwen_tokenizer_when_configured():
+    """Optional integration test: exercise the actual local chat template."""
+    import os
+    from transformers import AutoTokenizer
+
+    tokenizer_path = os.environ.get("TPR_ROLE_TOKENIZER_PATH")
+    if not tokenizer_path:
+        pytest.skip("set TPR_ROLE_TOKENIZER_PATH for real Qwen chat template validation")
+    tok = AutoTokenizer.from_pretrained(
+        tokenizer_path, local_files_only=True, trust_remote_code=False
+    )
+    probe = tree._probe_role_template(tok)
+    assert probe.headers and probe.endings
+    messages = [
+        {"role": "user", "content": "TPR_real_chat_role_probe_user"},
+        {"role": "assistant", "content": "TPR_real_chat_role_probe_assistant"},
+    ]
+    ids = tree._coerce_probe_token_ids(
+        tok.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+    )
+    anchors = tree._role_anchors(torch.tensor(ids, dtype=torch.long), probe)
+    assert (0, "user") in anchors
+    assert any(role == "assistant" for _, role in anchors)
