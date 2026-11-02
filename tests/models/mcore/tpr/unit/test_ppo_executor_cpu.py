@@ -414,7 +414,7 @@ def test_tp_sp_odd_segment_is_rejected_before_any_forward():
     odd = SegmentPlan([SegmentSpec(0, None, torch.tensor([1, 2, 3]), 0, 0)], root_id=0)
     with pytest.raises(ValueError, match="must be divisible by TP=2"):
         validate_replay_plan(odd, prepared, cp_size=1)
-    with pytest.raises(ValueError, match="native GEMM shapes are not padded"):
+    with pytest.raises(ValueError, match="must be divisible by TP=2"):
         SegmentExecutor(model, odd, prepared_model=prepared, segment_loss_fn=executor.segment_loss_fn,
                         segment_loss_term_counts={0: 1})
     # CP validation is separately owned by the native Ring shard contract.
@@ -435,7 +435,7 @@ def test_tp_sp_preflight_ignores_only_globally_pruned_odd_segments():
     validate_replay_plan(plan, prepared, active_segment_ids=frozenset({0}))
     validate_replay_plan(plan, prepared, active_segment_ids=frozenset())
     for active in (None, frozenset({0, 1})):
-        with pytest.raises(ValueError, match="segment 1 length=1"):
+        with pytest.raises(ValueError, match="logical_length=1 CP-local physical_length=1"):
             validate_replay_plan(plan, prepared, active_segment_ids=active)
     executor = SegmentExecutor(model, plan, prepared_model=prepared, active_segment_ids=frozenset({0}),
                                segment_loss_fn=lambda segment, logits: (logits.square().sum(), {}),
