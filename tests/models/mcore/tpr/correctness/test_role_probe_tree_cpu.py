@@ -449,3 +449,103 @@ def test_audit_extracts_exact_system_prompt_content():
     assert all(span["ends_with_im_end"] for span in summary["per_row"])
     assert all(span["within_prompt"] for span in summary["per_row"])
     assert all(n > 0 for n in summary["system_content_lengths"])
+
+
+class NewlineTerminatedChatTokenizer(FakeTokenizer):
+    """Chat messages end with [im_end, newline] before the next header."""
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+        ids = super().apply_chat_template(messages, tokenize, add_generation_prompt)
+        output = []
+        for token in ids:
+            output.append(token)
+            if token == 6002:
+                output.append(ord("\n"))
+        return output
+
+
+def _load_system_prompt_audit():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "parallel" / "audit_role_probe_from_tq.py"
+    spec = importlib.util.spec_from_file_location("tpr_system_end_audit_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_system_audit_accepts_template_im_end_plus_newline():
+    tok = NewlineTerminatedChatTokenizer()
+    prompt = [
+        {"role": "system", "content": "shared system instructions"},
+        {"role": "user", "content": "task"},
+    ]
+    sequences = [
+        tok.apply_chat_template(prompt + [{"role": "assistant", "content": "answer A"}]),
+        tok.apply_chat_template(prompt + [{"role": "assistant", "content": "answer B"}]),
+    ]
+    batch = {
+        "input_ids": [torch.tensor(seq, dtype=torch.long) for seq in sequences],
+        "prompts": [
+            torch.tensor(tok.apply_chat_template(prompt), dtype=torch.long) for _ in sequences
+        ],
+    }
+    result = _load_system_prompt_audit()._system_prompt_summary(
+        batch, tree._probe_role_template(tok), 6002
+    )
+    assert result["rows_with_exactly_one_system"] == 2
+    assert result["complete_system_spans"] is True
+    assert result["identical_system_content_across_rows"] is True
+    assert all(span["template_ending_token_ids"] == [6002, 10] for span in result["per_row"])
+    assert all(span["content_tokens"] == len("shared system instructions") for span in result["per_row"])
+
+
+def test_system_audit_rejects_unknown_trailing_token():
+    tok = NewlineTerminatedChatTokenizer()
+    system_only = [{"role": "system", "content": "some system prompt"}]
+    encoded = tok.apply_chat_template(system_only)
+    encoded[-1] = ord("!")  # im_end is present, but the actual suffix is invalid
+    data = torch.tensor(encoded, dtype=torch.long)
+    summary = _load_system_prompt_audit()._system_prompt_summary(
+        {"input_ids": [data], "prompts": [data]},
+        tree._probe_role_template(tok), 6002
+    )
+    assert summary["complete_system_spans"] is False
+    assert summary["per_row"][0]["template_ending_token_ids"] is None
+    assert summary["per_row"][0]["tail_token_ids_if_unmatched"][-2:] == [6002, ord("!")]
+
+
+def test_real_qwen_system_audit_when_configured():
+    import os
+    from transformers import AutoTokenizer
+
+    model = os.environ.get("TPR_ROLE_TOKENIZER_PATH")
+    if not model:
+        pytest.skip("set TPR_ROLE_TOKENIZER_PATH for real-tokenizer validation")
+    tok = AutoTokenizer.from_pretrained(
+        model, local_files_only=True, trust_remote_code=False
+    )
+    msgs = [
+        {"role": "system", "content": "Code review instructions."},
+        {"role": "user", "content": "Review this change."},
+        {"role": "assistant", "content": "Looks good."},
+    ]
+    ids = tree._coerce_probe_token_ids(
+        tok.apply_chat_template(msgs, tokenize=True, add_generation_prompt=False)
+    )
+    prompt = tree._coerce_probe_token_ids(
+        tok.apply_chat_template(msgs[:2], tokenize=True, add_generation_prompt=False)
+    )
+    data = {
+        "input_ids": [torch.tensor(ids, dtype=torch.long)],
+        "prompts": [torch.tensor(prompt, dtype=torch.long)],
+    }
+    im_end = tok.convert_tokens_to_ids("<|im_end|>")
+    summary = _load_system_prompt_audit()._system_prompt_summary(
+        data, tree._probe_role_template(tok), im_end
+    )
+    assert summary["complete_system_spans"] is True
+    assert summary["system_messages"] == 1
+    assert summary["per_row"][0]["template_ending_token_ids"][0] == im_end
+    assert summary["per_row"][0]["content_tokens"] > 0

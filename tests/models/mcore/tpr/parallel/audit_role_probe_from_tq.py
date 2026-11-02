@@ -106,9 +106,10 @@ def _summary(forest, batch):
 def _system_prompt_summary(batch, probe, im_end_id: int | None):
     """Audit System message spans from exact role headers, without re-tokenizing TQ.
 
-    Each interval is [system header start, next role header start); if the
-    interval closes with Qwen's im_end, its content is the token range after
-    the exact probed header and before im_end. No raw prompt text is emitted.
+    Each interval is [system header start, next role header start). The
+    content begins after the exact header and ends before a complete known
+    ChatML suffix starting with im_end (often im_end plus a newline). The
+    suffix must match byte-for-byte. No raw prompt text is emitted.
     """
     inputs = _rows(batch, "input_ids")
     prompts = _rows(batch, "prompts")
@@ -134,11 +135,29 @@ def _system_prompt_summary(batch, probe, im_end_id: int | None):
             if not header_lengths:
                 raise AssertionError(f"system header has no exact pattern at row={row}, pos={start}")
             content_start = start + max(header_lengths)
-            closed = (
-                im_end_id is not None and end > content_start
-                and int(tokens[end - 1]) == im_end_id
-            )
-            content_end = end - 1 if closed else None
+            # Qwen ChatML typically closes with <|im_end|> followed by a
+            # newline token. The exact ending (including separators) is
+            # learned by _probe_role_template; do not assume im_end is the
+            # token immediately before the next role header.
+            closing_candidates = []
+            if im_end_id is not None:
+                for ending in probe.endings:
+                    if not ending or len(ending) % 8:
+                        continue
+                    ending_ids = torch.frombuffer(bytearray(ending), dtype=torch.int64).tolist()
+                    if int(ending_ids[0]) != im_end_id:
+                        continue
+                    closing_start = end - len(ending_ids)
+                    if (
+                        closing_start >= content_start
+                        and raw[closing_start * 8:end * 8] == ending
+                    ):
+                        closing_candidates.append(ending_ids)
+            # Prefer the longest verified template suffix. Unknown suffixes
+            # fail closed instead of swallowing content as prompt text.
+            matched_ending = max(closing_candidates, key=len) if closing_candidates else None
+            closed = matched_ending is not None
+            content_end = end - len(matched_ending) if closed else None
             digest = (
                 hashlib.sha256(tokens[content_start:content_end].numpy().tobytes()).hexdigest()
                 if content_end is not None else None
@@ -154,6 +173,11 @@ def _system_prompt_summary(batch, probe, im_end_id: int | None):
                 "content_sha256_prefix": digest[:16] if digest is not None else None,
                 "starts_at_zero": start == 0,
                 "ends_with_im_end": closed,
+                "closing_token_position": content_end,
+                "template_ending_token_ids": matched_ending,
+                "tail_token_ids_if_unmatched": (
+                    tokens[max(content_start, end - 6):end].tolist() if not closed else None
+                ),
                 "within_prompt": end <= len(prompt),
             })
     counts = [sum(span["row"] == row for span in spans) for row in range(len(inputs))]
