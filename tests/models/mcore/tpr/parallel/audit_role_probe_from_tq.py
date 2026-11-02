@@ -112,7 +112,10 @@ def _system_prompt_summary(batch, probe, im_end_id: int | None):
     """
     inputs = _rows(batch, "input_ids")
     prompts = _rows(batch, "prompts")
+    if len(inputs) != len(prompts):
+        raise ValueError("input_ids and prompts have different row counts")
     spans = []
+    full_content_digests = []
     for row, (value, prompt) in enumerate(zip(inputs, prompts)):
         tokens = value.detach().cpu().contiguous().long()
         raw = tokens.numpy().tobytes()
@@ -137,16 +140,18 @@ def _system_prompt_summary(batch, probe, im_end_id: int | None):
             )
             content_end = end - 1 if closed else None
             digest = (
-                hashlib.sha256(tokens[content_start:content_end].numpy().tobytes()).hexdigest()[:16]
+                hashlib.sha256(tokens[content_start:content_end].numpy().tobytes()).hexdigest()
                 if content_end is not None else None
             )
+            if digest is not None:
+                full_content_digests.append(digest)
             spans.append({
                 "row": row,
                 "start": start,
                 "end_exclusive": end,
                 "header_tokens": max(header_lengths),
                 "content_tokens": content_end - content_start if content_end is not None else None,
-                "content_sha256_prefix": digest,
+                "content_sha256_prefix": digest[:16] if digest is not None else None,
                 "starts_at_zero": start == 0,
                 "ends_with_im_end": closed,
                 "within_prompt": end <= len(prompt),
@@ -160,13 +165,12 @@ def _system_prompt_summary(batch, probe, im_end_id: int | None):
             for span in spans
         )
     )
-    hashes = {span["content_sha256_prefix"] for span in spans if span["content_sha256_prefix"] is not None}
     return {
         "rows": len(inputs),
         "system_messages": len(spans),
         "rows_with_exactly_one_system": sum(count == 1 for count in counts),
         "complete_system_spans": complete,
-        "identical_system_content_across_rows": len(hashes) == 1 if complete else None,
+        "identical_system_content_across_rows": len(set(full_content_digests)) == 1 if complete else None,
         "system_content_lengths": [span["content_tokens"] for span in spans],
         "per_row": spans,
         "note": "Structural ChatML validation only; verify against original agent messages for a semantic ground truth.",
