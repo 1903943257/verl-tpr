@@ -336,7 +336,8 @@ def test_token_lcp_enforces_minimum_new_shared_span_at_each_branch():
     for row in tree.member_rows:
         row_refs = [ref for ref in tree.objective_refs if ref.sample_row == row]
         assert len(row_refs) == 64
-        path = tree.segment_plan.path_to(row_refs[0].segment_id)
+        last_ref = max(row_refs, key=lambda ref: ref.response_offset)
+        path = tree.segment_plan.path_to(last_ref.segment_id)
         replay = torch.cat([segment.token_ids for segment in path])
         assert torch.equal(replay, sequences[row])
         for segment in path:
@@ -352,6 +353,8 @@ def test_token_lcp_enforces_minimum_new_shared_span_at_each_branch():
         for segment, rows in shared_segments
     ) == [(0, 1200, 5), (1200, 1300, 3)]
     assert all(segment.length >= 1024 for segment, _rows in shared_segments)
+
+
 def test_token_lcp_accepts_exact_threshold_and_preserves_duplicate_rows():
     shared = torch.arange(1, 1025, dtype=torch.long)
     suffix_a = torch.tensor([90001, 90002, 90003], dtype=torch.long)
@@ -378,8 +381,15 @@ def test_token_lcp_accepts_exact_threshold_and_preserves_duplicate_rows():
     assert tree.member_rows == (0, 1, 2)
     assert tree.member_uids == ("groupA", "groupB")
     assert forest.logical_loss_tokens == 3
+    assert len(tree.segment_plan.segments) == 4
+    shared_root = [
+        segment for segment in tree.segment_plan.segments.values()
+        if segment.parent_id is None
+    ]
+    assert len(shared_root) == 1
+    assert shared_root[0].length == 1024
     assert sum(segment.length for segment in tree.segment_plan.segments.values()) == (
-        1024 + len(suffix_a) + len(suffix_b)
+        1024 + 2 * len(suffix_a) + len(suffix_b)
     )
 
 

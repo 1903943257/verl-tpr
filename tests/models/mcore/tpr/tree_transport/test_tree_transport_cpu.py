@@ -39,6 +39,8 @@ def _assert_min_shared_segment_lengths(forest, minimum):
                     f"shared segment {segment_id} has only {segment.length} Tokens "
                     f"for {len(rows)} rows (minimum={minimum})"
                 )
+
+
 def _assert_tree_equal(left, right):
     assert left.keys() == right.keys()
     for key in left:

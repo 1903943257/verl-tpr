@@ -795,6 +795,7 @@ def _enforce_min_shared_token_branches(root: _TurnNode, minimum: int) -> None:
         (-1, index): child for index, child in enumerate(promoted)
     }
 
+
 def build_tree_execution_plans(
     keys: list[str] | tuple[str, ...], batch: Any, *,
     require_loss_mask_alignment: bool = False,
