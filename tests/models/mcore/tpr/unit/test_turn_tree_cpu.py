@@ -262,8 +262,7 @@ def test_token_lcp_shares_exact_prefix_across_uids_without_model_tokens():
         path = tree.segment_plan.path_to(row_refs[0].segment_id)
         # The first supervised response token's path must reconstruct the
         # complete sequence, including the arbitrary in-prompt branch point.
-        path = tree.segment_plan.path_to(path[-1])
-        replay = torch.cat([tree.segment_plan.get(i).token_ids for i in path])
+        replay = torch.cat([segment.token_ids for segment in path])
         assert torch.equal(replay, batch["input_ids"][row])
 
 
