@@ -287,8 +287,13 @@ def test_token_lcp_minimum_shared_prefix_threshold_is_enforced():
 
 def test_token_lcp_accepts_exact_threshold_and_preserves_duplicate_rows():
     shared = torch.arange(1, 1025, dtype=torch.long)
-    suffix = torch.tensor([90001, 90002, 90003], dtype=torch.long)
-    sequences = [torch.cat((shared, suffix)), torch.cat((shared, suffix))]
+    suffix_a = torch.tensor([90001, 90002, 90003], dtype=torch.long)
+    suffix_b = torch.tensor([91001, 91002, 91003], dtype=torch.long)
+    sequences = [
+        torch.cat((shared, suffix_a)),
+        torch.cat((shared, suffix_a)),
+        torch.cat((shared, suffix_b)),
+    ]
     batch = {
         "input_ids": sequences,
         "prompts": [sequence[:-1].clone() for sequence in sequences],
@@ -296,17 +301,19 @@ def test_token_lcp_accepts_exact_threshold_and_preserves_duplicate_rows():
         "response_mask": [torch.ones(1, dtype=torch.bool) for _ in sequences],
     }
     forest = build_tree_execution_plans(
-        ["groupA_session_0", "groupB_session_0"],
+        ["groupA_session_0", "groupA_session_1", "groupB_session_0"],
         batch,
         tree_policy="token_lcp",
         min_shared_prefix_tokens=1024,
     )
     assert len(forest.trees) == 1
     tree = forest.trees[0]
-    assert tree.member_rows == (0, 1)
+    assert tree.member_rows == (0, 1, 2)
     assert tree.member_uids == ("groupA", "groupB")
-    assert forest.logical_loss_tokens == 2
-    assert sum(segment.length for segment in tree.segment_plan.segments.values()) == len(sequences[0])
+    assert forest.logical_loss_tokens == 3
+    assert sum(segment.length for segment in tree.segment_plan.segments.values()) == (
+        1024 + len(suffix_a) + len(suffix_b)
+    )
 
 
 @pytest.mark.parametrize("value", [0, -1, True])
