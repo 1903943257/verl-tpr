@@ -284,6 +284,74 @@ def test_token_lcp_minimum_shared_prefix_threshold_is_enforced():
     assert unique_tokens == logical_tokens
 
 
+def test_token_lcp_enforces_minimum_new_shared_span_at_each_branch():
+    prefix = torch.arange(1, 1201, dtype=torch.long)
+    short_shared = torch.arange(3000, 3024, dtype=torch.long)
+    long_shared = torch.arange(4000, 5276, dtype=torch.long)
+    short_nested = torch.arange(6000, 6020, dtype=torch.long)
+    responses = [
+        torch.arange(7000, 7064, dtype=torch.long),
+        torch.arange(8000, 8064, dtype=torch.long),
+        torch.arange(9000, 9064, dtype=torch.long),
+        torch.arange(10000, 10064, dtype=torch.long),
+        torch.arange(11000, 11064, dtype=torch.long),
+    ]
+    sequences = [
+        torch.cat((prefix, short_shared, long_shared, short_nested, responses[0])),
+        torch.cat((prefix, short_shared, long_shared, short_nested, responses[1])),
+        torch.cat((prefix, short_shared, long_shared, responses[2])),
+        torch.cat((prefix, short_shared, responses[3])),
+        torch.cat((prefix, responses[4])),
+    ]
+    prompts = [sequence[:-64].clone() for sequence in sequences]
+    masks = [torch.ones(64, dtype=torch.bool) for _ in sequences]
+    batch = {
+        "input_ids": sequences,
+        "prompts": prompts,
+        "responses": responses,
+        "response_mask": masks,
+        "loss_mask": [mask.clone() for mask in masks],
+    }
+    keys = [f"uid{row}_session_{row}" for row in range(len(sequences))]
+
+    trie = build_tree_execution_plans(
+        keys, batch, tree_policy="token_lcp",
+        min_shared_prefix_tokens=1024, tree_builder="trie",
+        require_loss_mask_alignment=True,
+    )
+    lcp = build_tree_execution_plans(
+        keys, batch, tree_policy="token_lcp",
+        min_shared_prefix_tokens=1024, tree_builder="lcp_sort",
+        require_loss_mask_alignment=True,
+    )
+
+    assert digest_forest_plan(trie) == digest_forest_plan(lcp)
+    assert len(lcp.trees) == 1
+    tree = lcp.trees[0]
+    assert tree.member_rows == tuple(range(5))
+    assert tree.logical_loss_tokens == 5 * 64
+    assert len(tree.segment_plan.segments) == 7
+
+    segment_rows = {}
+    for row in tree.member_rows:
+        row_refs = [ref for ref in tree.objective_refs if ref.sample_row == row]
+        assert len(row_refs) == 64
+        path = tree.segment_plan.path_to(row_refs[0].segment_id)
+        replay = torch.cat([segment.token_ids for segment in path])
+        assert torch.equal(replay, sequences[row])
+        for segment in path:
+            segment_rows.setdefault(segment.segment_id, set()).add(row)
+
+    shared_segments = [
+        (tree.segment_plan.get(segment_id), rows)
+        for segment_id, rows in segment_rows.items()
+        if len(rows) > 1
+    ]
+    assert sorted(
+        (segment.position_start, segment.length, len(rows))
+        for segment, rows in shared_segments
+    ) == [(0, 1200, 5), (1200, 1300, 3)]
+    assert all(segment.length >= 1024 for segment, _rows in shared_segments)
 def test_token_lcp_accepts_exact_threshold_and_preserves_duplicate_rows():
     shared = torch.arange(1, 1025, dtype=torch.long)
     suffix_a = torch.tensor([90001, 90002, 90003], dtype=torch.long)

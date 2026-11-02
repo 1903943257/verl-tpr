@@ -23,6 +23,22 @@ from .synthetic_from_tq import (
 )
 
 
+def _assert_min_shared_segment_lengths(forest, minimum):
+    for tree in forest.trees:
+        segment_rows = {}
+        for row in tree.member_rows:
+            row_refs = [ref for ref in tree.objective_refs if ref.sample_row == row]
+            assert row_refs, f"row {row} has no ObjectiveRef for path validation"
+            last_ref = max(row_refs, key=lambda ref: ref.response_offset)
+            for segment in tree.segment_plan.path_to(last_ref.segment_id):
+                segment_rows.setdefault(segment.segment_id, set()).add(row)
+        for segment_id, rows in segment_rows.items():
+            if len(rows) > 1:
+                segment = tree.segment_plan.get(segment_id)
+                assert segment.length >= minimum, (
+                    f"shared segment {segment_id} has only {segment.length} Tokens "
+                    f"for {len(rows)} rows (minimum={minimum})"
+                )
 def _assert_tree_equal(left, right):
     assert left.keys() == right.keys()
     for key in left:
@@ -372,3 +388,5 @@ def test_token_lcp_session_tree_shares_across_uids_and_matches_flat_oracle():
     assert direct.logical_loss_tokens == flat.logical_loss_tokens
     assert digest_forest_plan(direct) == digest_forest_plan(direct_trie)
     assert digest_forest_plan(direct) == digest_forest_plan(flat)
+    for forest in (direct, direct_trie, flat):
+        _assert_min_shared_segment_lengths(forest, minimum=6)

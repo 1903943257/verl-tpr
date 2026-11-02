@@ -727,6 +727,74 @@ def _build_unit_trie(
     return root
 
 
+def _enforce_min_shared_token_branches(root: _TurnNode, minimum: int) -> None:
+    """Expand shared branches shorter than minimum into independent paths.
+
+    Measure each candidate from the last retained shared branch on that path.
+    Collapse unary LCP boundaries before measuring so the threshold applies
+    to the full shared span that the executor would otherwise schedule.
+    Removing a short branch promotes its alternatives to the last retained
+    ancestor; their next candidate is measured from that same ancestor.
+    """
+    def row_order(node: _TurnNode) -> int:
+        return min(node.member_rows) if node.member_rows else node.source_row
+
+    def rewrite(node: _TurnNode, last_shared_end: int) -> list[_TurnNode]:
+        # Match the executor's compression: unary nodes do not form a
+        # physical Segment boundary and must be included in the span check.
+        while not node.terminal_rows and len(node.children) == 1:
+            node = next(iter(node.children.values()))
+
+        branch_count = len(node.children) + int(bool(node.terminal_rows))
+        shared_span = node.end - last_shared_end
+        short_branch = branch_count > 1 and shared_span < minimum
+        short_duplicate_leaf = (
+            not node.children
+            and len(node.terminal_rows) > 1
+            and shared_span < minimum
+        )
+
+        if short_branch or short_duplicate_leaf:
+            # Copy this short span into each outgoing path. The next retained
+            # Segment or unique leaf will start at last_shared_end and include
+            # the removed span, rather than scheduling it as shared work.
+            promoted = []
+            for child in node.children.values():
+                promoted.extend(rewrite(child, last_shared_end))
+            for row in node.terminal_rows:
+                promoted.append(_TurnNode(
+                    end=node.end,
+                    source_row=row,
+                    member_rows=[row],
+                    terminal_rows=[row],
+                ))
+            return sorted(promoted, key=row_order)
+
+        # A retained branch starts a new measurement domain. Unary nodes
+        # were collapsed above; terminal-only duplicate rows also share the
+        # incoming span and therefore retain/reset it only when it is long.
+        next_shared_end = (
+            node.end
+            if branch_count > 1 or len(node.terminal_rows) > 1
+            else last_shared_end
+        )
+        descendants = []
+        for child in node.children.values():
+            descendants.extend(rewrite(child, next_shared_end))
+        descendants.sort(key=row_order)
+        node.children = {
+            (-1, index): child for index, child in enumerate(descendants)
+        }
+        return [node]
+
+    promoted = []
+    for child in root.children.values():
+        promoted.extend(rewrite(child, 0))
+    promoted.sort(key=row_order)
+    root.children = {
+        (-1, index): child for index, child in enumerate(promoted)
+    }
+
 def build_tree_execution_plans(
     keys: list[str] | tuple[str, ...], batch: Any, *,
     require_loss_mask_alignment: bool = False,
@@ -853,6 +921,7 @@ def build_tree_execution_plans(
                 if tree_builder == "lcp_sort"
                 else _build_unit_trie(units_by_row)
             )
+            _enforce_min_shared_token_branches(root, min_shared_prefix_tokens)
             member_uids = tuple(dict.fromkeys(uid for _row, _tokens, uid in cluster))
             if len(root.children) != 1:
                 raise RuntimeError("token_lcp cluster does not have one common root prefix")
@@ -1398,6 +1467,7 @@ def build_tree_execution_plans_from_session_trees(
                 if tree_builder == "lcp_sort"
                 else _build_unit_trie(unit_rows)
             )
+            _enforce_min_shared_token_branches(root, min_shared_prefix_tokens)
             member_uids = tuple(dict.fromkeys(uid for _row, _tokens, uid in cluster))
             if len(root.children) != 1:
                 raise RuntimeError("token_lcp Session cluster does not have one common root prefix")
