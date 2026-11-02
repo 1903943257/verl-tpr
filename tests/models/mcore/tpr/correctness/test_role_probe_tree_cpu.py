@@ -619,7 +619,9 @@ def test_real_llama3_tokenizer_role_probe_and_system_audit_when_configured():
             {"role": "assistant", "content": "Change B needs a fix."},
         ],
     ]
-    expected_roles = ["system", "user", "assistant", "ipython", "assistant"]
+    # This Llama 3 tokenizer template appends an open assistant prefix even
+    # with add_generation_prompt=False; it is a real final header in the stream.
+    expected_roles = ["system", "user", "assistant", "ipython", "assistant", "assistant"]
     probe = tree._probe_role_template(tok)
     input_rows = []
     prompt_rows = []
@@ -634,7 +636,7 @@ def test_real_llama3_tokenizer_role_probe_and_system_audit_when_configured():
         assert ids[0] == tok.bos_token_id
 
         header_positions = [i for i, token_id in enumerate(ids) if token_id == start_header_id]
-        assert len(header_positions) == len(messages)
+        assert len(header_positions) == len(expected_roles)
         expected = tuple(
             [(0, expected_roles[0])]
             + list(zip(header_positions[1:], expected_roles[1:]))
@@ -657,3 +659,33 @@ def test_real_llama3_tokenizer_role_probe_and_system_audit_when_configured():
     assert summary["system_content_lengths"][0] > 0
     assert summary["system_content_lengths"][0] == summary["system_content_lengths"][1]
     assert all(span["within_prompt"] for span in summary["per_row"])
+
+
+class UnconditionalAssistantPrefixTokenizer(FakeTokenizer):
+    """A template that always appends an open assistant header."""
+
+    def _assistant_prefix(self):
+        return [6001, *self.encode("assistant"), 6003]
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+        ids = super().apply_chat_template(messages, tokenize, add_generation_prompt)
+        return [*ids, *self._assistant_prefix()]
+
+
+def test_role_probe_handles_unconditional_assistant_prefix_suffix():
+    tok = UnconditionalAssistantPrefixTokenizer()
+    probe = tree._probe_role_template(tok)
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "middle"},
+        {"role": "user", "content": "last"},
+    ]
+    ids = tok.apply_chat_template(messages)
+    anchors = tree._role_anchors(torch.tensor(ids, dtype=torch.long), probe)
+    expected = (
+        (0, "user"),
+        (len(tok.apply_chat_template(messages[:1])) - len(tok._assistant_prefix()), "assistant"),
+        (len(tok.apply_chat_template(messages[:2])) - len(tok._assistant_prefix()), "user"),
+        (len(ids) - len(tok._assistant_prefix()), "assistant"),
+    )
+    assert anchors == expected
