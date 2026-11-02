@@ -343,6 +343,12 @@ def _find_marker_span_via_rendered_template(
     return starts[0], ends[0]
 
 
+def _strip_exact_suffix(ids: list[int], suffix: list[int]) -> list[int]:
+    if suffix and len(ids) >= len(suffix) and ids[-len(suffix):] == suffix:
+        return ids[:-len(suffix)]
+    return ids
+
+
 def _probe_role_template(tokenizer: Any) -> _RoleProbe:
     """Probe exact role header token IDs from a tokenizer's chat template.
 
@@ -357,15 +363,35 @@ def _probe_role_template(tokenizer: Any) -> _RoleProbe:
     headers: list[tuple[str, bytes, bool]] = []
     endings: list[bytes] = []
     failures: dict[str, int] = {}
-    try:
-        # Some templates append an open assistant header (or another
-        # conversation-final suffix) even when add_generation_prompt=False.
-        # Rendering an empty conversation exposes that global suffix.
-        terminal_suffix = _coerce_probe_token_ids(tokenizer.apply_chat_template(
-            [], tokenize=True, add_generation_prompt=False
-        ))
-    except (ValueError, TypeError, KeyError, RuntimeError):
-        terminal_suffix = []
+    # Some templates append an open assistant header even when
+    # add_generation_prompt=False. Do not render []: HF wrappers may index
+    # conversation[0]. Infer this suffix by comparing non-empty renderings.
+    terminal_suffix = []
+    prefix_messages = [{"role": "user", "content": before}]
+    for next_role in ("assistant", "user"):
+        try:
+            prefix_ids = _coerce_probe_token_ids(tokenizer.apply_chat_template(
+                prefix_messages, tokenize=True, add_generation_prompt=False
+            ))
+            continued_ids = _coerce_probe_token_ids(tokenizer.apply_chat_template(
+                [*prefix_messages, {"role": next_role, "content": marker}],
+                tokenize=True, add_generation_prompt=False,
+            ))
+        except (ValueError, TypeError, KeyError, RuntimeError, IndexError):
+            continue
+        common = 0
+        while (common < min(len(prefix_ids), len(continued_ids))
+               and prefix_ids[common] == continued_ids[common]):
+            common += 1
+        candidate = prefix_ids[common:]
+        if candidate:
+            try:
+                suffix_text = tokenizer.decode(candidate, skip_special_tokens=False)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if "assistant" in suffix_text and before not in suffix_text:
+                terminal_suffix = candidate
+                break
 
     def reject(reason: str) -> None:
         failures[reason] = failures.get(reason, 0) + 1
@@ -396,24 +422,18 @@ def _probe_role_template(tokenizer: Any) -> _RoleProbe:
                     suffix_ids = _coerce_probe_token_ids(tokenizer.apply_chat_template(
                         suffix_msgs, tokenize=True, add_generation_prompt=False
                     )) if nonterminal else []
-                except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+                except (ValueError, TypeError, KeyError, RuntimeError, IndexError) as exc:
                     reject(f"template_or_tokens_error:{type(exc).__name__}:{exc}")
                     continue
+
+                all_ids = _strip_exact_suffix(all_ids, terminal_suffix)
+                old_ids = _strip_exact_suffix(old_ids, terminal_suffix)
+                suffix_ids = _strip_exact_suffix(suffix_ids, terminal_suffix)
+                bos_id = getattr(tokenizer, "bos_token_id", None)
+                if suffix_ids and bos_id is not None and suffix_ids[0] == int(bos_id):
+                    suffix_ids = suffix_ids[1:]
+
                 if following and all_ids[:len(old_ids)] != old_ids:
-                    # Remove a template-global suffix only when the remaining
-                    # previous conversation is an exact prefix of the full
-                    # rendering. This covers final assistant prefixes as well
-                    # as terminal EOS tokens without guessing at token IDs.
-                    if (
-                        terminal_suffix
-                        and len(old_ids) >= len(terminal_suffix)
-                        and old_ids[-len(terminal_suffix):] == terminal_suffix
-                        and all_ids[:len(old_ids) - len(terminal_suffix)]
-                        == old_ids[:-len(terminal_suffix)]
-                    ):
-                        old_ids = old_ids[:-len(terminal_suffix)]
-                    # Some templates expose eos_token_id as a terminal suffix
-                    # even when the empty-conversation rendering is empty.
                     terminal_id = getattr(tokenizer, "eos_token_id", None)
                     while (
                         terminal_id is not None
