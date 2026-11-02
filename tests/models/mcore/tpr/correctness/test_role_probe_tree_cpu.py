@@ -549,3 +549,111 @@ def test_real_qwen_system_audit_when_configured():
     assert summary["system_messages"] == 1
     assert summary["per_row"][0]["template_ending_token_ids"][0] == im_end
     assert summary["per_row"][0]["content_tokens"] > 0
+
+
+class TerminalEosChatTokenizer(FakeTokenizer):
+    """A template that appends eos_token_id only to the final rendered chat."""
+
+    eos_token_id = 6004
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+        ids = super().apply_chat_template(messages, tokenize, add_generation_prompt)
+        if not add_generation_prompt:
+            ids.append(self.eos_token_id)
+        return ids
+
+
+def test_role_probe_handles_terminal_eos_added_to_prefix_rendering():
+    tok = TerminalEosChatTokenizer()
+    probe = tree._probe_role_template(tok)
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "middle"},
+        {"role": "user", "content": "last"},
+    ]
+    ids = tok.apply_chat_template(messages)
+    anchors = tree._role_anchors(torch.tensor(ids, dtype=torch.long), probe)
+    expected = (
+        (0, "user"),
+        (len(tok.apply_chat_template(messages[:1])) - 1, "assistant"),
+        (len(tok.apply_chat_template(messages[:2])) - 1, "user"),
+    )
+    assert anchors == expected
+
+
+def test_real_llama3_tokenizer_role_probe_and_system_audit_when_configured():
+    import os
+    from transformers import AutoTokenizer
+
+    path = os.environ.get("TPR_LLAMA3_TOKENIZER_PATH")
+    if not path:
+        pytest.skip("set TPR_LLAMA3_TOKENIZER_PATH for Llama 3 tokenizer validation")
+    tok = AutoTokenizer.from_pretrained(
+        path, local_files_only=True, trust_remote_code=False
+    )
+
+    def special_id(token):
+        value = tok.convert_tokens_to_ids(token)
+        assert isinstance(value, int)
+        assert tok.convert_ids_to_tokens(value) == token
+        return value
+
+    start_header_id = special_id("<|start_header_id|>")
+    eot_id = special_id("<|eot_id|>")
+    assert tok.bos_token_id is not None
+
+    shared_system = "You are a code review assistant. Follow the repository conventions."
+    message_sets = [
+        [
+            {"role": "system", "content": shared_system},
+            {"role": "user", "content": "Review change A."},
+            {"role": "assistant", "content": "I will inspect change A."},
+            {"role": "ipython", "content": "tests passed"},
+            {"role": "assistant", "content": "Change A looks good."},
+        ],
+        [
+            {"role": "system", "content": shared_system},
+            {"role": "user", "content": "Review change B."},
+            {"role": "assistant", "content": "I will inspect change B."},
+            {"role": "ipython", "content": "one test failed"},
+            {"role": "assistant", "content": "Change B needs a fix."},
+        ],
+    ]
+    expected_roles = ["system", "user", "assistant", "ipython", "assistant"]
+    probe = tree._probe_role_template(tok)
+    input_rows = []
+    prompt_rows = []
+
+    for messages in message_sets:
+        ids = tree._coerce_probe_token_ids(tok.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=False
+        ))
+        prompt_ids = tree._coerce_probe_token_ids(tok.apply_chat_template(
+            messages[:2], tokenize=True, add_generation_prompt=False
+        ))
+        assert ids[0] == tok.bos_token_id
+
+        header_positions = [i for i, token_id in enumerate(ids) if token_id == start_header_id]
+        assert len(header_positions) == len(messages)
+        expected = tuple(
+            [(0, expected_roles[0])]
+            + list(zip(header_positions[1:], expected_roles[1:]))
+        )
+        actual = tree._role_anchors(torch.tensor(ids, dtype=torch.long), probe)
+        assert actual == expected
+
+        input_rows.append(torch.tensor(ids, dtype=torch.long))
+        prompt_rows.append(torch.tensor(prompt_ids, dtype=torch.long))
+
+    summary = _load_system_prompt_audit()._system_prompt_summary(
+        {"input_ids": input_rows, "prompts": prompt_rows},
+        probe,
+        eot_id,
+    )
+    assert summary["rows"] == 2
+    assert summary["system_messages"] == 2
+    assert summary["complete_system_spans"] is True
+    assert summary["identical_system_content_across_rows"] is True
+    assert summary["system_content_lengths"][0] > 0
+    assert summary["system_content_lengths"][0] == summary["system_content_lengths"][1]
+    assert all(span["within_prompt"] for span in summary["per_row"])

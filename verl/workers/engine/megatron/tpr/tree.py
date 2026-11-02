@@ -363,7 +363,10 @@ def _probe_role_template(tokenizer: Any) -> _RoleProbe:
     # The final assistant may include a template-generated <think> prelude;
     # a middle-of-conversation assistant usually has a shorter plain header.
     # Probe both forms instead of treating the last-message form as canonical.
-    for role in ("system", "developer", "user", "assistant", "tool"):
+    # Llama 3 uses "ipython" as a tool-execution role in its prompt format.
+    # Keep it as a semantic role candidate; it is discovered only when the
+    # tokenizer's own chat template can serialize it.
+    for role in ("system", "developer", "user", "assistant", "tool", "ipython"):
         for following in (False, True):
             for nonterminal in ((False, True) if role == "assistant" else (False,)):
                 prefix_msgs = [{"role": "user", "content": before}] if following else []
@@ -386,7 +389,21 @@ def _probe_role_template(tokenizer: Any) -> _RoleProbe:
                 except (ValueError, TypeError, KeyError, RuntimeError) as exc:
                     reject(f"template_or_tokens_error:{type(exc).__name__}:{exc}")
                     continue
-                if all_ids[:len(old_ids)] != old_ids:
+                if following and all_ids[:len(old_ids)] != old_ids:
+                    # Some HF templates append eos_token_id when rendering a
+                    # standalone conversation with add_generation_prompt=False.
+                    # That terminal-only suffix disappears when another
+                    # message is appended, so remove it only when the rest of
+                    # the prefix matches byte-for-byte.
+                    terminal_id = getattr(tokenizer, "eos_token_id", None)
+                    while (
+                        terminal_id is not None
+                        and old_ids
+                        and old_ids[-1] == int(terminal_id)
+                        and all_ids[:len(old_ids) - 1] == old_ids[:-1]
+                    ):
+                        old_ids = old_ids[:-1]
+                if following and all_ids[:len(old_ids)] != old_ids:
                     reject("previous_message_not_prefix")
                     continue
                 if nonterminal and (not suffix_ids or all_ids[-len(suffix_ids):] != suffix_ids):
