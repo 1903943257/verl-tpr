@@ -153,7 +153,7 @@ def main():
             torch.frombuffer(bytearray(header), dtype=torch.int64).tolist(),
             skip_special_tokens=False,
         )
-        match = re.match(r"<\\|im_start\\|>([a-zA-Z_]+)\\n", rendered)
+        match = re.match(r"<\|im_start\|>([a-zA-Z_]+)\n", rendered)
         if match:
             wire_role = match.group(1)
             if semantic_role in rendered_role and rendered_role[semantic_role] != wire_role:

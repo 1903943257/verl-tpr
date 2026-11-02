@@ -288,9 +288,9 @@ class ToolWrappedAsUserTokenizer(FakeTokenizer):
             role = message["role"]
             if role == "tool":
                 ids.extend([6001, *self.encode("user"), 6003])
-                ids.extend(self.encode("<tool_response>\\n"))
+                ids.extend(self.encode("<tool_response>\n"))
                 ids.extend(self.encode(message["content"]))
-                ids.extend(self.encode("\\n</tool_response>"))
+                ids.extend(self.encode("\n</tool_response>"))
             else:
                 ids.extend([6001, *self.encode(role), 6003])
                 ids.extend(self.encode(message["content"]))
@@ -344,7 +344,7 @@ def test_role_probe_real_qwen_tool_header_when_configured():
     rendered = tok.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=False
     )
-    if "<|im_start|>user\\n<tool_response>" not in rendered:
+    if "<|im_start|>user\n<tool_response>" not in rendered:
         pytest.skip("tokenizer does not wrap tool replies as ChatML user messages")
     probe = tree._probe_role_template(tok)
     ids = tree._coerce_probe_token_ids(
