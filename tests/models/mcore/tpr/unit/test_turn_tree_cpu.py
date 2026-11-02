@@ -193,3 +193,127 @@ def test_legacy_loss_term_validation_remains_in_legacy_only(field, value):
     fields = {"query_offset": 0, "target_token_id": 1, field: value}
     with pytest.raises(ValueError, match=f"{field} must be a non-negative integer"):
         SegmentLossTerm(**fields)
+
+
+def _make_token_lcp_batch(shared_tokens: int, *, rows: int = 2):
+    shared = torch.arange(1, shared_tokens + 1, dtype=torch.long)
+    inputs, prompts, responses, masks = [], [], [], []
+    keys = []
+    for row in range(rows):
+        prompt_tail = torch.full((300,), 100_000 + row, dtype=torch.long)
+        response = torch.full((64,), 200_000 + row, dtype=torch.long)
+        tokens = torch.cat((shared, prompt_tail, response))
+        inputs.append(tokens)
+        prompts.append(tokens[:-response.numel()].clone())
+        responses.append(response)
+        masks.append(torch.ones(response.numel(), dtype=torch.bool))
+        keys.append(f"uid{row}_session_{row}")
+    return keys, {
+        "input_ids": inputs,
+        "prompts": prompts,
+        "responses": responses,
+        "response_mask": masks,
+        "loss_mask": [mask.clone() for mask in masks],
+    }
+
+
+def test_token_lcp_shares_exact_prefix_across_uids_without_model_tokens():
+    keys, batch = _make_token_lcp_batch(1200)
+    # The token sequences contain no Qwen message-ending IDs and no tokenizer
+    # or Chat Template is loaded. The first divergence is inside the prompt.
+    trie = build_tree_execution_plans(
+        keys, batch, tree_policy="token_lcp",
+        min_shared_prefix_tokens=1024, tree_builder="trie",
+        require_loss_mask_alignment=True,
+    )
+    lcp = build_tree_execution_plans(
+        keys, batch, tree_policy="token_lcp",
+        min_shared_prefix_tokens=1024, tree_builder="lcp_sort",
+        require_loss_mask_alignment=True,
+    )
+
+    assert len(trie.trees) == 1
+    tree = trie.trees[0]
+    assert tree.uid == "__minibatch__"
+    assert tree.member_uids == ("uid0", "uid1")
+    assert tree.member_rows == (0, 1)
+    assert digest_forest_plan(trie) == digest_forest_plan(lcp)
+    assert trie.logical_loss_tokens == 128
+    assert sum(segment.length for segment in tree.segment_plan.segments.values()) == (
+        1200 + 364 + 364
+    )
+    shared_segments = [
+        segment for segment in tree.segment_plan.segments.values()
+        if segment.parent_id is None
+    ]
+    assert len(shared_segments) == 1
+    assert shared_segments[0].length == 1200
+    assert torch.equal(shared_segments[0].token_ids, batch["input_ids"][0][:1200])
+
+    for row in tree.member_rows:
+        row_refs = [ref for ref in tree.objective_refs if ref.sample_row == row]
+        assert len(row_refs) == 64
+        assert all(
+            ref.target_token_id == int(batch["input_ids"][row][
+                len(batch["prompts"][row]) + ref.response_offset
+            ])
+            for ref in row_refs
+        )
+        path = tree.segment_plan.path_to(row_refs[0].segment_id)
+        # The first supervised response token's path must reconstruct the
+        # complete sequence, including the arbitrary in-prompt branch point.
+        path = tree.segment_plan.path_to(path[-1])
+        replay = torch.cat([tree.segment_plan.get(i).token_ids for i in path])
+        assert torch.equal(replay, batch["input_ids"][row])
+
+
+def test_token_lcp_minimum_shared_prefix_threshold_is_enforced():
+    keys, batch = _make_token_lcp_batch(1023)
+    forest = build_tree_execution_plans(
+        keys, batch, tree_policy="token_lcp",
+        min_shared_prefix_tokens=1024,
+    )
+    assert len(forest.trees) == 2
+    assert sorted(tree.member_rows for tree in forest.trees) == [(0,), (1,)]
+    assert all(tree.member_uids in (("uid0",), ("uid1",)) for tree in forest.trees)
+    logical_tokens = sum(tokens.numel() for tokens in batch["input_ids"])
+    unique_tokens = sum(
+        segment.length
+        for tree in forest.trees
+        for segment in tree.segment_plan.segments.values()
+    )
+    assert unique_tokens == logical_tokens
+
+
+def test_token_lcp_accepts_exact_threshold_and_preserves_duplicate_rows():
+    shared = torch.arange(1, 1025, dtype=torch.long)
+    suffix = torch.tensor([90001, 90002, 90003], dtype=torch.long)
+    sequences = [torch.cat((shared, suffix)), torch.cat((shared, suffix))]
+    batch = {
+        "input_ids": sequences,
+        "prompts": [sequence[:-1].clone() for sequence in sequences],
+        "responses": [sequence[-1:].clone() for sequence in sequences],
+        "response_mask": [torch.ones(1, dtype=torch.bool) for _ in sequences],
+    }
+    forest = build_tree_execution_plans(
+        ["groupA_session_0", "groupB_session_0"],
+        batch,
+        tree_policy="token_lcp",
+        min_shared_prefix_tokens=1024,
+    )
+    assert len(forest.trees) == 1
+    tree = forest.trees[0]
+    assert tree.member_rows == (0, 1)
+    assert tree.member_uids == ("groupA", "groupB")
+    assert forest.logical_loss_tokens == 2
+    assert sum(segment.length for segment in tree.segment_plan.segments.values()) == len(sequences[0])
+
+
+@pytest.mark.parametrize("value", [0, -1, True])
+def test_token_lcp_rejects_invalid_minimum_shared_prefix(value):
+    keys, batch = _make_token_lcp_batch(1024)
+    with pytest.raises(ValueError, match="min_shared_prefix_tokens"):
+        build_tree_execution_plans(
+            keys, batch, tree_policy="token_lcp",
+            min_shared_prefix_tokens=value,
+        )

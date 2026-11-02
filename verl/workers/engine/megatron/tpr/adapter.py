@@ -339,19 +339,28 @@ def run_tpr_forward_backward_batch(
         if detailed_profile:
             stage_ms[name] = stage_ms.get(name, 0.0) + (time.perf_counter() - start) * 1000
 
+    # token_lcp is the model-agnostic minibatch-scope path; keep the legacy
+    # default until Full-vs-TPR numerical and NPU performance gates pass.
     tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
     # Experimental alternative for A/B benchmarking; keep the insertion Trie
     # as the default until CPU-scale and end-to-end parity/performance are proven.
     tree_builder = os.getenv("TPR_TREE_BUILDER", "trie")
     try:
         turn_min_tokens = int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128"))
+        min_shared_prefix_tokens = int(os.getenv("TPR_MIN_SHARED_PREFIX_TOKENS", "1024"))
     except ValueError as exc:
-        raise ValueError("TPR_TURN_MIN_SEGMENT_TOKENS must be a positive integer") from exc
+        raise ValueError(
+            "TPR_TURN_MIN_SEGMENT_TOKENS and TPR_MIN_SHARED_PREFIX_TOKENS "
+            "must be positive integers"
+        ) from exc
+    if min_shared_prefix_tokens < 1:
+        raise ValueError("TPR_MIN_SHARED_PREFIX_TOKENS must be positive")
     keys = _trajectory_keys_from_minibatch(data)
     forest = build_tree_execution_plans(
         keys, data, tree_policy=tree_policy,
         turn_min_segment_tokens=turn_min_tokens,
         tree_builder=tree_builder,
+        min_shared_prefix_tokens=min_shared_prefix_tokens,
     )
     if not forest.trees or not forest.logical_loss_tokens:
         raise ValueError("TPR PPO mini-batch has no supervised response tokens")

@@ -328,3 +328,47 @@ def test_real_tq_batch_three_session_topologies_and_direct_cross_session_merge()
             sep="\\n",
             flush=True,
         )
+
+
+def test_token_lcp_session_tree_shares_across_uids_and_matches_flat_oracle():
+    trees, _ = make_synthetic_batch()
+    trees[0]["uid"] = "uid_A"
+    trees[1]["uid"] = "uid_B"
+    fields = make_tree_fields(trees)
+
+    direct = build_tree_execution_plans_from_tree_fields(
+        fields,
+        require_loss_mask_alignment=True,
+        tree_policy="token_lcp",
+        min_shared_prefix_tokens=6,
+        tree_builder="lcp_sort",
+    )
+    direct_trie = build_tree_execution_plans_from_tree_fields(
+        fields,
+        require_loss_mask_alignment=True,
+        tree_policy="token_lcp",
+        min_shared_prefix_tokens=6,
+        tree_builder="trie",
+    )
+    rows = [
+        row
+        for tree in trees
+        for row in reconstruct_session_tree(tree)
+    ]
+    keys, batch = rows_to_tpr_batch(rows)
+    flat = build_tree_execution_plans(
+        keys,
+        batch,
+        require_loss_mask_alignment=True,
+        tree_policy="token_lcp",
+        min_shared_prefix_tokens=6,
+        tree_builder="lcp_sort",
+    )
+
+    assert len(direct.trees) == 1
+    assert direct.trees[0].uid == "__minibatch__"
+    assert direct.trees[0].member_uids == ("uid_A", "uid_B")
+    assert direct.trees[0].member_rows == tuple(range(6))
+    assert direct.logical_loss_tokens == flat.logical_loss_tokens
+    assert digest_forest_plan(direct) == digest_forest_plan(direct_trie)
+    assert digest_forest_plan(direct) == digest_forest_plan(flat)

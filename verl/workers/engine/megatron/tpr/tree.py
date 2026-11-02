@@ -135,6 +135,8 @@ class TreeExecutionPlan:
     member_rows: tuple[int, ...]
     segment_plan: SegmentPlan
     objective_refs: tuple[SegmentObjectiveRef, ...]
+    # Original logical GRPO UIDs represented by this physical tree.
+    member_uids: tuple[str, ...] = ()
     active_segment_ids: frozenset[SegmentId] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -634,19 +636,115 @@ def _compress(node: _TurnNode, parent_id: int | None, start: int, inputs: list[T
         pending.extend((child, segment_id, node.end, path) for child in reversed(node.children.values()))
 
 
+def _token_lcp_length(left: Tensor, right: Tensor) -> int:
+    """Exact common-prefix length in Token IDs, independent of model/template."""
+    left_ids = left.detach().cpu().numpy()
+    right_ids = right.detach().cpu().numpy()
+    limit = min(left_ids.size, right_ids.size)
+    if limit == 0:
+        return 0
+    mismatch = np.flatnonzero(left_ids[:limit] != right_ids[:limit])
+    return int(mismatch[0]) if mismatch.size else int(limit)
+
+
+def _token_lcp_clusters(
+    rows: list[tuple[int, Tensor, str]],
+    prompt_lengths: list[int],
+    minimum_shared_prefix_tokens: int,
+) -> list[tuple[list[tuple[int, Tensor, str]], set[int]]]:
+    """Partition rows into lexicographic clusters sharing a minimum Token prefix."""
+    ordered = sorted(
+        rows,
+        key=lambda item: (item[1].contiguous().numpy().tobytes(), item[0]),
+    )
+    if not ordered:
+        return []
+    adjacent_lcps = [
+        _token_lcp_length(ordered[index - 1][1], ordered[index][1])
+        for index in range(1, len(ordered))
+    ]
+    clusters: list[list[tuple[int, Tensor, str]]] = []
+    start = 0
+    for index, shared in enumerate(adjacent_lcps):
+        if shared < minimum_shared_prefix_tokens:
+            clusters.append(ordered[start:index + 1])
+            start = index + 1
+    clusters.append(ordered[start:])
+
+    result = []
+    for cluster in clusters:
+        cuts = {
+            shared
+            for left, right in zip(cluster, cluster[1:])
+            if (shared := _token_lcp_length(left[1], right[1])) > 0
+        }
+        cuts.update(
+            prompt_lengths[row]
+            for row, _tokens, _uid in cluster
+            if 0 < prompt_lengths[row]
+        )
+        result.append((sorted(cluster, key=lambda item: item[0]), cuts))
+    return sorted(result, key=lambda item: item[0][0][0])
+
+
+def _token_units_bytes(tokens: Tensor, cut_positions: set[int]) -> tuple[tuple[bytes, int], ...]:
+    """Split one sequence only at batch-global LCP depths and prompt boundaries."""
+    if tokens.ndim != 1 or tokens.numel() == 0:
+        raise ValueError("token-level tree rows must be non-empty one-dimensional tensors")
+    boundaries = sorted(
+        {position for position in cut_positions if 0 < position < tokens.numel()}
+        | {tokens.numel()}
+    )
+    previous = 0
+    units = []
+    for end in boundaries:
+        units.append((tokens[previous:end].contiguous().numpy().tobytes(), end))
+        previous = end
+    return tuple(units)
+
+
+def _build_unit_trie(
+    rows: list[tuple[int, tuple[tuple[bytes, int], ...]]],
+) -> _TurnNode:
+    """Insertion-order reference Trie for globally aligned exact Token units."""
+    if not rows:
+        raise ValueError("cannot build an empty unit Trie")
+    root = _TurnNode(0, rows[0][0])
+    for row, units in rows:
+        if not units:
+            raise ValueError(f"trajectory row {row} has no token units")
+        node = root
+        for signature, end in units:
+            child = node.children.get(signature)
+            if child is None:
+                child = _TurnNode(end, row)
+                node.children[signature] = child
+            elif child.end != end:
+                raise RuntimeError("equal token unit signatures have inconsistent endpoints")
+            child.member_rows.append(row)
+            node = child
+        node.terminal_rows.append(row)
+    return root
+
+
 def build_tree_execution_plans(
     keys: list[str] | tuple[str, ...], batch: Any, *,
     require_loss_mask_alignment: bool = False,
     tree_policy: str = "qwen_turn", turn_min_segment_tokens: int = 128,
     tree_builder: str = "trie",
+    min_shared_prefix_tokens: int = 1024,
 ) -> ForestExecutionPlan:
-    """Build the executable topology and retain one ref per masked response.
+    """Build a Forest while retaining one PPO ObjectiveRef per supervised token.
 
-    tree_builder="trie" is the insertion-order reference implementation.
-    tree_builder="lcp_sort" sorts complete Turn-unit sequences and rebuilds
-    the same trie from adjacent longest-common-prefix lengths.
+    token_lcp is model- and UID-agnostic: it groups rows by exact Token-ID
+    prefix within this input minibatch and only creates a shared physical tree
+    when the common prefix reaches min_shared_prefix_tokens. Logical UIDs
+    remain attached as member_uids and ObjectiveRefs retain original rows.
+
+    Legacy qwen_turn and experimental role_probe remain available for
+    controlled comparison; neither is used by the token-level path.
     """
-    if tree_policy not in ("qwen_turn", "role_probe"):
+    if tree_policy not in ("qwen_turn", "role_probe", "token_lcp"):
         raise ValueError(f"unsupported TPR tree_policy: {tree_policy!r}")
     role_probe = None
     if tree_policy == "role_probe":
@@ -659,6 +757,11 @@ def build_tree_execution_plans(
     if (not isinstance(turn_min_segment_tokens, int) or isinstance(turn_min_segment_tokens, bool)
             or turn_min_segment_tokens < 1):
         raise ValueError("turn_min_segment_tokens must be a positive integer")
+    if (not isinstance(min_shared_prefix_tokens, int)
+            or isinstance(min_shared_prefix_tokens, bool)
+            or min_shared_prefix_tokens < 1):
+        raise ValueError("min_shared_prefix_tokens must be a positive integer")
+
     inputs, masks = _rows(batch, "input_ids"), _rows(batch, "response_mask")
     if len(keys) != len(inputs) or len(keys) != len(masks):
         raise ValueError("keys, input_ids and response_mask must have identical row counts")
@@ -673,8 +776,11 @@ def build_tree_execution_plans(
 
     groups: dict[str, _TurnNode] = {}
     lcp_rows: dict[str, list[tuple[int, tuple[tuple[bytes, int], ...]]]] = {}
-    selected = []
-    cpu_inputs = []
+    token_rows: list[tuple[int, Tensor, str]] = []
+    selected: list[list[int]] = []
+    cpu_inputs: list[Tensor] = []
+    prompt_lengths: list[int] = []
+
     for row, (key, tokens, mask) in enumerate(zip(keys, inputs, masks, strict=True)):
         if (not tokens.numel() or tokens.dtype == torch.bool or torch.is_floating_point(tokens)
                 or torch.is_complex(tokens) or bool((tokens < 0).any())):
@@ -709,6 +815,12 @@ def build_tree_execution_plans(
             if prompt_length > tokens.numel() or not torch.equal(tokens[:prompt_length].cpu(), prompt.cpu()):
                 raise ValueError(f"turn builder prompt is not an exact input prefix for row={row}")
         uid, _, _ = _parse_key(key)
+        prompt_lengths.append(prompt_length)
+
+        if tree_policy == "token_lcp":
+            token_rows.append((row, cpu_tokens, uid))
+            continue
+
         if role_probe is not None:
             units = _role_units_bytes(cpu_tokens, prompt_length, turn_min_segment_tokens, role_probe)
         elif tree_builder == "lcp_sort":
@@ -728,11 +840,30 @@ def build_tree_execution_plans(
                 node.member_rows.append(row)
             node.terminal_rows.append(row)
 
-    if tree_builder == "lcp_sort":
-        groups = {uid: _build_lcp_group(rows) for uid, rows in lcp_rows.items()}
+    group_entries: list[tuple[str, _TurnNode, tuple[str, ...], int | None]] = []
+    if tree_policy == "token_lcp":
+        clusters = _token_lcp_clusters(token_rows, prompt_lengths, min_shared_prefix_tokens)
+        for cluster_index, (cluster, cut_positions) in enumerate(clusters):
+            units_by_row = [
+                (row, _token_units_bytes(tokens, cut_positions))
+                for row, tokens, _uid in cluster
+            ]
+            root = (
+                _build_lcp_group(units_by_row)
+                if tree_builder == "lcp_sort"
+                else _build_unit_trie(units_by_row)
+            )
+            member_uids = tuple(dict.fromkeys(uid for _row, _tokens, uid in cluster))
+            if len(root.children) != 1:
+                raise RuntimeError("token_lcp cluster does not have one common root prefix")
+            group_entries.append(("__minibatch__", root, member_uids, cluster_index))
+    else:
+        if tree_builder == "lcp_sort":
+            groups = {uid: _build_lcp_group(rows) for uid, rows in lcp_rows.items()}
+        group_entries = [(uid, root, (uid,), None) for uid, root in groups.items()]
 
     result = []
-    for uid, root in groups.items():
+    for uid, root, member_uids, cluster_index in group_entries:
         for tree_index, child in enumerate(root.children.values()):
             segments, paths = [], {}
             _compress(child, None, 0, cpu_inputs, segments, paths, ())
@@ -749,9 +880,15 @@ def build_tree_execution_plans(
                         segment_id, target - 1 - plan.get(segment_id).position_start,
                         int(cpu_inputs[row][target]), row, offset,
                     ))
-            result.append(TreeExecutionPlan(uid, tree_index, tuple(child.member_rows), plan, tuple(refs)))
+            result.append(TreeExecutionPlan(
+                uid,
+                cluster_index if cluster_index is not None else tree_index,
+                tuple(child.member_rows),
+                plan,
+                tuple(refs),
+                member_uids,
+            ))
     return ForestExecutionPlan(tuple(result), sum(map(len, selected)))
-
 
 
 @dataclass(frozen=True, slots=True)
@@ -1024,6 +1161,24 @@ def _session_tree_units(
     return tuple(result)
 
 
+def _token_session_units(
+    tokens: Tensor, cut_positions: set[int]
+) -> tuple[_SessionTreeUnit, ...]:
+    boundaries = sorted(
+        {position for position in cut_positions if 0 < position < tokens.numel()}
+        | {tokens.numel()}
+    )
+    previous = 0
+    units = []
+    for end in boundaries:
+        part = tokens[previous:end].clone()
+        units.append(_SessionTreeUnit(
+            part.contiguous().numpy().tobytes(), previous, end, part
+        ))
+        previous = end
+    return tuple(units)
+
+
 def _compress_session_tree_units(
     node: _TurnNode,
     parent_id: SegmentId | None,
@@ -1070,32 +1225,35 @@ def build_tree_execution_plans_from_session_trees(
     tree_policy: str = "qwen_turn",
     turn_min_segment_tokens: int = 128,
     tree_builder: str = "lcp_sort",
+    min_shared_prefix_tokens: int = 1024,
 ) -> ForestExecutionPlan:
     """Build a minibatch Forest directly from independent Session Tree payloads.
 
-    Each input mapping is exactly one Session (one root and its local Nodes /
-    Leaves). Session-local topology is traversed as token chunks; no complete
-    trajectory rows are materialized. Leaves from different Sessions are then
-    grouped by UID and their exact qwen_turn units are merged by the selected
-    Trie/LCP builder. Node IDs are scoped to their containing Session Tree.
-    ObjectiveRef.sample_row indexes the stable traversal order: NonTensorStack
-    Session order, then each Session's Leaf sequence order.
+    Legacy qwen_turn preserves historical UID-scoped behavior. token_lcp
+    instead clusters exact Token-ID prefixes across all Sessions/UIDs in this
+    supplied minibatch and retains logical UIDs in member_uids. Since only the
+    supplied minibatch is visible here, sharing cannot cross DP/minibatch scope.
     """
     if not session_trees:
         raise ValueError("cannot build a Forest from an empty Session Tree batch")
-    if tree_policy != "qwen_turn":
-        raise ValueError("Production TPR only supports qwen_turn")
+    if tree_policy not in ("qwen_turn", "token_lcp"):
+        raise ValueError(f"unsupported Session Tree policy: {tree_policy!r}")
     if tree_builder not in ("trie", "lcp_sort"):
         raise ValueError(f"unknown TPR tree_builder: {tree_builder!r}")
     if (not isinstance(turn_min_segment_tokens, int) or isinstance(turn_min_segment_tokens, bool)
             or turn_min_segment_tokens < 1):
         raise ValueError("turn_min_segment_tokens must be a positive integer")
+    if (not isinstance(min_shared_prefix_tokens, int)
+            or isinstance(min_shared_prefix_tokens, bool)
+            or min_shared_prefix_tokens < 1):
+        raise ValueError("min_shared_prefix_tokens must be a positive integer")
 
     seen_trees, seen_sessions = set(), set()
     grouped_rows: dict[str, list[tuple[int, tuple[_SessionTreeUnit, ...], int, list[int]]]] = {}
     units_by_row: list[tuple[_SessionTreeUnit, ...]] = []
     selected_by_row: list[list[int]] = []
     prompt_lengths: list[int] = []
+    token_rows: list[tuple[int, Tensor, str]] = []
     row_index = 0
 
     for tree in session_trees:
@@ -1207,34 +1365,64 @@ def build_tree_execution_plans_from_session_trees(
                 or total_length - prompt_length != response_mask.numel()
             ):
                 raise ValueError("Leaf prompt/response boundary does not align with its response_mask")
-            units = _session_tree_units(chunks, prompt_length, turn_min_segment_tokens)
             selected = torch.nonzero(response_mask, as_tuple=False).flatten().tolist()
             if selected and prompt_length + selected[0] == 0:
                 raise ValueError("Leaf has no preceding query token for its first supervised token")
-            grouped_rows.setdefault(uid, []).append((row_index, units, prompt_length, selected))
+            if tree_policy == "token_lcp":
+                full_tokens = _concat_chunk_range(chunks, 0, total_length)
+                token_rows.append((row_index, full_tokens, uid))
+                units: tuple[_SessionTreeUnit, ...] = ()
+            else:
+                units = _session_tree_units(chunks, prompt_length, turn_min_segment_tokens)
+                grouped_rows.setdefault(uid, []).append(
+                    (row_index, units, prompt_length, selected)
+                )
             units_by_row.append(units)
             selected_by_row.append(selected)
             prompt_lengths.append(prompt_length)
             row_index += 1
 
-    result = []
-    for uid, rows in grouped_rows.items():
-        if tree_builder == "lcp_sort":
-            root = _build_lcp_group([
-                (row, tuple((unit.signature, unit.end) for unit in units))
-                for row, units, _, _ in rows
-            ])
-        else:
-            root = _TurnNode(0, rows[0][0])
-            for row, units, _, _ in rows:
-                node = root
-                for unit in units:
-                    node = node.children.setdefault(
-                        unit.signature, _TurnNode(unit.end, row)
-                    )
-                    node.member_rows.append(row)
-                node.terminal_rows.append(row)
+    group_entries: list[tuple[str, _TurnNode, tuple[str, ...], int | None]] = []
+    if tree_policy == "token_lcp":
+        for cluster_index, (cluster, cut_positions) in enumerate(
+            _token_lcp_clusters(token_rows, prompt_lengths, min_shared_prefix_tokens)
+        ):
+            for row, tokens, _uid in cluster:
+                units_by_row[row] = _token_session_units(tokens, cut_positions)
+            unit_rows = [
+                (row, tuple((unit.signature, unit.end) for unit in units_by_row[row]))
+                for row, _tokens, _uid in cluster
+            ]
+            root = (
+                _build_lcp_group(unit_rows)
+                if tree_builder == "lcp_sort"
+                else _build_unit_trie(unit_rows)
+            )
+            member_uids = tuple(dict.fromkeys(uid for _row, _tokens, uid in cluster))
+            if len(root.children) != 1:
+                raise RuntimeError("token_lcp Session cluster does not have one common root prefix")
+            group_entries.append(("__minibatch__", root, member_uids, cluster_index))
+    else:
+        for uid, rows in grouped_rows.items():
+            if tree_builder == "lcp_sort":
+                root = _build_lcp_group([
+                    (row, tuple((unit.signature, unit.end) for unit in units))
+                    for row, units, _, _ in rows
+                ])
+            else:
+                root = _TurnNode(0, rows[0][0])
+                for row, units, _, _ in rows:
+                    node = root
+                    for unit in units:
+                        node = node.children.setdefault(
+                            unit.signature, _TurnNode(unit.end, row)
+                        )
+                        node.member_rows.append(row)
+                    node.terminal_rows.append(row)
+            group_entries.append((uid, root, (uid,), None))
 
+    result = []
+    for uid, root, member_uids, cluster_index in group_entries:
         for tree_index, child in enumerate(root.children.values()):
             segments, paths = [], {}
             _compress_session_tree_units(
@@ -1256,7 +1444,12 @@ def build_tree_execution_plans_from_session_trees(
                         offset,
                     ))
             result.append(TreeExecutionPlan(
-                uid, tree_index, tuple(child.member_rows), plan, tuple(refs)
+                uid,
+                cluster_index if cluster_index is not None else tree_index,
+                tuple(child.member_rows),
+                plan,
+                tuple(refs),
+                member_uids,
             ))
 
     return ForestExecutionPlan(tuple(result), sum(map(len, selected_by_row)))
@@ -1294,16 +1487,18 @@ def _write_plan(hasher, plan: SegmentPlan) -> None:
 
 
 def digest_segment_plan(plan: SegmentPlan) -> str:
-    hasher = hashlib.sha256(b"TPR-PPO-turn-v2")
+    hasher = hashlib.sha256(b"TPR-PPO-tree-v3")
     _write_plan(hasher, plan)
     return hasher.hexdigest()
 
 
 def digest_forest_plan(forest: ForestExecutionPlan) -> str:
-    hasher = hashlib.sha256(b"TPR-PPO-turn-v2")
+    hasher = hashlib.sha256(b"TPR-PPO-tree-v3")
     _write_record(hasher, forest.logical_loss_tokens)
     for tree in forest.trees:
-        _write_record(hasher, (tree.uid, tree.tree_index, tree.member_rows))
+        _write_record(hasher, (
+            tree.uid, tree.tree_index, tree.member_rows, tree.member_uids or (tree.uid,)
+        ))
         _write_plan(hasher, tree.segment_plan)
         for ref in tree.objective_refs:
             _write_record(hasher, (ref.segment_id, ref.query_offset, ref.target_token_id,
