@@ -194,7 +194,10 @@ def _execution_cost(sequences, keys, prompts=None, minimum=128):
                                for s, n in zip(sequences, boundaries, strict=True)]}
     if prompts is not None:
         batch["prompts"] = [torch.tensor(s[:n]) for s, n in zip(sequences, prompts, strict=True)]
-    forest = build_tree_execution_plans(keys, batch, turn_min_segment_tokens=minimum)
+    forest = build_tree_execution_plans(
+        keys, batch, tree_policy="qwen_turn",
+        turn_min_segment_tokens=minimum,
+    )
     return sum(segment.length for tree in forest.trees for segment in tree.segment_plan.segments.values())
 
 

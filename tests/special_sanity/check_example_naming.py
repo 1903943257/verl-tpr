@@ -106,6 +106,10 @@ DEFAULT_IGNORE_FILES = (
     # folding ``_multi_rs`` into a ROLLOUT_SERVER env-var toggle rather than
     # in this PR.
     "examples/rollout_correction/run_qwen2_5_7b_fsdp_multi_rs.sh",
+    # TPR experiment launchers are specialized training workflows; preserve their stable paths.
+    "examples/tpr/run_overnight_p16s2_5step.sh",
+    "examples/tpr/run_rollout_probe.sh",
+    "examples/tpr/run_train_rebench.sh",
 )
 
 

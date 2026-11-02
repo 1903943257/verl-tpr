@@ -49,8 +49,9 @@ fourway() {
   export PYTEST_ADDOPTS='-q -s -x'
   export HCCL_DETERMINISTIC=true
   export TPR_OFFLINE_GRAD_SYNC_DTYPE=bf16
-  export TPR_TREE_POLICY=qwen_turn
-  export TPR_TURN_MIN_SEGMENT_TOKENS=128
+  export TPR_TREE_POLICY=token_lcp
+  export TPR_TREE_BUILDER=lcp_sort
+  export TPR_MIN_SHARED_PREFIX_TOKENS=1024
   export TPR_RUN_FIXED_SHAPE_40K_BENCH=1
   export TPR_BENCH_CP_SIZE=4
   export TPR_BENCH_SOURCE_STEP=0

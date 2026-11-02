@@ -339,15 +339,27 @@ def run_tpr_forward_backward_batch(
         if detailed_profile:
             stage_ms[name] = stage_ms.get(name, 0.0) + (time.perf_counter() - start) * 1000
 
-    tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
+    # Token-LCP is the model-agnostic production builder. Sharing is scoped
+    # to this local Actor minibatch (therefore one DP replica and one minibatch).
+    # Legacy policies/builders remain explicit opt-ins for temporary rollback.
+    tree_policy = os.getenv("TPR_TREE_POLICY", "token_lcp")
+    tree_builder = os.getenv("TPR_TREE_BUILDER", "lcp_sort")
     try:
         turn_min_tokens = int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128"))
+        min_shared_prefix_tokens = int(os.getenv("TPR_MIN_SHARED_PREFIX_TOKENS", "1024"))
     except ValueError as exc:
-        raise ValueError("TPR_TURN_MIN_SEGMENT_TOKENS must be a positive integer") from exc
+        raise ValueError(
+            "TPR_TURN_MIN_SEGMENT_TOKENS and TPR_MIN_SHARED_PREFIX_TOKENS "
+            "must be positive integers"
+        ) from exc
+    if min_shared_prefix_tokens < 1:
+        raise ValueError("TPR_MIN_SHARED_PREFIX_TOKENS must be positive")
     keys = _trajectory_keys_from_minibatch(data)
     forest = build_tree_execution_plans(
         keys, data, tree_policy=tree_policy,
         turn_min_segment_tokens=turn_min_tokens,
+        tree_builder=tree_builder,
+        min_shared_prefix_tokens=min_shared_prefix_tokens,
     )
     if not forest.trees or not forest.logical_loss_tokens:
         raise ValueError("TPR PPO mini-batch has no supervised response tokens")

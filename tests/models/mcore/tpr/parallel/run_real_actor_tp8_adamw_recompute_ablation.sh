@@ -36,8 +36,9 @@ fi
 export TPR_REAL_ACTOR_MINIBATCH="$CAPTURE"
 export TPR_OFFLINE_CAPTURE_LIST="$(IFS=:; echo "${CAPTURES[*]}")"
 export TPR_QWEN_4B_PATH="${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}"
-export TPR_TREE_POLICY=qwen_turn
-export TPR_TURN_MIN_SEGMENT_TOKENS=128
+export TPR_TREE_POLICY=token_lcp
+export TPR_TREE_BUILDER=lcp_sort
+export TPR_MIN_SHARED_PREFIX_TOKENS=1024
 export TPR_OFFLINE_SP=0
 export TPR_OFFLINE_ROWS=all
 export TPR_OFFLINE_ADAMW_LR="${TPR_OFFLINE_ADAMW_LR:-1e-6}"

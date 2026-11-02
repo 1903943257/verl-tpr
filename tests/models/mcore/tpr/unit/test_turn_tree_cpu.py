@@ -1,4 +1,4 @@
-"""The single production topology preserves historical Turn/PPO ownership."""
+"""Token-LCP production defaults and legacy Turn/PPO compatibility regressions."""
 
 import random
 
@@ -57,13 +57,43 @@ def test_turn_forest_matches_reference_for_branches_duplicates_and_masks(seed, w
 
     expected = reference_plan(keys, batch, **options)
     actual = build_tree_execution_plans(keys, batch, **options)
+    lcp = build_tree_execution_plans(keys, batch, tree_builder="lcp_sort", **options)
 
     assert _records(actual) == _records(expected)
+    assert _records(lcp) == _records(expected)
     assert actual.logical_loss_tokens == sum(int(mask.sum()) for mask in masks)
+    assert digest_forest_plan(actual) == digest_forest_plan(lcp)
     assert digest_forest_plan(actual) == digest_forest_plan(build_tree_execution_plans(keys, batch, **options))
     # The persisted topology is unique; metadata access does not materialize a second tree.
     assert all(not hasattr(tree, "tree") for tree in actual.trees)
     assert all(not hasattr(tree, "nodes") for tree in actual.trees)
+
+
+def test_lcp_sort_preserves_prefix_termination_duplicate_rows_and_sibling_order():
+    sequences = [
+        [1, 2, 151645, 3, 151645],
+        [1, 2, 151645],
+        [1, 2, 151645, 4, 151645],
+        [1, 2, 151645, 3, 151645],
+        [9, 151645, 10],
+    ]
+    batch = {
+        "input_ids": [torch.tensor(tokens) for tokens in sequences],
+        "response_mask": [torch.ones(len(tokens) - 2, dtype=torch.bool) for tokens in sequences],
+    }
+    keys = ["same_tpr_0", "same_tpr_1", "same_tpr_2", "same_tpr_3", "other_tpr_4"]
+    trie = build_tree_execution_plans(
+        keys, batch, tree_policy="qwen_turn", turn_min_segment_tokens=1,
+        tree_builder="trie",
+    )
+    lcp = build_tree_execution_plans(
+        keys, batch, tree_policy="qwen_turn", turn_min_segment_tokens=1,
+        tree_builder="lcp_sort",
+    )
+
+    assert _records(lcp) == _records(trie)
+    assert digest_forest_plan(lcp) == digest_forest_plan(trie)
+    assert [tree.member_rows for tree in lcp.trees] == [(0, 1, 2, 3), (4,)]
 
 
 def test_parent_query_ownership_and_internal_terminal_are_preserved():
@@ -71,7 +101,10 @@ def test_parent_query_ownership_and_internal_terminal_are_preserved():
                  [1, 2, 151645], [1, 2, 151645, 3, 151645]]
     batch = {"input_ids": [torch.tensor(tokens) for tokens in sequences],
              "response_mask": [torch.ones(len(tokens) - 2, dtype=torch.bool) for tokens in sequences]}
-    forest = build_tree_execution_plans([f"u_s_{i}" for i in range(4)], batch, turn_min_segment_tokens=1)
+    forest = build_tree_execution_plans(
+        [f"u_s_{i}" for i in range(4)], batch,
+        tree_policy="qwen_turn", turn_min_segment_tokens=1,
+    )
     executable = forest.trees[0]
     branching = [ref for ref in executable.objective_refs if ref.response_offset == 1]
     assert [(ref.sample_row, ref.target_token_id) for ref in branching] == [(0, 3), (1, 4), (3, 3)]
@@ -85,16 +118,24 @@ def test_digest_covers_tokens_schedule_and_logical_refs():
     keys = ["u_s_0", "u_s_1"]
     batch = {"input_ids": [torch.tensor([1, 151645, 3]), torch.tensor([1, 151645, 4])],
              "response_mask": [torch.tensor([True]), torch.tensor([True])]}
-    plan = build_tree_execution_plans(keys, batch, turn_min_segment_tokens=1)
+    plan = build_tree_execution_plans(
+        keys, batch, tree_policy="qwen_turn", turn_min_segment_tokens=1,
+    )
     digest = digest_forest_plan(plan)
     assert len(digest) == 64
     assert digest_segment_plan(plan.trees[0].segment_plan) == digest_segment_plan(
-        build_tree_execution_plans(keys, batch, turn_min_segment_tokens=1).trees[0].segment_plan)
+        build_tree_execution_plans(
+            keys, batch, tree_policy="qwen_turn", turn_min_segment_tokens=1,
+        ).trees[0].segment_plan)
     batch["response_mask"][0][0] = False
-    assert digest_forest_plan(build_tree_execution_plans(keys, batch, turn_min_segment_tokens=1)) != digest
+    assert digest_forest_plan(build_tree_execution_plans(
+        keys, batch, tree_policy="qwen_turn", turn_min_segment_tokens=1,
+    )) != digest
     batch["response_mask"][0][0] = True
     batch["input_ids"][0][-1] = 5
-    assert digest_forest_plan(build_tree_execution_plans(keys, batch, turn_min_segment_tokens=1)) != digest
+    assert digest_forest_plan(build_tree_execution_plans(
+        keys, batch, tree_policy="qwen_turn", turn_min_segment_tokens=1,
+    )) != digest
 
 
 def test_parent_position_validation_rejects_disconnected_cycles():
@@ -132,17 +173,26 @@ def test_active_segments_follow_query_owners_not_target_children():
         "input_ids": [torch.tensor([1, 151645, 2, 151645]), torch.tensor([1, 151645, 3, 151645])],
         "response_mask": [torch.tensor([True, False]), torch.tensor([False, False])],
     }
-    tree = build_tree_execution_plans(["u_s_0", "u_s_1"], batch, turn_min_segment_tokens=1).trees[0]
+    tree = build_tree_execution_plans(
+        ["u_s_0", "u_s_1"], batch,
+        tree_policy="qwen_turn", turn_min_segment_tokens=1,
+    ).trees[0]
     assert len(tree.segment_plan.segments) == 3
     assert tree.objective_refs[0].target_token_id == 2
     assert tree.active_segment_ids == frozenset({0})
     batch["response_mask"][0] = torch.tensor([False, True])
-    tree = build_tree_execution_plans(["u_s_0", "u_s_1"], batch, turn_min_segment_tokens=1).trees[0]
+    tree = build_tree_execution_plans(
+        ["u_s_0", "u_s_1"], batch,
+        tree_policy="qwen_turn", turn_min_segment_tokens=1,
+    ).trees[0]
     child = tree.objective_refs[0].segment_id
     assert tree.active_segment_ids == frozenset({0, child})
     for mask in batch["response_mask"]:
         mask.zero_()
-    tree = build_tree_execution_plans(["u_s_0", "u_s_1"], batch, turn_min_segment_tokens=1).trees[0]
+    tree = build_tree_execution_plans(
+        ["u_s_0", "u_s_1"], batch,
+        tree_policy="qwen_turn", turn_min_segment_tokens=1,
+    ).trees[0]
     assert tree.active_segment_ids == frozenset()
 
 
@@ -169,3 +219,226 @@ def test_legacy_loss_term_validation_remains_in_legacy_only(field, value):
     fields = {"query_offset": 0, "target_token_id": 1, field: value}
     with pytest.raises(ValueError, match=f"{field} must be a non-negative integer"):
         SegmentLossTerm(**fields)
+
+
+def _make_token_lcp_batch(shared_tokens: int, *, rows: int = 2):
+    shared = torch.arange(1, shared_tokens + 1, dtype=torch.long)
+    inputs, prompts, responses, masks = [], [], [], []
+    keys = []
+    for row in range(rows):
+        prompt_tail = torch.full((300,), 100_000 + row, dtype=torch.long)
+        response = torch.full((64,), 200_000 + row, dtype=torch.long)
+        tokens = torch.cat((shared, prompt_tail, response))
+        inputs.append(tokens)
+        prompts.append(tokens[:-response.numel()].clone())
+        responses.append(response)
+        masks.append(torch.ones(response.numel(), dtype=torch.bool))
+        keys.append(f"uid{row}_session_{row}")
+    return keys, {
+        "input_ids": inputs,
+        "prompts": prompts,
+        "responses": responses,
+        "response_mask": masks,
+        "loss_mask": [mask.clone() for mask in masks],
+    }
+
+
+def test_default_builder_uses_token_lcp_and_lcp_sort():
+    keys, batch = _make_token_lcp_batch(1200)
+    default = build_tree_execution_plans(keys, batch)
+    explicit = build_tree_execution_plans(
+        keys, batch, tree_policy="token_lcp",
+        tree_builder="lcp_sort", min_shared_prefix_tokens=1024,
+    )
+
+    assert digest_forest_plan(default) == digest_forest_plan(explicit)
+    assert len(default.trees) == 1
+    assert default.trees[0].member_uids == ("uid0", "uid1")
+    assert default.trees[0].segment_plan.get(0).length == 1200
+
+
+
+def test_token_lcp_shares_exact_prefix_across_uids_without_model_tokens():
+    keys, batch = _make_token_lcp_batch(1200)
+    # The token sequences contain no Qwen message-ending IDs and no tokenizer
+    # or Chat Template is loaded. The first divergence is inside the prompt.
+    trie = build_tree_execution_plans(
+        keys, batch, tree_policy="token_lcp",
+        min_shared_prefix_tokens=1024, tree_builder="trie",
+        require_loss_mask_alignment=True,
+    )
+    lcp = build_tree_execution_plans(
+        keys, batch, tree_policy="token_lcp",
+        min_shared_prefix_tokens=1024, tree_builder="lcp_sort",
+        require_loss_mask_alignment=True,
+    )
+
+    assert len(trie.trees) == 1
+    tree = trie.trees[0]
+    assert tree.uid == "__minibatch__"
+    assert tree.member_uids == ("uid0", "uid1")
+    assert tree.member_rows == (0, 1)
+    assert digest_forest_plan(trie) == digest_forest_plan(lcp)
+    assert trie.logical_loss_tokens == 128
+    assert sum(segment.length for segment in tree.segment_plan.segments.values()) == (
+        1200 + 364 + 364
+    )
+    shared_segments = [
+        segment for segment in tree.segment_plan.segments.values()
+        if segment.parent_id is None
+    ]
+    assert len(shared_segments) == 1
+    assert shared_segments[0].length == 1200
+    assert torch.equal(shared_segments[0].token_ids, batch["input_ids"][0][:1200])
+
+    for row in tree.member_rows:
+        row_refs = [ref for ref in tree.objective_refs if ref.sample_row == row]
+        assert len(row_refs) == 64
+        assert all(
+            ref.target_token_id == int(batch["input_ids"][row][
+                len(batch["prompts"][row]) + ref.response_offset
+            ])
+            for ref in row_refs
+        )
+        path = tree.segment_plan.path_to(row_refs[0].segment_id)
+        # The first supervised response token's path must reconstruct the
+        # complete sequence, including the arbitrary in-prompt branch point.
+        replay = torch.cat([segment.token_ids for segment in path])
+        assert torch.equal(replay, batch["input_ids"][row])
+
+
+def test_token_lcp_minimum_shared_prefix_threshold_is_enforced():
+    keys, batch = _make_token_lcp_batch(1023)
+    forest = build_tree_execution_plans(
+        keys, batch, tree_policy="token_lcp",
+        min_shared_prefix_tokens=1024,
+    )
+    assert len(forest.trees) == 2
+    assert sorted(tree.member_rows for tree in forest.trees) == [(0,), (1,)]
+    assert all(tree.member_uids in (("uid0",), ("uid1",)) for tree in forest.trees)
+    logical_tokens = sum(tokens.numel() for tokens in batch["input_ids"])
+    unique_tokens = sum(
+        segment.length
+        for tree in forest.trees
+        for segment in tree.segment_plan.segments.values()
+    )
+    assert unique_tokens == logical_tokens
+
+
+def test_token_lcp_enforces_minimum_new_shared_span_at_each_branch():
+    prefix = torch.arange(1, 1201, dtype=torch.long)
+    short_shared = torch.arange(3000, 3024, dtype=torch.long)
+    long_shared = torch.arange(4000, 5276, dtype=torch.long)
+    short_nested = torch.arange(6000, 6020, dtype=torch.long)
+    responses = [
+        torch.arange(7000, 7064, dtype=torch.long),
+        torch.arange(8000, 8064, dtype=torch.long),
+        torch.arange(9000, 9064, dtype=torch.long),
+        torch.arange(10000, 10064, dtype=torch.long),
+        torch.arange(11000, 11064, dtype=torch.long),
+    ]
+    sequences = [
+        torch.cat((prefix, short_shared, long_shared, short_nested, responses[0])),
+        torch.cat((prefix, short_shared, long_shared, short_nested, responses[1])),
+        torch.cat((prefix, short_shared, long_shared, responses[2])),
+        torch.cat((prefix, short_shared, responses[3])),
+        torch.cat((prefix, responses[4])),
+    ]
+    prompts = [sequence[:-64].clone() for sequence in sequences]
+    masks = [torch.ones(64, dtype=torch.bool) for _ in sequences]
+    batch = {
+        "input_ids": sequences,
+        "prompts": prompts,
+        "responses": responses,
+        "response_mask": masks,
+        "loss_mask": [mask.clone() for mask in masks],
+    }
+    keys = [f"uid{row}_session_{row}" for row in range(len(sequences))]
+
+    trie = build_tree_execution_plans(
+        keys, batch, tree_policy="token_lcp",
+        min_shared_prefix_tokens=1024, tree_builder="trie",
+        require_loss_mask_alignment=True,
+    )
+    lcp = build_tree_execution_plans(
+        keys, batch, tree_policy="token_lcp",
+        min_shared_prefix_tokens=1024, tree_builder="lcp_sort",
+        require_loss_mask_alignment=True,
+    )
+
+    assert digest_forest_plan(trie) == digest_forest_plan(lcp)
+    assert len(lcp.trees) == 1
+    tree = lcp.trees[0]
+    assert tree.member_rows == tuple(range(5))
+    assert tree.logical_loss_tokens == 5 * 64
+    assert len(tree.segment_plan.segments) == 7
+
+    segment_rows = {}
+    for row in tree.member_rows:
+        row_refs = [ref for ref in tree.objective_refs if ref.sample_row == row]
+        assert len(row_refs) == 64
+        last_ref = max(row_refs, key=lambda ref: ref.response_offset)
+        path = tree.segment_plan.path_to(last_ref.segment_id)
+        replay = torch.cat([segment.token_ids for segment in path])
+        assert torch.equal(replay, sequences[row])
+        for segment in path:
+            segment_rows.setdefault(segment.segment_id, set()).add(row)
+
+    shared_segments = [
+        (tree.segment_plan.get(segment_id), rows)
+        for segment_id, rows in segment_rows.items()
+        if len(rows) > 1
+    ]
+    assert sorted(
+        (segment.position_start, segment.length, len(rows))
+        for segment, rows in shared_segments
+    ) == [(0, 1200, 5), (1200, 1300, 3)]
+    assert all(segment.length >= 1024 for segment, _rows in shared_segments)
+
+
+def test_token_lcp_accepts_exact_threshold_and_preserves_duplicate_rows():
+    shared = torch.arange(1, 1025, dtype=torch.long)
+    suffix_a = torch.tensor([90001, 90002, 90003], dtype=torch.long)
+    suffix_b = torch.tensor([91001, 91002, 91003], dtype=torch.long)
+    sequences = [
+        torch.cat((shared, suffix_a)),
+        torch.cat((shared, suffix_a)),
+        torch.cat((shared, suffix_b)),
+    ]
+    batch = {
+        "input_ids": sequences,
+        "prompts": [sequence[:-1].clone() for sequence in sequences],
+        "responses": [sequence[-1:].clone() for sequence in sequences],
+        "response_mask": [torch.ones(1, dtype=torch.bool) for _ in sequences],
+    }
+    forest = build_tree_execution_plans(
+        ["groupA_session_0", "groupA_session_1", "groupB_session_0"],
+        batch,
+        tree_policy="token_lcp",
+        min_shared_prefix_tokens=1024,
+    )
+    assert len(forest.trees) == 1
+    tree = forest.trees[0]
+    assert tree.member_rows == (0, 1, 2)
+    assert tree.member_uids == ("groupA", "groupB")
+    assert forest.logical_loss_tokens == 3
+    assert len(tree.segment_plan.segments) == 4
+    shared_root = [
+        segment for segment in tree.segment_plan.segments.values()
+        if segment.parent_id is None
+    ]
+    assert len(shared_root) == 1
+    assert shared_root[0].length == 1024
+    assert sum(segment.length for segment in tree.segment_plan.segments.values()) == (
+        1024 + 2 * len(suffix_a) + len(suffix_b)
+    )
+
+
+@pytest.mark.parametrize("value", [0, -1, True])
+def test_token_lcp_rejects_invalid_minimum_shared_prefix(value):
+    keys, batch = _make_token_lcp_batch(1024)
+    with pytest.raises(ValueError, match="min_shared_prefix_tokens"):
+        build_tree_execution_plans(
+            keys, batch, tree_policy="token_lcp",
+            min_shared_prefix_tokens=value,
+        )

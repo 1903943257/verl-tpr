@@ -36,6 +36,11 @@ GATES: dict[str, Gate] = {
         bootstrap=True,
         note="CPU contract; run under the actual project environment.",
     ),
+    "cpu-tree-transport": Gate(
+        "tests/models/mcore/tpr/tree_transport/test_tree_transport_cpu.py",
+        bootstrap=True,
+        note="Direct Session Tree NonTensorStack consumption, cross-Session Forest construction and flat-row oracle parity.",
+    ),
     "npu-attention": Gate(
         "tests/models/mcore/tpr/equivalence/test_rectangular_attention_npu.py",
         kind="torchrun", ranks=1,
@@ -88,6 +93,7 @@ SUITES: dict[str, tuple[str, ...]] = {
     "cpu-core": ("cpu-isolated",),
     "cpu-recompute": ("cpu-recompute",),
     "cpu-parallel": ("cpu-parallel-report",),
+    "cpu-tree-transport": ("cpu-tree-transport",),
     "npu-core": ("npu-attention", "npu-tree"),
     "npu-ring": ("npu-ring",),
     "npu-tp": ("npu-tp",),
@@ -101,6 +107,7 @@ SUITE_DESCRIPTIONS: dict[str, str] = {
     "cpu-core": "Default lightweight CPU regression (existing stubbed runner).",
     "cpu-recompute": "Real Megatron import / fake TransformerBlock recompute contract.",
     "cpu-parallel": "Selected CPU parallel-shape contract.",
+    "cpu-tree-transport": "Direct Session Tree consumption and cross-Session Forest correctness (CPU).",
     "npu-core": "Rectangular attention and tree gradients.",
     "npu-ring": "Ring CP numerical contract.",
     "npu-tp": "Megatron TP2 correctness.",

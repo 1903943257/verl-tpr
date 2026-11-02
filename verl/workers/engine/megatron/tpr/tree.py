@@ -1,5 +1,5 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
-"""Turn-boundary token sharing and native PPO query ownership.
+"""Token-level prefix sharing and native PPO query ownership.
 
 The compressed SegmentPlan is the only persistent physical topology. Temporary
 Turn trie nodes are discarded after assigning each logical response token to
@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+from functools import lru_cache
+
+import numpy as np
 from bisect import bisect_right
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -22,6 +26,7 @@ from torch import Tensor
 
 SegmentId = int
 QWEN3_IM_END_TOKEN_ID = 151645
+SESSION_TREE_SCHEMA_VERSION = 1
 
 
 def _validate_segment_id(value: int, *, field_name: str = "segment_id") -> None:
@@ -130,6 +135,8 @@ class TreeExecutionPlan:
     member_rows: tuple[int, ...]
     segment_plan: SegmentPlan
     objective_refs: tuple[SegmentObjectiveRef, ...]
+    # Original logical GRPO UIDs represented by this physical tree.
+    member_uids: tuple[str, ...] = ()
     active_segment_ids: frozenset[SegmentId] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -197,7 +204,7 @@ class _TurnNode:
     source_row: int
     member_rows: list[int] = field(default_factory=list)
     terminal_rows: list[int] = field(default_factory=list)
-    children: dict[tuple[int, ...], _TurnNode] = field(default_factory=dict)
+    children: dict[tuple[int, ...] | bytes, _TurnNode] = field(default_factory=dict)
 
 
 def _turn_units(tokens: list[int], prompt_length: int, minimum: int):
@@ -211,6 +218,406 @@ def _turn_units(tokens: list[int], prompt_length: int, minimum: int):
             continue
         yield tuple(tokens[previous:end]), end
         previous = end
+
+
+def _turn_units_bytes(tokens: Tensor, prompt_length: int, minimum: int) -> tuple[tuple[bytes, int], ...]:
+    """Extract the same Turn units as _turn_units, using compact exact byte signatures.
+
+    Token IDs are CPU int64 values, so their contiguous byte representation is
+    an exact equality/sort key. This avoids materializing one Python int object
+    per token in the LCP path and lets sorting/LCP comparisons run in C.
+    """
+    boundaries = {
+        int(position) + 1
+        for position in torch.nonzero(tokens == QWEN3_IM_END_TOKEN_ID, as_tuple=False).flatten().tolist()
+    }
+    if 0 < prompt_length < tokens.numel():
+        boundaries.add(prompt_length)
+    boundaries.add(tokens.numel())
+    previous = 0
+    units = []
+    for end in sorted(boundaries):
+        if end < tokens.numel() and end - previous < minimum:
+            continue
+        signature = tokens[previous:end].contiguous().numpy().tobytes()
+        units.append((signature, end))
+        previous = end
+    return tuple(units)
+
+
+
+@dataclass(frozen=True, slots=True)
+class _RoleProbe:
+    headers: tuple[tuple[str, bytes, bool], ...]
+    endings: tuple[bytes, ...]
+
+
+def _coerce_probe_token_ids(value: Any) -> list[int]:
+    """Unwrap one token sequence from supported HF tokenizer return formats.
+
+    Some tokenizer versions or wrappers return BatchEncoding/input_ids, a
+    singleton batch, tuple, ndarray, or Tensor rather than a plain list.
+    Reject multi-row batches and non-integer values instead of guessing.
+    """
+    origin_type = type(value).__name__
+    if isinstance(value, Mapping):
+        if "input_ids" not in value:
+            raise TypeError(f"{origin_type} has no input_ids")
+        value = value["input_ids"]
+    if isinstance(value, (Tensor, np.ndarray)):
+        if value.ndim == 2 and value.shape[0] == 1:
+            value = value[0]
+        elif value.ndim != 1:
+            raise ValueError(f"{origin_type} has unsupported shape {tuple(value.shape)}")
+        value = value.tolist()
+    if isinstance(value, (tuple, list)) and len(value) == 1 and isinstance(value[0], (tuple, list)):
+        value = value[0]
+    if not isinstance(value, (tuple, list)):
+        raise TypeError(f"{origin_type} produced {type(value).__name__}, not a token sequence")
+    if any(
+        not isinstance(token, (int, np.integer)) or isinstance(token, (bool, np.bool_))
+        for token in value
+    ):
+        raise TypeError(f"{origin_type} contains non-integer or multi-row token IDs")
+    return [int(token) for token in value]
+
+
+def _find_role_marker(sequence: list[int], marker: list[int], start: int) -> int:
+    return next(
+        (i for i in range(start, len(sequence) - len(marker) + 1)
+         if sequence[i:i + len(marker)] == marker), -1
+    )
+
+
+def _find_marker_span_via_rendered_template(
+    tokenizer: Any, msgs: list[dict[str, str]], all_ids: list[int],
+    marker: str,
+) -> tuple[int, int] | None:
+    """Fallback when standalone marker tokenization differs in context.
+
+    Use the exact rendered chat template to locate a unique content sentinel.
+    The split is accepted ONLY if the surrounding token IDs match the actual
+    full-template encoding (or exact fast-tokenizer character offsets).
+    """
+    try:
+        rendered_text = tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=False
+        )
+    except (ValueError, TypeError, KeyError, RuntimeError):
+        return None
+    if not isinstance(rendered_text, str) or rendered_text.count(marker) != 1:
+        return None
+    start_char = rendered_text.index(marker)
+    end_char = start_char + len(marker)
+    try:
+        prefix = _coerce_probe_token_ids(
+            tokenizer.encode(rendered_text[:start_char], add_special_tokens=False)
+        )
+        suffix = _coerce_probe_token_ids(
+            tokenizer.encode(rendered_text[end_char:], add_special_tokens=False)
+        )
+    except (TypeError, ValueError):
+        prefix = suffix = None
+    if (prefix is not None and suffix is not None
+            and all_ids[:len(prefix)] == prefix
+            and (not suffix or all_ids[-len(suffix):] == suffix)
+            and len(prefix) + len(suffix) <= len(all_ids)):
+        return len(prefix), len(all_ids) - len(suffix)
+
+    # Fast tokenizers expose offsets for every token in the rendered text.
+    # Refuse a split unless both character boundaries coincide with tokens.
+    try:
+        encoded = tokenizer(
+            rendered_text, add_special_tokens=False, return_offsets_mapping=True
+        )
+        ids = _coerce_probe_token_ids(encoded)
+        offsets = encoded["offset_mapping"]
+        if isinstance(offsets, (Tensor, np.ndarray)):
+            offsets = offsets.tolist()
+    except (ValueError, TypeError, KeyError, RuntimeError, NotImplementedError):
+        return None
+    if ids != all_ids:
+        return None
+    starts = [i for i, (a, _b) in enumerate(offsets) if a == start_char]
+    ends = [i + 1 for i, (_a, b) in enumerate(offsets) if b == end_char]
+    if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+        return None
+    return starts[0], ends[0]
+
+
+def _strip_exact_suffix(ids: list[int], suffix: list[int]) -> list[int]:
+    if suffix and len(ids) >= len(suffix) and ids[-len(suffix):] == suffix:
+        return ids[:-len(suffix)]
+    return ids
+
+
+def _probe_role_template(tokenizer: Any) -> _RoleProbe:
+    """Probe exact role header token IDs from a tokenizer's chat template.
+
+    No Qwen token ID is used. Unstable templates/implicit roles are not
+    assumed to have recoverable message boundaries.
+    """
+    marker = "TPRRoleProbeContentQ7X9"
+    before = "TPRRoleProbePreviousB8Y6"
+    marker_ids = _coerce_probe_token_ids(tokenizer.encode(marker, add_special_tokens=False))
+    if not marker_ids:
+        raise ValueError("empty role probe marker")
+    headers: list[tuple[str, bytes, bool]] = []
+    endings: list[bytes] = []
+    failures: dict[str, int] = {}
+    # Some templates append an open assistant header even when
+    # add_generation_prompt=False. Do not render []: HF wrappers may index
+    # conversation[0]. Infer this suffix by comparing non-empty renderings.
+    terminal_suffix = []
+    prefix_messages = [{"role": "user", "content": before}]
+    for next_role in ("assistant", "user"):
+        try:
+            prefix_ids = _coerce_probe_token_ids(tokenizer.apply_chat_template(
+                prefix_messages, tokenize=True, add_generation_prompt=False
+            ))
+            continued_ids = _coerce_probe_token_ids(tokenizer.apply_chat_template(
+                [*prefix_messages, {"role": next_role, "content": marker}],
+                tokenize=True, add_generation_prompt=False,
+            ))
+        except (ValueError, TypeError, KeyError, RuntimeError, IndexError):
+            continue
+        common = 0
+        while (common < min(len(prefix_ids), len(continued_ids))
+               and prefix_ids[common] == continued_ids[common]):
+            common += 1
+        candidate = prefix_ids[common:]
+        if candidate:
+            try:
+                suffix_text = tokenizer.decode(candidate, skip_special_tokens=False)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if "assistant" in suffix_text and before not in suffix_text:
+                terminal_suffix = candidate
+                break
+
+    def reject(reason: str) -> None:
+        failures[reason] = failures.get(reason, 0) + 1
+
+    # The final assistant may include a template-generated <think> prelude;
+    # a middle-of-conversation assistant usually has a shorter plain header.
+    # Probe both forms instead of treating the last-message form as canonical.
+    # Llama 3 uses "ipython" as a tool-execution role in its prompt format.
+    # Keep it as a semantic role candidate; it is discovered only when the
+    # tokenizer's own chat template can serialize it.
+    for role in ("system", "developer", "user", "assistant", "tool", "ipython"):
+        for following in (False, True):
+            for nonterminal in ((False, True) if role == "assistant" else (False,)):
+                prefix_msgs = [{"role": "user", "content": before}] if following else []
+                # A later user turn forces the target assistant to be non-final.
+                suffix_msgs = (
+                    [{"role": "user", "content": "TPRRoleProbeFollowingC5Z2"}]
+                    if nonterminal else []
+                )
+                msgs = [*prefix_msgs, {"role": role, "content": marker}, *suffix_msgs]
+                try:
+                    all_ids = _coerce_probe_token_ids(tokenizer.apply_chat_template(
+                        msgs, tokenize=True, add_generation_prompt=False
+                    ))
+                    old_ids = _coerce_probe_token_ids(tokenizer.apply_chat_template(
+                        prefix_msgs, tokenize=True, add_generation_prompt=False
+                    )) if following else []
+                    suffix_ids = _coerce_probe_token_ids(tokenizer.apply_chat_template(
+                        suffix_msgs, tokenize=True, add_generation_prompt=False
+                    )) if nonterminal else []
+                except (ValueError, TypeError, KeyError, RuntimeError, IndexError) as exc:
+                    reject(f"template_or_tokens_error:{type(exc).__name__}:{exc}")
+                    continue
+
+                all_ids = _strip_exact_suffix(all_ids, terminal_suffix)
+                old_ids = _strip_exact_suffix(old_ids, terminal_suffix)
+                suffix_ids = _strip_exact_suffix(suffix_ids, terminal_suffix)
+                bos_id = getattr(tokenizer, "bos_token_id", None)
+                if suffix_ids and bos_id is not None and suffix_ids[0] == int(bos_id):
+                    suffix_ids = suffix_ids[1:]
+
+                if following and all_ids[:len(old_ids)] != old_ids:
+                    terminal_id = getattr(tokenizer, "eos_token_id", None)
+                    while (
+                        terminal_id is not None
+                        and old_ids
+                        and old_ids[-1] == int(terminal_id)
+                        and all_ids[:len(old_ids) - 1] == old_ids[:-1]
+                    ):
+                        old_ids = old_ids[:-1]
+                if following and all_ids[:len(old_ids)] != old_ids:
+                    reject("previous_message_not_prefix")
+                    continue
+                if nonterminal and (not suffix_ids or all_ids[-len(suffix_ids):] != suffix_ids):
+                    reject("following_message_not_suffix")
+                    continue
+                target_end = len(all_ids) - len(suffix_ids)
+                body = _find_role_marker(all_ids, marker_ids, len(old_ids))
+                body_end = body + len(marker_ids)
+                if body < 0:
+                    span = _find_marker_span_via_rendered_template(
+                        tokenizer, msgs, all_ids, marker
+                    )
+                    if span is None:
+                        reject("marker_not_token_aligned")
+                        continue
+                    body, body_end = span
+                if body < len(old_ids) or body_end > target_end:
+                    reject("marker_outside_target_message")
+                    continue
+                header = all_ids[len(old_ids):body]
+                ending = all_ids[body_end:target_end]
+                if not header or not ending:
+                    reject("empty_header_or_ending")
+                    continue
+                if role not in tokenizer.decode(header, skip_special_tokens=False):
+                    reject("role_not_in_header")
+                    continue
+                item = (role, np.asarray(header, dtype=np.int64).tobytes(), not following)
+                if item not in headers:
+                    headers.append(item)
+                end_bytes = np.asarray(ending, dtype=np.int64).tobytes()
+                if end_bytes not in endings:
+                    endings.append(end_bytes)
+    if not headers or not endings:
+        raise ValueError(
+            "chat template has no stable explicit role headers; "
+            f"probe_failures={failures}; "
+            "check tokenizer.chat_template and probe token alignment"
+        )
+    return _RoleProbe(tuple(headers), tuple(endings))
+
+
+@lru_cache(maxsize=4)
+def _role_probe_from_path(path: str) -> _RoleProbe:
+    from transformers import AutoTokenizer
+
+    return _probe_role_template(AutoTokenizer.from_pretrained(
+        path, local_files_only=True, trust_remote_code=False
+    ))
+
+
+def _role_anchors(tokens: Tensor, probe: _RoleProbe) -> tuple[tuple[int, str], ...]:
+    """Locate exact headers, preferring the most specific complete pattern.
+
+    Chat templates may wrap a semantic tool message as a user message with a
+    <tool_response> prefix. The short user header then matches the start of
+    the longer tool header at exactly the same position. This is not a
+    conflicting boundary. If equally specific headers imply different roles,
+    the actual token stream is ambiguous: fail rather than guess.
+    """
+    raw = tokens.contiguous().numpy().tobytes()
+    candidates: dict[int, list[tuple[int, str]]] = {}
+    for role, header, first_only in probe.headers:
+        seek = 0
+        while (offset := raw.find(header, seek)) >= 0:
+            seek = offset + 1
+            if offset % 8:
+                continue
+            if offset == 0:
+                if not first_only:
+                    continue
+            elif first_only or not any(raw.endswith(end, 0, offset) for end in probe.endings):
+                continue
+            candidates.setdefault(offset // 8, []).append((len(header), role))
+    found = []
+    for pos, matches in sorted(candidates.items()):
+        longest = max(length for length, _ in matches)
+        roles = {role for length, role in matches if length == longest}
+        if len(roles) != 1:
+            raise ValueError(
+                f"conflicting longest Role candidates at {pos}: "
+                f"roles={sorted(roles)}, header_bytes={longest}"
+            )
+        found.append((pos, next(iter(roles))))
+    return tuple(found)
+
+
+def _role_units_bytes(
+    tokens: Tensor, prompt_length: int, minimum: int, probe: _RoleProbe
+) -> tuple[tuple[bytes, int], ...]:
+    """Token-exact units at candidate role starts; never split inside a short unit."""
+    if not 0 <= prompt_length <= tokens.numel():
+        raise ValueError("invalid prompt length")
+    boundaries = {pos for pos, _ in _role_anchors(tokens, probe) if 0 < pos < tokens.numel()}
+    if 0 < prompt_length < tokens.numel():
+        boundaries.add(prompt_length)
+    boundaries.add(tokens.numel())
+    previous = 0
+    units = []
+    for end in sorted(boundaries):
+        if end < tokens.numel() and end - previous < minimum:
+            continue
+        units.append((tokens[previous:end].contiguous().numpy().tobytes(), end))
+        previous = end
+    return tuple(units)
+
+
+def _unit_lcp(left: tuple[tuple[bytes, int], ...], right: tuple[tuple[bytes, int], ...]) -> int:
+    """Return the exact common prefix length in complete units, not raw tokens."""
+    limit = min(len(left), len(right))
+    shared = 0
+    while shared < limit and left[shared][0] == right[shared][0]:
+        shared += 1
+    return shared
+
+
+def _build_lcp_group(rows: list[tuple[int, tuple[tuple[bytes, int], ...]]]) -> _TurnNode:
+    """Build a compressed unit trie from sorted rows and adjacent LCPs.
+
+    The builder is deliberately unit-agnostic: callers provide exact byte
+    signatures and their token endpoints, so the same implementation serves
+    Token-LCP units and the retained legacy comparison path.
+    """
+    if not rows:
+        raise ValueError("LCP tree group must contain at least one trajectory")
+
+    # Python's sort is stable; row is included explicitly to make duplicate
+    # sequence ordering independent of sort implementation details.
+    ordered = sorted(
+        rows,
+        key=lambda item: (tuple(signature for signature, _ in item[1]), item[0]),
+    )
+    root = _TurnNode(0, ordered[0][0])
+    nodes = [root]
+    previous_units = None
+    previous_path = [root]
+
+    for row, units in ordered:
+        if not units:
+            raise ValueError(f"LCP trajectory row {row} has no units")
+        shared = 0 if previous_units is None else _unit_lcp(previous_units, units)
+        path = previous_path[:shared + 1]
+        parent = path[-1]
+
+        # Adjacent-LCP construction guarantees that every suffix unit starts
+        # a new child at this parent. A collision indicates a broken ordering
+        # or LCP calculation, so fail rather than silently changing topology.
+        for signature, end in units[shared:]:
+            if signature in parent.children:
+                raise RuntimeError("LCP builder encountered an existing suffix child")
+            child = _TurnNode(end, row)
+            parent.children[signature] = child
+            nodes.append(child)
+            path.append(child)
+            parent = child
+
+        for prefix_node in path[1:]:
+            prefix_node.member_rows.append(row)
+        parent.terminal_rows.append(row)
+        previous_units = units
+        previous_path = path
+
+    # Restore the insertion-Trie's externally visible order: original row order
+    # for members/terminals and first-seen row order for sibling branches.
+    for node in nodes:
+        node.member_rows.sort()
+        node.terminal_rows.sort()
+        if node.member_rows:
+            node.source_row = node.member_rows[0]
+        node.children = dict(
+            sorted(node.children.items(), key=lambda item: item[1].member_rows[0])
+        )
+    return root
 
 
 def _compress(node: _TurnNode, parent_id: int | None, start: int, inputs: list[Tensor],
@@ -229,22 +636,202 @@ def _compress(node: _TurnNode, parent_id: int | None, start: int, inputs: list[T
         pending.extend((child, segment_id, node.end, path) for child in reversed(node.children.values()))
 
 
+def _token_lcp_length(left: Tensor, right: Tensor) -> int:
+    """Exact common-prefix length in Token IDs, independent of model/template."""
+    left_ids = left.detach().cpu().numpy()
+    right_ids = right.detach().cpu().numpy()
+    limit = min(left_ids.size, right_ids.size)
+    if limit == 0:
+        return 0
+    mismatch = np.flatnonzero(left_ids[:limit] != right_ids[:limit])
+    return int(mismatch[0]) if mismatch.size else int(limit)
+
+
+def _token_lcp_clusters(
+    rows: list[tuple[int, Tensor, str]],
+    prompt_lengths: list[int],
+    minimum_shared_prefix_tokens: int,
+) -> list[tuple[list[tuple[int, Tensor, str]], set[int]]]:
+    """Partition rows into lexicographic clusters sharing a minimum Token prefix."""
+    ordered = sorted(
+        rows,
+        key=lambda item: (item[1].contiguous().numpy().tobytes(), item[0]),
+    )
+    if not ordered:
+        return []
+    adjacent_lcps = [
+        _token_lcp_length(ordered[index - 1][1], ordered[index][1])
+        for index in range(1, len(ordered))
+    ]
+    clusters: list[list[tuple[int, Tensor, str]]] = []
+    start = 0
+    for index, shared in enumerate(adjacent_lcps):
+        if shared < minimum_shared_prefix_tokens:
+            clusters.append(ordered[start:index + 1])
+            start = index + 1
+    clusters.append(ordered[start:])
+
+    result = []
+    for cluster in clusters:
+        cuts = {
+            shared
+            for left, right in zip(cluster, cluster[1:])
+            if (shared := _token_lcp_length(left[1], right[1])) > 0
+        }
+        cuts.update(
+            prompt_lengths[row]
+            for row, _tokens, _uid in cluster
+            if 0 < prompt_lengths[row]
+        )
+        result.append((sorted(cluster, key=lambda item: item[0]), cuts))
+    return sorted(result, key=lambda item: item[0][0][0])
+
+
+def _token_units_bytes(tokens: Tensor, cut_positions: set[int]) -> tuple[tuple[bytes, int], ...]:
+    """Split one sequence only at batch-global LCP depths and prompt boundaries."""
+    if tokens.ndim != 1 or tokens.numel() == 0:
+        raise ValueError("token-level tree rows must be non-empty one-dimensional tensors")
+    boundaries = sorted(
+        {position for position in cut_positions if 0 < position < tokens.numel()}
+        | {tokens.numel()}
+    )
+    previous = 0
+    units = []
+    for end in boundaries:
+        units.append((tokens[previous:end].contiguous().numpy().tobytes(), end))
+        previous = end
+    return tuple(units)
+
+
+def _build_unit_trie(
+    rows: list[tuple[int, tuple[tuple[bytes, int], ...]]],
+) -> _TurnNode:
+    """Insertion-order reference Trie for globally aligned exact Token units."""
+    if not rows:
+        raise ValueError("cannot build an empty unit Trie")
+    root = _TurnNode(0, rows[0][0])
+    for row, units in rows:
+        if not units:
+            raise ValueError(f"trajectory row {row} has no token units")
+        node = root
+        for signature, end in units:
+            child = node.children.get(signature)
+            if child is None:
+                child = _TurnNode(end, row)
+                node.children[signature] = child
+            elif child.end != end:
+                raise RuntimeError("equal token unit signatures have inconsistent endpoints")
+            child.member_rows.append(row)
+            node = child
+        node.terminal_rows.append(row)
+    return root
+
+
+def _enforce_min_shared_token_branches(root: _TurnNode, minimum: int) -> None:
+    """Expand shared branches shorter than minimum into independent paths.
+
+    Measure each candidate from the last retained shared branch on that path.
+    Collapse unary LCP boundaries before measuring so the threshold applies
+    to the full shared span that the executor would otherwise schedule.
+    Removing a short branch promotes its alternatives to the last retained
+    ancestor; their next candidate is measured from that same ancestor.
+    """
+    def row_order(node: _TurnNode) -> int:
+        return min(node.member_rows) if node.member_rows else node.source_row
+
+    def rewrite(node: _TurnNode, last_shared_end: int) -> list[_TurnNode]:
+        # Match the executor's compression: unary nodes do not form a
+        # physical Segment boundary and must be included in the span check.
+        while not node.terminal_rows and len(node.children) == 1:
+            node = next(iter(node.children.values()))
+
+        branch_count = len(node.children) + int(bool(node.terminal_rows))
+        shared_span = node.end - last_shared_end
+        short_branch = branch_count > 1 and shared_span < minimum
+        short_duplicate_leaf = (
+            not node.children
+            and len(node.terminal_rows) > 1
+            and shared_span < minimum
+        )
+
+        if short_branch or short_duplicate_leaf:
+            # Copy this short span into each outgoing path. The next retained
+            # Segment or unique leaf will start at last_shared_end and include
+            # the removed span, rather than scheduling it as shared work.
+            promoted = []
+            for child in node.children.values():
+                promoted.extend(rewrite(child, last_shared_end))
+            for row in node.terminal_rows:
+                promoted.append(_TurnNode(
+                    end=node.end,
+                    source_row=row,
+                    member_rows=[row],
+                    terminal_rows=[row],
+                ))
+            return sorted(promoted, key=row_order)
+
+        # A retained branch starts a new measurement domain. Unary nodes
+        # were collapsed above; terminal-only duplicate rows also share the
+        # incoming span and therefore retain/reset it only when it is long.
+        next_shared_end = (
+            node.end
+            if branch_count > 1 or len(node.terminal_rows) > 1
+            else last_shared_end
+        )
+        descendants = []
+        for child in node.children.values():
+            descendants.extend(rewrite(child, next_shared_end))
+        descendants.sort(key=row_order)
+        node.children = {
+            (-1, index): child for index, child in enumerate(descendants)
+        }
+        return [node]
+
+    promoted = []
+    for child in root.children.values():
+        promoted.extend(rewrite(child, 0))
+    promoted.sort(key=row_order)
+    root.children = {
+        (-1, index): child for index, child in enumerate(promoted)
+    }
+
+
 def build_tree_execution_plans(
     keys: list[str] | tuple[str, ...], batch: Any, *,
     require_loss_mask_alignment: bool = False,
-    tree_policy: str = "qwen_turn", turn_min_segment_tokens: int = 128,
+    tree_policy: str = "token_lcp", turn_min_segment_tokens: int = 128,
+    tree_builder: str = "lcp_sort",
+    min_shared_prefix_tokens: int = 1024,
 ) -> ForestExecutionPlan:
-    """Build the sole executable topology and retain one ref per masked response.
+    """Build a Forest while retaining one PPO ObjectiveRef per supervised token.
 
-    Turn signatures are token-exact, and only complete ChatML messages or the
-    captured prompt endpoint can create a shared internal node. Duplicate rows
-    share physical tokens but retain independent PPO references and weights.
+    token_lcp is model- and UID-agnostic: it groups rows by exact Token-ID
+    prefix within this input minibatch and only creates a shared physical tree
+    when the common prefix reaches min_shared_prefix_tokens. Logical UIDs
+    remain attached as member_uids and ObjectiveRefs retain original rows.
+
+    token_lcp is the default production policy. Legacy qwen_turn and
+    diagnostic role_probe remain available only for explicit compatibility
+    and controlled comparison.
     """
-    if tree_policy != "qwen_turn":
-        raise ValueError("Production TPR only supports qwen_turn")
+    if tree_policy not in ("qwen_turn", "role_probe", "token_lcp"):
+        raise ValueError(f"unsupported TPR tree_policy: {tree_policy!r}")
+    role_probe = None
+    if tree_policy == "role_probe":
+        tokenizer_path = os.environ.get("TPR_ROLE_TOKENIZER_PATH")
+        if not tokenizer_path:
+            raise ValueError("role_probe requires TPR_ROLE_TOKENIZER_PATH")
+        role_probe = _role_probe_from_path(tokenizer_path)
+    if tree_builder not in ("trie", "lcp_sort"):
+        raise ValueError(f"unknown TPR tree_builder: {tree_builder!r}")
     if (not isinstance(turn_min_segment_tokens, int) or isinstance(turn_min_segment_tokens, bool)
             or turn_min_segment_tokens < 1):
         raise ValueError("turn_min_segment_tokens must be a positive integer")
+    if (not isinstance(min_shared_prefix_tokens, int)
+            or isinstance(min_shared_prefix_tokens, bool)
+            or min_shared_prefix_tokens < 1):
+        raise ValueError("min_shared_prefix_tokens must be a positive integer")
+
     inputs, masks = _rows(batch, "input_ids"), _rows(batch, "response_mask")
     if len(keys) != len(inputs) or len(keys) != len(masks):
         raise ValueError("keys, input_ids and response_mask must have identical row counts")
@@ -258,8 +845,12 @@ def build_tree_execution_plans(
             raise ValueError("optional batch field rows do not match keys")
 
     groups: dict[str, _TurnNode] = {}
-    selected = []
-    cpu_inputs = []
+    lcp_rows: dict[str, list[tuple[int, tuple[tuple[bytes, int], ...]]]] = {}
+    token_rows: list[tuple[int, Tensor, str]] = []
+    selected: list[list[int]] = []
+    cpu_inputs: list[Tensor] = []
+    prompt_lengths: list[int] = []
+
     for row, (key, tokens, mask) in enumerate(zip(keys, inputs, masks, strict=True)):
         if (not tokens.numel() or tokens.dtype == torch.bool or torch.is_floating_point(tokens)
                 or torch.is_complex(tokens) or bool((tokens < 0).any())):
@@ -294,14 +885,56 @@ def build_tree_execution_plans(
             if prompt_length > tokens.numel() or not torch.equal(tokens[:prompt_length].cpu(), prompt.cpu()):
                 raise ValueError(f"turn builder prompt is not an exact input prefix for row={row}")
         uid, _, _ = _parse_key(key)
-        node = groups.setdefault(uid, _TurnNode(0, row))
-        for signature, end in _turn_units(cpu_tokens.tolist(), prompt_length, turn_min_segment_tokens):
-            node = node.children.setdefault(signature, _TurnNode(end, row))
-            node.member_rows.append(row)
-        node.terminal_rows.append(row)
+        prompt_lengths.append(prompt_length)
+
+        if tree_policy == "token_lcp":
+            token_rows.append((row, cpu_tokens, uid))
+            continue
+
+        if role_probe is not None:
+            units = _role_units_bytes(cpu_tokens, prompt_length, turn_min_segment_tokens, role_probe)
+        elif tree_builder == "lcp_sort":
+            units = _turn_units_bytes(cpu_tokens, prompt_length, turn_min_segment_tokens)
+        else:
+            units = None
+        if tree_builder == "lcp_sort":
+            lcp_rows.setdefault(uid, []).append((row, units))
+        else:
+            node = groups.setdefault(uid, _TurnNode(0, row))
+            row_units = (
+                iter(units) if units is not None else
+                _turn_units(cpu_tokens.tolist(), prompt_length, turn_min_segment_tokens)
+            )
+            for signature, end in row_units:
+                node = node.children.setdefault(signature, _TurnNode(end, row))
+                node.member_rows.append(row)
+            node.terminal_rows.append(row)
+
+    group_entries: list[tuple[str, _TurnNode, tuple[str, ...], int | None]] = []
+    if tree_policy == "token_lcp":
+        clusters = _token_lcp_clusters(token_rows, prompt_lengths, min_shared_prefix_tokens)
+        for cluster_index, (cluster, cut_positions) in enumerate(clusters):
+            units_by_row = [
+                (row, _token_units_bytes(tokens, cut_positions))
+                for row, tokens, _uid in cluster
+            ]
+            root = (
+                _build_lcp_group(units_by_row)
+                if tree_builder == "lcp_sort"
+                else _build_unit_trie(units_by_row)
+            )
+            _enforce_min_shared_token_branches(root, min_shared_prefix_tokens)
+            member_uids = tuple(dict.fromkeys(uid for _row, _tokens, uid in cluster))
+            if len(root.children) != 1:
+                raise RuntimeError("token_lcp cluster does not have one common root prefix")
+            group_entries.append(("__minibatch__", root, member_uids, cluster_index))
+    else:
+        if tree_builder == "lcp_sort":
+            groups = {uid: _build_lcp_group(rows) for uid, rows in lcp_rows.items()}
+        group_entries = [(uid, root, (uid,), None) for uid, root in groups.items()]
 
     result = []
-    for uid, root in groups.items():
+    for uid, root, member_uids, cluster_index in group_entries:
         for tree_index, child in enumerate(root.children.values()):
             segments, paths = [], {}
             _compress(child, None, 0, cpu_inputs, segments, paths, ())
@@ -318,8 +951,599 @@ def build_tree_execution_plans(
                         segment_id, target - 1 - plan.get(segment_id).position_start,
                         int(cpu_inputs[row][target]), row, offset,
                     ))
-            result.append(TreeExecutionPlan(uid, tree_index, tuple(child.member_rows), plan, tuple(refs)))
+            result.append(TreeExecutionPlan(
+                uid,
+                cluster_index if cluster_index is not None else tree_index,
+                tuple(child.member_rows),
+                plan,
+                tuple(refs),
+                member_uids,
+            ))
     return ForestExecutionPlan(tuple(result), sum(map(len, selected)))
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionTreeUnit:
+    signature: bytes
+    start: int
+    end: int
+    token_ids: Tensor
+
+
+def _session_tree_tokens(value: Any, name: str) -> Tensor:
+    if not isinstance(value, Tensor):
+        try:
+            value = torch.as_tensor(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a one-dimensional integer sequence") from exc
+    if value.ndim != 1:
+        raise ValueError(f"{name} must be a one-dimensional tensor")
+    if (value.dtype == torch.bool or torch.is_floating_point(value)
+            or torch.is_complex(value) or bool((value < 0).any())):
+        raise ValueError(f"{name} must contain non-negative integer token IDs")
+    return value.detach().to(device="cpu", dtype=torch.long).clone()
+
+
+def _session_tree_mask(value: Any, name: str) -> Tensor:
+    if not isinstance(value, Tensor):
+        try:
+            value = torch.as_tensor(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{name} must be a one-dimensional 0/1 sequence") from exc
+    if value.ndim != 1:
+        raise ValueError(f"{name} must be a one-dimensional tensor")
+    result = value.detach().to(device="cpu")
+    if not bool(((result == 0) | (result == 1)).all()):
+        raise ValueError(f"{name} must contain only 0/1 values")
+    return result.to(torch.bool)
+
+
+def _session_tree_logprobs(value: Any, name: str, expected: int) -> Tensor | None:
+    if value is None:
+        return None
+    if isinstance(value, Tensor):
+        if value.ndim != 1 or torch.is_complex(value):
+            raise ValueError(f"{name} must be a one-dimensional numeric tensor")
+        if value.numel() != expected:
+            raise ValueError(f"{name} must align with its response token chunk")
+        return value.detach().to(device="cpu", dtype=torch.float32).clone()
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        values = list(value)
+        if len(values) != expected:
+            raise ValueError(f"{name} must align with its response token chunk")
+        if any(item is not None and not isinstance(item, (int, float)) for item in values):
+            raise ValueError(f"{name} must contain numbers or None")
+        if any(item is None for item in values):
+            return None
+        return torch.tensor(values, dtype=torch.float32)
+    raise TypeError(f"{name} must be a one-dimensional tensor, sequence, or None")
+
+
+def _validate_session_tree_scores(value: Any, name: str, expected: int) -> None:
+    if value is None:
+        return
+    if isinstance(value, Tensor):
+        if value.ndim != 1 or torch.is_complex(value):
+            raise ValueError(f"{name} must be a one-dimensional numeric tensor")
+        if value.numel() != expected:
+            raise ValueError(f"{name} must align with its Leaf response")
+        return
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        values = list(value)
+        if len(values) != expected or any(
+            not isinstance(item, (int, float)) for item in values
+        ):
+            raise ValueError(f"{name} must contain one numeric score per response token")
+        return
+    raise TypeError(f"{name} must be a one-dimensional tensor, sequence, or None")
+
+
+def _trim_token_chunks(chunks: list[Tensor], count: int) -> int:
+    """Trim count tokens from the right; return any count not present."""
+    remaining = count
+    while remaining and chunks:
+        tail = chunks[-1]
+        if tail.numel() <= remaining:
+            remaining -= tail.numel()
+            chunks.pop()
+        else:
+            chunks[-1] = tail[:-remaining]
+            remaining = 0
+    return remaining
+
+
+def _trim_response_chunks(
+    chunks: list[tuple[Tensor, Tensor, Tensor | None]], count: int
+) -> int:
+    """Trim response tokens and their leaf-independent node metadata together."""
+    remaining = count
+    while remaining and chunks:
+        tokens, mask, logprobs = chunks[-1]
+        if tokens.numel() <= remaining:
+            remaining -= tokens.numel()
+            chunks.pop()
+        else:
+            keep = tokens.numel() - remaining
+            chunks[-1] = (
+                tokens[:keep],
+                mask[:keep],
+                None if logprobs is None else logprobs[:keep],
+            )
+            remaining = 0
+    return remaining
+
+
+def _session_leaf_chunks(
+    tree: Mapping[str, Any], leaf: Mapping[str, Any]
+) -> tuple[list[Tensor], list[tuple[Tensor, Tensor, Tensor | None]], Tensor, Tensor, int]:
+    """Resolve one Leaf into prompt/response chunk references, without making a full row."""
+    kind = leaf.get("kind", "node_path")
+    if kind == "trajectory":
+        trajectory = leaf.get("trajectory")
+        if not isinstance(trajectory, Mapping):
+            raise ValueError("materialized trajectory Leaf must contain a trajectory mapping")
+        prompt = _session_tree_tokens(trajectory.get("prompt_ids"), "trajectory.prompt_ids")
+        response = _session_tree_tokens(trajectory.get("response_ids"), "trajectory.response_ids")
+        logprobs = _session_tree_logprobs(
+            trajectory.get("response_logprobs"),
+            "trajectory.response_logprobs",
+            response.numel(),
+        )
+        response_mask = _session_tree_mask(leaf.get("response_mask"), "leaf.response_mask")
+        loss_mask = _session_tree_mask(leaf.get("loss_mask", leaf["response_mask"]), "leaf.loss_mask")
+        if response_mask.numel() != response.numel() or loss_mask.numel() != response.numel():
+            raise ValueError("trajectory Leaf masks must align with response_ids")
+        if bool((loss_mask & ~response_mask).any()):
+            raise ValueError("Leaf loss_mask cannot select response_mask=0 tokens")
+        _validate_session_tree_scores(
+            leaf.get("rm_scores"), "leaf.rm_scores", response.numel()
+        )
+        response_chunk = (
+            response,
+            torch.ones_like(response, dtype=torch.bool),
+            logprobs,
+        )
+        return [prompt], [response_chunk], response_mask, loss_mask, prompt.numel()
+
+    if kind != "node_path":
+        raise ValueError(f"unsupported Session Tree Leaf kind: {kind!r}")
+    nodes = {node["node_id"]: node for node in tree["nodes"]}
+    path = []
+    visited = set()
+    current = leaf.get("leaf_node_id")
+    if not isinstance(current, int) or isinstance(current, bool) or current < 0:
+        raise ValueError("node_path Leaf leaf_node_id must be a non-negative integer")
+    while current is not None:
+        if current in visited:
+            raise ValueError("cycle detected in Session Tree Node path")
+        visited.add(current)
+        node = nodes.get(current)
+        if node is None:
+            raise ValueError(f"Leaf references missing node {current!r}")
+        path.append(node)
+        current = node.get("parent_id")
+    path.reverse()
+    if not path or path[0]["node_id"] != tree["root_node_id"]:
+        raise ValueError("Leaf path does not reach the declared Session Tree root")
+    chain_id = leaf.get("chain_id")
+    chain_start = next((i for i, node in enumerate(path) if node.get("chain_id") == chain_id), None)
+    if chain_start is None:
+        raise ValueError(f"Leaf chain_id={chain_id!r} is absent from its Node path")
+
+    prompt_chunks: list[Tensor] = [
+        _session_tree_tokens(path[0].get("prompt_ids"), "root.prompt_ids")
+    ]
+    response_chunks: list[tuple[Tensor, Tensor, Tensor | None]] = []
+    for index, node in enumerate(path):
+        removed = node.get("removed_prefix_token_count", 0)
+        if not isinstance(removed, int) or isinstance(removed, bool) or removed < 0:
+            raise ValueError("removed_prefix_token_count must be a non-negative integer")
+        trim_response = _trim_response_chunks(response_chunks, removed)
+        trim_prompt = _trim_token_chunks(prompt_chunks, trim_response)
+        if trim_prompt:
+            raise ValueError("removed_prefix_token_count exceeds the accumulated Leaf prefix")
+
+        if index:
+            prompt_delta = _session_tree_tokens(node.get("prompt_ids"), "node.prompt_ids")
+            if prompt_delta.numel():
+                response_chunks.append((
+                    prompt_delta,
+                    torch.zeros(prompt_delta.numel(), dtype=torch.bool),
+                    torch.zeros(prompt_delta.numel(), dtype=torch.float32),
+                ))
+
+        if index == chain_start:
+            prompt_chunks.extend(tokens for tokens, _, _ in response_chunks)
+            response_chunks.clear()
+
+        generated = _session_tree_tokens(node.get("response_ids"), "node.response_ids")
+        logprobs = _session_tree_logprobs(
+            node.get("response_logprobs"),
+            "node.response_logprobs",
+            generated.numel(),
+        )
+        if generated.numel():
+            response_chunks.append((
+                generated,
+                torch.ones(generated.numel(), dtype=torch.bool),
+                logprobs,
+            ))
+
+    response_mask = _session_tree_mask(leaf.get("response_mask"), "leaf.response_mask")
+    loss_mask = _session_tree_mask(leaf.get("loss_mask", leaf["response_mask"]), "leaf.loss_mask")
+    response_length = sum(tokens.numel() for tokens, _, _ in response_chunks)
+    if response_mask.numel() != response_length or loss_mask.numel() != response_length:
+        raise ValueError(
+            f"Leaf masks must align with reconstructed response chunks: "
+            f"response={response_length}, response_mask={response_mask.numel()}, "
+            f"loss_mask={loss_mask.numel()}"
+        )
+    if bool((loss_mask & ~response_mask).any()):
+        raise ValueError("Leaf loss_mask cannot select response_mask=0 tokens")
+    _validate_session_tree_scores(
+        leaf.get("rm_scores"), "leaf.rm_scores", response_length
+    )
+    prompt_length = sum(chunk.numel() for chunk in prompt_chunks)
+    return prompt_chunks, response_chunks, response_mask, loss_mask, prompt_length
+
+
+def _concat_chunk_range(chunks: list[Tensor], start: int, end: int) -> Tensor:
+    parts = []
+    offset = 0
+    for chunk in chunks:
+        chunk_end = offset + chunk.numel()
+        left, right = max(start, offset), min(end, chunk_end)
+        if left < right:
+            parts.append(chunk[left - offset:right - offset])
+        offset = chunk_end
+        if offset >= end:
+            break
+    if not parts:
+        raise ValueError(f"empty token range [{start}, {end})")
+    return parts[0].clone() if len(parts) == 1 else torch.cat(parts)
+
+
+def _session_tree_units(
+    chunks: list[Tensor], prompt_length: int, minimum: int
+) -> tuple[_SessionTreeUnit, ...]:
+    total = sum(chunk.numel() for chunk in chunks)
+    if total == 0:
+        raise ValueError("Session Tree Leaf resolves to an empty token sequence")
+    boundaries = set()
+    cursor = 0
+    for chunk in chunks:
+        ends = torch.nonzero(chunk == QWEN3_IM_END_TOKEN_ID, as_tuple=False).flatten().tolist()
+        boundaries.update(cursor + int(position) + 1 for position in ends)
+        cursor += chunk.numel()
+    if 0 < prompt_length < total:
+        boundaries.add(prompt_length)
+    boundaries.add(total)
+
+    result = []
+    previous = 0
+    for end in sorted(boundaries):
+        if end < total and end - previous < minimum:
+            continue
+        tokens = _concat_chunk_range(chunks, previous, end)
+        result.append(_SessionTreeUnit(
+            tokens.contiguous().numpy().tobytes(), previous, end, tokens
+        ))
+        previous = end
+    return tuple(result)
+
+
+def _token_session_units(
+    tokens: Tensor, cut_positions: set[int]
+) -> tuple[_SessionTreeUnit, ...]:
+    boundaries = sorted(
+        {position for position in cut_positions if 0 < position < tokens.numel()}
+        | {tokens.numel()}
+    )
+    previous = 0
+    units = []
+    for end in boundaries:
+        part = tokens[previous:end].clone()
+        units.append(_SessionTreeUnit(
+            part.contiguous().numpy().tobytes(), previous, end, part
+        ))
+        previous = end
+    return tuple(units)
+
+
+def _compress_session_tree_units(
+    node: _TurnNode,
+    parent_id: SegmentId | None,
+    start: int,
+    units_by_row: list[tuple[_SessionTreeUnit, ...]],
+    segments: list[SegmentSpec],
+    paths: dict[int, tuple[int, ...]],
+    path: tuple[int, ...],
+) -> None:
+    pending = [(node, parent_id, start, path)]
+    while pending:
+        node, parent_id, start, path = pending.pop()
+        while not node.terminal_rows and len(node.children) == 1:
+            node = next(iter(node.children.values()))
+        source_units = units_by_row[node.source_row]
+        token_parts = [
+            unit.token_ids for unit in source_units
+            if unit.start >= start and unit.end <= node.end
+        ]
+        if not token_parts:
+            raise RuntimeError("Session Tree compression produced an empty Segment")
+        token_ids = token_parts[0] if len(token_parts) == 1 else torch.cat(token_parts)
+        segment_id = len(segments)
+        segments.append(SegmentSpec(segment_id, parent_id, token_ids, start, start))
+        path = (*path, segment_id)
+        paths.update((row, path) for row in node.terminal_rows)
+        pending.extend(
+            (child, segment_id, node.end, path)
+            for child in reversed(node.children.values())
+        )
+
+
+def _session_unit_token_at(units: tuple[_SessionTreeUnit, ...], position: int) -> int:
+    for unit in units:
+        if unit.start <= position < unit.end:
+            return int(unit.token_ids[position - unit.start])
+    raise IndexError(f"token position {position} is outside Session Tree Leaf units")
+
+
+def build_tree_execution_plans_from_session_trees(
+    session_trees: Sequence[Mapping[str, Any]],
+    *,
+    require_loss_mask_alignment: bool = False,
+    tree_policy: str = "token_lcp",
+    turn_min_segment_tokens: int = 128,
+    tree_builder: str = "lcp_sort",
+    min_shared_prefix_tokens: int = 1024,
+) -> ForestExecutionPlan:
+    """Build a minibatch Forest directly from independent Session Tree payloads.
+
+    token_lcp clusters exact Token-ID prefixes across all Sessions/UIDs in
+    this supplied minibatch and retains logical UIDs in member_uids. Since only
+    the supplied minibatch is visible here, sharing cannot cross DP/minibatch
+    scope. Legacy qwen_turn remains available only when explicitly requested.
+    """
+    if not session_trees:
+        raise ValueError("cannot build a Forest from an empty Session Tree batch")
+    if tree_policy not in ("qwen_turn", "token_lcp"):
+        raise ValueError(f"unsupported Session Tree policy: {tree_policy!r}")
+    if tree_builder not in ("trie", "lcp_sort"):
+        raise ValueError(f"unknown TPR tree_builder: {tree_builder!r}")
+    if (not isinstance(turn_min_segment_tokens, int) or isinstance(turn_min_segment_tokens, bool)
+            or turn_min_segment_tokens < 1):
+        raise ValueError("turn_min_segment_tokens must be a positive integer")
+    if (not isinstance(min_shared_prefix_tokens, int)
+            or isinstance(min_shared_prefix_tokens, bool)
+            or min_shared_prefix_tokens < 1):
+        raise ValueError("min_shared_prefix_tokens must be a positive integer")
+
+    seen_trees, seen_sessions = set(), set()
+    grouped_rows: dict[str, list[tuple[int, tuple[_SessionTreeUnit, ...], int, list[int]]]] = {}
+    units_by_row: list[tuple[_SessionTreeUnit, ...]] = []
+    selected_by_row: list[list[int]] = []
+    prompt_lengths: list[int] = []
+    token_rows: list[tuple[int, Tensor, str]] = []
+    row_index = 0
+
+    for tree in session_trees:
+        if not isinstance(tree, Mapping):
+            raise TypeError("each NonTensorStack element must be a Session Tree mapping")
+        tree_id, uid, session_id = tree.get("tree_id"), tree.get("uid"), tree.get("session_id")
+        if not all(isinstance(value, str) and value for value in (tree_id, uid, session_id)):
+            raise ValueError("each Session Tree needs non-empty tree_id, uid and session_id")
+        if tree.get("schema_version") != SESSION_TREE_SCHEMA_VERSION:
+            raise ValueError(
+                f"unsupported Session Tree schema_version: {tree.get('schema_version')!r}"
+            )
+        if tree_id in seen_trees or (uid, session_id) in seen_sessions:
+            raise ValueError("NonTensorStack must contain one unique tree per Session")
+        seen_trees.add(tree_id)
+        seen_sessions.add((uid, session_id))
+
+        nodes = tree.get("nodes")
+        leaves = tree.get("leaves")
+        if (
+            not isinstance(nodes, Sequence)
+            or isinstance(nodes, (str, bytes))
+            or not nodes
+            or not isinstance(leaves, Sequence)
+            or isinstance(leaves, (str, bytes))
+            or not leaves
+        ):
+            raise ValueError("each Session Tree must contain Nodes and Leaves")
+        node_by_id = {}
+        for node in nodes:
+            if not isinstance(node, Mapping):
+                raise TypeError("Session Tree Nodes must be mappings")
+            node_id = node.get("node_id")
+            if (
+                not isinstance(node_id, int)
+                or isinstance(node_id, bool)
+                or node_id < 0
+                or node_id in node_by_id
+            ):
+                raise ValueError("Session Tree Node IDs must be unique non-negative integers")
+            chain_id = node.get("chain_id")
+            if not isinstance(chain_id, int) or isinstance(chain_id, bool) or chain_id < 0:
+                raise ValueError("Session Tree Node chain_id must be a non-negative integer")
+            _session_tree_tokens(node.get("prompt_ids"), "node.prompt_ids")
+            response_ids = _session_tree_tokens(node.get("response_ids"), "node.response_ids")
+            _session_tree_logprobs(
+                node.get("response_logprobs"),
+                "node.response_logprobs",
+                response_ids.numel(),
+            )
+            removed = node.get("removed_prefix_token_count", 0)
+            if not isinstance(removed, int) or isinstance(removed, bool) or removed < 0:
+                raise ValueError("removed_prefix_token_count must be a non-negative integer")
+            node_by_id[node_id] = node
+        root_id = tree.get("root_node_id")
+        if not isinstance(root_id, int) or isinstance(root_id, bool) or root_id < 0:
+            raise ValueError("root_node_id must be a non-negative integer")
+        roots = [node_id for node_id, node in node_by_id.items() if node.get("parent_id") is None]
+        if roots != [root_id]:
+            raise ValueError("each Session Tree must have exactly its declared root")
+        children_by_parent = {node_id: [] for node_id in node_by_id}
+        for node_id, node in node_by_id.items():
+            parent_id = node.get("parent_id")
+            if parent_id is not None:
+                if (
+                    not isinstance(parent_id, int)
+                    or isinstance(parent_id, bool)
+                    or parent_id < 0
+                ):
+                    raise ValueError(f"Session Tree Node {node_id} has an invalid parent_id")
+                if parent_id not in node_by_id:
+                    raise ValueError(f"Session Tree Node {node_id} references missing parent {parent_id}")
+                children_by_parent[parent_id].append(node_id)
+        visited_nodes = set()
+        pending_nodes = [root_id]
+        while pending_nodes:
+            node_id = pending_nodes.pop()
+            if node_id in visited_nodes:
+                raise ValueError("cycle or duplicate child in Session Tree topology")
+            visited_nodes.add(node_id)
+            pending_nodes.extend(children_by_parent[node_id])
+        if visited_nodes != set(node_by_id):
+            raise ValueError("Session Tree contains unreachable Nodes")
+
+        leaf_ids = set()
+        for leaf in leaves:
+            if not isinstance(leaf, Mapping):
+                raise TypeError("Session Tree Leaves must be mappings")
+            leaf_id = leaf.get("leaf_id")
+            if not isinstance(leaf_id, str) or not leaf_id or leaf_id in leaf_ids:
+                raise ValueError("Session Tree Leaf IDs must be unique non-empty strings")
+            leaf_ids.add(leaf_id)
+            leaf_index = leaf.get("leaf_index")
+            if not isinstance(leaf_index, int) or isinstance(leaf_index, bool) or leaf_index < 0:
+                raise ValueError("Session Tree Leaf leaf_index must be a non-negative integer")
+            chain_id = leaf.get("chain_id")
+            if not isinstance(chain_id, int) or isinstance(chain_id, bool) or chain_id < 0:
+                raise ValueError("Session Tree Leaf chain_id must be a non-negative integer")
+            prompt_chunks, response_chunks, response_mask, loss_mask, prompt_length = (
+                _session_leaf_chunks(tree, leaf)
+            )
+            if require_loss_mask_alignment and not torch.equal(response_mask, loss_mask):
+                raise ValueError("Leaf response_mask and loss_mask disagree")
+            chunks = [chunk for chunk in prompt_chunks if chunk.numel()]
+            chunks.extend(tokens for tokens, _, _ in response_chunks if tokens.numel())
+            total_length = sum(chunk.numel() for chunk in chunks)
+            if (
+                prompt_length > total_length
+                or total_length - prompt_length != response_mask.numel()
+            ):
+                raise ValueError("Leaf prompt/response boundary does not align with its response_mask")
+            selected = torch.nonzero(response_mask, as_tuple=False).flatten().tolist()
+            if selected and prompt_length + selected[0] == 0:
+                raise ValueError("Leaf has no preceding query token for its first supervised token")
+            if tree_policy == "token_lcp":
+                full_tokens = _concat_chunk_range(chunks, 0, total_length)
+                token_rows.append((row_index, full_tokens, uid))
+                units: tuple[_SessionTreeUnit, ...] = ()
+            else:
+                units = _session_tree_units(chunks, prompt_length, turn_min_segment_tokens)
+                grouped_rows.setdefault(uid, []).append(
+                    (row_index, units, prompt_length, selected)
+                )
+            units_by_row.append(units)
+            selected_by_row.append(selected)
+            prompt_lengths.append(prompt_length)
+            row_index += 1
+
+    group_entries: list[tuple[str, _TurnNode, tuple[str, ...], int | None]] = []
+    if tree_policy == "token_lcp":
+        for cluster_index, (cluster, cut_positions) in enumerate(
+            _token_lcp_clusters(token_rows, prompt_lengths, min_shared_prefix_tokens)
+        ):
+            for row, tokens, _uid in cluster:
+                units_by_row[row] = _token_session_units(tokens, cut_positions)
+            unit_rows = [
+                (row, tuple((unit.signature, unit.end) for unit in units_by_row[row]))
+                for row, _tokens, _uid in cluster
+            ]
+            root = (
+                _build_lcp_group(unit_rows)
+                if tree_builder == "lcp_sort"
+                else _build_unit_trie(unit_rows)
+            )
+            _enforce_min_shared_token_branches(root, min_shared_prefix_tokens)
+            member_uids = tuple(dict.fromkeys(uid for _row, _tokens, uid in cluster))
+            if len(root.children) != 1:
+                raise RuntimeError("token_lcp Session cluster does not have one common root prefix")
+            group_entries.append(("__minibatch__", root, member_uids, cluster_index))
+    else:
+        for uid, rows in grouped_rows.items():
+            if tree_builder == "lcp_sort":
+                root = _build_lcp_group([
+                    (row, tuple((unit.signature, unit.end) for unit in units))
+                    for row, units, _, _ in rows
+                ])
+            else:
+                root = _TurnNode(0, rows[0][0])
+                for row, units, _, _ in rows:
+                    node = root
+                    for unit in units:
+                        node = node.children.setdefault(
+                            unit.signature, _TurnNode(unit.end, row)
+                        )
+                        node.member_rows.append(row)
+                    node.terminal_rows.append(row)
+            group_entries.append((uid, root, (uid,), None))
+
+    result = []
+    for uid, root, member_uids, cluster_index in group_entries:
+        for tree_index, child in enumerate(root.children.values()):
+            segments, paths = [], {}
+            _compress_session_tree_units(
+                child, None, 0, units_by_row, segments, paths, ()
+            )
+            plan = SegmentPlan(segments, root_id=0)
+            refs = []
+            for row in child.member_rows:
+                path = paths[row]
+                ends = [plan.get(segment_id).position_end for segment_id in path]
+                for offset in selected_by_row[row]:
+                    target = prompt_lengths[row] + offset
+                    segment_id = path[bisect_right(ends, target - 1)]
+                    refs.append(SegmentObjectiveRef(
+                        segment_id,
+                        target - 1 - plan.get(segment_id).position_start,
+                        _session_unit_token_at(units_by_row[row], target),
+                        row,
+                        offset,
+                    ))
+            result.append(TreeExecutionPlan(
+                uid,
+                cluster_index if cluster_index is not None else tree_index,
+                tuple(child.member_rows),
+                plan,
+                tuple(refs),
+                member_uids,
+            ))
+
+    return ForestExecutionPlan(tuple(result), sum(map(len, selected_by_row)))
+
+
+def build_tree_execution_plans_from_tree_fields(
+    fields: Any,
+    *,
+    tree_field: str = "trajectory_tree",
+    **kwargs: Any,
+) -> ForestExecutionPlan:
+    """Consume the proposed TQ TensorDict / NonTensorStack field directly."""
+    getter = getattr(fields, "get", None)
+    if not callable(getter):
+        raise TypeError("TQ tree fields must be a TensorDict-like mapping")
+    stacked = getter(tree_field)
+    if stacked is None or not callable(getattr(stacked, "tolist", None)):
+        raise TypeError(f"TQ fields must contain NonTensorStack at {tree_field!r}")
+    session_trees = stacked.tolist()
+    if not isinstance(session_trees, list):
+        raise TypeError("trajectory_tree NonTensorStack.tolist() must return a list")
+    return build_tree_execution_plans_from_session_trees(session_trees, **kwargs)
 
 
 def _write_record(hasher, record) -> None:
@@ -335,16 +1559,18 @@ def _write_plan(hasher, plan: SegmentPlan) -> None:
 
 
 def digest_segment_plan(plan: SegmentPlan) -> str:
-    hasher = hashlib.sha256(b"TPR-PPO-turn-v2")
+    hasher = hashlib.sha256(b"TPR-PPO-tree-v3")
     _write_plan(hasher, plan)
     return hasher.hexdigest()
 
 
 def digest_forest_plan(forest: ForestExecutionPlan) -> str:
-    hasher = hashlib.sha256(b"TPR-PPO-turn-v2")
+    hasher = hashlib.sha256(b"TPR-PPO-tree-v3")
     _write_record(hasher, forest.logical_loss_tokens)
     for tree in forest.trees:
-        _write_record(hasher, (tree.uid, tree.tree_index, tree.member_rows))
+        _write_record(hasher, (
+            tree.uid, tree.tree_index, tree.member_rows, tree.member_uids or (tree.uid,)
+        ))
         _write_plan(hasher, tree.segment_plan)
         for ref in tree.objective_refs:
             _write_record(hasher, (ref.segment_id, ref.query_offset, ref.target_token_id,

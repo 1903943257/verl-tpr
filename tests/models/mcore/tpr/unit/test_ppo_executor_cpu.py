@@ -70,6 +70,7 @@ def test_branch_replay_matches_full_rows(loss_scale, mask_branch_tokens, freeze_
     forest = build_tree_execution_plans(
         tuple(f"sample_tpr_{row}" for row in range(len(batch["input_ids"]))),
         batch,
+        tree_policy="qwen_turn",
         turn_min_segment_tokens=1,
     )
     denominator = forest.logical_loss_tokens
@@ -132,7 +133,8 @@ def test_branch_replay_matches_full_rows(loss_scale, mask_branch_tokens, freeze_
 def test_failed_replay_restores_context_and_cannot_resume():
     model = _PrefixModel()
     forest = build_tree_execution_plans(
-        tuple(f"sample_tpr_{row}" for row in range(5)), _batch(), turn_min_segment_tokens=1,
+        tuple(f"sample_tpr_{row}" for row in range(5)), _batch(),
+        tree_policy="qwen_turn", turn_min_segment_tokens=1,
     )
     tree = forest.trees[0]
 
@@ -207,7 +209,8 @@ def test_push_caches_compact_detached_kv_in_state(monkeypatch):
 
 def _executor(model, *, owns_loss=True):
     forest = build_tree_execution_plans(
-        tuple(f"sample_tpr_{row}" for row in range(5)), _batch(), turn_min_segment_tokens=1,
+        tuple(f"sample_tpr_{row}" for row in range(5)), _batch(),
+        tree_policy="qwen_turn", turn_min_segment_tokens=1,
     )
     tree = forest.trees[0]
     return SegmentExecutor(
@@ -290,7 +293,10 @@ def test_global_zero_objective_branches_are_pruned_with_identical_gradients(pare
         "input_ids": [torch.tensor([1, 151645, 2, 151645]), torch.tensor([1, 151645, 3, 151645])],
         "response_mask": [torch.tensor([parent_owns_query, not parent_owns_query]), torch.tensor([False, False])],
     }
-    tree = build_tree_execution_plans(["u_s_0", "u_s_1"], batch, turn_min_segment_tokens=1).trees[0]
+    tree = build_tree_execution_plans(
+        ["u_s_0", "u_s_1"], batch,
+        tree_policy="qwen_turn", turn_min_segment_tokens=1,
+    ).trees[0]
     refs = {key: tree.refs_for_segment(key) for key in tree.segment_plan.segments}
 
     def objective(segment, logits):
@@ -408,7 +414,7 @@ def test_tp_sp_odd_segment_is_rejected_before_any_forward():
     odd = SegmentPlan([SegmentSpec(0, None, torch.tensor([1, 2, 3]), 0, 0)], root_id=0)
     with pytest.raises(ValueError, match="must be divisible by TP=2"):
         validate_replay_plan(odd, prepared, cp_size=1)
-    with pytest.raises(ValueError, match="native GEMM shapes are not padded"):
+    with pytest.raises(ValueError, match="must be divisible by TP=2"):
         SegmentExecutor(model, odd, prepared_model=prepared, segment_loss_fn=executor.segment_loss_fn,
                         segment_loss_term_counts={0: 1})
     # CP validation is separately owned by the native Ring shard contract.
@@ -429,7 +435,7 @@ def test_tp_sp_preflight_ignores_only_globally_pruned_odd_segments():
     validate_replay_plan(plan, prepared, active_segment_ids=frozenset({0}))
     validate_replay_plan(plan, prepared, active_segment_ids=frozenset())
     for active in (None, frozenset({0, 1})):
-        with pytest.raises(ValueError, match="segment 1 length=1"):
+        with pytest.raises(ValueError, match="logical_length=1 CP-local physical_length=1"):
             validate_replay_plan(plan, prepared, active_segment_ids=active)
     executor = SegmentExecutor(model, plan, prepared_model=prepared, active_segment_ids=frozenset({0}),
                                segment_loss_fn=lambda segment, logits: (logits.square().sum(), {}),

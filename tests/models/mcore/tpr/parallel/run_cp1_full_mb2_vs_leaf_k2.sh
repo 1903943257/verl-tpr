@@ -42,8 +42,9 @@ fi
 [[ -f "$TPR_CP1_CAPTURE" ]] || { echo "Missing capture $TPR_CP1_CAPTURE" >&2; exit 2; }
 [[ -d "$TPR_QWEN_4B_PATH" ]] || { echo "Missing Qwen3-4B weights: $TPR_QWEN_4B_PATH" >&2; exit 2; }
 export TPR_RUN_CP1_SHORT_ACTOR=1
-export TPR_TREE_POLICY=qwen_turn
-export TPR_TURN_MIN_SEGMENT_TOKENS=128
+export TPR_TREE_POLICY=token_lcp
+export TPR_TREE_BUILDER=lcp_sort
+export TPR_MIN_SHARED_PREFIX_TOKENS=1024
 export TPR_PPO_LOGPROB_CHUNK_TOKENS=256
 export TPR_ROOT_NATIVE_RING=0
 export TPR_RING_COALESCE_PREFIX_FULL=0

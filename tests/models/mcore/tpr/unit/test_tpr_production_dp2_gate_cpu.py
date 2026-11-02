@@ -28,26 +28,22 @@ def test_production_dp2_tp2_cp2_requires_no_offline_test_flags(monkeypatch):
     assert _gate()(_sizes(), ppo=True) == 2
 
 
-@pytest.mark.parametrize("sizes", [
-    _sizes(cp=4), _sizes(tp=1, cp=4), _sizes(dp=3),
-    _sizes(pp=2), _sizes(ep=2), _sizes(tp=4), _sizes(cp=1),
-])
-def test_unvalidated_dp_topologies_still_fail_closed(sizes, monkeypatch):
-    monkeypatch.delenv("TPR_EXPERIMENTAL_OFFLINE_DP2", raising=False)
+@pytest.mark.parametrize("sizes", [_sizes(pp=2), _sizes(ep=2)])
+def test_pipeline_and_expert_parallelism_remain_unsupported(sizes):
     with pytest.raises(NotImplementedError):
         _gate()(sizes, ppo=True)
 
 
-def test_non_ppo_dp2_is_still_gated():
-    with pytest.raises(NotImplementedError):
-        _gate()(_sizes(), ppo=False)
+def test_positive_tp_cp_dp_layouts_are_delegated_to_megatron():
+    for sizes in (
+        _sizes(cp=4), _sizes(tp=1, cp=4), _sizes(dp=3),
+        _sizes(tp=4), _sizes(cp=1),
+    ):
+        assert _gate()(sizes, ppo=True) == sizes["TP"]
 
 
-def test_dp1_supported_topologies_unchanged():
-    for cp in (1, 2, 4):
-        assert _gate()(_sizes(dp=1, cp=cp), ppo=True) == 2
-    assert _gate()(_sizes(tp=1, cp=2, dp=1), ppo=True) == 1
-
+def test_non_ppo_dp2_is_not_rejected_by_a_stale_topology_allowlist():
+    assert _gate()(_sizes(), ppo=False) == 2
 
 def _mindspeed_cli_sanitizer():
     """Import only the pure stdlib function, not NPU-gated test dependencies."""
