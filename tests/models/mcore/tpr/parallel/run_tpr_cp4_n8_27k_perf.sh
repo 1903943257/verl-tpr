@@ -77,8 +77,9 @@ export TPR_QWEN_4B_PATH="${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}
 [[ -d "$TPR_QWEN_4B_PATH" ]] || { echo "Missing Qwen3-4B checkpoint" >&2; exit 2; }
 export HCCL_DETERMINISTIC=true
 export TPR_OFFLINE_GRAD_SYNC_DTYPE=bf16
-export TPR_TREE_POLICY=qwen_turn
-export TPR_TURN_MIN_SEGMENT_TOKENS=128
+export TPR_TREE_POLICY=token_lcp
+export TPR_TREE_BUILDER=lcp_sort
+export TPR_MIN_SHARED_PREFIX_TOKENS=1024
 export TPR_BENCH_CONTROLLED_N8_AUDIT="$AUDIT"
 export TPR_BENCH_SOURCE_STEP=0
 export TPR_BENCH_OUTPUT_DIR="$RESULTS"

@@ -35,7 +35,9 @@ if [ "$OVERALL" -eq 0 ]; then
     export TPR_CP1_N8_CAPTURE="$CAPTURE"
     export TPR_QWEN_4B_PATH="$CKPT"
     export TPR_RUN_CP1_N8_FAIR=1
-    export TPR_TREE_POLICY=qwen_turn
+    export TPR_TREE_POLICY=token_lcp
+    export TPR_TREE_BUILDER=lcp_sort
+    export TPR_MIN_SHARED_PREFIX_TOKENS=1024
     export TPR_CP1_N8_WARMUPS="${TPR_CP1_N8_WARMUPS:-1}"
     export TPR_CP1_N8_REPEATS="${TPR_CP1_N8_REPEATS:-3}"
     export TPR_CP1_N8_STAGE_PROFILE=0

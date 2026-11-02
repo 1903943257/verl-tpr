@@ -339,12 +339,11 @@ def run_tpr_forward_backward_batch(
         if detailed_profile:
             stage_ms[name] = stage_ms.get(name, 0.0) + (time.perf_counter() - start) * 1000
 
-    # token_lcp is the model-agnostic minibatch-scope path; keep the legacy
-    # default until Full-vs-TPR numerical and NPU performance gates pass.
-    tree_policy = os.getenv("TPR_TREE_POLICY", "qwen_turn")
-    # Experimental alternative for A/B benchmarking; keep the insertion Trie
-    # as the default until CPU-scale and end-to-end parity/performance are proven.
-    tree_builder = os.getenv("TPR_TREE_BUILDER", "trie")
+    # Token-LCP is the model-agnostic production builder. Sharing is scoped
+    # to this local Actor minibatch (therefore one DP replica and one minibatch).
+    # Legacy policies/builders remain explicit opt-ins for temporary rollback.
+    tree_policy = os.getenv("TPR_TREE_POLICY", "token_lcp")
+    tree_builder = os.getenv("TPR_TREE_BUILDER", "lcp_sort")
     try:
         turn_min_tokens = int(os.getenv("TPR_TURN_MIN_SEGMENT_TOKENS", "128"))
         min_shared_prefix_tokens = int(os.getenv("TPR_MIN_SHARED_PREFIX_TOKENS", "1024"))

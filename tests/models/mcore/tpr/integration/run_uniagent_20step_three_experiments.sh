@@ -137,13 +137,14 @@ export TPR_OFFLINE_OUTPUT_DIR="$RUN_ROOT/offline"
 export TPR_OFFLINE_SAVE_FULL_GRADS=0
 unset TPR_OFFLINE_FULL_GRAD_STEPS || true
 export TPR_EXEC_PROFILE=1
-export TPR_TURN_MIN_SEGMENT_TOKENS=128
 unset TPR_MEM_TRACE || true
 
 # ================================================================
 # E2: OFFLINE FULL 20-step correctness/reference and segment perf.
 # ================================================================
-export TPR_TREE_POLICY=qwen_turn  # Full's keys intentionally never share
+export TPR_TREE_POLICY=token_lcp
+export TPR_TREE_BUILDER=lcp_sort
+export TPR_MIN_SHARED_PREFIX_TOKENS=1024 # Full mode does not invoke the TPR builder
 export TPR_OFFLINE_RUN_MODES=full
 echo "TPR_NIGHTLY_E2_START offline_full_ring_20_distinct_captures"
 full_exit=0
@@ -155,7 +156,9 @@ echo "TPR_NIGHTLY_E2_EXIT=$full_exit"
 # E3: OFFLINE SHARED TURN TPR 20-step correctness and segment perf.
 # Independent of E2 result. Full OOM must NOT skip TPR.
 # ================================================================
-export TPR_TREE_POLICY=qwen_turn
+export TPR_TREE_POLICY=token_lcp
+export TPR_TREE_BUILDER=lcp_sort
+export TPR_MIN_SHARED_PREFIX_TOKENS=1024
 export TPR_OFFLINE_RUN_MODES=tpr
 echo "TPR_NIGHTLY_E3_START offline_turn_tpr_20_distinct_captures"
 tpr_exit=0

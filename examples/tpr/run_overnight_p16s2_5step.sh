@@ -57,7 +57,9 @@ export GATEWAY_COUNT=1
 export NUM_AGENT_WORKERS=1
 export SESSION_HARD_CAP=True
 export TRAJECTORY_SELECTION=all
-export TPR_TREE_POLICY=qwen_turn
+export TPR_TREE_POLICY=token_lcp
+export TPR_TREE_BUILDER=lcp_sort
+export TPR_MIN_SHARED_PREFIX_TOKENS=1024
 export TPR_E2E_EXTERNAL_LOG=1
 
 {

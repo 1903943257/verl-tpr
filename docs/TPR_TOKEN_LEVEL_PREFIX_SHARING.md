@@ -1,4 +1,4 @@
-# Token-Level Prefix Sharing (Phase 1)
+# Token-Level Prefix Sharing
 
 ## Goal
 
@@ -27,7 +27,7 @@ A cluster therefore shares a prefix only when every member has an exact common p
 
 ## Configuration
 
-Opt in for a controlled comparison:
+Production defaults:
 
 ```bash
 export TPR_TREE_POLICY=token_lcp
@@ -35,7 +35,10 @@ export TPR_MIN_SHARED_PREFIX_TOKENS=1024
 export TPR_TREE_BUILDER=lcp_sort
 ```
 
-TPR_TREE_POLICY=qwen_turn remains the existing default until NPU correctness and performance validation is complete. role_probe remains an experimental diagnostic path, not a prerequisite for Token-Level sharing.
+The Actor adapter now selects Token-LCP and the LCP-sorted builder by default.
+The legacy `qwen_turn` policy and diagnostic `role_probe` remain available
+only as explicit temporary compatibility/rollback paths; they are not the
+production construction strategy.
 
 ## Correctness requirements
 
@@ -43,7 +46,7 @@ Token-Level boundaries may occur inside a serialized message. This is intentiona
 
 CPU tests cover cross-UID sharing in one minibatch; no sharing below the minimum prefix threshold; exact-threshold and duplicate-row behavior; arbitrary divergence positions inside the prompt without Qwen marker IDs; Trie/LCP plan agreement; direct Session Tree consumption and equivalence to the flattened-row oracle.
 
-CPU topology tests do not replace Full-vs-TPR forward/backward parity or NPU validation. Do not switch the production default until those gates pass.
+CPU topology tests do not replace Full-vs-TPR forward/backward parity or NPU validation. Token-LCP is now the selected production construction policy, but this change does not by itself certify full training correctness or performance; retain the existing NPU correctness and parity gates before declaring the rollout complete.
 
 ## Phase 2: explicit message metadata
 

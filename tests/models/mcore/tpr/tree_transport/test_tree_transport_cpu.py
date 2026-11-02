@@ -74,7 +74,8 @@ def _flat_reference_plan(trees):
         keys,
         batch,
         require_loss_mask_alignment=True,
-        turn_min_segment_tokens=1,
+        tree_policy="token_lcp",
+        min_shared_prefix_tokens=1,
         tree_builder="lcp_sort",
     )
     return rows, batch, plan
@@ -85,13 +86,15 @@ def _assert_direct_plan_matches_flat_reference(trees, fields=None):
     direct = build_tree_execution_plans_from_tree_fields(
         fields,
         require_loss_mask_alignment=True,
-        turn_min_segment_tokens=1,
+        tree_policy="token_lcp",
+        min_shared_prefix_tokens=1,
         tree_builder="lcp_sort",
     )
     direct_trie = build_tree_execution_plans_from_tree_fields(
         fields,
         require_loss_mask_alignment=True,
-        turn_min_segment_tokens=1,
+        tree_policy="token_lcp",
+        min_shared_prefix_tokens=1,
         tree_builder="trie",
     )
     rows, batch, reference = _flat_reference_plan(trees)
@@ -357,9 +360,7 @@ def test_token_lcp_session_tree_shares_across_uids_and_matches_flat_oracle():
     direct = build_tree_execution_plans_from_tree_fields(
         fields,
         require_loss_mask_alignment=True,
-        tree_policy="token_lcp",
         min_shared_prefix_tokens=6,
-        tree_builder="lcp_sort",
     )
     direct_trie = build_tree_execution_plans_from_tree_fields(
         fields,

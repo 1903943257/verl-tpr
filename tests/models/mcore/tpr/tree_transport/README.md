@@ -38,12 +38,18 @@ from verl.workers.engine.megatron.tpr.tree import (
 forest = build_tree_execution_plans_from_tree_fields(
     fields,
     require_loss_mask_alignment=True,
-    tree_policy="qwen_turn",
+    tree_policy="token_lcp",
+    min_shared_prefix_tokens=1024,
     tree_builder="lcp_sort",
 )
 ```
 
-The direct builder walks each Leaf's Node path as token chunks. It does not
+The default direct builder uses Token-LCP to compare exact serialized Token-ID
+sequences across all Session Trees in the supplied Actor minibatch. It does
+not inspect model-specific message boundaries or tokenizer metadata.
+
+The direct builder walks each Leaf's Node path as token chunks and merges
+exact common Token-ID prefixes across the supplied Actor minibatch. It does not
 materialize complete `prompts`, `responses`, or `input_ids` rows before
 building the cross-Session topology. It preserves per-Leaf response/loss mask
 ownership and maps selected response tokens to `SegmentObjectiveRef` objects.

@@ -6,10 +6,10 @@ cd "$(dirname "$0")/../../../../.."
 export TPR_RUN_REAL_ACTOR_TP2CP4=1
 export TPR_REAL_ACTOR_MINIBATCH="${TPR_REAL_ACTOR_MINIBATCH:-/workspace/tpr_actor_capture_4b_n8_run1/actor_update_rank0_batch0.pt}"
 export TPR_QWEN_4B_PATH="${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}"
-# Production TPR no longer accepts the historical exact-tree policy.
-# Force the only supported policy for this experiment even if a previous
-# shell exported TPR_TREE_POLICY=exact.
-export TPR_TREE_POLICY=qwen_turn
+# Use model-agnostic Token-LCP construction for this offline replay.
+export TPR_TREE_POLICY=token_lcp
+export TPR_TREE_BUILDER=lcp_sort
+export TPR_MIN_SHARED_PREFIX_TOKENS=1024
 export TPR_RECOMPUTE_LOG_DIR="${TPR_RECOMPUTE_LOG_DIR:-/workspace/tpr_log/recompute}"
 mkdir -p "$TPR_RECOMPUTE_LOG_DIR"
 export TPR_OFFLINE_RECOMPUTE="${TPR_OFFLINE_RECOMPUTE:-0}"

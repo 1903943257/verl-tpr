@@ -1,5 +1,5 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
-"""Turn-boundary token sharing and native PPO query ownership.
+"""Token-level prefix sharing and native PPO query ownership.
 
 The compressed SegmentPlan is the only persistent physical topology. Temporary
 Turn trie nodes are discarded after assigning each logical response token to
@@ -562,11 +562,11 @@ def _unit_lcp(left: tuple[tuple[bytes, int], ...], right: tuple[tuple[bytes, int
 
 
 def _build_lcp_group(rows: list[tuple[int, tuple[tuple[bytes, int], ...]]]) -> _TurnNode:
-    """Build a Turn trie from sorted rows and adjacent LCPs.
+    """Build a compressed unit trie from sorted rows and adjacent LCPs.
 
-    This is deliberately unit-agnostic: the current caller supplies qwen_turn
-    spans, while a future message-role extractor can supply message spans
-    without changing the sorting/LCP construction.
+    The builder is deliberately unit-agnostic: callers provide exact byte
+    signatures and their token endpoints, so the same implementation serves
+    Token-LCP units and the retained legacy comparison path.
     """
     if not rows:
         raise ValueError("LCP tree group must contain at least one trajectory")
@@ -799,8 +799,8 @@ def _enforce_min_shared_token_branches(root: _TurnNode, minimum: int) -> None:
 def build_tree_execution_plans(
     keys: list[str] | tuple[str, ...], batch: Any, *,
     require_loss_mask_alignment: bool = False,
-    tree_policy: str = "qwen_turn", turn_min_segment_tokens: int = 128,
-    tree_builder: str = "trie",
+    tree_policy: str = "token_lcp", turn_min_segment_tokens: int = 128,
+    tree_builder: str = "lcp_sort",
     min_shared_prefix_tokens: int = 1024,
 ) -> ForestExecutionPlan:
     """Build a Forest while retaining one PPO ObjectiveRef per supervised token.
@@ -810,8 +810,9 @@ def build_tree_execution_plans(
     when the common prefix reaches min_shared_prefix_tokens. Logical UIDs
     remain attached as member_uids and ObjectiveRefs retain original rows.
 
-    Legacy qwen_turn and experimental role_probe remain available for
-    controlled comparison; neither is used by the token-level path.
+    token_lcp is the default production policy. Legacy qwen_turn and
+    diagnostic role_probe remain available only for explicit compatibility
+    and controlled comparison.
     """
     if tree_policy not in ("qwen_turn", "role_probe", "token_lcp"):
         raise ValueError(f"unsupported TPR tree_policy: {tree_policy!r}")
@@ -1292,17 +1293,17 @@ def build_tree_execution_plans_from_session_trees(
     session_trees: Sequence[Mapping[str, Any]],
     *,
     require_loss_mask_alignment: bool = False,
-    tree_policy: str = "qwen_turn",
+    tree_policy: str = "token_lcp",
     turn_min_segment_tokens: int = 128,
     tree_builder: str = "lcp_sort",
     min_shared_prefix_tokens: int = 1024,
 ) -> ForestExecutionPlan:
     """Build a minibatch Forest directly from independent Session Tree payloads.
 
-    Legacy qwen_turn preserves historical UID-scoped behavior. token_lcp
-    instead clusters exact Token-ID prefixes across all Sessions/UIDs in this
-    supplied minibatch and retains logical UIDs in member_uids. Since only the
-    supplied minibatch is visible here, sharing cannot cross DP/minibatch scope.
+    token_lcp clusters exact Token-ID prefixes across all Sessions/UIDs in
+    this supplied minibatch and retains logical UIDs in member_uids. Since only
+    the supplied minibatch is visible here, sharing cannot cross DP/minibatch
+    scope. Legacy qwen_turn remains available only when explicitly requested.
     """
     if not session_trees:
         raise ValueError("cannot build a Forest from an empty Session Tree batch")

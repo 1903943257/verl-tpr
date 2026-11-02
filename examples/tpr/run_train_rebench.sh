@@ -59,7 +59,9 @@ export CONCURRENCY=8
 export GATEWAY_COUNT=1
 export NUM_AGENT_WORKERS=1
 export CAPTURE_ACTOR=False
-export TPR_TREE_POLICY=qwen_turn
+export TPR_TREE_POLICY=token_lcp
+export TPR_TREE_BUILDER=lcp_sort
+export TPR_MIN_SHARED_PREFIX_TOKENS=1024
 
 # The strict 24K session stop must be applied by the canonical launcher.
 # Fail early if its pinned UniAgent source differs; do not silently continue.

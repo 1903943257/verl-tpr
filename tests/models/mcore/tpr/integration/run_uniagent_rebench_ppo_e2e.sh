@@ -18,7 +18,9 @@ TRAIN_FILE=${TRAIN_FILE:-/workspace/tpr_experiments/shortfix/shortfix_candidates
 TEST_FILE=${TEST_FILE:-${TRAIN_FILE}}
 TASK_CONFIG=${TASK_CONFIG:-${TPR_CHECKOUT}/examples/tpr/task_config_swe_rebench_docker.yaml}
 TPR_ENABLED=${TPR_ENABLED:-False}
-export TPR_TREE_POLICY=${TPR_TREE_POLICY:-qwen_turn}
+export TPR_TREE_POLICY=${TPR_TREE_POLICY:-token_lcp}
+export TPR_TREE_BUILDER=${TPR_TREE_BUILDER:-lcp_sort}
+export TPR_MIN_SHARED_PREFIX_TOKENS=${TPR_MIN_SHARED_PREFIX_TOKENS:-1024}
 
 # ------------------------------------------------------------
 # Same rollout behavior as the original UniAgent launcher
