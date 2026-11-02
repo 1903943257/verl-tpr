@@ -165,6 +165,12 @@ verl is fast with:
 
 .. toctree::
    :maxdepth: 1
+   :caption: TPR
+
+   TPR_TOKEN_LEVEL_PREFIX_SHARING
+
+.. toctree::
+   :maxdepth: 1
    :caption: Hardware Support
 
    hardware/multi_chip_support

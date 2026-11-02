@@ -1,5 +1,7 @@
 # Token-Level Prefix Sharing
 
+Last updated: 11/02/2026
+
 ## Goal
 
 Make physical Prefix Tree construction independent of model-specific message serialization. The builder consumes only the exact input_ids supplied to one Actor PPO minibatch. It does not load a tokenizer, inspect a Chat Template, recognize Role headers, or depend on Qwen special-token IDs.

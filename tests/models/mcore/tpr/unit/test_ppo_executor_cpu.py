@@ -70,6 +70,7 @@ def test_branch_replay_matches_full_rows(loss_scale, mask_branch_tokens, freeze_
     forest = build_tree_execution_plans(
         tuple(f"sample_tpr_{row}" for row in range(len(batch["input_ids"]))),
         batch,
+        tree_policy="qwen_turn",
         turn_min_segment_tokens=1,
     )
     denominator = forest.logical_loss_tokens
@@ -132,7 +133,8 @@ def test_branch_replay_matches_full_rows(loss_scale, mask_branch_tokens, freeze_
 def test_failed_replay_restores_context_and_cannot_resume():
     model = _PrefixModel()
     forest = build_tree_execution_plans(
-        tuple(f"sample_tpr_{row}" for row in range(5)), _batch(), turn_min_segment_tokens=1,
+        tuple(f"sample_tpr_{row}" for row in range(5)), _batch(),
+        tree_policy="qwen_turn", turn_min_segment_tokens=1,
     )
     tree = forest.trees[0]
 
@@ -207,7 +209,8 @@ def test_push_caches_compact_detached_kv_in_state(monkeypatch):
 
 def _executor(model, *, owns_loss=True):
     forest = build_tree_execution_plans(
-        tuple(f"sample_tpr_{row}" for row in range(5)), _batch(), turn_min_segment_tokens=1,
+        tuple(f"sample_tpr_{row}" for row in range(5)), _batch(),
+        tree_policy="qwen_turn", turn_min_segment_tokens=1,
     )
     tree = forest.trees[0]
     return SegmentExecutor(
@@ -290,7 +293,10 @@ def test_global_zero_objective_branches_are_pruned_with_identical_gradients(pare
         "input_ids": [torch.tensor([1, 151645, 2, 151645]), torch.tensor([1, 151645, 3, 151645])],
         "response_mask": [torch.tensor([parent_owns_query, not parent_owns_query]), torch.tensor([False, False])],
     }
-    tree = build_tree_execution_plans(["u_s_0", "u_s_1"], batch, turn_min_segment_tokens=1).trees[0]
+    tree = build_tree_execution_plans(
+        ["u_s_0", "u_s_1"], batch,
+        tree_policy="qwen_turn", turn_min_segment_tokens=1,
+    ).trees[0]
     refs = {key: tree.refs_for_segment(key) for key in tree.segment_plan.segments}
 
     def objective(segment, logits):
