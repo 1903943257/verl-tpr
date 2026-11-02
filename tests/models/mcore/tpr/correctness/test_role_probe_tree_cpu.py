@@ -357,3 +357,70 @@ def test_role_probe_real_qwen_tool_header_when_configured():
     assert (tool_start, "tool") in anchors
     assert (0, "user") in anchors
     assert len(anchors) >= 3
+
+
+class FinalAssistantThinkingTokenizer(FakeTokenizer):
+    """Final assistant has a thinking prelude; non-final assistant does not."""
+
+    def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=False):
+        ids = []
+        for i, msg in enumerate(messages):
+            ids.extend([6001, *self.encode(msg["role"]), 6003])
+            if msg["role"] == "assistant" and i == len(messages) - 1:
+                ids.extend(self.encode("<think>\n\n</think>\n\n"))
+            ids.extend(self.encode(msg["content"]))
+            ids.append(6002)
+        return ids
+
+
+def test_role_probe_recovers_nonterminal_assistant_header():
+    tok = FinalAssistantThinkingTokenizer()
+    probe = tree._probe_role_template(tok)
+    msgs = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "middle"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "last"},
+    ]
+    ids = tok.apply_chat_template(msgs)
+    anchors = tree._role_anchors(torch.tensor(ids, dtype=torch.long), probe)
+    expected = tuple(
+        (len(tok.apply_chat_template(msgs[:i])) if i else 0, msg["role"])
+        for i, msg in enumerate(msgs)
+    )
+    # For this context-sensitive fake, rendering a truncated prefix changes
+    # the last assistant. Read its offset from the complete token stream instead.
+    starts = [i for i, token in enumerate(ids) if token == 6001]
+    assert anchors == tuple((pos, msg["role"]) for pos, msg in zip(starts, msgs))
+    assert len(starts) == 4
+
+
+def test_real_qwen_nonterminal_assistant_role_recall_when_configured():
+    import os
+    from transformers import AutoTokenizer
+
+    path = os.environ.get("TPR_ROLE_TOKENIZER_PATH")
+    if not path:
+        pytest.skip("set TPR_ROLE_TOKENIZER_PATH for real-tokenizer validation")
+    tok = AutoTokenizer.from_pretrained(
+        path, local_files_only=True, trust_remote_code=False
+    )
+    msgs = [
+        {"role": "user", "content": "Run a test"},
+        {"role": "assistant", "content": "Calling tool now"},
+        {"role": "tool", "content": "3 tests passed"},
+        {"role": "assistant", "content": "Finished processing results"},
+        {"role": "user", "content": "Thanks"},
+    ]
+    ids = tree._coerce_probe_token_ids(tok.apply_chat_template(
+        msgs, tokenize=True, add_generation_prompt=False
+    ))
+    marker = tok.convert_tokens_to_ids("<|im_start|>")
+    assert isinstance(marker, int) and marker >= 0
+    expected = [i for i, token in enumerate(ids) if token == marker]
+    probe = tree._probe_role_template(tok)
+    anchors = tree._role_anchors(torch.tensor(ids, dtype=torch.long), probe)
+    assert [i for i, _ in anchors] == expected
+    assert [role for _, role in anchors] == [
+        "user", "assistant", "tool", "assistant", "user"
+    ]

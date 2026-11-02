@@ -162,6 +162,8 @@ def main():
     match_count = reference_count = recovered_count = 0
     role_label_checked = role_label_correct = 0
     role_counts = {}
+    reference_wire_role_counts = {}
+    missed_wire_role_counts = {}
     for tokens in _rows(batch, "input_ids"):
         cpu = tokens.detach().cpu().long()
         anchors = tree._role_anchors(cpu, probe)
@@ -173,6 +175,16 @@ def main():
             estimated = dict(anchors)
             match_count += len(real & set(estimated))
             reference_count += len(real)
+            for position in real:
+                label = tokenizer.decode(
+                    cpu[position + 1:min(len(cpu), position + 24)].tolist(),
+                    skip_special_tokens=False
+                ).split("\n", 1)[0].strip()
+                if label not in {"system", "developer", "user", "assistant", "tool"}:
+                    label = "<unclassified>"
+                reference_wire_role_counts[label] = reference_wire_role_counts.get(label, 0) + 1
+                if position not in estimated:
+                    missed_wire_role_counts[label] = missed_wire_role_counts.get(label, 0) + 1
             for position in real & set(estimated):
                 rendered = tokenizer.decode(
                     cpu[position + 1:min(len(cpu), position + 24)].tolist(),
@@ -190,6 +202,8 @@ def main():
         "role_header_patterns": len(probe.headers),
         "recovered_role_headers": recovered_count,
         "recovered_role_counts": role_counts,
+        "reference_wire_role_counts": reference_wire_role_counts,
+        "missed_wire_role_counts": missed_wire_role_counts,
         "rendered_role_aliases": {
             role: wire for role, wire in rendered_role.items() if role != wire
         },

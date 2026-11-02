@@ -360,54 +360,66 @@ def _probe_role_template(tokenizer: Any) -> _RoleProbe:
     def reject(reason: str) -> None:
         failures[reason] = failures.get(reason, 0) + 1
 
+    # The final assistant may include a template-generated <think> prelude;
+    # a middle-of-conversation assistant usually has a shorter plain header.
+    # Probe both forms instead of treating the last-message form as canonical.
     for role in ("system", "developer", "user", "assistant", "tool"):
         for following in (False, True):
-            prefix_msgs = [{"role": "user", "content": before}] if following else []
-            msgs = [*prefix_msgs, {"role": role, "content": marker}]
-            try:
-                all_ids = tokenizer.apply_chat_template(msgs, tokenize=True, add_generation_prompt=False)
-                old_ids = tokenizer.apply_chat_template(
-                    prefix_msgs, tokenize=True, add_generation_prompt=False
-                ) if following else []
-            except (ValueError, TypeError, KeyError, RuntimeError):
-                reject("template_render_error")
-                continue
-            try:
-                all_ids = _coerce_probe_token_ids(all_ids)
-                old_ids = _coerce_probe_token_ids(old_ids)
-            except (TypeError, ValueError) as exc:
-                reject(f"invalid_token_ids:{type(exc).__name__}:{exc}")
-                continue
-            if all_ids[:len(old_ids)] != old_ids:
-                reject("previous_message_not_prefix")
-                continue
-            body = _find_role_marker(all_ids, marker_ids, len(old_ids))
-            body_end = body + len(marker_ids)
-            if body < 0:
-                span = _find_marker_span_via_rendered_template(
-                    tokenizer, msgs, all_ids, marker
+            for nonterminal in ((False, True) if role == "assistant" else (False,)):
+                prefix_msgs = [{"role": "user", "content": before}] if following else []
+                # A later user turn forces the target assistant to be non-final.
+                suffix_msgs = (
+                    [{"role": "user", "content": "TPRRoleProbeFollowingC5Z2"}]
+                    if nonterminal else []
                 )
-                if span is None:
-                    reject("marker_not_token_aligned")
+                msgs = [*prefix_msgs, {"role": role, "content": marker}, *suffix_msgs]
+                try:
+                    all_ids = _coerce_probe_token_ids(tokenizer.apply_chat_template(
+                        msgs, tokenize=True, add_generation_prompt=False
+                    ))
+                    old_ids = _coerce_probe_token_ids(tokenizer.apply_chat_template(
+                        prefix_msgs, tokenize=True, add_generation_prompt=False
+                    )) if following else []
+                    suffix_ids = _coerce_probe_token_ids(tokenizer.apply_chat_template(
+                        suffix_msgs, tokenize=True, add_generation_prompt=False
+                    )) if nonterminal else []
+                except (ValueError, TypeError, KeyError, RuntimeError) as exc:
+                    reject(f"template_or_tokens_error:{type(exc).__name__}:{exc}")
                     continue
-                body, body_end = span
-            if body < len(old_ids):
-                reject("marker_before_previous_message")
-                continue
-            header = all_ids[len(old_ids):body]
-            ending = all_ids[body_end:]
-            if not header or not ending:
-                reject("empty_header_or_ending")
-                continue
-            if role not in tokenizer.decode(header, skip_special_tokens=False):
-                reject("role_not_in_header")
-                continue
-            item = (role, np.asarray(header, dtype=np.int64).tobytes(), not following)
-            if item not in headers:
-                headers.append(item)
-            end_bytes = np.asarray(ending, dtype=np.int64).tobytes()
-            if end_bytes not in endings:
-                endings.append(end_bytes)
+                if all_ids[:len(old_ids)] != old_ids:
+                    reject("previous_message_not_prefix")
+                    continue
+                if nonterminal and (not suffix_ids or all_ids[-len(suffix_ids):] != suffix_ids):
+                    reject("following_message_not_suffix")
+                    continue
+                target_end = len(all_ids) - len(suffix_ids)
+                body = _find_role_marker(all_ids, marker_ids, len(old_ids))
+                body_end = body + len(marker_ids)
+                if body < 0:
+                    span = _find_marker_span_via_rendered_template(
+                        tokenizer, msgs, all_ids, marker
+                    )
+                    if span is None:
+                        reject("marker_not_token_aligned")
+                        continue
+                    body, body_end = span
+                if body < len(old_ids) or body_end > target_end:
+                    reject("marker_outside_target_message")
+                    continue
+                header = all_ids[len(old_ids):body]
+                ending = all_ids[body_end:target_end]
+                if not header or not ending:
+                    reject("empty_header_or_ending")
+                    continue
+                if role not in tokenizer.decode(header, skip_special_tokens=False):
+                    reject("role_not_in_header")
+                    continue
+                item = (role, np.asarray(header, dtype=np.int64).tobytes(), not following)
+                if item not in headers:
+                    headers.append(item)
+                end_bytes = np.asarray(ending, dtype=np.int64).tobytes()
+                if end_bytes not in endings:
+                    endings.append(end_bytes)
     if not headers or not endings:
         raise ValueError(
             "chat template has no stable explicit role headers; "
