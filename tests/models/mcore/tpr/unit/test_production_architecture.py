@@ -115,9 +115,13 @@ def test_module_spec_rejects_mixed_attention_without_model_mutation() -> None:
     assert dense.submodules.self_attention.module is Dense
 
 
-def test_turn_tree_is_only_production_builder() -> None:
+def test_token_lcp_is_default_production_builder() -> None:
     source = _source("tree")
-    assert 'tree_policy: str = "qwen_turn"' in source
+    adapter = _source("adapter")
+    assert 'tree_policy: str = "token_lcp"' in source
+    assert 'tree_builder: str = "lcp_sort"' in source
+    assert 'os.getenv("TPR_TREE_POLICY", "token_lcp")' in adapter
+    assert 'os.getenv("TPR_TREE_BUILDER", "lcp_sort")' in adapter
     assert "def build_tree_execution_plans(" in source
     assert "class TrajectoryTree" not in source
     assert "class SegmentLossTerm" not in source
