@@ -62,9 +62,9 @@ case "${TRAIN_SP}" in
   *) echo "TRAIN_SP must be True or False" >&2; exit 2 ;;
 esac
 # SP is passed explicitly to both Engine and TransformerConfig below.
-# _validate_tpr_parallel_sizes remains the source of truth for supported DP
-# layouts: current PPO support includes TP2 x CP2 x DP2, but not arbitrary DP>1.
-TPR_CP_BACKEND=${TPR_CP_BACKEND:-ring}
+# Megatron validates TP/CP/DP topology legality; TPR does not maintain a
+# separate topology allowlist. The current executor still requires PP=EP=1,
+# and CP>1 uses the Ring backend.
 TRAIN_DP=$((N_GPUS_PER_NODE / (TRAIN_TP * TRAIN_PP * TRAIN_CP)))
 TRAIN_PROMPT_BSZ=${TRAIN_PROMPT_BSZ:-$TRAIN_DP}
 GEN_BATCH_SIZE=${GEN_BATCH_SIZE:-$TRAIN_DP}
