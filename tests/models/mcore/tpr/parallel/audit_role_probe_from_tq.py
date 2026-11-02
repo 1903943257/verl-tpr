@@ -12,6 +12,7 @@ reported with a Qwen reference only when that tokenizer exposes ChatML IDs.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -99,6 +100,76 @@ def _summary(forest, batch):
         "reuse_factor": round(logical / unique, 5) if unique else None,
         "segments": forest.segment_count,
         "logical_loss_tokens": forest.logical_loss_tokens,
+    }
+
+
+def _system_prompt_summary(batch, probe, im_end_id: int | None):
+    """Audit System message spans from exact role headers, without re-tokenizing TQ.
+
+    Each interval is [system header start, next role header start); if the
+    interval closes with Qwen's im_end, its content is the token range after
+    the exact probed header and before im_end. No raw prompt text is emitted.
+    """
+    inputs = _rows(batch, "input_ids")
+    prompts = _rows(batch, "prompts")
+    spans = []
+    for row, (value, prompt) in enumerate(zip(inputs, prompts)):
+        tokens = value.detach().cpu().contiguous().long()
+        raw = tokens.numpy().tobytes()
+        anchors = tree._role_anchors(tokens, probe)
+        for i, (start, role) in enumerate(anchors):
+            if role != "system":
+                continue
+            end = anchors[i + 1][0] if i + 1 < len(anchors) else len(tokens)
+            header_lengths = [
+                len(header) // 8
+                for candidate_role, header, first_only in probe.headers
+                if candidate_role == "system"
+                and (not first_only or start == 0)
+                and raw[start * 8:start * 8 + len(header)] == header
+            ]
+            if not header_lengths:
+                raise AssertionError(f"system header has no exact pattern at row={row}, pos={start}")
+            content_start = start + max(header_lengths)
+            closed = (
+                im_end_id is not None and end > content_start
+                and int(tokens[end - 1]) == im_end_id
+            )
+            content_end = end - 1 if closed else None
+            digest = (
+                hashlib.sha256(tokens[content_start:content_end].numpy().tobytes()).hexdigest()[:16]
+                if content_end is not None else None
+            )
+            spans.append({
+                "row": row,
+                "start": start,
+                "end_exclusive": end,
+                "header_tokens": max(header_lengths),
+                "content_tokens": content_end - content_start if content_end is not None else None,
+                "content_sha256_prefix": digest,
+                "starts_at_zero": start == 0,
+                "ends_with_im_end": closed,
+                "within_prompt": end <= len(prompt),
+            })
+    counts = [sum(span["row"] == row for span in spans) for row in range(len(inputs))]
+    complete = (
+        len(inputs) > 0
+        and all(count == 1 for count in counts)
+        and all(
+            span["starts_at_zero"] and span["ends_with_im_end"] and span["within_prompt"]
+            for span in spans
+        )
+    )
+    hashes = {span["content_sha256_prefix"] for span in spans if span["content_sha256_prefix"] is not None}
+    return {
+        "rows": len(inputs),
+        "system_messages": len(spans),
+        "rows_with_exactly_one_system": sum(count == 1 for count in counts),
+        "complete_system_spans": complete,
+        "identical_system_content_across_rows": len(hashes) == 1 if complete else None,
+        "system_content_lengths": [span["content_tokens"] for span in spans],
+        "per_row": spans,
+        "note": "Structural ChatML validation only; verify against original agent messages for a semantic ground truth.",
     }
 
 
@@ -207,6 +278,13 @@ def main():
         "rendered_role_aliases": {
             role: wire for role, wire in rendered_role.items() if role != wire
         },
+        "system_prompt_audit": _system_prompt_summary(
+            batch, probe,
+            tokenizer.convert_tokens_to_ids("<|im_end|>")
+            if has_chatml_reference
+            and tokenizer.convert_ids_to_tokens(tokenizer.convert_tokens_to_ids("<|im_end|>")) == "<|im_end|>"
+            else None,
+        ),
         "qwen_chatml_reference": {
             "available": has_chatml_reference,
             "reference_message_starts": reference_count if has_chatml_reference else None,

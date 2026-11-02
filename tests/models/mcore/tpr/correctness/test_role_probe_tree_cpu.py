@@ -250,7 +250,7 @@ def test_role_probe_rejects_multi_sequence_tokenizer_result():
             ids = super().apply_chat_template(messages, tokenize, add_generation_prompt)
             return {"input_ids": [ids, ids]}
 
-    with pytest.raises(ValueError, match="invalid_token_ids"):
+    with pytest.raises(ValueError, match="multi-row token IDs"):
         tree._probe_role_template(MultiSequenceTokenizer())
 
 
@@ -424,3 +424,28 @@ def test_real_qwen_nonterminal_assistant_role_recall_when_configured():
     assert [role for _, role in anchors] == [
         "user", "assistant", "tool", "assistant", "user"
     ]
+
+
+def test_audit_extracts_exact_system_prompt_content():
+    import importlib.util
+    from pathlib import Path
+
+    audit_path = (
+        Path(__file__).resolve().parents[1]
+        / "parallel"
+        / "audit_role_probe_from_tq.py"
+    )
+    audit_spec = importlib.util.spec_from_file_location("tpr_system_span_audit_under_test", audit_path)
+    audit = importlib.util.module_from_spec(audit_spec)
+    audit_spec.loader.exec_module(audit)
+
+    batch, _, _, _ = _make_batch()
+    summary = audit._system_prompt_summary(batch, tree._probe_role_template(FakeTokenizer()), 6002)
+    assert summary["rows"] == 2
+    assert summary["system_messages"] == 2
+    assert summary["complete_system_spans"] is True
+    assert summary["identical_system_content_across_rows"] is True
+    assert all(span["starts_at_zero"] for span in summary["per_row"])
+    assert all(span["ends_with_im_end"] for span in summary["per_row"])
+    assert all(span["within_prompt"] for span in summary["per_row"])
+    assert all(n > 0 for n in summary["system_content_lengths"])
