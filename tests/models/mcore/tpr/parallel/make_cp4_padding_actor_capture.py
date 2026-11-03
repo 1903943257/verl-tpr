@@ -146,6 +146,12 @@ def main() -> None:
     response_lcp = _lcp_all(response_rows)
     if response_lcp >= response_length:
         raise ValueError("All response rows are identical; no branching after shared prompt")
+    branch_length = response_length - response_lcp
+    if branch_length < 128:
+        raise ValueError(
+            f"Only {branch_length} divergent suffix tokens remain; need >=128 "
+            "to exercise the contiguous CP4 Query merge path"
+        )
 
     # The shared prefix is prompt + the common response-token prefix. Choose a
     # small prompt trim so the actual trie segment, not just the prompt field,
