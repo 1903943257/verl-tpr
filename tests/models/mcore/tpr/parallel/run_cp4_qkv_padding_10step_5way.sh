@@ -179,8 +179,8 @@ print(
 )
 if not requested:
     raise SystemExit(f"FAIL: {arm}: requested Merge flags do not match arm")
-if arm == "none" and (kv or query):
-    raise SystemExit("FAIL: None unexpectedly executed merged FA")
+if arm == "none" and (kv or query or padded < 1):
+    raise SystemExit("FAIL: None must keep physical Padding but execute no Merge")
 if arm == "kv" and (kv < 1 or query != 0 or padded < 1):
     raise SystemExit("FAIL: KV+Padding path did not execute")
 if arm == "qkv" and (query < 1 or padded < 1):
