@@ -46,10 +46,9 @@ def _rows(value, name: str) -> list[torch.Tensor]:
 
 
 def _rebuild_rows(original, rows: list[torch.Tensor]):
-    if isinstance(original, torch.Tensor):
-        return torch.stack(rows, dim=0).contiguous()
-    from tensordict import NonTensorStack
-    return NonTensorStack(*rows)
+    # All rows were validated to have equal length, so materialize a dense
+    # tensor even when the source used a NonTensorStack container.
+    return torch.stack(rows, dim=0).contiguous()
 
 
 def _lcp_all(rows: list[torch.Tensor]) -> int:
