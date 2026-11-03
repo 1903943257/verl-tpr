@@ -19,17 +19,44 @@ from pathlib import Path
 import torch
 
 
-def _sha256(value: torch.Tensor) -> str:
-    return hashlib.sha256(
-        value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
-    ).hexdigest()
+def _sha256(value) -> str:
+    digest = hashlib.sha256()
+    if isinstance(value, torch.Tensor):
+        digest.update(value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+    elif hasattr(value, "unbind"):
+        for item in value.unbind(0):
+            digest.update(_sha256(item).encode())
+    else:
+        digest.update(repr(value).encode())
+    return digest.hexdigest()
 
 
-def _lcp_all(rows: torch.Tensor) -> int:
-    if rows.ndim != 2 or rows.shape[0] < 2:
-        raise ValueError("responses must be a 2-D tensor with at least two rows")
+def _rows(value, name: str) -> list[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        if value.ndim != 2:
+            raise ValueError(f"{name} must have shape [N, sequence], got {tuple(value.shape)}")
+        result = list(value.unbind(0))
+    elif hasattr(value, "unbind"):
+        result = list(value.unbind(0))
+    else:
+        raise TypeError(f"{name} must be a Tensor or row-stack with unbind(0)")
+    if not result or not all(isinstance(row, torch.Tensor) and row.ndim == 1 for row in result):
+        raise ValueError(f"{name} rows must be non-empty one-dimensional tensors")
+    return result
+
+
+def _rebuild_rows(original, rows: list[torch.Tensor]):
+    if isinstance(original, torch.Tensor):
+        return torch.stack(rows, dim=0).contiguous()
+    from tensordict import NonTensorStack
+    return NonTensorStack(*rows)
+
+
+def _lcp_all(rows: list[torch.Tensor]) -> int:
+    if len(rows) < 2:
+        raise ValueError("responses must contain at least two rows")
+    limit = min(row.numel() for row in rows)
     first = rows[0]
-    limit = rows.shape[1]
     for row in rows[1:]:
         mismatch = torch.nonzero(first[:limit] != row[:limit], as_tuple=False)
         if mismatch.numel():
@@ -89,37 +116,35 @@ def main() -> None:
     if missing:
         raise KeyError(f"Capture is missing required Actor PPO fields: {missing}")
 
-    input_ids = td["input_ids"]
-    prompts = td["prompts"]
-    responses = td["responses"]
-    if not all(isinstance(x, torch.Tensor) for x in (input_ids, prompts, responses)):
-        raise TypeError("input_ids/prompts/responses must be dense tensors")
-    if input_ids.ndim != 2 or prompts.ndim != 2 or responses.ndim != 2:
-        raise ValueError(
-            "Expected dense [N, sequence] tensors; got "
-            f"input_ids={tuple(input_ids.shape)}, prompts={tuple(prompts.shape)}, "
-            f"responses={tuple(responses.shape)}"
-        )
+    input_ids_value = td["input_ids"]
+    prompts_value = td["prompts"]
+    responses_value = td["responses"]
+    input_rows = _rows(input_ids_value, "input_ids")
+    prompt_rows = _rows(prompts_value, "prompts")
+    response_rows = _rows(responses_value, "responses")
 
     rows = len(raw["keys"])
-    if input_ids.shape[0] != rows or prompts.shape[0] != rows or responses.shape[0] != rows:
+    if not (len(input_rows) == len(prompt_rows) == len(response_rows) == rows):
         raise ValueError("Capture row counts do not match keys")
-    old_prompt = prompts.shape[1]
-    response_length = responses.shape[1]
+    old_prompt = prompt_rows[0].numel()
+    response_length = response_rows[0].numel()
+    if any(row.numel() != old_prompt for row in prompt_rows):
+        raise ValueError("Source prompt rows have different lengths")
+    if any(row.numel() != response_length for row in response_rows):
+        raise ValueError("Source response rows have different lengths")
     old_total = old_prompt + response_length
-    if input_ids.shape[1] != old_total:
-        raise ValueError(
-            f"input_ids length {input_ids.shape[1]} != prompt+response {old_total}"
-        )
-    if not torch.equal(prompts, prompts[:1].expand_as(prompts)):
+    if any(row.numel() != old_total for row in input_rows):
+        raise ValueError("input_ids rows do not have prompt+response length")
+    if not all(torch.equal(prompt_rows[0], row) for row in prompt_rows[1:]):
         raise ValueError(
             "Source rows do not have an identical shared prompt; refusing to "
             "invent a different session topology"
         )
-    if not torch.equal(input_ids, torch.cat((prompts, responses), dim=-1)):
-        raise ValueError("Source input_ids are not exactly prompt + response")
+    for row, prompt, response in zip(input_rows, prompt_rows, response_rows, strict=True):
+        if not torch.equal(row, torch.cat((prompt, response))):
+            raise ValueError("Source input_ids are not exactly prompt + response")
 
-    response_lcp = _lcp_all(responses)
+    response_lcp = _lcp_all(response_rows)
     if response_lcp >= response_length:
         raise ValueError("All response rows are identical; no branching after shared prompt")
 
@@ -138,10 +163,13 @@ def main() -> None:
         raise AssertionError("Internal error computing non-aligned shared Prefix")
     padded_prefix = ((expected_shared_prefix + 7) // 8) * 8
 
-    new_prompts = prompts[:, :new_prompt].contiguous()
-    new_input_ids = torch.cat((new_prompts, responses), dim=-1).contiguous()
-    td.set("prompts", new_prompts)
-    td.set("input_ids", new_input_ids)
+    new_prompt_rows = [row[:new_prompt].contiguous() for row in prompt_rows]
+    new_input_rows = [
+        torch.cat((prompt, response)).contiguous()
+        for prompt, response in zip(new_prompt_rows, response_rows, strict=True)
+    ]
+    td.set("prompts", _rebuild_rows(prompts_value, new_prompt_rows))
+    td.set("input_ids", _rebuild_rows(input_ids_value, new_input_rows))
 
     # Update any explicit sequence-position fields. The Actor capture normally
     # stores only input_ids/prompts/responses; if an attention mask or position
@@ -182,9 +210,17 @@ def main() -> None:
         if _sha256(td[key]) != digest:
             raise AssertionError(f"Original PPO field changed unexpectedly: {key}")
 
-    if not torch.equal(td["input_ids"], torch.cat((td["prompts"], td["responses"]), dim=-1)):
+    derived_prompts = _rows(td["prompts"], "derived prompts")
+    derived_responses = _rows(td["responses"], "derived responses")
+    derived_inputs = _rows(td["input_ids"], "derived input_ids")
+    if any(
+        not torch.equal(ids, torch.cat((prompt, response)))
+        for ids, prompt, response in zip(
+            derived_inputs, derived_prompts, derived_responses, strict=True
+        )
+    ):
         raise AssertionError("Derived input_ids do not equal derived prompt + original response")
-    if td["prompts"].shape[1] != new_prompt:
+    if any(prompt.numel() != new_prompt for prompt in derived_prompts):
         raise AssertionError("Derived prompt length mismatch")
 
     output.parent.mkdir(parents=True, exist_ok=True)
