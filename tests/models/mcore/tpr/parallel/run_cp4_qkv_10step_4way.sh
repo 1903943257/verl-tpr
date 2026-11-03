@@ -10,9 +10,10 @@ OUT=${TPR_FOURWAY_OUTPUT_DIR:-/workspace/tpr_experiments/performance/cp4_qkv_pad
 DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-8,9,10,11,12,13,14,15}
 TEST=tests/models/mcore/tpr/parallel/test_real_actor_tp2cp4_multistep_npu.py
 COMPARE=tests/models/mcore/tpr/parallel/compare_real_actor_tp2cp4_multistep.py
+PYTEST_ENTRY=tests/models/mcore/tpr/parallel/_fourway_pytest_entry.py
 
 cd "$REPO"
-[[ -f "$TEST" && -f "$COMPARE" ]] || { echo 'ERROR: missing existing multistep test/comparator' >&2; exit 2; }
+[[ -f "$TEST" && -f "$COMPARE" && -f "$PYTEST_ENTRY" ]] || { echo 'ERROR: missing multistep test/comparator/argv-isolated pytest entry' >&2; exit 2; }
 [[ -f "$CAP" && -d "$MODEL" ]] || { echo "ERROR: missing capture or model: $CAP $MODEL" >&2; exit 2; }
 [[ ! -e "$OUT" ]] || { echo "ERROR: output already exists: $OUT; use a fresh TPR_FOURWAY_OUTPUT_DIR" >&2; exit 2; }
 [[ $(awk -F, '{print NF}' <<< "$DEVICES") -eq 8 ]] || { echo "ERROR: exactly 8 NPUs required" >&2; exit 2; }
@@ -62,10 +63,9 @@ export TPR_OFFLINE_SAVE_FULL_GRADS=0
 export TPR_EXEC_PROFILE=0
 unset TPR_OFFLINE_FULL_GRAD_STEPS TPR_OFFLINE_CAPTURE_MANIFEST || true
 
-python -m pytest -q \
-  tests/models/mcore/tpr/parallel/test_native_full_dynamic_microbatches_cpu.py \
-  tests/models/mcore/tpr/parallel/test_multistep_artifact_recovery_cpu.py \
-  tests/models/mcore/tpr/parallel/test_cp4_multistep_replica_audit_cpu.py \
+# pytest.main() receives its flags internally, so MindSpeed never parses
+# pytest short options out of the process sys.argv.
+TPR_FOURWAY_PYTEST_PHASE=preflight python "$PYTEST_ENTRY" \
   2>&1 | tee "$OUT/preflight.log"
 
 run_arm() {
@@ -79,8 +79,9 @@ run_arm() {
   export TPR_RING_COALESCE_PREFIX_PADDED="$padded"
   printf 'mode=%s kv=%s query=%s padded=%s\n' "$mode" "$kv" "$query" "$padded" > "$dir/settings.txt"
   echo "======== $label: ten optimizer steps ========"
-  torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29786 \
-    -m pytest -vv -s -x "$TEST" 2>&1 | tee "$dir/run.log"
+  TPR_FOURWAY_PYTEST_PHASE=multistep \
+    torchrun --nproc_per_node=8 --master_addr=127.0.0.1 --master_port=29786 \
+    "$PYTEST_ENTRY" 2>&1 | tee "$dir/run.log"
 
   for step in 1 2 5 10; do
     for rank in {0..7}; do
