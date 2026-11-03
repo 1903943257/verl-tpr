@@ -22,7 +22,7 @@ import torch
 def _sha256(value) -> str:
     digest = hashlib.sha256()
     if isinstance(value, torch.Tensor):
-        digest.update(value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+        digest.update(value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
     elif hasattr(value, "unbind"):
         for item in value.unbind(0):
             digest.update(_sha256(item).encode())
