@@ -166,7 +166,7 @@ padded = sum(
     for item in forward
 )
 requested = all(
-    item.get("kv_merge_requested") is True
+    item.get("kv_merge_requested") is (arm in ("kv", "qkv"))
     and item.get("query_merge_requested") is (arm == "qkv")
     and item.get("padded_kv_merge_requested") is (arm in ("kv", "qkv"))
     for item in forward
