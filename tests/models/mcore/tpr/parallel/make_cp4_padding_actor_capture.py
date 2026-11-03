@@ -20,10 +20,23 @@ import torch
 
 
 def _sha256(value) -> str:
+    """Hash dense or ragged values without flattening a NestedTensor."""
     digest = hashlib.sha256()
-    if isinstance(value, torch.Tensor):
-        digest.update(value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+    if isinstance(value, torch.Tensor) and value.is_nested:
+        digest.update(b"nested_tensor")
+        digest.update(str(value.dtype).encode())
+        rows = value.unbind(0)
+        digest.update(str(len(rows)).encode())
+        for item in rows:
+            digest.update(_sha256(item).encode())
+    elif isinstance(value, torch.Tensor):
+        digest.update(b"tensor")
+        digest.update(str(value.dtype).encode())
+        digest.update(str(tuple(value.shape)).encode())
+        raw = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+        digest.update(raw.numpy().tobytes())
     elif hasattr(value, "unbind"):
+        digest.update(type(value).__name__.encode())
         for item in value.unbind(0):
             digest.update(_sha256(item).encode())
     else:
