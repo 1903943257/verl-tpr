@@ -4,11 +4,11 @@
 set -Eeuo pipefail
 
 REPO=/workspace/verl-tpr-main
-CAP=\${TPR_REAL_ACTOR_MINIBATCH:-/workspace/tpr_experiments/performance/cp4_n8_merge_padding_synthetic_v1/cp4_n8_padding_synthetic.pt}
-CAP_REPORT=\${CAP%.pt}.json
-MODEL=\${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}
-OUT=\${TPR_FIVEWAY_OUTPUT_DIR:-/workspace/tpr_experiments/performance/cp4_qkv_padding_10step_5way_20261103}
-DEVICES=\${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+CAP=${TPR_REAL_ACTOR_MINIBATCH:-/workspace/tpr_experiments/performance/cp4_n8_merge_padding_synthetic_v1/cp4_n8_padding_synthetic.pt}
+CAP_REPORT=${CAP%.pt}.json
+MODEL=${TPR_QWEN_4B_PATH:-/workspace/hf_models/Qwen3-4B-128K}
+OUT=${TPR_FIVEWAY_OUTPUT_DIR:-/workspace/tpr_experiments/performance/cp4_qkv_padding_10step_5way_20261103}
+DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
 TEST=tests/models/mcore/tpr/parallel/test_real_actor_tp2cp4_multistep_npu.py
 COMPARE=tests/models/mcore/tpr/parallel/compare_real_actor_tp2cp4_multistep.py
 REPEAT_COMPARE=tests/models/mcore/tpr/parallel/compare_cp4_full_repeat.py
@@ -129,7 +129,7 @@ run_arm() {
 
   for step in 1 2 5 10; do
     for rank in {0..7}; do
-      [[ -f "$dir/\${mode}_step\${step}_rank\${rank}.pt" ]] || {
+      [[ -f "$dir/${mode}_step${step}_rank${rank}.pt" ]] || {
         echo "ERROR: missing $label snapshot step=$step rank=$rank" >&2
         exit 3
       }
@@ -199,14 +199,14 @@ run_arm full_b full 0 0 0
 # Compare each TPR arm independently against BOTH Full endpoints.
 for arm in none kv qkv; do
   for baseline in full_a full_b; do
-    target="$OUT/compare_\${arm}_vs_\${baseline}"
+    target="$OUT/compare_${arm}_vs_${baseline}"
     mkdir "$target"
     for step in 1 2 5 10; do
       for rank in {0..7}; do
-        ln -s "$OUT/$baseline/full_step\${step}_rank\${rank}.pt" \
-          "$target/full_step\${step}_rank\${rank}.pt"
-        ln -s "$OUT/$arm/tpr_step\${step}_rank\${rank}.pt" \
-          "$target/tpr_step\${step}_rank\${rank}.pt"
+        ln -s "$OUT/$baseline/full_step${step}_rank${rank}.pt" \
+          "$target/full_step${step}_rank${rank}.pt"
+        ln -s "$OUT/$arm/tpr_step${step}_rank${rank}.pt" \
+          "$target/tpr_step${step}_rank${rank}.pt"
       done
     done
     python "$COMPARE" "$target" --steps 10 2>&1 | tee "$target/compare.log"
