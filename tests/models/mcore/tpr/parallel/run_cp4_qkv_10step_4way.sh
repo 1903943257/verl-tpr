@@ -12,7 +12,8 @@ TEST=tests/models/mcore/tpr/parallel/test_real_actor_tp2cp4_multistep_npu.py
 COMPARE=tests/models/mcore/tpr/parallel/compare_real_actor_tp2cp4_multistep.py
 
 cd "$REPO"
-[[ $(git branch --show-current) == main ]] || { echo "ERROR: expected $REPO on main" >&2; exit 2; }
+# Docker worktrees may have a host-only .git pointer. Runtime execution must
+# not invoke Git; the host is responsible for checkout/version management.
 [[ -f "$TEST" && -f "$COMPARE" ]] || { echo 'ERROR: missing existing multistep test/comparator' >&2; exit 2; }
 [[ -f "$CAP" && -d "$MODEL" ]] || { echo "ERROR: missing capture or model: $CAP $MODEL" >&2; exit 2; }
 [[ ! -e "$OUT" ]] || { echo "ERROR: output already exists: $OUT; use a fresh TPR_FOURWAY_OUTPUT_DIR" >&2; exit 2; }
@@ -42,7 +43,6 @@ assert count > 0 and active_adv > 0, "Zero active PPO tokens/advantages"
 PY
 
 mkdir -p "$OUT"
-git rev-parse HEAD > "$OUT/git_head.txt"
 printf 'repo=%s\ncapture=%s\nmodel=%s\ndevices=%s\nsteps=10\noptimizer=CPU_FP32_master_AdamW\ndata=repeated_fixed_PPO_capture_NOT_online\n' \
   "$REPO" "$CAP" "$MODEL" "$DEVICES" > "$OUT/experiment.txt"
 
