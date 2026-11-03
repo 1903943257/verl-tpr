@@ -12,8 +12,6 @@ TEST=tests/models/mcore/tpr/parallel/test_real_actor_tp2cp4_multistep_npu.py
 COMPARE=tests/models/mcore/tpr/parallel/compare_real_actor_tp2cp4_multistep.py
 
 cd "$REPO"
-# Docker worktrees may have a host-only .git pointer. Runtime execution must
-# not invoke Git; the host is responsible for checkout/version management.
 [[ -f "$TEST" && -f "$COMPARE" ]] || { echo 'ERROR: missing existing multistep test/comparator' >&2; exit 2; }
 [[ -f "$CAP" && -d "$MODEL" ]] || { echo "ERROR: missing capture or model: $CAP $MODEL" >&2; exit 2; }
 [[ ! -e "$OUT" ]] || { echo "ERROR: output already exists: $OUT; use a fresh TPR_FOURWAY_OUTPUT_DIR" >&2; exit 2; }
