@@ -181,7 +181,7 @@ def main() -> None:
         value = td[key]
         if not isinstance(value, torch.Tensor):
             continue
-        if value.ndim >= 2 and value.shape[0] == rows and value.shape[-1] == old_total:
+        if value.ndim >= 2 and value.shape[-1] == old_total:
             if key == "position_ids":
                 updated = value.index_select(-1, keep)
                 updated[..., new_prompt:] -= drop
