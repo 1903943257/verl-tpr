@@ -24,6 +24,52 @@ recomputation, or cross-trajectory sharing is included.
 
 ## Run on one NPU
 
+### Quick BF16 P32/S32 comparison (summary only)
+
+Use the **same checkpoint/profile and device** as the FP32 experiment:
+
+```bash
+export ASCEND_RT_VISIBLE_DEVICES=0
+export TPR_QWEN_4B_PATH=/workspace/hf_models/Qwen3-4B-128K
+export TPR_SPLIT_BF16_OUTPUT=/workspace/tpr_experiments/split_bf16_p32s32_quick1
+bash tests/models/mcore/tpr/parallel/run_split_bf16_quick.sh
+```
+
+This runs `full`, `split_connected`, and production `split_replay` with BF16
+parameters/QKV/parameter gradients and the existing **CANN attention adapter**.
+It reuses the FP32 experiment's execution code, seed 20261104, token generation,
+global loss coefficients, prefix boundary query, and denominator. The linear
+loss reduction stays FP32. Autocast is disabled; the model itself is BF16.
+It uses direct `parameter.grad`, as in the short BF16 CP2 test, without a
+production optimizer or FP32 `main_grad` wrapper. Existing BF16 fusion settings
+are reported rather than represented as identical to the FP32 reference.
+
+Only three aggregate gradient comparisons (`rel_l2`, cosine, max absolute
+difference, norms, elements, and loss gap) are printed. Only `report.json` and
+the sibling console log are written: no parameter lists, gradient shards, layer
+traces, or per-tensor progress. Exact full-parameter comparisons still require
+reading every gradient. Two temporary CPU BF16 gradient snapshots require
+about **16 GB host RAM for 4B** (about 7 GB for 1.7B), plus one current tensor
+and bounded FP64 metric workspace. There are no large gradient files to compare
+offline. This is an error measurement, without automatic accuracy acceptance.
+
+Defaults are P32/S32 and profile `4b`. `TPR_SPLIT_BF16_PREFIX`,
+`TPR_SPLIT_BF16_SUFFIX`, and `TPR_SPLIT_BF16_PROFILE` override them; if unset,
+the corresponding existing `TPR_SPLIT_FP32_*` settings are inherited.
+`TPR_EXPERIMENT_DELAYED_DKV_FP32` defaults to `1` in this launcher to match the
+FP32 launcher and can be set to `0` for a separate legacy-dKV run with a new
+output directory. Its actual value is recorded. Q/K/V and parameter gradients
+remain BF16 with either setting.
+
+Compare the reported token hash/profile with the previous FP32 report. A large
+BF16 split error here shows that short length alone does not prevent the issue.
+A small one only establishes this short synthetic case; long/real-data tests
+remain necessary. Unlike the FP32 run, this uses CANN attention and BF16 fusion
+settings, so this experiment alone cannot separate arithmetic precision from
+attention backend effects.
+
+### FP32 detailed reference
+
 Use the same Ascend/MindSpeed/Megatron environment as the existing experiments:
 
 ```bash

@@ -229,12 +229,68 @@ def _compare_traces(reference, candidate, *, atol, rtol):
     return sorted(result, key=lambda item: (order[item["stage"]], item["start"], item["event"]))
 
 
-def run_three_way(model, tokens, prefix_length, output_dir, *, production_attention=False, atol=1e-5, rtol=1e-4):
-    """Run on one unchanged model; stream FP32 parameter gradients to disk."""
+def _run_arm(model, tokens, prefix_length, arm, trace, *, loss_fn=_loss):
+    """Shared Full/connected/production Replay execution for precision diagnostics."""
     from verl.models.mcore.tpr.context import TPRAttentionContext, use_tpr_attention_context
     from verl.workers.engine.megatron.tpr.executor import SegmentExecutor, build_suffix_rotary_pos_emb
     from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
 
+    if arm not in ARMS:
+        raise ValueError(f"Unknown diagnostic arm: {arm}")
+    length = tokens.numel()
+    if arm == "full":
+        loss = loss_fn(_forward(model, tokens, 0, trace), 0, length)
+        loss.backward()
+    elif arm == "split_connected":
+        rotary = build_suffix_rotary_pos_emb(model.rotary_pos_emb, prefix_length=0, suffix_length=prefix_length)
+        prefix = TPRAttentionContext(0, prefix_length, suffix_rotary_pos_emb=rotary)
+        with use_tpr_attention_context(prefix):
+            prefix_loss = loss_fn(_forward(model, tokens[:prefix_length], 0, trace), 0, length)
+        if len(prefix.new_key_values) != len(model.decoder.layers) or any(
+            not tensor.requires_grad for pair in prefix.new_key_values.values() for tensor in pair
+        ):
+            raise AssertionError("Connected split lost a live prefix KV graph")
+        rotary = build_suffix_rotary_pos_emb(
+            model.rotary_pos_emb, prefix_length=prefix_length, suffix_length=length - prefix_length
+        )
+        suffix = TPRAttentionContext(
+            prefix_length,
+            length - prefix_length,
+            past_key_values=prefix.new_key_values,
+            suffix_rotary_pos_emb=rotary,
+        )
+        with use_tpr_attention_context(suffix):
+            suffix_loss = loss_fn(_forward(model, tokens[prefix_length:], prefix_length, trace), prefix_length, length)
+        loss = prefix_loss + suffix_loss
+        loss.backward()
+        del prefix, suffix, prefix_loss, suffix_loss
+    else:
+        plan = SegmentPlan(
+            (
+                SegmentSpec(0, None, tokens[:prefix_length].cpu(), 0, 0),
+                SegmentSpec(1, 0, tokens[prefix_length:].cpu(), prefix_length, prefix_length),
+            ),
+            root_id=0,
+        )
+
+        def objective(segment, logits):
+            trace.record("logits", logits, sequence_dim=1, start=segment.position_start)
+            return loss_fn(logits, segment.position_start, length), {}
+
+        executor = SegmentExecutor(
+            model,
+            plan,
+            expected_layer_numbers=tuple(layer.layer_number for layer in model.decoder.layers),
+            segment_loss_fn=objective,
+            segment_loss_term_counts={0: prefix_length, 1: length - prefix_length - 1},
+        )
+        loss = executor.run()
+        del executor
+    return loss
+
+
+def run_three_way(model, tokens, prefix_length, output_dir, *, production_attention=False, atol=1e-5, rtol=1e-4):
+    """Run on one unchanged model; stream FP32 parameter gradients to disk."""
     length = tokens.numel()
     if tokens.ndim != 1 or tokens.dtype != torch.long or not 0 < prefix_length < length - 1:
         raise ValueError("Require 1-D token IDs, nonempty prefix, and suffix of at least two tokens")
@@ -279,58 +335,7 @@ def run_three_way(model, tokens, prefix_length, output_dir, *, production_attent
                 model.zero_grad(set_to_none=True)
                 folder = output_dir / arm
                 folder.mkdir()
-                if arm == "full":
-                    loss = _loss(_forward(model, tokens, 0, trace), 0, length)
-                    loss.backward()
-                elif arm == "split_connected":
-                    rotary = build_suffix_rotary_pos_emb(
-                        model.rotary_pos_emb, prefix_length=0, suffix_length=prefix_length
-                    )
-                    prefix = TPRAttentionContext(0, prefix_length, suffix_rotary_pos_emb=rotary)
-                    with use_tpr_attention_context(prefix):
-                        prefix_loss = _loss(_forward(model, tokens[:prefix_length], 0, trace), 0, length)
-                    if len(prefix.new_key_values) != len(model.decoder.layers) or any(
-                        not tensor.requires_grad for pair in prefix.new_key_values.values() for tensor in pair
-                    ):
-                        raise AssertionError("Connected split lost a live prefix KV graph")
-                    rotary = build_suffix_rotary_pos_emb(
-                        model.rotary_pos_emb, prefix_length=prefix_length, suffix_length=length - prefix_length
-                    )
-                    suffix = TPRAttentionContext(
-                        prefix_length,
-                        length - prefix_length,
-                        past_key_values=prefix.new_key_values,
-                        suffix_rotary_pos_emb=rotary,
-                    )
-                    with use_tpr_attention_context(suffix):
-                        suffix_loss = _loss(
-                            _forward(model, tokens[prefix_length:], prefix_length, trace), prefix_length, length
-                        )
-                    loss = prefix_loss + suffix_loss
-                    loss.backward()
-                    del prefix, suffix, prefix_loss, suffix_loss
-                else:
-                    plan = SegmentPlan(
-                        (
-                            SegmentSpec(0, None, tokens[:prefix_length].cpu(), 0, 0),
-                            SegmentSpec(1, 0, tokens[prefix_length:].cpu(), prefix_length, prefix_length),
-                        ),
-                        root_id=0,
-                    )
-
-                    def objective(segment, logits):
-                        trace.record("logits", logits, sequence_dim=1, start=segment.position_start)
-                        return _loss(logits, segment.position_start, length), {}
-
-                    executor = SegmentExecutor(
-                        model,
-                        plan,
-                        expected_layer_numbers=tuple(layer.layer_number for layer in model.decoder.layers),
-                        segment_loss_fn=objective,
-                        segment_loss_term_counts={0: prefix_length, 1: length - prefix_length - 1},
-                    )
-                    loss = executor.run()
-                    del executor
+                loss = _run_arm(model, tokens, prefix_length, arm, trace)
                 expected_calls = len(model.decoder.layers) * {"full": 1, "split_connected": 2, "split_replay": 3}[arm]
                 actual_calls = sum(item["stage"].endswith(".attention_math") for item in trace.records)
                 if actual_calls != expected_calls:

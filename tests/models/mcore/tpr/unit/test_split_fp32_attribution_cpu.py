@@ -31,7 +31,7 @@ def _rope(tensor, phase):
     pairs = tensor.reshape(*tensor.shape[:-1], 2, 2)
     a, b = pairs[..., 0], pairs[..., 1]
     cosine, sine = phase[..., ::2].cos(), phase[..., ::2].sin()
-    return torch.stack((a * cosine - b * sine, a * sine + b * cosine), dim=-1).flatten(-2)
+    return torch.stack((a * cosine - b * sine, a * sine + b * cosine), dim=-1).flatten(-2).to(tensor.dtype)
 
 
 class _Embedding(nn.Module):
