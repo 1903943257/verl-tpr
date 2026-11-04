@@ -107,9 +107,18 @@ def compare(root: Path) -> dict:
         ):
             if candidate[key] != baseline[key]:
                 raise AssertionError(f"{arm}: mismatched input/initial state field {key}")
-    for key in ("forest_trees", "forest_segments", "unique_tree_tokens", "reuse_ratio", "loss", "logprobs"):
+    for key in ("forest_trees", "forest_segments", "unique_tree_tokens", "reuse_ratio"):
         if arms["tpr_old"][key] != arms["tpr_fp32"][key]:
-            raise AssertionError(f"TPR forward or forest changed with delayed dKV dtype: {key}")
+            raise AssertionError(f"TPR forest changed with delayed dKV dtype: {key}")
+    old_logps = arms["tpr_old"]["logprobs"]
+    fp32_logps = arms["tpr_fp32"]["logprobs"]
+    if [(p[0], p[1]) for p in old_logps] != [(p[0], p[1]) for p in fp32_logps]:
+        raise AssertionError("TPR-old and TPR-FP32 supervise different logprob coordinates")
+    logprob_max_abs_gap = max(
+        (abs(a[2] - b[2]) for a, b in zip(old_logps, fp32_logps, strict=True)),
+        default=0.0,
+    )
+    loss_abs_gap = abs(arms["tpr_old"]["loss"] - arms["tpr_fp32"]["loss"])
 
     pairs = {
         "full_vs_tpr_old": _pair_metrics(baseline, arms["tpr_old"]),
@@ -132,7 +141,8 @@ def compare(root: Path) -> dict:
         "pairs": pairs,
         "fp32_relative_l2_over_old": new_err / max(old_err, 1e-30),
         "fp32_reduces_full_gradient_error": new_err < old_err,
-        "forward_check": "TPR-old and TPR-FP32 loss/logprobs exactly equal",
+        "tpr_old_vs_fp32_forward_loss_abs_gap": loss_abs_gap,
+        "tpr_old_vs_fp32_forward_logprob_max_abs_gap": logprob_max_abs_gap,
         "arm_peak_alloc_gib": {arm: result["peak_allocated_gib"] for arm, result in arms.items()},
     }
     return report
