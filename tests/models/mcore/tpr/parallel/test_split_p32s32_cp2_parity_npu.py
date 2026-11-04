@@ -256,6 +256,9 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
             # logprobs; the reduction happens only after backward collectives.
             total_loss, logps = _collect_observations(loss, observations, coverage, runtime.cp_group, cp)
             if runtime.cp_rank != 0:
+                # Keep every CP rank at the same phase while rank0 streams
+                # complete 4B parameter gradients and compares CPU shards.
+                dist.barrier(group=runtime.cp_group)
                 continue
             output = root / arm
             output.mkdir(parents=True, exist_ok=False)
@@ -293,6 +296,8 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
                 f"output={output/'result.json'}",
                 flush=True,
             )
+            if cp > 1:
+                dist.barrier(group=runtime.cp_group)
         if cp == 2 and runtime.cp_rank == 0:
             full = json.loads((root / "full_cp2" / "result.json").read_text())
             tpr = json.loads((root / "tpr_cp2" / "result.json").read_text())
