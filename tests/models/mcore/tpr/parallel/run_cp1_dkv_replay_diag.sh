@@ -21,6 +21,8 @@ TEST="tests/models/mcore/tpr/parallel/test_real_actor_cp1_n8_fair_npu.py"
 mkdir -p "$ROOT"
 export TPR_CP1_N8_CAPTURE="$CAP"
 export TPR_QWEN_4B_PATH="$MODEL"
+# The N8 Actor test has an explicit opt-in pytest skip guard.
+export TPR_RUN_CP1_N8_FAIR=1
 export TPR_TREE_POLICY=qwen_turn
 export TPR_LEAF_BATCH_SIZE=1
 export TPR_CP1_N8_WARMUPS=0
@@ -51,7 +53,7 @@ for arm in tpr_old tpr_fp32; do
   echo "===== DKV REPLAY DIAGNOSTICS arm=$arm delayed_dkv_fp32=$TPR_EXPERIMENT_DELAYED_DKV_FP32 ====="
   torchrun --master_addr=127.0.0.1 --master_port="${TPR_TEST_MASTER_PORT:-29869}" \
     --nproc_per_node=1 -m tests.models.mcore.tpr._mindspeed_first_pytest \
-    -q -s -x "$TEST" 2>&1 | tee "$ROOT/$arm/run.log"
+    -q -s -x -rs "$TEST" 2>&1 | tee "$ROOT/$arm/run.log"
   [[ -s "$ROOT/$arm/dkv.jsonl" ]] || {
     echo "ERROR: no dKV diagnostics written for $arm" >&2
     exit 1
