@@ -81,3 +81,63 @@ python -m tests.models.mcore.tpr._mindspeed_first_pytest -q -x \
 That repository bootstrap requires the configured MindSpeed environment even
 for the CPU tests. A CPU-only reviewer can bootstrap optional package initializers
 as in the existing local audit; this does not validate real NPU integration.
+
+
+## Recover an existing FP32 three-arm run (no NPU)
+
+If all three `manifest.json`, `trace.pt` and `grad_*.pt` sets were
+written, but the run failed during `torch.load(Path(...), mmap=True)`, do
+**not** start a new 48GB run. On this experiment branch use:
+
+```bash
+python -m tests.models.mcore.tpr.parallel.compare_split_fp32_saved \
+  /workspace/tpr_experiments/split_fp32_p32s32_run1 \
+  --prefix 32 --suffix 32
+```
+
+The recovery reuses existing per-layer JSONs, reconstructs the fixed linear
+loss from saved grad-enabled logits, streams the three all-parameter
+comparisons on CPU, and writes `report.json`. Loss reconstruction may differ
+slightly in final sum order; it is labelled as recovered. The path is passed
+to `torch.load` as a string for the installed `torch_npu` serialization
+wrapper. Do not delete the gradients before `report.json` exists.
+
+## Separate BF16 CP1 vs Ring CP2 P32S32 parity
+
+The **existing FP32 math-attention gradient dumps cannot be used as a
+reference for BF16 Ring CP2**. Test matched BF16 across all arms instead:
+
+```bash
+export TPR_QWEN_4B_PATH=/workspace/hf_models/Qwen3-4B-128K
+export TPR_P32S32_DEVICES=0,1
+export TPR_P32S32_OUTPUT=/workspace/tpr_experiments/p32s32_cp2_bf16_run1
+bash tests/models/mcore/tpr/parallel/run_split_p32s32_cp2_parity.sh
+```
+
+This runs sequentially:
+- Full CP1, one ordinary 64-token square CANN forward/backward
+- Full CP2, the **same** 64-token sequence on 2-NPU TPR Ring CP
+- TPR CP2, a Prefix32/Suffix32 two-segment Push/Leaf/Pop replay on the
+  same two ranks and weights
+
+All modes use the same deterministic tokens/checkpoint and the same
+global-position linear loss as the FP32 attribution test, computed with BF16
+model parameters and FP32 loss arithmetic. The 63 next-token logprobs are
+measured separately and are **not** the backward objective. All BF16
+parameter gradients are compared after CP2 FP32 SUM/average then BF16 cast.
+The result `comparison.json` contains all three pairwise gradient rel-L2,
+cosine, max-abs, loss gap, and next-token logprob error.
+
+Only **Full CP1 and Full CP2** parameter gradients are persisted: roughly
+16GB total. The TPR CP2 gradients are compared directly, not dumped as a
+third set. No optimizer update. CP1 square CANN and CP2 Ring may differ from
+ordinary BF16 kernel rounding; report differences, do not assert bitwise
+equivalence. This is a separate BF16 kernel/topology diagnostic, not another
+arm of the original all-FP32 math-attention experiment.
+
+CPU sanity gate (MindSpeed-first bootstrap in configured development env):
+
+```bash
+python -m tests.models.mcore.tpr._mindspeed_first_pytest -q -x \
+  tests/models/mcore/tpr/unit/test_split_saved_and_cp2_loss_cpu.py
+```
