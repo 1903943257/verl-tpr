@@ -20,8 +20,8 @@ export TPR_ROOT_NATIVE_RING=0 TPR_LEAF_BATCH_SIZE=1 TPR_EXEC_PROFILE=0
 export TPR_EXPERIMENT_DELAYED_DKV_FP32=1
 export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HCCL_DETERMINISTIC=true
 unset TPR_DKV_REPLAY_DIAG_PATH TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
-# Use an explicit IPv4 loopback rendezvous instead of --standalone. This avoids
-# hostname/IPv6 resolution in containers and makes the single-rank endpoint clear.
+# Use an explicit IPv4 loopback rendezvous to avoid hostname/IPv6
+# resolution in containers and make the single-rank endpoint deterministic.
 export MASTER_ADDR=127.0.0.1
 export MASTER_PORT="${TPR_SPLIT_FP32_MASTER_PORT:-29681}"
 if ! [[ "$MASTER_PORT" =~ ^[0-9]+$ ]] || (( MASTER_PORT < 1 || MASTER_PORT > 65535 )); then
