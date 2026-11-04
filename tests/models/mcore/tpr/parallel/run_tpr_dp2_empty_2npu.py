@@ -37,6 +37,7 @@ def _production_run_forest():
     namespace = {
         "Tensor": torch.Tensor, "nullcontext": nullcontext,
         "Callable": Callable, "Any": Any,
+        "ForestExecutionPlan": object, "TreeExecutionPlan": object,
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(source), "exec"), namespace)
     return namespace["run_forest"]
