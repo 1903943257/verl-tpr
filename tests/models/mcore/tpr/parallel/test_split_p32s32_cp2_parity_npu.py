@@ -239,6 +239,7 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
             profile="4b", params_dtype=torch.bfloat16,
         )
         model.train()
+        parameter_versions = {name: parameter._version for name, parameter in model.named_parameters()}
         witness = _initial_fingerprint(model) if runtime.cp_rank == 0 else None
         if runtime.cp_rank == 0:
             print(f"P32S32_CP_READY cp={cp} token_hash={sha} fingerprint={witness}", flush=True)
@@ -255,6 +256,10 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
             # CP2 will also all-reduce per-segment partial losses and token
             # logprobs; the reduction happens only after backward collectives.
             total_loss, logps = _collect_observations(loss, observations, coverage, runtime.cp_group, cp)
+            if parameter_versions != {
+                name: parameter._version for name, parameter in model.named_parameters()
+            }:
+                raise AssertionError(f"Model parameters changed in-place during {arm}")
             if runtime.cp_rank != 0:
                 # Keep every CP rank at the same phase while rank0 streams
                 # complete 4B parameter gradients and compares CPU shards.
