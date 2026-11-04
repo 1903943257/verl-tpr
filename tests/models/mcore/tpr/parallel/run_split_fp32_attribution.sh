@@ -20,9 +20,21 @@ export TPR_ROOT_NATIVE_RING=0 TPR_LEAF_BATCH_SIZE=1 TPR_EXEC_PROFILE=0
 export TPR_EXPERIMENT_DELAYED_DKV_FP32=1
 export PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 HCCL_DETERMINISTIC=true
 unset TPR_DKV_REPLAY_DIAG_PATH TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
+# Use an explicit IPv4 loopback rendezvous instead of --standalone. This avoids
+# hostname/IPv6 resolution in containers and makes the single-rank endpoint clear.
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT="${TPR_SPLIT_FP32_MASTER_PORT:-29681}"
+if ! [[ "$MASTER_PORT" =~ ^[0-9]+$ ]] || (( MASTER_PORT < 1 || MASTER_PORT > 65535 )); then
+  echo "ERROR: invalid TPR_SPLIT_FP32_MASTER_PORT=$MASTER_PORT" >&2
+  exit 2
+fi
+
 echo 'FP32 parameters + gradients + math attention. Qwen3-4B gradient dumps require about 48 GB disk.'
 echo "Synthetic sequence: P=$TPR_SPLIT_FP32_PREFIX S=$TPR_SPLIT_FP32_SUFFIX"
-"${PYTHON_BIN:-python}" -m torch.distributed.run --standalone --nproc_per_node=1 \
+echo "Distributed rendezvous: MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
+"${PYTHON_BIN:-python}" -m torch.distributed.run \
+  --nnodes=1 --node_rank=0 --nproc_per_node=1 \
+  --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
   -m tests.models.mcore.tpr._mindspeed_first_pytest -q -s -x \
   tests/models/mcore/tpr/parallel/test_real_actor_split_fp32_attribution_npu.py \
   2>&1 | tee "${TPR_SPLIT_FP32_OUTPUT}.log"
