@@ -118,32 +118,31 @@ def _concatenate_kv(entries: tuple[tuple[SequenceShard, Mapping[int, KVPair]], .
         raise RuntimeError("sharded KV must be consumed through a context-parallel attention backend")
     if not entries:
         return MappingProxyType({})
-    if len(entries) == 1 and entries[0][0].local_length == entries[0][0].global_length:
-        return entries[0][1]
-
-    # A CP1 SP Segment may own a padded physical KV tensor. Local causal
-    # attention consumes only its logical prefix; slicing remains in autograd,
-    # so descendant dK/dV for virtual padding is exactly zero.
-    logical_entries = tuple(
-        (
-            shard,
+    if len(entries) == 1:
+        shard, key_values = entries[0]
+        if shard.local_length == shard.global_length:
+            return key_values
+        return MappingProxyType(
             {
                 layer: tuple(_logical_cp1_kv_tensor(tensor, shard) for tensor in pair)
                 for layer, pair in key_values.items()
-            },
+            }
         )
-        for shard, key_values in entries
-    )
-    layer_numbers = tuple(logical_entries[0][1])
-    if len(logical_entries) == 1:
-        return MappingProxyType(logical_entries[0][1])
+
+    # Trim each Segment's tail before concatenating its logical Prefix KV.
     return MappingProxyType(
         {
             layer: tuple(
-                torch.cat([key_values[layer][index] for _, key_values in logical_entries], dim=0)
+                torch.cat(
+                    [
+                        _logical_cp1_kv_tensor(key_values[layer][index], shard)
+                        for shard, key_values in entries
+                    ],
+                    dim=0,
+                )
                 for index in (0, 1)
             )
-            for layer in layer_numbers
+            for layer in entries[0][1]
         }
     )
 
