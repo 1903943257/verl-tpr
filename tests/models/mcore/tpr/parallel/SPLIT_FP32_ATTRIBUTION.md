@@ -70,6 +70,21 @@ attention backend effects.
 
 ### FP32 detailed reference
 
+Git is optional in both FP32 and BF16 experiment containers. If the source is
+mounted from a host worktree whose `.git` pointer cannot resolve in Docker,
+the report records `source_head: null`, `source_head_origin: "unavailable"`,
+and the captured Git error; this does not fail the numerical experiment or
+print a fatal Git error to the console. Missing Git and Git timeouts are also
+handled. A host may explicitly pass its revision through the container's
+`TPR_SOURCE_HEAD` environment variable; it is labeled `"environment"` and is
+not claimed to have been verified against the mounted files. No Git operation
+inside the container is needed in that case.
+
+If an older BF16 runner failed only at `git rev-parse HEAD` **after all three
+`SPLIT_BF16_ARM_DONE` messages**, the already-written `report.json` contains
+the complete gradient/loss comparisons and can be used without repeating the
+NPU run. Only the final environment metadata and console summary are missing.
+
 Use the same Ascend/MindSpeed/Megatron environment as the existing experiments:
 
 ```bash

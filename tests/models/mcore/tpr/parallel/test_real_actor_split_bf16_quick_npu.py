@@ -4,7 +4,6 @@
 
 import json
 import os
-import subprocess
 from pathlib import Path
 
 import pytest
@@ -22,6 +21,7 @@ def test_real_qwen_split_bf16_quick():
     from megatron.core import parallel_state
 
     from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
+    from .experiment_source import source_metadata
     from .split_bf16_quick import run_bf16_quick
     from .test_tpr_10k_parallel_parity_npu import _runtime
 
@@ -36,6 +36,7 @@ def test_real_qwen_split_bf16_quick():
         raise FileExistsError(output)
     if int(os.getenv("WORLD_SIZE", "1")) != 1:
         raise ValueError("Requires exactly TP1/CP1/DP1")
+    source = source_metadata()
     runtime = _runtime(1, 1, 1)
     try:
         model, hf = make_real_qwen3_tp_model(
@@ -80,7 +81,7 @@ def test_real_qwen_split_bf16_quick():
                     "masked_softmax_fusion",
                 )
             },
-            "source_head": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+            **source,
         }
         (output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
         for name, pair in report["pairs"].items():
