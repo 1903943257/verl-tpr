@@ -16,7 +16,8 @@ from pathlib import Path
 
 import torch
 
-from .split_fp32_attribution import ARMS, _compare_traces, _loss, tensor_difference
+from .fast_fp32_grad_compare import fast_fp32_tensor_difference
+from .split_fp32_attribution import ARMS, _compare_traces, _loss
 
 
 def _read_manifest(root: Path, arm: str) -> list[dict]:
@@ -73,6 +74,51 @@ def _trace_loss(trace: list[dict], *, total_length: int) -> tuple[float, int]:
     if cursor != total_length:
         raise ValueError(f"Saved logits cover {cursor} of {total_length} tokens")
     return loss, len(ranges)
+
+
+def _stat_signature(path: Path) -> tuple[int, int]:
+    status = path.stat()
+    return status.st_size, status.st_mtime_ns
+
+
+def _read_completed_parameters(path: Path) -> dict[tuple[str, str, int], dict]:
+    """Read complete JSONL lines; a partial last line from interruption is ignored."""
+    completed = {}
+    if not path.exists():
+        return completed
+    lines = path.read_text().splitlines()
+    for number, line in enumerate(lines, 1):
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            if number == len(lines):
+                print(f"INFO: ignoring interrupted last checkpoint line: {number}", flush=True)
+                break
+            raise
+        completed[(item["left"], item["right"], item["index"])] = item
+    return completed
+
+
+def _cached_matches(
+    item: dict | None,
+    *,
+    entry: dict,
+    left_signature: tuple[int, int],
+    right_signature: tuple[int, int],
+    atol: float,
+    rtol: float,
+) -> bool:
+    return (
+        item is not None
+        and item.get("name") == entry["name"]
+        and item.get("shape") == entry["shape"]
+        and item.get("file") == entry["file"]
+        and item.get("left_signature") == list(left_signature)
+        and item.get("right_signature") == list(right_signature)
+        and item.get("atol") == atol
+        and item.get("rtol") == rtol
+        and isinstance(item.get("metrics"), dict)
+    )
 
 
 def compare_saved(root: Path, *, prefix: int, suffix: int, atol: float = 1e-5, rtol: float = 1e-4,
@@ -133,20 +179,75 @@ def compare_saved(root: Path, *, prefix: int, suffix: int, atol: float = 1e-5, r
         ("full", "split_replay"),
         ("split_connected", "split_replay"),
     )
+    checkpoint_path = root / ".offline_compare_progress.jsonl"
+    completed = _read_completed_parameters(checkpoint_path)
     for left, right in pairs:
-        print(f"Comparing saved FP32 gradients: {left} vs {right} ({len(reference_manifest)} tensors)", flush=True)
+        print(
+            f"Comparing saved FP32 gradients: {left} vs {right} "
+            f"({len(reference_manifest)} tensors; checkpoint={checkpoint_path})",
+            flush=True,
+        )
         metrics = []
         for index, entry in enumerate(reference_manifest):
             left_path = root / left / entry["file"]
             right_path = root / right / entry["file"]
+            left_signature = _stat_signature(left_path)
+            right_signature = _stat_signature(right_path)
+            cached = completed.get((left, right, index))
+            if _cached_matches(
+                cached, entry=entry, left_signature=left_signature,
+                right_signature=right_signature, atol=atol, rtol=rtol,
+            ):
+                metrics.append({"name": entry["name"], **cached["metrics"]})
+                if index % 10 == 0 or index == len(reference_manifest) - 1:
+                    print(f"  RESUMED {left} vs {right}: {index + 1}/{len(reference_manifest)}", flush=True)
+                continue
+
+            print(
+                f"  START {left} vs {right}: {index + 1}/{len(reference_manifest)} "
+                f"{entry['name']} shape={entry['shape']}",
+                flush=True,
+            )
             a = torch.load(str(left_path), weights_only=True, map_location="cpu", mmap=True)
             b = torch.load(str(right_path), weights_only=True, map_location="cpu", mmap=True)
-            if a.dtype != torch.float32 or b.dtype != torch.float32 or tuple(a.shape) != tuple(entry["shape"]) or tuple(b.shape) != tuple(entry["shape"]):
+            if (
+                a.dtype != torch.float32 or b.dtype != torch.float32
+                or tuple(a.shape) != tuple(entry["shape"])
+                or tuple(b.shape) != tuple(entry["shape"])
+            ):
                 raise ValueError(f"Incorrect gradient dtype or shape at {entry['name']}")
-            metrics.append({"name": entry["name"], **tensor_difference(a, b, atol=atol, rtol=rtol)})
+
+            last_progress = 0
+
+            def show_progress(done: int, total: int) -> None:
+                nonlocal last_progress
+                if done == total or done - last_progress >= 32 * 1024 * 1024:
+                    print(
+                        f"    {entry['name']}: {done:,}/{total:,} elements "
+                        f"({100 * done / max(total, 1):.1f}%)",
+                        flush=True,
+                    )
+                    last_progress = done
+
+            result = fast_fp32_tensor_difference(
+                a, b, atol=atol, rtol=rtol, progress=show_progress,
+            )
             del a, b
-            if (index + 1) % 32 == 0 or index + 1 == len(reference_manifest):
-                print(f"  {left} vs {right}: {index+1}/{len(reference_manifest)} tensors", flush=True)
+            metrics.append({"name": entry["name"], **result})
+            checkpoint_record = {
+                "left": left, "right": right, "index": index,
+                "name": entry["name"], "shape": entry["shape"],
+                "file": entry["file"],
+                "left_signature": list(left_signature),
+                "right_signature": list(right_signature),
+                "atol": atol, "rtol": rtol, "metrics": result,
+            }
+            # Write each completed parameter before advancing. On interruption,
+            # subsequent invocations resume only from verified completed shards.
+            with checkpoint_path.open("a", encoding="utf-8") as output:
+                output.write(json.dumps(checkpoint_record, sort_keys=True) + "\n")
+            completed[(left, right, index)] = checkpoint_record
+            print(f"  DONE {left} vs {right}: {index + 1}/{len(reference_manifest)}", flush=True)
         a_norm_sq = sum(item["reference_norm"] ** 2 for item in metrics)
         b_norm_sq = sum(item["candidate_norm"] ** 2 for item in metrics)
         diff_sq = sum(item["difference_norm"] ** 2 for item in metrics)
