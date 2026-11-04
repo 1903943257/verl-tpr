@@ -392,7 +392,7 @@ def run_three_way(model, tokens, prefix_length, output_dir, *, production_attent
             metrics = []
             for entry in manifests[0]:
                 a, b = [
-                    torch.load(output_dir / arm / entry["file"], weights_only=True, map_location="cpu", mmap=True)
+                    torch.load(str(output_dir / arm / entry["file"]), weights_only=True, map_location="cpu", mmap=True)
                     for arm in (left, right)
                 ]
                 metrics.append({"name": entry["name"], **tensor_difference(a, b, atol=atol, rtol=rtol)})
