@@ -65,29 +65,34 @@ def _tensor(output):
 class LayerTrace:
     """Save aligned module outputs/gradients; Push and Replay remain separate."""
 
-    def __init__(self):
+    def __init__(self, *, forward_only=False, attention_impl=math_attention, attention_stage="attention_math"):
         self.records = []
         self.handles = []
         self.active_layer = None
         self.arm = None
+        self.forward_only = forward_only
+        self.attention_impl = attention_impl
+        self.attention_stage = attention_stage
 
     def record(self, stage, tensor, *, sequence_dim=0, start=None, record_grad=True):
         from verl.models.mcore.tpr.context import get_tpr_attention_context
 
         if not isinstance(tensor, Tensor) or not tensor.is_floating_point():
             return
-        if tensor.dtype != torch.float32:
+        if tensor.dtype != torch.float32 and not (self.forward_only and tensor.dtype == torch.bfloat16):
             raise TypeError(f"{stage}: expected FP32, received {tensor.dtype}")
+        record_grad = record_grad and not self.forward_only
         context = get_tpr_attention_context()
         if start is None:
             start = 0 if context is None else context.prefix_length
-        snapshot = tensor.detach().movedim(sequence_dim, 0).cpu().clone()
+        snapshot = tensor.detach().movedim(sequence_dim, 0).cpu().float().clone()
         item = {
             "stage": stage,
             "arm": self.arm,
             "start": start,
             "end": start + snapshot.shape[0],
             "forward": snapshot,
+            "source_dtype": str(tensor.dtype),
             "gradient": None,
             "grad_enabled": torch.is_grad_enabled(),
             "expect_gradient": record_grad and tensor.requires_grad and torch.is_grad_enabled(),
@@ -130,7 +135,10 @@ class LayerTrace:
                 "q_norm": getattr(layer.self_attention, "q_layernorm", None),
                 "k_norm": getattr(layer.self_attention, "k_layernorm", None),
                 "attention": layer.self_attention,
+                "attention_projection": getattr(layer.self_attention, "linear_proj", None),
                 "pre_mlp_norm": getattr(layer, "pre_mlp_layernorm", None),
+                "mlp_fc1": getattr(layer.mlp, "linear_fc1", None),
+                "mlp_fc2": getattr(layer.mlp, "linear_fc2", None),
                 "mlp": getattr(layer, "mlp", None),
             }
             for name, module in slots.items():
@@ -154,8 +162,8 @@ class LayerTrace:
         self.record(f"{base}.q_rope", query, record_grad=False)
         self.record(f"{base}.k_all", key, start=0, record_grad=False)
         self.record(f"{base}.v_all", value, start=0, record_grad=False)
-        output = math_attention(query, key, value, **kwargs)
-        self.record(f"{base}.attention_math", output)
+        output = self.attention_impl(query, key, value, **kwargs)
+        self.record(f"{base}.{self.attention_stage}", output)
         return output
 
     def close(self):

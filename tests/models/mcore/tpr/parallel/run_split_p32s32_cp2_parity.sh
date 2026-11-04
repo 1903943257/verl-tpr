@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Controlled 64-token BF16: 1-NPU Full, 2-NPU Ring Full, 2-NPU Ring TPR P32+S32.
 # Full CP1/CP2 and TPR CP2 use identical checkpoint/tokens/fixed loss.
-# Outputs only two reference full-gradient sets (~16 GB); TPR is compared online.
+# Two temporary reference gradient sets (~16 GB); TPR is compared online.
 set -Eeuo pipefail
 cd "$(dirname "$0")/../../../../.."
 
@@ -24,18 +24,30 @@ fi
 export TPR_RUN_P32S32_CP2_PARITY=1
 export TPR_ROOT_NATIVE_RING=0
 export TPR_LEAF_BATCH_SIZE=1
-export TPR_EXPERIMENT_DELAYED_DKV_FP32=0
+export TPR_EXPERIMENT_DELAYED_DKV_FP32="${TPR_EXPERIMENT_DELAYED_DKV_FP32:-1}"
+export TPR_P32S32_PROFILE="${TPR_P32S32_PROFILE:-4b}"
+export TPR_P32S32_GRAD_SYNC_DTYPE="${TPR_P32S32_GRAD_SYNC_DTYPE:-bf16}"
+export TPR_P32S32_KEEP_GRADS="${TPR_P32S32_KEEP_GRADS:-0}"
+[[ "$TPR_EXPERIMENT_DELAYED_DKV_FP32" =~ ^[01]$ && "$TPR_P32S32_KEEP_GRADS" =~ ^[01]$ ]] || {
+    echo 'dKV and keep-grads gates must be 0 or 1' >&2; exit 2;
+}
+[[ "$TPR_P32S32_GRAD_SYNC_DTYPE" == bf16 || "$TPR_P32S32_GRAD_SYNC_DTYPE" == fp32 ]] || {
+    echo 'Gradient reduction dtype must be bf16 or fp32' >&2; exit 2;
+}
 export TPR_RING_COALESCE_PREFIX_FULL=0
 export TPR_RING_COALESCE_PREFIX_QUERY=0
 export TPR_RING_COALESCE_PREFIX_PADDED=0
 export HCCL_DETERMINISTIC=true PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
-unset TPR_DKV_REPLAY_DIAG_PATH || true
+unset TPR_DKV_REPLAY_DIAG_PATH TPR_MEM_TRACE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
 mkdir -p "$TPR_P32S32_OUTPUT"
 export TPR_P32S32_OUTPUT="$(cd "$TPR_P32S32_OUTPUT" && pwd -P)"
 
 TEST=tests/models/mcore/tpr/parallel/test_split_p32s32_cp2_parity_npu.py
 echo "P32S32_CP_TEST output=$TPR_P32S32_OUTPUT"
 echo "P32S32_CP_TEST attention=CP1_square_CANN_vs_CP2_TPR_Ring dtype=BF16"
+echo "P32S32_CP_TEST grad_reduce=$TPR_P32S32_GRAD_SYNC_DTYPE delayed_dKV_FP32=$TPR_EXPERIMENT_DELAYED_DKV_FP32"
+echo 'CP2 Full uses production TPR Ring on one complete segment; this is not native MindSpeed Full.'
+echo 'Temporary reference gradients require about 16 GB disk for 4B; deleted after success unless KEEP_GRADS=1.'
 echo "P32S32_CP_TEST fixed_loss + diagnostic next-token logprobs; no PPO, no optimizer"
 
 export ASCEND_RT_VISIBLE_DEVICES="$DEVICE0"

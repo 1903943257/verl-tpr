@@ -22,6 +22,7 @@ def test_real_qwen_split_bf16_quick():
 
     from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
     from .experiment_source import source_metadata
+    from .split_attention_precision import ATTENTION_MODES
     from .split_bf16_quick import run_bf16_quick
     from .test_tpr_10k_parallel_parity_npu import _runtime
 
@@ -30,10 +31,13 @@ def test_real_qwen_split_bf16_quick():
     prefix = int(os.getenv("TPR_SPLIT_BF16_PREFIX", "32"))
     suffix = int(os.getenv("TPR_SPLIT_BF16_SUFFIX", "32"))
     profile = os.getenv("TPR_SPLIT_BF16_PROFILE", "4b")
+    diagnostics = os.getenv("TPR_SPLIT_BF16_DIAGNOSTICS", "0") == "1"
     if prefix < 1 or suffix < 2 or prefix + suffix > 512:
         raise ValueError("Short diagnostic requires P>=1, S>=2, total<=512")
     if output.exists():
         raise FileExistsError(output)
+    if diagnostics and (prefix, suffix) != (32, 32):
+        raise ValueError("Attention attribution is deliberately limited to P32/S32")
     if int(os.getenv("WORLD_SIZE", "1")) != 1:
         raise ValueError("Requires exactly TP1/CP1/DP1")
     source = source_metadata()
@@ -57,10 +61,7 @@ def test_real_qwen_split_bf16_quick():
         config.grad_scale_func = None
         generator = torch.Generator(device="cpu").manual_seed(20261104)
         tokens = torch.randint(256, hf.vocab_size - 256, (prefix + suffix,), generator=generator).to(runtime.device)
-        with torch.autocast(device_type="npu", enabled=False):
-            report = run_bf16_quick(model, tokens, prefix, output)
-        torch.npu.synchronize()
-        report["environment"] = {
+        environment = {
             "torch": torch.__version__,
             "torch_npu": torch_npu.__version__,
             "checkpoint": str(checkpoint),
@@ -83,13 +84,51 @@ def test_real_qwen_split_bf16_quick():
             },
             **source,
         }
-        (output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-        for name, pair in report["pairs"].items():
-            print(
-                f"SPLIT_BF16 {name}: rel_l2={pair['gradient_relative_l2']:.9g} "
-                f"cosine={pair['gradient_cosine']:.12g} max_abs={pair['gradient_max_abs']:.9g} "
-                f"loss_gap={pair['loss_abs_gap']:.9g} elements={pair['elements']}",
-                flush=True,
+        modes = ATTENTION_MODES if diagnostics else ("cann",)
+        if diagnostics:
+            output.mkdir(parents=True, exist_ok=False)
+        reports, baselines = {}, {}
+        versions = {name: p._version for name, p in model.named_parameters()}
+        for mode in modes:
+            destination = output / mode if diagnostics else output
+            with torch.autocast(device_type="npu", enabled=False):
+                report = run_bf16_quick(
+                    model,
+                    tokens,
+                    prefix,
+                    destination,
+                    attention_mode=mode,
+                    trace_forward=diagnostics,
+                    forward_baselines=baselines,
+                )
+            torch.npu.synchronize()
+            if versions != {name: p._version for name, p in model.named_parameters()}:
+                raise AssertionError("Model weights changed across attention precision modes")
+            report["environment"] = environment
+            (destination / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+            reports[mode] = report
+            for name, pair in report["pairs"].items():
+                print(
+                    f"SPLIT_BF16 mode={mode} {name}: rel_l2={pair['gradient_relative_l2']:.9g} "
+                    f"cosine={pair['gradient_cosine']:.12g} max_abs={pair['gradient_max_abs']:.9g} "
+                    f"loss_gap={pair['loss_abs_gap']:.9g} logprob_max_abs={pair['logprob_max_abs']:.9g} "
+                    f"ce_gap={pair['cross_entropy_abs_gap']:.9g} elements={pair['elements']}",
+                    flush=True,
+                )
+            if diagnostics:
+                print(f"SPLIT_BF16_FORWARD mode={mode} " + json.dumps(report["forward_summary"]), flush=True)
+        if diagnostics:
+            (output / "report.json").write_text(
+                json.dumps(
+                    {
+                        "environment": environment,
+                        "fixed_model_across_modes": True,
+                        "scope": "P32/S32 BF16 network; attention-only ablations, not an optimizer/PPO training run",
+                        "modes": reports,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
             )
         print(f"SPLIT_BF16_QUICK_DONE report={output / 'report.json'}", flush=True)
     finally:

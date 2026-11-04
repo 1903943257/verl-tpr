@@ -1,5 +1,9 @@
 # Full / connected split / replay split FP32 attribution
 
+For the subsequent **P32/S32 BF16 layer-forward attribution, local attention
+FP32 ablation, and BF16 CP2 Ring comparison**, see
+[P32S32_PRECISION_DIAGNOSTICS.md](P32S32_PRECISION_DIAGNOSTICS.md).
+
 Run this from the existing delayed-dKV experiment branch. It uses one real
 Qwen3 checkpoint, one synthetic trajectory, and three executions with unchanged
 weights. Default length is 32 prefix + 32 suffix tokens. No external capture or
@@ -185,13 +189,16 @@ All modes use the same deterministic tokens/checkpoint and the same
 global-position linear loss as the FP32 attribution test, computed with BF16
 model parameters and FP32 loss arithmetic. The 63 next-token logprobs are
 measured separately and are **not** the backward objective. All BF16
-parameter gradients are compared after CP2 FP32 SUM/average then BF16 cast.
+parameter gradients are compared after CP2 SUM/average, using BF16 by default.
+`TPR_P32S32_GRAD_SYNC_DTYPE=fp32` explicitly selects FP32 collective staging
+and a BF16 result instead. The actual setting is recorded.
 The result `comparison.json` contains all three pairwise gradient rel-L2,
 cosine, max-abs, loss gap, and next-token logprob error.
 
-Only **Full CP1 and Full CP2** parameter gradients are persisted: roughly
-16GB total. The TPR CP2 gradients are compared directly, not dumped as a
-third set. No optimizer update. CP1 square CANN and CP2 Ring may differ from
+Only **Full CP1 and Full CP2** parameter gradients are temporarily written:
+roughly 16GB total for 4B, deleted after success unless
+`TPR_P32S32_KEEP_GRADS=1`. The TPR CP2 gradients are compared directly, not
+dumped as a third set. No optimizer update. CP1 square CANN and CP2 Ring may differ from
 ordinary BF16 kernel rounding; report differences, do not assert bitwise
 equivalence. This is a separate BF16 kernel/topology diagnostic, not another
 arm of the original all-FP32 math-attention experiment.

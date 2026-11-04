@@ -27,7 +27,10 @@ if ! [[ "$MASTER_PORT" =~ ^[0-9]+$ ]] || (( MASTER_PORT < 1 || MASTER_PORT > 655
   echo 'Invalid TPR_SPLIT_BF16_MASTER_PORT' >&2; exit 2;
 fi
 echo "BF16 CANN, P=$TPR_SPLIT_BF16_PREFIX S=$TPR_SPLIT_BF16_SUFFIX, delayed_dKV_FP32=$TPR_EXPERIMENT_DELAYED_DKV_FP32"
-echo 'Summary only; no tensor dumps. Two CPU BF16 gradient snapshots need about 16 GB RAM for Qwen3-4B.'
+echo 'No tensor dumps. Two CPU BF16 gradient snapshots need about 16 GB RAM for Qwen3-4B.'
+if [[ "${TPR_SPLIT_BF16_DIAGNOSTICS:-0}" == 1 ]]; then
+  echo 'P32/S32 diagnostics: CANN / BF16 math / local FP32 math attention, forward statistics only.'
+fi
 "${PYTHON_BIN:-python}" -m torch.distributed.run \
   --nnodes=1 --node_rank=0 --nproc_per_node=1 \
   --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \

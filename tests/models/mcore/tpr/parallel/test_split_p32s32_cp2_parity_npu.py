@@ -8,9 +8,10 @@ CP1 runs ordinary square attention; CP2 runs production TPR Ring CP. This is
 separate from the all-FP32 explicit-math test, and it does not claim the CP1
 and CP2 attention kernels have identical BF16 rounding.
 
-No optimizer step. CP2 gradients are averaged across CP replicas in FP32
-after SegmentExecutor scales local backward loss by CP size.
+No optimizer step. CP2 gradient reduction precision is explicit (BF16 by
+default); SegmentExecutor scales local backward loss by CP size before averaging.
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -51,13 +52,11 @@ def _objective(logits, positions, tokens, *, global_length=64):
     logits_fp32 = logits.float()
     token_weights = torch.sin(positions.float() + 1).masked_fill(~positions_loss_mask, 0)
     vocab_weights = torch.cos(torch.arange(vocabulary, dtype=torch.float32, device=logits.device) * 0.173)
-    local_loss = (
-        logits_fp32 * token_weights[None, :, None] * vocab_weights[None, None, :]
-    ).sum() / ((global_length - 1) * math.sqrt(vocabulary))
+    local_loss = (logits_fp32 * token_weights[None, :, None] * vocab_weights[None, None, :]).sum() / (
+        (global_length - 1) * math.sqrt(vocabulary)
+    )
     # Report logprobs for 63 prediction queries; the last token has no target.
-    next_logprobs = logits_fp32.log_softmax(dim=-1).gather(
-        -1, target[None, :, None]
-    ).reshape(-1).detach()
+    next_logprobs = logits_fp32.log_softmax(dim=-1).gather(-1, target[None, :, None]).reshape(-1).detach()
     observations = torch.zeros(global_length, dtype=torch.float32, device=logits.device)
     coverage = torch.zeros(global_length, dtype=torch.int32, device=logits.device)
     valid_positions = positions[positions_loss_mask]
@@ -68,6 +67,7 @@ def _objective(logits, positions, tokens, *, global_length=64):
 
 def _initial_fingerprint(model):
     from .test_real_actor_cp1_short_full_tpr_npu import _initial_weight_fingerprint
+
     return _initial_weight_fingerprint(model)
 
 
@@ -86,6 +86,8 @@ def _save_gradients(model, folder: Path) -> list[dict]:
 
 def _compare_current_grads(model, reference: Path) -> dict:
     """Stream the reference CPU shards; current BF16 candidate stays on NPU."""
+    from .fast_fp32_grad_compare import fast_tensor_difference
+
     manifest = json.loads((reference / "manifest.json").read_text())
     params = dict(model.named_parameters())
     if list(params) != [entry["name"] for entry in manifest]:
@@ -93,7 +95,7 @@ def _compare_current_grads(model, reference: Path) -> dict:
     reference_sq = candidate_sq = diff_sq = dot = 0.0
     maximum = 0.0
     count = 0
-    for index, entry in enumerate(manifest):
+    for entry in manifest:
         name = entry["name"]
         gradient = params[name].grad
         if gradient is None:
@@ -102,22 +104,15 @@ def _compare_current_grads(model, reference: Path) -> dict:
         actual = gradient.detach().cpu().contiguous()
         if baseline.dtype != torch.bfloat16 or actual.dtype != torch.bfloat16 or list(actual.shape) != entry["shape"]:
             raise ValueError(f"{name}: mismatched gradient dtype/shape")
-        baseline = baseline.reshape(-1)
-        actual = actual.reshape(-1)
-        for start in range(0, baseline.numel(), 262144):
-            a = baseline[start:start+262144].double()
-            b = actual[start:start+262144].double()
-            if not bool(torch.isfinite(a).all() and torch.isfinite(b).all()):
-                raise FloatingPointError(f"{name}: nonfinite gradient")
-            delta = b - a
-            reference_sq += float(a.square().sum())
-            candidate_sq += float(b.square().sum())
-            diff_sq += float(delta.square().sum())
-            dot += float((a*b).sum())
-            maximum = max(maximum, float(delta.abs().max()))
-            count += a.numel()
-        if (index + 1) % 32 == 0:
-            print(f"P32S32_CP_GRAD_COMPARE {reference.name} {index + 1}/{len(manifest)}", flush=True)
+        metric = fast_tensor_difference(baseline, actual)
+        ra, rb = metric["reference_norm"], metric["candidate_norm"]
+        reference_sq += ra * ra
+        candidate_sq += rb * rb
+        diff_sq += metric["difference_norm"] ** 2
+        dot += (metric["cosine"] or 0.0) * ra * rb
+        maximum = max(maximum, metric["max_abs"])
+        count += metric["elements"]
+        del baseline, actual
     if not reference_sq or not candidate_sq:
         raise ValueError("Empty or zero gradient norm")
     return {
@@ -131,18 +126,16 @@ def _compare_current_grads(model, reference: Path) -> dict:
 
 
 def _compare_loss_logprobs(a: dict, b: dict) -> dict:
-    if any(a[k] != b[k] for k in ("checkpoint", "input_sha256", "initial_weights_witness", "tokens")):
-        raise AssertionError("Comparing different inputs or weights")
+    if any(
+        a[k] != b[k]
+        for k in ("checkpoint", "input_sha256", "initial_weights_witness", "tokens", "profile", "delayed_dkv_fp32")
+    ):
+        raise AssertionError("Comparing different inputs, weights or precision controls")
     if len(a["logprobs"]) != 63 or len(b["logprobs"]) != 63:
         raise AssertionError("Expected 63 causal next-token logprobs")
-    diffs = [float(y)-float(x) for x,y in zip(a["logprobs"], b["logprobs"], strict=True)]
-    denom = sum(float(x)**2 for x in a["logprobs"])
-    return {
-        "loss_abs_gap": abs(a["loss"] - b["loss"]),
-        "logprob_rel_l2": math.sqrt(sum(d*d for d in diffs) / denom) if denom else None,
-        "logprob_max_abs": max(abs(d) for d in diffs),
-        "logprob_mean_abs": sum(abs(d) for d in diffs)/len(diffs),
-    }
+    from .split_bf16_quick import token_metric_difference
+
+    return {"loss_abs_gap": abs(a["loss"] - b["loss"]), **token_metric_difference(a, b)}
 
 
 def _collect_observations(local_loss, observations, coverage, cp_group, cp):
@@ -161,9 +154,7 @@ def _collect_observations(local_loss, observations, coverage, cp_group, cp):
 
 def _run_full_cp1(model, tokens):
     positions = torch.arange(tokens.numel(), device=tokens.device)
-    logits = model(
-        input_ids=tokens[None,:], position_ids=positions[None,:], attention_mask=None
-    )
+    logits = model(input_ids=tokens[None, :], position_ids=positions[None, :], attention_mask=None)
     loss, values, coverage = _objective(logits, positions, tokens)
     loss.backward()
     return loss.detach(), values, coverage
@@ -197,10 +188,13 @@ def _run_cp2(model, runtime, tokens, mode: str):
         return local_loss, {}
 
     executor = SegmentExecutor(
-        model, SegmentPlan(segments, root_id=0),
+        model,
+        SegmentPlan(segments, root_id=0),
         expected_layer_numbers=tuple(layer.layer_number for layer in model.decoder.layers),
-        cp_group=runtime.cp_group, cp_backend="ring",
-        segment_loss_fn=segment_loss, segment_loss_term_counts=counts,
+        cp_group=runtime.cp_group,
+        cp_backend="ring",
+        segment_loss_fn=segment_loss,
+        segment_loss_term_counts=counts,
     )
     reported_loss = executor.run().detach()
     # The executor multiplies each local CP loss by CP size before backward,
@@ -210,16 +204,35 @@ def _run_cp2(model, runtime, tokens, mode: str):
 
 def _sync_cp_weight_grads(model, runtime):
     from .grad_sync_precision import reduce_average_weight_grad
+
     for name, parameter in model.named_parameters():
         reduce_average_weight_grad(
-            parameter, runtime.cp_group, name=name, reduce_dtype="fp32"
+            parameter, runtime.cp_group, name=name, reduce_dtype=os.getenv("TPR_P32S32_GRAD_SYNC_DTYPE", "bf16")
         )
 
 
+def _remove_reference_gradients(folder):
+    """Remove only this experiment's manifest-listed temporary gradient files."""
+    manifest = folder / "manifest.json"
+    entries = json.loads(manifest.read_text())
+    files = [folder / entry["file"] for entry in entries]
+    if any(
+        path.resolve().parent != folder.resolve() or not path.name.startswith("grad_") or path.suffix != ".pt"
+        for path in files
+    ):
+        raise ValueError("Unexpected gradient cleanup target")
+    for path in files:
+        path.unlink()
+    manifest.unlink()
+    folder.rmdir()
+
+
 def test_p32s32_cp1_cp2_full_vs_tpr():
-    import torch_npu  # noqa: F401
+    import torch_npu
     from megatron.core import parallel_state
+
     from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
+    from .experiment_source import source_metadata
     from .test_tpr_10k_parallel_parity_npu import _runtime
 
     mode = os.environ.get("TPR_P32S32_MODE")
@@ -228,6 +241,11 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
     cp = 1 if mode == "full_cp1" else 2
     root = Path(os.environ["TPR_P32S32_OUTPUT"]).resolve()
     checkpoint = Path(os.environ["TPR_QWEN_4B_PATH"]).resolve()
+    profile = os.getenv("TPR_P32S32_PROFILE", "4b")
+    sync_dtype = os.getenv("TPR_P32S32_GRAD_SYNC_DTYPE", "bf16")
+    if sync_dtype not in ("bf16", "fp32"):
+        raise ValueError("TPR_P32S32_GRAD_SYNC_DTYPE must be bf16 or fp32")
+    source = source_metadata()
     if cp == 2 and not (root / "full_cp1" / "result.json").is_file():
         raise FileNotFoundError("Run Full CP1 first")
     runtime = _runtime(1, cp, 1)
@@ -235,8 +253,12 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
         device_tokens = _tokens().to(runtime.device)
         sha = hashlib.sha256(device_tokens.cpu().numpy().tobytes()).hexdigest()
         model, _ = make_real_qwen3_tp_model(
-            runtime, model_path=checkpoint, tp_size=1, cp_size=cp,
-            profile="4b", params_dtype=torch.bfloat16,
+            runtime,
+            model_path=checkpoint,
+            tp_size=1,
+            cp_size=cp,
+            profile=profile,
+            params_dtype=torch.bfloat16,
         )
         model.train()
         parameter_versions = {name: parameter._version for name, parameter in model.named_parameters()}
@@ -256,9 +278,7 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
             # CP2 will also all-reduce per-segment partial losses and token
             # logprobs; the reduction happens only after backward collectives.
             total_loss, logps = _collect_observations(loss, observations, coverage, runtime.cp_group, cp)
-            if parameter_versions != {
-                name: parameter._version for name, parameter in model.named_parameters()
-            }:
+            if parameter_versions != {name: parameter._version for name, parameter in model.named_parameters()}:
                 raise AssertionError(f"Model parameters changed in-place during {arm}")
             if runtime.cp_rank != 0:
                 # Keep every CP rank at the same phase while rank0 streams
@@ -268,15 +288,28 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
             output = root / arm
             output.mkdir(parents=True, exist_ok=False)
             payload = {
-                "mode": arm, "checkpoint": str(checkpoint), "input_sha256": sha,
-                "tokens": _tokens().tolist(), "initial_weights_witness": witness,
-                "dtype": "torch.bfloat16", "loss": total_loss, "logprobs": logps,
+                "mode": arm,
+                "checkpoint": str(checkpoint),
+                "input_sha256": sha,
+                "tokens": _tokens().tolist(),
+                "initial_weights_witness": witness,
+                "dtype": "torch.bfloat16",
+                "loss": total_loss,
+                "logprobs": logps,
+                "next_token_cross_entropy": -sum(logps) / len(logps),
+                "profile": profile,
+                "delayed_dkv_fp32": os.getenv("TPR_EXPERIMENT_DELAYED_DKV_FP32", "0") == "1",
                 "objective": "fixed_global_position_linear_no_ppo",
                 "logprobs_scope": "next_token_diagnostic_not_backward_objective",
                 "topology": {"tp": 1, "cp": cp, "dp": 1},
-                "gradient_cp_reduce": "fp32_sum_divide_by_cp_then_cast_bf16" if cp > 1 else None,
+                "gradient_cp_reduce": f"{sync_dtype}_sum_divide_by_cp_then_cast_bf16" if cp > 1 else None,
                 "optimizer_step": False,
                 "model_attention": "CP1 square CANN" if cp == 1 else "TPR Ring CP2",
+                "native_mindspeed_full": False,
+                "gradient_comparison_rank": 0,
+                "source": source,
+                "torch": torch.__version__,
+                "torch_npu": torch_npu.__version__,
             }
             if arm == "full_cp1":
                 _save_gradients(model, output / "grads")
@@ -298,7 +331,7 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
             print(
                 f"P32S32_CP_DONE mode={arm} loss={total_loss:.9g} "
                 f"comparisons={[key for key in payload if key.endswith('_comparison')]} "
-                f"output={output/'result.json'}",
+                f"output={output / 'result.json'}",
                 flush=True,
             )
             if cp > 1:
@@ -307,7 +340,9 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
             full = json.loads((root / "full_cp2" / "result.json").read_text())
             tpr = json.loads((root / "tpr_cp2" / "result.json").read_text())
             summary = {
-                "scope": "BF16 real Qwen3-4B, one P32S32 trajectory; CP1 square vs CP2 Ring",
+                "scope": f"BF16 real Qwen3-{profile}, P32S32; CP1 square vs production TPR Ring CP2",
+                "gradient_cp_reduce_dtype": sync_dtype,
+                "native_mindspeed_full": False,
                 "full_cp1_vs_full_cp2": full["full_cp1_comparison"],
                 "full_cp1_vs_tpr_cp2": tpr["full_cp1_comparison"],
                 "full_cp2_vs_tpr_cp2": tpr["full_cp2_comparison"],
@@ -321,9 +356,13 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
                     f"cosine={comparison['gradient_cosine']:.9g} "
                     f"grad_max_abs={comparison['gradient_max_abs']:.9g} "
                     f"loss_abs_gap={comparison['loss_abs_gap']:.9g} "
-                    f"logprob_max_abs={comparison['logprob_max_abs']:.9g}",
+                    f"logprob_max_abs={comparison['logprob_max_abs']:.9g} "
+                    f"ce_gap={comparison['cross_entropy_abs_gap']:.9g}",
                     flush=True,
                 )
+            if os.getenv("TPR_P32S32_KEEP_GRADS", "0") == "0":
+                for arm in ("full_cp1", "full_cp2"):
+                    _remove_reference_gradients(root / arm / "grads")
     finally:
         if parallel_state.model_parallel_is_initialized():
             parallel_state.destroy_model_parallel()
