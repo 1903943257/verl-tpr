@@ -117,6 +117,9 @@ class TPRAttentionContext:
 
     compact_new_kv: bool = False
     batch_size: int = 1
+    # CP1 SP uses a padded local physical suffix while suffix_length remains
+    # the logical Segment length. For CP>1 this matches the backend shard.
+    local_physical_suffix_length: int | None = None
     _new_key_values: dict[int, KVPair] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -128,6 +131,19 @@ class TPRAttentionContext:
                 raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
         if type(self.batch_size) is not int or self.batch_size < 1:
             raise ValueError("TPR context batch_size must be a positive integer")
+        if self.local_physical_suffix_length is not None:
+            if (
+                type(self.local_physical_suffix_length) is not int
+                or self.local_physical_suffix_length < 1
+            ):
+                raise ValueError("local_physical_suffix_length must be a positive integer")
+            if (
+                self.attention_backend is None
+                and self.local_physical_suffix_length < self.suffix_length
+            ):
+                raise ValueError(
+                    "CP1 local physical suffix length cannot be shorter than its logical Segment"
+                )
         if self.batch_size > 1 and self.attention_backend is not None:
             raise NotImplementedError("grouped TPR leaf execution is restricted to CP=1")
         if not isinstance(self.compact_new_kv, bool):
@@ -150,6 +166,14 @@ class TPRAttentionContext:
                 raise ValueError("attention backend Prefix/Suffix lengths must match TPRAttentionContext")
             if backend.local_suffix_length <= 0:
                 raise ValueError("attention backend local suffix length must be positive")
+            if (
+                self.local_physical_suffix_length is not None
+                and self.local_physical_suffix_length != backend.local_suffix_length
+            ):
+                raise ValueError(
+                    "local physical suffix length must match attention backend shard: "
+                    f"{self.local_physical_suffix_length} != {backend.local_suffix_length}"
+                )
 
         for layer, pair in self.past_key_values.items():
             _validate_layer_number(layer)
@@ -160,7 +184,13 @@ class TPRAttentionContext:
 
     @property
     def local_suffix_length(self) -> int:
-        return self.suffix_length if self.attention_backend is None else self.attention_backend.local_suffix_length
+        if self.attention_backend is not None:
+            return self.attention_backend.local_suffix_length
+        return (
+            self.suffix_length
+            if self.local_physical_suffix_length is None
+            else self.local_physical_suffix_length
+        )
 
     def new_collector(self) -> TPRAttentionContext:
         """Collect checkpoint K/V while sharing immutable prefix state.
@@ -176,6 +206,7 @@ class TPRAttentionContext:
             suffix_rotary_pos_emb=self.suffix_rotary_pos_emb,
             attention_backend=self.attention_backend,
             compact_new_kv=False,
+            local_physical_suffix_length=self.local_physical_suffix_length,
         )
 
     @property

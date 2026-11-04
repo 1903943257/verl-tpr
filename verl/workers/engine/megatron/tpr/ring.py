@@ -55,6 +55,7 @@ from .ring_layout import (
     _RingStaticLayout,
     _RingRangeSlice,
     make_ring_sequence_shard,
+    make_cp1_sp_sequence_shard,
     classify_ring_block,
     _load_mindspeed_ring_primitives,
     _process_group_global_ranks,

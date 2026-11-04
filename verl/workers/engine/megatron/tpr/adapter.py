@@ -38,7 +38,11 @@ from verl.utils.megatron_utils import unwrap_model
 from verl.utils.metric import AggregationType, Metric
 
 from .executor import SegmentEventProfiler, SegmentExecutor, prepare_replay_model, validate_replay_plan
-from .ring import aggregate_cp_loss, resolve_engine_cp_runtime
+from .ring import (
+    aggregate_cp_loss,
+    make_cp1_sp_sequence_shard,
+    resolve_engine_cp_runtime,
+)
 from .tree import ForestExecutionPlan, TreeExecutionPlan, assert_tp_plan_agreement, digest_forest_plan
 
 if TYPE_CHECKING:
@@ -421,10 +425,17 @@ def run_tpr_forward_backward_batch(
     def run_one_tree(tree_plan):
         nonlocal tree_number
         setup_start = time.perf_counter() if detailed_profile else None
-        shard_for_segment = (
-            None if cp_runtime.backend is None
-            else lambda segment: cp_runtime.backend.make_sequence_shard(segment.length)
-        )
+        sp_tp_size = tp_size if getattr(config, "sequence_parallel", False) else 1
+        if cp_runtime.backend is not None:
+            shard_for_segment = (
+                lambda segment: cp_runtime.backend.make_sequence_shard(segment.length)
+            )
+        elif sp_tp_size > 1:
+            shard_for_segment = lambda segment: make_cp1_sp_sequence_shard(
+                segment.length, sp_tp_size=sp_tp_size,
+            )
+        else:
+            shard_for_segment = None
         callback, counts = objective.bind_tree(tree_plan, shard_for_segment=shard_for_segment)
         executor = SegmentExecutor(
             model,

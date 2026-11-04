@@ -27,7 +27,7 @@ from torch import Tensor
 from verl.models.mcore.tpr.context import KVPair
 from verl.models.mcore.tpr.context import _compact_kv_tensor as _compact_graph_free_tensor
 
-from .ring import SequenceShard
+from .ring import SequenceShard, iter_valid_sequence_slices
 from .tree import SegmentId, SegmentSpec, _validate_segment_id
 
 _generations = count()
@@ -98,15 +98,57 @@ class PastKVAnchors:
         return _concatenate_kv(tuple((entry.shard, entry.key_values) for entry in self.entries))
 
 
+def _logical_cp1_kv_tensor(tensor: Tensor, shard: SequenceShard) -> Tensor:
+    """Expose only logical Prefix tokens while retaining the autograd edge."""
+
+    if shard.cp_size != 1:
+        raise RuntimeError("logical CP1 KV trimming requires a size-one shard")
+    if shard.valid_local_length != shard.global_length:
+        raise RuntimeError(
+            "CP1 Prefix shard must own every logical token: "
+            f"valid={shard.valid_local_length}, logical={shard.global_length}"
+        )
+    if shard.local_length == shard.global_length:
+        return tensor
+    slices = tuple(local_slice for _, local_slice in iter_valid_sequence_slices(shard))
+    if not slices:
+        raise RuntimeError("CP1 Prefix shard contains no logical KV tokens")
+    if len(slices) == 1:
+        return tensor[slices[0]]
+    return torch.cat([tensor[local_slice] for local_slice in slices], dim=0)
+
+
 def _concatenate_kv(entries: tuple[tuple[SequenceShard, Mapping[int, KVPair]], ...]) -> Mapping[int, KVPair]:
     if any(shard.cp_size != 1 for shard, _ in entries):
         raise RuntimeError("sharded KV must be consumed through a context-parallel attention backend")
-    if len(entries) <= 1:
-        return entries[0][1] if entries else MappingProxyType({})
+    if not entries:
+        return MappingProxyType({})
+
+    # A CP1 SP Segment may own a padded physical KV tensor. Local causal
+    # attention consumes only its logical prefix; slicing remains in autograd,
+    # so descendant dK/dV for virtual padding is exactly zero.
+    logical_entries = tuple(
+        (
+            shard,
+            {
+                layer: tuple(_logical_cp1_kv_tensor(tensor, shard) for tensor in pair)
+                for layer, pair in key_values.items()
+            },
+        )
+        for shard, key_values in entries
+    )
+    layer_numbers = tuple(logical_entries[0][1])
+    if any(tuple(key_values) != layer_numbers for _, key_values in logical_entries[1:]):
+        raise RuntimeError("CP1 Prefix KV layers differ across Segments")
+    if len(logical_entries) == 1:
+        return MappingProxyType(logical_entries[0][1])
     return MappingProxyType(
         {
-            layer: tuple(torch.cat([kv[layer][index] for _, kv in entries], dim=0) for index in (0, 1))
-            for layer in entries[0][1]
+            layer: tuple(
+                torch.cat([key_values[layer][index] for _, key_values in logical_entries], dim=0)
+                for index in (0, 1)
+            )
+            for layer in layer_numbers
         }
     )
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ring zigzag SequenceShard layout, padding and shape validation."""
+"""SequenceShard layouts and physical padding for TPR Ring and CP1 SP."""
 
 from __future__ import annotations
 
@@ -178,6 +178,31 @@ def round_up_sequence_length(logical_length: int, alignment: int) -> int:
     _validate_integer("logical_length", logical_length, minimum=1)
     _validate_integer("alignment", alignment, minimum=1)
     return ((logical_length + alignment - 1) // alignment) * alignment
+
+
+def make_cp1_sp_sequence_shard(
+    global_length: int,
+    *,
+    sp_tp_size: int,
+) -> SequenceShard:
+    """Return a contiguous CP1 shard padded for native Megatron TP+SP.
+
+    CP1 owns the complete logical Segment. When sequence parallelism is
+    enabled, its physical sequence must be divisible by TP so Megatron can
+    scatter the sequence dimension evenly across TP ranks. Padding is kept
+    as a trailing physical range and excluded by the logical length.
+    """
+
+    _validate_integer("global_length", global_length, minimum=1)
+    _validate_integer("sp_tp_size", sp_tp_size, minimum=1)
+    padded_length = round_up_sequence_length(global_length, sp_tp_size)
+    return SequenceShard(
+        global_length,
+        ((0, padded_length),),
+        cp_rank=0,
+        cp_size=1,
+        padded_length=padded_length,
+    )
 
 
 def iter_valid_sequence_slices(
