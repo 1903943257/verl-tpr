@@ -124,6 +124,23 @@ def _count_tq_prompt_groups(partition_id: str = "train") -> int:
     return sum(1 for tag in data.get(partition_id, {}).values() if tag.get("is_prompt", False))
 
 
+def _validate_filtered_train_batch_size(filtered_size: int, train_batch_size: int) -> None:
+    """Fail before worker/model initialization if filtering leaves no full step.
+
+    V1 uses floor division by the global train batch size to compute epochs,
+    even when async sampling fetches smaller generation batches.
+    """
+    if not isinstance(train_batch_size, int) or isinstance(train_batch_size, bool) or train_batch_size <= 0:
+        raise ValueError(f"data.train_batch_size must be positive, got {train_batch_size!r}")
+    if filtered_size < train_batch_size:
+        raise ValueError(
+            f"Training dataset has only {filtered_size} samples AFTER filtering / "
+            f"train_max_samples; data.train_batch_size={train_batch_size} needs at "
+            "least one complete batch. Supply more prompt instances, relax "
+            "data.filter_overlong_prompts, or reduce the global train batch size."
+        )
+
+
 class PPOTrainer(ABC):
     """Base class for PPO trainer.
 
@@ -728,6 +745,9 @@ class PPOTrainer(ABC):
             self.processor,
             is_train=True,
             max_samples=self.config.data.get("train_max_samples", -1),
+        )
+        _validate_filtered_train_batch_size(
+            len(self.train_dataset), self.config.data.train_batch_size
         )
         self.val_dataset = create_rl_dataset(
             self.config.data.val_files,
