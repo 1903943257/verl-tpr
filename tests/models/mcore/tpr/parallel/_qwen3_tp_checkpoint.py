@@ -75,6 +75,54 @@ _DENSE_PROFILES = {
 }
 
 
+class _MindSpeedNativeRingCore(MegatronModule):
+    """Standard MCore SelfAttention + explicit MindSpeed native SBH Ring core.
+
+    Avoid assuming that every target MindSpeed build patches the local MCore
+    DotProductAttention constructor/forward identically. Only this API bridge
+    is provided here; the complete Ring forward/backward remains in MindSpeed.
+    """
+
+    def __init__(
+        self,
+        config,
+        layer_number,
+        attn_mask_type,
+        attention_type,
+        attention_dropout=None,
+        softmax_scale=None,
+        cp_comm_type=None,
+        pg_collection=None,
+    ):
+        super().__init__(config=config)
+        if config.tensor_model_parallel_size != 1 or config.context_parallel_size != 2:
+            raise ValueError("Native Ring reference requires TP1/CP2")
+        if config.attention_dropout != 0 or attention_dropout not in (None, 0.0):
+            raise ValueError("Native Ring reference requires zero dropout")
+        if getattr(attn_mask_type, "name", None) != "causal":
+            raise ValueError("Native Ring reference requires causal SelfAttention")
+        if config.apply_query_key_layer_scaling:
+            raise ValueError("Native Ring reference does not cover query-key layer scaling")
+        from megatron.core import parallel_state
+
+        self.cp_group = getattr(pg_collection, "cp", None)
+        if self.cp_group is None:
+            self.cp_group = parallel_state.get_context_parallel_group()
+        self.softmax_scale = 1 / math.sqrt(config.kv_channels) if softmax_scale is None else softmax_scale
+        self.native_ring_calls = 0
+
+    def forward(
+        self, query, key, value, attention_mask=None, attn_mask_type=None, attention_bias=None, packed_seq_params=None
+    ):
+        if attention_mask is not None or attention_bias is not None or packed_seq_params is not None:
+            raise ValueError("Native diagnostic requires unpadded causal attention without supplied mask/bias/packing")
+        from .native_ring_reference import native_ring_attention
+
+        output = native_ring_attention(query, key, value, cp_group=self.cp_group, softmax_scale=self.softmax_scale)
+        self.native_ring_calls += 1
+        return output
+
+
 def load_qwen3_dense_config(path: Path, *, profile: str = "1.7b"):
     """Validate exact real HF model profile before loading TP shards."""
     _validate_checkpoint_files(path)
@@ -224,6 +272,7 @@ def make_real_qwen3_tp_model(
     cp_size: int = 1,
     profile: str = "1.7b",
     native_attention: bool = False,
+    native_ring_reference: bool = False,
     params_dtype: torch.dtype = torch.bfloat16,
 ):
     """Construct real Qwen3 TP shards; optionally use unmodified MCore attention.
@@ -233,6 +282,10 @@ def make_real_qwen3_tp_model(
     """
     if params_dtype not in (torch.bfloat16, torch.float32):
         raise ValueError("Qwen checkpoint fixture supports BF16 or FP32 parameters")
+    if native_ring_reference and (
+        not native_attention or tp_size != 1 or cp_size != 2 or params_dtype != torch.bfloat16
+    ):
+        raise ValueError("Native Ring API reference requires native SelfAttention, BF16, TP1/CP2")
     if params_dtype == torch.float32 and (tp_size != 1 or cp_size != 1 or native_attention):
         raise ValueError("FP32 diagnostic fixture requires controlled TP1/CP1 attention")
     precision_overrides = {}
@@ -308,6 +361,9 @@ def make_real_qwen3_tp_model(
     if not native_attention:
         for layer_spec in layer_specs:
             layer_spec.submodules.self_attention.submodules.core_attention = core_attention_cls
+    elif native_ring_reference:
+        for layer_spec in layer_specs:
+            layer_spec.submodules.self_attention.submodules.core_attention = _MindSpeedNativeRingCore
     from types import SimpleNamespace
 
     pg = SimpleNamespace(
@@ -346,6 +402,10 @@ def make_real_qwen3_tp_model(
 
         if any(isinstance(m, TPRSelfAttention) for m in model.modules()):
             raise AssertionError("Native Full must never construct a TPR attention module")
+        if native_ring_reference and not all(
+            isinstance(layer.self_attention.core_attention, _MindSpeedNativeRingCore) for layer in model.decoder.layers
+        ):
+            raise AssertionError("Native Ring API bridge was bypassed")
     elif not all(isinstance(layer.self_attention.core_attention, core_attention_cls) for layer in model.decoder.layers):
         raise AssertionError(
             f"Qwen attention core is not the expected CP-compatible reference adapter for CP={cp_size}"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Controlled 64-token BF16: 1-NPU Full, 2-NPU Ring Full, 2-NPU Ring TPR P32+S32.
+# Controlled 64-token BF16: CP1 Full, MindSpeed CP2 Full, TPR CP2 Full/split.
 # Full CP1/CP2 and TPR CP2 use identical checkpoint/tokens/fixed loss.
-# Two temporary reference gradient sets (~16 GB); TPR is compared online.
+# Three temporary references (~24 GB for 4B); split is compared online.
 set -Eeuo pipefail
 cd "$(dirname "$0")/../../../../.."
 
@@ -28,7 +28,9 @@ export TPR_EXPERIMENT_DELAYED_DKV_FP32="${TPR_EXPERIMENT_DELAYED_DKV_FP32:-1}"
 export TPR_P32S32_PROFILE="${TPR_P32S32_PROFILE:-4b}"
 export TPR_P32S32_GRAD_SYNC_DTYPE="${TPR_P32S32_GRAD_SYNC_DTYPE:-bf16}"
 export TPR_P32S32_KEEP_GRADS="${TPR_P32S32_KEEP_GRADS:-0}"
-[[ "$TPR_EXPERIMENT_DELAYED_DKV_FP32" =~ ^[01]$ && "$TPR_P32S32_KEEP_GRADS" =~ ^[01]$ ]] || {
+export TPR_P32S32_NATIVE_RING="${TPR_P32S32_NATIVE_RING:-1}"
+export TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS=0
+[[ "$TPR_EXPERIMENT_DELAYED_DKV_FP32" =~ ^[01]$ && "$TPR_P32S32_KEEP_GRADS" =~ ^[01]$ && "$TPR_P32S32_NATIVE_RING" =~ ^[01]$ ]] || {
     echo 'dKV and keep-grads gates must be 0 or 1' >&2; exit 2;
 }
 [[ "$TPR_P32S32_GRAD_SYNC_DTYPE" == bf16 || "$TPR_P32S32_GRAD_SYNC_DTYPE" == fp32 ]] || {
@@ -46,8 +48,8 @@ TEST=tests/models/mcore/tpr/parallel/test_split_p32s32_cp2_parity_npu.py
 echo "P32S32_CP_TEST output=$TPR_P32S32_OUTPUT"
 echo "P32S32_CP_TEST attention=CP1_square_CANN_vs_CP2_TPR_Ring dtype=BF16"
 echo "P32S32_CP_TEST grad_reduce=$TPR_P32S32_GRAD_SYNC_DTYPE delayed_dKV_FP32=$TPR_EXPERIMENT_DELAYED_DKV_FP32"
-echo 'CP2 Full uses production TPR Ring on one complete segment; this is not native MindSpeed Full.'
-echo 'Temporary reference gradients require about 16 GB disk for 4B; deleted after success unless KEEP_GRADS=1.'
+echo "Native MindSpeed CP2 Full enabled=$TPR_P32S32_NATIVE_RING; separate from the TPR whole-segment control."
+echo 'With the native control, temporary gradients require about 24 GB disk for 4B; cleaned after success.'
 echo "P32S32_CP_TEST fixed_loss + diagnostic next-token logprobs; no PPO, no optimizer"
 
 export ASCEND_RT_VISIBLE_DEVICES="$DEVICE0"
@@ -64,8 +66,20 @@ echo "===== P32S32_CP_STAGE 1: Full CP1 64 tokens on NPU $DEVICE0 ====="
 }
 
 export ASCEND_RT_VISIBLE_DEVICES="$DEVICE0,$DEVICE1"
+if [[ "$TPR_P32S32_NATIVE_RING" == 1 ]]; then
+    export TPR_P32S32_MODE=native_cp2
+    echo '===== P32S32_CP_STAGE 2: Native MindSpeed Ring CP2 Full ====='
+    "${PYTHON_BIN:-python}" -m torch.distributed.run --nnodes=1 --node_rank=0 \
+        --nproc_per_node=2 --master_addr=127.0.0.1 \
+        --master_port="${TPR_P32S32_PORT_NATIVE:-29694}" \
+        -m tests.models.mcore.tpr._mindspeed_first_pytest \
+        -q -s -x -rs "$TEST" 2>&1 | tee "$TPR_P32S32_OUTPUT/native_cp2.log"
+    [[ -s "$TPR_P32S32_OUTPUT/native_cp2/result.json" ]] || {
+        echo 'Native MindSpeed control did not produce result.json' >&2; exit 1;
+    }
+fi
 export TPR_P32S32_MODE=cp2_both
-echo "===== P32S32_CP_STAGE 2: Full CP2 64 tokens vs TPR CP2 P32+S32 ====="
+echo "===== P32S32_CP_STAGE 3: TPR Ring Full CP2 vs TPR CP2 P32+S32 ====="
 "${PYTHON_BIN:-python}" -m torch.distributed.run --nnodes=1 --node_rank=0 \
     --nproc_per_node=2 --master_addr=127.0.0.1 \
     --master_port="${TPR_P32S32_PORT_CP2:-29692}" \

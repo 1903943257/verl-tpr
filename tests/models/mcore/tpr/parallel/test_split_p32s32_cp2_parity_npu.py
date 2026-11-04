@@ -1,10 +1,10 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: Apache-2.0
-"""Controlled BF16 P32S32 parity: CP1 whole, CP2 whole, CP2 TPR replay.
+"""Controlled BF16 P32S32 parity: CP1, native MindSpeed CP2, TPR whole/replay.
 
 A real Qwen3-4B checkpoint, one identical 64-token synthetic sequence and the
 same fixed global-position linear loss, plus next-token logprobs (diagnostic).
-CP1 runs ordinary square attention; CP2 runs production TPR Ring CP. This is
+CP1 uses square attention; CP2 compares native MindSpeed Ring and TPR Ring. This is
 separate from the all-FP32 explicit-math test, and it does not claim the CP1
 and CP2 attention kernels have identical BF16 rounding.
 
@@ -160,6 +160,20 @@ def _run_full_cp1(model, tokens):
     return loss.detach(), values, coverage
 
 
+def _run_native_cp2(model, runtime, tokens):
+    """Ordinary MCore SelfAttention + MindSpeed Ring; no SegmentExecutor/context."""
+    from .native_ring_reference import native_cp_positions
+
+    positions = native_cp_positions(64, runtime.cp_rank, 2, device=tokens.device)
+    local_tokens = tokens.index_select(0, positions)
+    logits = model(input_ids=local_tokens[None, :], position_ids=positions[None, :], attention_mask=None)
+    loss, values, coverage = _objective(logits, positions, tokens)
+    (loss * 2).backward()  # Same CP-average normalization as the TPR controls.
+    if any(layer.self_attention.core_attention.native_ring_calls != 1 for layer in model.decoder.layers):
+        raise AssertionError("Native MindSpeed Ring must execute once in every layer")
+    return loss.detach(), values, coverage
+
+
 def _run_cp2(model, runtime, tokens, mode: str):
     from verl.workers.engine.megatron.tpr.executor import SegmentExecutor
     from verl.workers.engine.megatron.tpr.ring import make_ring_sequence_shard
@@ -236,18 +250,21 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
     from .test_tpr_10k_parallel_parity_npu import _runtime
 
     mode = os.environ.get("TPR_P32S32_MODE")
-    if mode not in ("full_cp1", "cp2_both"):
-        raise ValueError("TPR_P32S32_MODE must be full_cp1 or cp2_both")
+    if mode not in ("full_cp1", "native_cp2", "cp2_both"):
+        raise ValueError("TPR_P32S32_MODE must be full_cp1, native_cp2 or cp2_both")
     cp = 1 if mode == "full_cp1" else 2
     root = Path(os.environ["TPR_P32S32_OUTPUT"]).resolve()
     checkpoint = Path(os.environ["TPR_QWEN_4B_PATH"]).resolve()
     profile = os.getenv("TPR_P32S32_PROFILE", "4b")
     sync_dtype = os.getenv("TPR_P32S32_GRAD_SYNC_DTYPE", "bf16")
+    include_native = os.getenv("TPR_P32S32_NATIVE_RING", "1") == "1"
     if sync_dtype not in ("bf16", "fp32"):
         raise ValueError("TPR_P32S32_GRAD_SYNC_DTYPE must be bf16 or fp32")
     source = source_metadata()
     if cp == 2 and not (root / "full_cp1" / "result.json").is_file():
         raise FileNotFoundError("Run Full CP1 first")
+    if mode == "cp2_both" and include_native and not (root / "native_cp2/result.json").is_file():
+        raise FileNotFoundError("Run native MindSpeed CP2 Full before TPR CP2 controls")
     runtime = _runtime(1, cp, 1)
     try:
         device_tokens = _tokens().to(runtime.device)
@@ -259,19 +276,27 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
             cp_size=cp,
             profile=profile,
             params_dtype=torch.bfloat16,
+            native_attention=mode == "native_cp2",
+            native_ring_reference=mode == "native_cp2",
         )
+        if model.config.gradient_accumulation_fusion or model.config.recompute_granularity is not None:
+            raise AssertionError("Matched controls require direct parameter.grad and no recomputation")
+        model.config.grad_scale_func = None
         model.train()
         parameter_versions = {name: parameter._version for name, parameter in model.named_parameters()}
         witness = _initial_fingerprint(model) if runtime.cp_rank == 0 else None
         if runtime.cp_rank == 0:
             print(f"P32S32_CP_READY cp={cp} token_hash={sha} fingerprint={witness}", flush=True)
-        modes = ["full_cp1"] if cp == 1 else ["full_cp2", "tpr_cp2"]
+        modes = ["full_cp1"] if cp == 1 else ["native_cp2"] if mode == "native_cp2" else ["full_cp2", "tpr_cp2"]
         for arm in modes:
             model.zero_grad(set_to_none=True)
             if runtime.cp_rank == 0:
                 print(f"P32S32_CP_BEGIN mode={arm}", flush=True)
             if arm == "full_cp1":
                 loss, observations, coverage = _run_full_cp1(model, device_tokens)
+            elif arm == "native_cp2":
+                loss, observations, coverage = _run_native_cp2(model, runtime, device_tokens)
+                _sync_cp_weight_grads(model, runtime)
             else:
                 loss, observations, coverage = _run_cp2(model, runtime, device_tokens, arm)
                 _sync_cp_weight_grads(model, runtime)
@@ -304,8 +329,25 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
                 "topology": {"tp": 1, "cp": cp, "dp": 1},
                 "gradient_cp_reduce": f"{sync_dtype}_sum_divide_by_cp_then_cast_bf16" if cp > 1 else None,
                 "optimizer_step": False,
-                "model_attention": "CP1 square CANN" if cp == 1 else "TPR Ring CP2",
-                "native_mindspeed_full": False,
+                "model_attention": "CP1 square CANN"
+                if cp == 1
+                else "MindSpeed native SBH Ring"
+                if arm == "native_cp2"
+                else "TPR Ring CP2",
+                "native_mindspeed_full": arm == "native_cp2",
+                "native_training_engine": False,
+                "native_ring_api_bridge": arm == "native_cp2",
+                "native_ring_entrypoint": (
+                    "mindspeed.core.context_parallel.ring_context_parallel."
+                    "ring_context_parallel.ringattn_context_parallel"
+                )
+                if arm == "native_cp2"
+                else None,
+                "native_ring_calls": [
+                    layer.self_attention.core_attention.native_ring_calls for layer in model.decoder.layers
+                ]
+                if arm == "native_cp2"
+                else None,
                 "gradient_comparison_rank": 0,
                 "source": source,
                 "torch": torch.__version__,
@@ -313,20 +355,20 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
             }
             if arm == "full_cp1":
                 _save_gradients(model, output / "grads")
-            elif arm == "full_cp2":
-                baseline = json.loads((root / "full_cp1" / "result.json").read_text())
-                payload["full_cp1_comparison"] = {
-                    **_compare_loss_logprobs(baseline, payload),
-                    **_compare_current_grads(model, root / "full_cp1" / "grads"),
-                }
-                _save_gradients(model, output / "grads")
             else:
-                for other in ("full_cp1", "full_cp2"):
+                others = ["full_cp1"]
+                if arm != "native_cp2" and include_native:
+                    others.append("native_cp2")
+                if arm == "tpr_cp2":
+                    others.append("full_cp2")
+                for other in others:
                     baseline = json.loads((root / other / "result.json").read_text())
                     payload[f"{other}_comparison"] = {
                         **_compare_loss_logprobs(baseline, payload),
                         **_compare_current_grads(model, root / other / "grads"),
                     }
+                if arm in ("native_cp2", "full_cp2"):
+                    _save_gradients(model, output / "grads")
             (output / "result.json").write_text(json.dumps(payload, indent=2))
             print(
                 f"P32S32_CP_DONE mode={arm} loss={total_loss:.9g} "
@@ -336,32 +378,37 @@ def test_p32s32_cp1_cp2_full_vs_tpr():
             )
             if cp > 1:
                 dist.barrier(group=runtime.cp_group)
-        if cp == 2 and runtime.cp_rank == 0:
+        if mode == "cp2_both" and runtime.cp_rank == 0:
             full = json.loads((root / "full_cp2" / "result.json").read_text())
             tpr = json.loads((root / "tpr_cp2" / "result.json").read_text())
             summary = {
-                "scope": f"BF16 real Qwen3-{profile}, P32S32; CP1 square vs production TPR Ring CP2",
+                "scope": f"BF16 real Qwen3-{profile}, P32S32; CP1, native MindSpeed Ring, TPR Ring Full/split",
                 "gradient_cp_reduce_dtype": sync_dtype,
-                "native_mindspeed_full": False,
+                "full_cp2_is_native": False,
+                "includes_native_mindspeed_reference": include_native,
                 "full_cp1_vs_full_cp2": full["full_cp1_comparison"],
                 "full_cp1_vs_tpr_cp2": tpr["full_cp1_comparison"],
                 "full_cp2_vs_tpr_cp2": tpr["full_cp2_comparison"],
             }
+            if include_native:
+                native = json.loads((root / "native_cp2/result.json").read_text())
+                summary.update(
+                    full_cp1_vs_native_cp2=native["full_cp1_comparison"],
+                    native_cp2_vs_full_cp2=full["native_cp2_comparison"],
+                    native_cp2_vs_tpr_cp2=tpr["native_cp2_comparison"],
+                )
             (root / "comparison.json").write_text(json.dumps(summary, indent=2))
             for key, comparison in summary.items():
                 if not isinstance(comparison, dict):
                     continue
                 print(
                     f"P32S32_CP_COMPARE {key}: grad_rel_l2={comparison['gradient_relative_l2']:.9g} "
-                    f"cosine={comparison['gradient_cosine']:.9g} "
-                    f"grad_max_abs={comparison['gradient_max_abs']:.9g} "
                     f"loss_abs_gap={comparison['loss_abs_gap']:.9g} "
-                    f"logprob_max_abs={comparison['logprob_max_abs']:.9g} "
-                    f"ce_gap={comparison['cross_entropy_abs_gap']:.9g}",
+                    f"logprob_max_abs={comparison['logprob_max_abs']:.9g}",
                     flush=True,
                 )
             if os.getenv("TPR_P32S32_KEEP_GRADS", "0") == "0":
-                for arm in ("full_cp1", "full_cp2"):
+                for arm in ("full_cp1", "native_cp2", "full_cp2") if include_native else ("full_cp1", "full_cp2"):
                     _remove_reference_gradients(root / arm / "grads")
     finally:
         if parallel_state.model_parallel_is_initialized():

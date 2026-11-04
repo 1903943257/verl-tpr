@@ -1,5 +1,8 @@
 # P32/S32 BF16 forward attribution and CP2 comparison
 
+For the follow-up **matched first-projection shape probe and native MindSpeed
+CP2 Ring baseline**, see [PROJECTION_NATIVE_RING_CHECKS.md](PROJECTION_NATIVE_RING_CHECKS.md).
+
 This experiment deliberately stays at **32 prefix + 32 suffix tokens**. All
 attention precision modes use the same loaded real Qwen checkpoint, BF16 model,
 seed 20261104, synthetic tokens, global positions and fixed linear loss as the
@@ -26,7 +29,8 @@ The launcher runs sequentially:
    attention implementations below. A single BF16 model is reused without
    updates; all non-attention fusion settings remain unchanged across modes.
 2. One NPU: complete 64-token BF16 Full reference.
-3. Two NPUs: complete 64-token BF16 Ring Full and P32/S32 Ring Replay.
+3. Two NPUs: native MindSpeed Ring Full, then TPR Ring Full and P32/S32 Replay
+   in separate processes. The native reference is now included by default.
 
 Models from different processes/stages are not kept on the NPU simultaneously.
 P32/S32 math attention has only tiny attention matrices; the FP32 ablation
@@ -36,7 +40,7 @@ reductions are retained in all modes.
 The one-NPU comparisons need two temporary CPU BF16 gradient snapshots (about
 16 GB host RAM for 4B, plus CPU forward snapshots and bounded metric workspace).
 They write no raw gradient/activation tensors. The CP1-to-CP2 process boundary
-uses two temporary gradient reference sets, about 16 GB disk for 4B. Those are
+uses three temporary gradient reference sets with the native control, about 24 GB disk for 4B. Those are
 deleted after successful comparisons by default; `TPR_P32S32_KEEP_GRADS=1`
 retains them for debugging. Only manifest-listed generated files are removed.
 
@@ -96,10 +100,11 @@ logprob errors, and next-token cross-entropy gaps. Query 31 still predicts token
 backward objective. This is **not** a PPO/optimizer training run; BF16 describes
 computation precision rather than a training metric.
 
-`cp2/comparison.json` compares CP1 Full, CP2 Full, and CP2 Replay. CP2 Full here
-means **production TPR Ring on one complete segment**, not unmodified native
-MindSpeed Full. All positions and gradient normalization follow the existing
-production Ring/executor contracts. Comparisons use rank 0's finalized weight
+`cp2/comparison.json` compares CP1 Full, native MindSpeed CP2 Full, TPR CP2 Full,
+and TPR CP2 Replay. The `full_cp2` name still means **production TPR Ring on one
+complete segment**; `native_cp2` identifies the new native API control described
+in the follow-up guide. Positions and gradient normalization are matched.
+Comparisons use rank 0's finalized weight
 gradients; they do not certify cross-replica equality or an optimizer step.
 
 The default CP weight-gradient collective is BF16. For an independent FP32

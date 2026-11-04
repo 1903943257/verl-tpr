@@ -4,6 +4,9 @@ For the subsequent **P32/S32 BF16 layer-forward attribution, local attention
 FP32 ablation, and BF16 CP2 Ring comparison**, see
 [P32S32_PRECISION_DIAGNOSTICS.md](P32S32_PRECISION_DIAGNOSTICS.md).
 
+The matched first-layer projection and native MindSpeed Ring follow-up is in
+[PROJECTION_NATIVE_RING_CHECKS.md](PROJECTION_NATIVE_RING_CHECKS.md).
+
 Run this from the existing delayed-dKV experiment branch. It uses one real
 Qwen3 checkpoint, one synthetic trajectory, and three executions with unchanged
 weights. Default length is 32 prefix + 32 suffix tokens. No external capture or
@@ -195,8 +198,10 @@ and a BF16 result instead. The actual setting is recorded.
 The result `comparison.json` contains all three pairwise gradient rel-L2,
 cosine, max-abs, loss gap, and next-token logprob error.
 
-Only **Full CP1 and Full CP2** parameter gradients are temporarily written:
-roughly 16GB total for 4B, deleted after success unless
+**Full CP1, Full TPR CP2, and the enabled native MindSpeed CP2 reference**
+parameter gradients are temporarily written:
+roughly 16GB total for 4B, or 24GB with the now-default native MindSpeed
+reference, deleted after success unless
 `TPR_P32S32_KEEP_GRADS=1`. The TPR CP2 gradients are compared directly, not
 dumped as a third set. No optimizer update. CP1 square CANN and CP2 Ring may differ from
 ordinary BF16 kernel rounding; report differences, do not assert bitwise
