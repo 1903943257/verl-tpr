@@ -28,6 +28,7 @@ from torch import Tensor
 from verl.models.mcore.tpr.context import KVPair
 from verl.models.mcore.tpr.context import _compact_kv_tensor as _compact_graph_free_tensor
 
+from .dkv_diagnostics import record_dkv_accumulation
 from .ring import SequenceShard
 from .tree import SegmentId, SegmentSpec, _validate_segment_id
 
@@ -148,6 +149,7 @@ class KVPrefixState:
         self._key_values = _normalize_local_kv(key_values, local_length=self.local_length)
         self.layer_numbers = tuple(self._key_values)
         self._gradients: dict[int, KVPair] = {}
+        self._diagnostic_accumulation_counts: dict[int, int] = {}
         self.released = False
         self._generation = next(_generations)
 
@@ -200,6 +202,20 @@ class KVPrefixState:
         else:
             for buffer, gradient in zip(self._gradients[layer_number], gradients, strict=True):
                 buffer.add_(gradient.detach().to(dtype=buffer.dtype))
+        self._record_layer_accumulation(layer_number, gradients)
+
+    def _record_layer_accumulation(self, layer_number: int, incoming: KVPair) -> None:
+        count = self._diagnostic_accumulation_counts.get(layer_number, 0) + 1
+        self._diagnostic_accumulation_counts[layer_number] = count
+        record_dkv_accumulation(
+            segment_id=self.segment_id,
+            layer=layer_number,
+            accumulation_count=count,
+            incoming_key=incoming[0],
+            incoming_value=incoming[1],
+            buffer_key=self._gradients[layer_number][0],
+            buffer_value=self._gradients[layer_number][1],
+        )
 
     def accumulate_anchor_gradients(self, anchors: KVPrefixAnchors, *, consume: bool = False) -> None:
         """Accumulate dKV, optionally taking ownership of executor-only grads."""
@@ -231,6 +247,7 @@ class KVPrefixState:
                     owned_storage.add((buffer.device, buffer.untyped_storage().data_ptr()))
                     buffers.append(buffer)
                 self._gradients[layer] = tuple(buffers)
+                self._record_layer_accumulation(layer, (key.grad, value.grad))
             else:
                 self.accumulate_layer_gradients(layer, key.grad, value.grad)
             if consume:
@@ -241,12 +258,14 @@ class KVPrefixState:
         if self._gradients and set(self._gradients) != set(self.layer_numbers):
             raise RuntimeError(f"segment {self.segment_id} gradient layers must be {self.layer_numbers}")
         gradients, self._gradients = self._gradients, {}
+        self._diagnostic_accumulation_counts.clear()
         self._generation = next(_generations)
         return MappingProxyType(gradients)
 
     def release(self) -> None:
         self._key_values.clear()
         self._gradients.clear()
+        self._diagnostic_accumulation_counts.clear()
         self.released = True
         self._generation = next(_generations)
 
