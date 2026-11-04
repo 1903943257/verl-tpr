@@ -110,3 +110,15 @@ def test_proposed_joint_alignment_contract(tp, cp, length):
         f"joint_padded={joint_padded}",
         flush=True,
     )
+
+
+@pytest.mark.parametrize(("tp", "length"), [(2, 9), (4, 9), (2, 10), (4, 12)])
+def test_cp1_sequence_parallel_has_no_automatic_padding(tp, length):
+    """CP1 uses the unpadded segment and rejects unaligned TP+SP lengths."""
+    aligned = length % tp == 0
+    if aligned:
+        validate_replay_plan(_plan(length), _prepared(tp), cp_size=1)
+    else:
+        with pytest.raises(ValueError, match="CP-local physical_length=.*must be divisible"):
+            validate_replay_plan(_plan(length), _prepared(tp), cp_size=1)
+    print(f"TP_SP_CP1 tp={tp} logical={length} aligned={aligned}", flush=True)
