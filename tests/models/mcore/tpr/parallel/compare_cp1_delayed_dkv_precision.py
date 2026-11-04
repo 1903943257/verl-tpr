@@ -1,7 +1,8 @@
 """Compare exact all-parameter TP1/CP1 BF16 gradients from three fixed-input PPO arms.
 
 Full is a controlled whole-sequence square-CANN reference, not the native VERL
-trainer schedule.  The two TPR arms differ only in delayed dKV accumulation.
+trainer schedule. N=8 real captured trajectories, one NPU, no TP/CP/DP.
+The two TPR arms differ only in delayed dKV accumulation.
 """
 from __future__ import annotations
 
@@ -83,7 +84,7 @@ def compare(root: Path) -> dict:
             raise FileNotFoundError(file)
         arms[arm] = json.loads(file.read_text())
 
-    expected_mode = {"full": "full", "tpr_old": "shared", "tpr_fp32": "shared"}
+    expected_mode = {"full": "full_mb1", "tpr_old": "tpr", "tpr_fp32": "tpr"}
     expected_fp32 = {"full": False, "tpr_old": False, "tpr_fp32": True}
     for arm, result in arms.items():
         if result["mode"] != expected_mode[arm]:
@@ -92,8 +93,8 @@ def compare(root: Path) -> dict:
             raise AssertionError(f"{arm} delayed dKV precision gate mismatch")
         if result["topology"] != {"tp": 1, "cp": 1, "dp": 1, "world": 1}:
             raise AssertionError(f"{arm} must be truly TP1 CP1 DP1")
-        if result["optimizer_step"]:
-            raise AssertionError(f"{arm} updated parameters")
+        if result["optimizer_step"] or result.get("logical_trajectories") != 8:
+            raise AssertionError(f"{arm} must have exactly eight rows and no optimizer step")
         if not result.get("full_grad_dir") or result.get("full_gradient_scope") != "ALL_PARAMETERS_BF16_TP1_CP1":
             raise AssertionError(f"{arm} is missing complete BF16 gradients")
 
@@ -128,8 +129,8 @@ def compare(root: Path) -> dict:
     old_err = pairs["full_vs_tpr_old"]["relative_l2"]
     new_err = pairs["full_vs_tpr_fp32"]["relative_l2"]
     report = {
-        "scope": "Qwen3-4B BF16 one NPU TP1 CP1 DP1, fixed cropped two-row Actor PPO",
-        "full_reference": "controlled whole-sequence square-CANN; not native VERL trainer",
+        "scope": "Qwen3-4B BF16 one NPU TP1 CP1 DP1, fixed cropped eight-row Actor PPO",
+        "full_reference": "controlled eight independent whole-sequence B1 square-CANN; not native VERL trainer",
         "optimizer_step": False,
         "branch_relay_only_changed": True,
         "source_capture": baseline["source_capture"],
