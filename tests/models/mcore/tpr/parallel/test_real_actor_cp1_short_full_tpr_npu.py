@@ -479,7 +479,6 @@ def test_real_actor_cp1_short_full_vs_tpr():
             )
         stats = {
             "mode": mode,
-            "experimental_delayed_dkv_accum_fp32": os.getenv("TPR_EXPERIMENT_DELAYED_DKV_FP32", "0") == "1",
             "reference": (
                 "whole_GPT_no_TPR_context_CP1_square_CANN"
                 if mode == "full" else "whole_GPT_2rows_1physical_forward_CP1_square_CANN"
