@@ -169,3 +169,40 @@ def test_explicit_cp_padding_must_satisfy_joint_tp_sp_alignment():
         )
     corrected = make_ring_sequence_shard(9, cp_rank=0, cp_size=2, sp_tp_size=4)
     assert (corrected.padded_length, corrected.local_length) == (16, 8)
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+@pytest.mark.parametrize("sp_enabled", [False, True])
+def test_engine_runtime_uses_model_tp_sp_alignment(monkeypatch, tp_size, cp_size, sp_enabled):
+    """Adapter's runtime construction must match the standalone Executor."""
+    from megatron.core import parallel_state
+    import torch.distributed as dist
+
+    from verl.workers.engine.megatron.tpr.ring import resolve_engine_cp_runtime
+
+    fake_cp_group = object()
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_world_size", lambda group=None: cp_size)
+    monkeypatch.setattr(dist, "get_rank", lambda group=None: 0)
+    monkeypatch.setattr(parallel_state, "model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state, "get_context_parallel_group", lambda: fake_cp_group)
+
+    engine = SimpleNamespace(
+        engine_config=SimpleNamespace(
+            context_parallel_size=cp_size,
+            tpr_cp_backend=None,
+            dynamic_context_parallel=False,
+        )
+    )
+    config = SimpleNamespace(
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=sp_enabled,
+    )
+    runtime = resolve_engine_cp_runtime(engine, config)
+    assert runtime.backend.sp_tp_size == (tp_size if sp_enabled else 1)
+    shard = runtime.backend.make_sequence_shard(9)
+    if sp_enabled:
+        assert shard.local_length % tp_size == 0
+    else:
+        assert shard.padded_length == ((9 + 2 * cp_size - 1) // (2 * cp_size)) * (2 * cp_size)
