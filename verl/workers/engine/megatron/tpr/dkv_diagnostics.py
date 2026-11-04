@@ -44,10 +44,11 @@ def _tensor_stats(tensor: Tensor) -> dict[str, Any]:
         result.update(norm=0.0, max_abs=0.0, finite=True)
         return result
     values = detached.float()
+    finite = bool(torch.isfinite(values).all().item())
     result.update(
-        norm=float(torch.linalg.vector_norm(values).item()),
-        max_abs=float(values.abs().max().item()),
-        finite=bool(torch.isfinite(values).all().item()),
+        norm=float(torch.linalg.vector_norm(values).item()) if finite else None,
+        max_abs=float(values.abs().max().item()) if finite else None,
+        finite=finite,
     )
     return result
 
@@ -61,11 +62,16 @@ def _difference_stats(expected: Tensor, actual: Tensor) -> dict[str, Any]:
         }
     expected_fp32 = expected.detach().float()
     actual_fp32 = actual.detach().float()
+    if not bool(torch.isfinite(expected_fp32).all().item()) or not bool(
+        torch.isfinite(actual_fp32).all().item()
+    ):
+        return {"shape_match": True, "finite": False, "relative_l2": None, "max_abs": None}
     difference = actual_fp32 - expected_fp32
     expected_norm = float(torch.linalg.vector_norm(expected_fp32).item())
     difference_norm = float(torch.linalg.vector_norm(difference).item())
     return {
         "shape_match": True,
+        "finite": True,
         "relative_l2": difference_norm / max(expected_norm, 1e-30),
         "max_abs": float(difference.abs().max().item()) if difference.numel() else 0.0,
     }
