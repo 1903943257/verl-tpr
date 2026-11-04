@@ -28,7 +28,7 @@ from torch import Tensor
 from verl.models.mcore.tpr.context import KVPair
 from verl.models.mcore.tpr.context import _compact_kv_tensor as _compact_graph_free_tensor
 
-from .dkv_diagnostics import record_dkv_accumulation
+from .dkv_diagnostics import dkv_diagnostics_enabled, record_dkv_accumulation
 from .ring import SequenceShard
 from .tree import SegmentId, SegmentSpec, _validate_segment_id
 
@@ -205,6 +205,8 @@ class KVPrefixState:
         self._record_layer_accumulation(layer_number, gradients)
 
     def _record_layer_accumulation(self, layer_number: int, incoming: KVPair) -> None:
+        if not dkv_diagnostics_enabled():
+            return
         count = self._diagnostic_accumulation_counts.get(layer_number, 0) + 1
         self._diagnostic_accumulation_counts[layer_number] = count
         record_dkv_accumulation(
