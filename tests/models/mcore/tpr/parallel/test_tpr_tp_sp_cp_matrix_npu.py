@@ -1,17 +1,23 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: Apache-2.0
-"""Configurable NPU TP+SP+RingCP model-level Push/Visit/Pop smoke test.
+"""Configurable NPU TP+SP model-level Push/Visit/Pop smoke test.
 
-This checks the real model's attention/SP input shapes and nonzero finite
-backward gradients. It is not Base-vs-TPR numerical parity or PPO E2E.
+CP1 checks contiguous SP-only physical padding; CP>1 checks Ring plus SP.
+This checks real attention/SP input shapes and nonzero finite backward
+gradients. It is not Base-vs-TPR numerical parity or PPO E2E.
 
-On eight visible Ascend NPUs, e.g.:
+On four visible Ascend NPUs, e.g.:
+  TPR_RUN_TP_SP_CP_MATRIX=1 TPR_TEST_TP=4 TPR_TEST_CP=1 \
+    torchrun --nproc_per_node=4 --master_port=29861 -m pytest -s -x \
+    tests/models/mcore/tpr/parallel/test_tpr_tp_sp_cp_matrix_npu.py
+
+On eight visible Ascend NPUs:
   TPR_RUN_TP_SP_CP_MATRIX=1 TPR_TEST_TP=4 TPR_TEST_CP=2 \
     torchrun --nproc_per_node=8 --master_port=29861 -m pytest -s -x \
     tests/models/mcore/tpr/parallel/test_tpr_tp_sp_cp_matrix_npu.py
 
-Additional: TP2*CP2 (4 cards), TP2*CP4 (8), TP4*CP4 (16, multi-node),
-TP8*CP2 (16, multi-node), with WORLD_SIZE=TP*CP and DP=1.
+Additional: TP2*CP1/2 (2/4 cards), TP8*CP1 (8 cards), TP2*CP4 (8),
+TP4*CP4 / TP8*CP2 (16, multi-node), with WORLD_SIZE=TP*CP and DP=1.
 """
 from __future__ import annotations
 
@@ -37,7 +43,10 @@ try:
     from ._qwen3_tp_checkpoint import make_real_qwen3_tp_model
     from .test_real_actor_tp2cp4_offline_ppo_npu import _sanitize_mindspeed_repatch_args
     from verl.workers.engine.megatron.tpr.executor import SegmentExecutor
-    from verl.workers.engine.megatron.tpr.ring import make_ring_sequence_shard
+    from verl.workers.engine.megatron.tpr.ring import (
+        make_cp1_sp_sequence_shard,
+        make_ring_sequence_shard,
+    )
     from verl.workers.engine.megatron.tpr.tree import SegmentPlan, SegmentSpec
 finally:
     sys.argv[:] = _original_argv
@@ -52,8 +61,8 @@ pytestmark = pytest.mark.skipif(
 def runtime():
     tp_size = int(os.getenv("TPR_TEST_TP", "4"))
     cp_size = int(os.getenv("TPR_TEST_CP", "2"))
-    if tp_size not in (2, 4, 8) or cp_size not in (2, 4, 8):
-        pytest.skip("TP/SP smoke supports TP=2/4/8 and CP=2/4/8")
+    if tp_size not in (2, 4, 8) or cp_size not in (1, 2, 4, 8):
+        pytest.skip("TP/SP smoke supports TP=2/4/8 and CP=1/2/4/8")
     world_size = tp_size * cp_size
     if int(os.getenv("WORLD_SIZE", "1")) != world_size:
         pytest.skip(f"TP{tp_size} x CP{cp_size} x DP1 requires {world_size} ranks")
@@ -94,7 +103,10 @@ def runtime():
     tp_group = parallel_state.get_tensor_model_parallel_group()
     cp_group = parallel_state.get_context_parallel_group()
     assert dist.get_world_size(tp_group) == tp_size
-    assert dist.get_world_size(cp_group) == cp_size
+    if cp_size > 1:
+        assert dist.get_world_size(cp_group) == cp_size
+    elif cp_group is not None:
+        assert dist.get_world_size(cp_group) == 1
     state = SimpleNamespace(
         tp_group=tp_group, cp_group=cp_group,
         pp_group=parallel_state.get_pipeline_model_parallel_group(),
@@ -151,16 +163,35 @@ def test_tp_sp_cp_push_visit_pop_layout_and_backward(runtime):
         )
     )
 
-    def objective(_segment, logits):
+    def shard_for_length(length):
+        if runtime.cp_size > 1:
+            return make_ring_sequence_shard(
+                length,
+                cp_rank=runtime.cp_rank,
+                cp_size=runtime.cp_size,
+                sp_tp_size=runtime.tp_size,
+            )
+        return make_cp1_sp_sequence_shard(
+            length, sp_tp_size=runtime.tp_size,
+        )
+
+    def objective(segment, logits):
         assert logits.ndim == 3
-        loss = logits.float().square().mean()
+        shard = shard_for_length(segment.length)
+        valid = shard.physical_global_indices(device=logits.device) < segment.length
+        assert bool(valid.any().item())
+        loss = logits[:, valid].float().square().mean()
         return loss, {}
 
     try:
         model.zero_grad(set_to_none=True)
         executor = SegmentExecutor(
-            model, plan, cp_group=runtime.cp_group, cp_backend="ring",
-            segment_loss_fn=objective, segment_loss_term_counts={1: 1},
+            model,
+            plan,
+            cp_group=runtime.cp_group if runtime.cp_size > 1 else None,
+            cp_backend="ring" if runtime.cp_size > 1 else None,
+            segment_loss_fn=objective,
+            segment_loss_term_counts={1: 1},
         )
         loss = executor.run()
         assert bool(torch.isfinite(loss).item())
@@ -168,19 +199,15 @@ def test_tp_sp_cp_push_visit_pop_layout_and_backward(runtime):
         assert grad is not None and bool(torch.isfinite(grad).all().item())
         assert bool(grad.float().abs().sum().gt(0).item())
         physical = [
-            make_ring_sequence_shard(
-                length,
-                cp_rank=runtime.cp_rank,
-                cp_size=runtime.cp_size,
-                sp_tp_size=runtime.tp_size,
-            ).local_length for length in (prefix_len, suffix_len, prefix_len)
+            shard_for_length(length).local_length
+            for length in (prefix_len, suffix_len, prefix_len)
         ]
         assert seen_input == [length // runtime.tp_size for length in physical], (
-            "Attention input must be TP-local inside each CP shard",
+            "Attention input must be TP-local inside the physical shard",
             seen_input, physical,
         )
         assert seen_qkv == physical, (
-            "Megatron QKV must TP-allgather the complete CP-local sequence",
+            "Megatron QKV must TP-allgather the complete physical sequence",
             seen_qkv, physical,
         )
         if dist.get_rank() == 0:
