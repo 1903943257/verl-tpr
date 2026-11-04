@@ -47,11 +47,13 @@ def _summarize_arm(arm: str, path: Path) -> dict:
         item["seed_to_hook"]["relative_l2"]
         for item in replay_hooks
         if item["seed_to_hook"].get("shape_match") is True
+        and item["seed_to_hook"].get("relative_l2") is not None
     ]
     hook_max_abs = [
         item["seed_to_hook"]["max_abs"]
         for item in replay_hooks
         if item["seed_to_hook"].get("shape_match") is True
+        and item["seed_to_hook"].get("max_abs") is not None
     ]
     dtype_mismatches = [
         {
