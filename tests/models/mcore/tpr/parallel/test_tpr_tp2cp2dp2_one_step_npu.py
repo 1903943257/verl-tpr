@@ -329,10 +329,12 @@ def _placement(capture, runtime, expected_tokens):
     if os.getenv("TPR_DP2_EMPTY_REPLICA", "0") == "1":
         # Synthetic DP-boundary audit only: preserve all prompt/trajectory
         # tokens while removing supervision from exactly DP0's local forest.
+        source_tokens = global_tokens
         if runtime.dp_rank == 0:
-            batch["response_mask"].zero_()
-            if "loss_mask" in batch:
-                batch["loss_mask"].zero_()
+            for key in ("response_mask", "loss_mask"):
+                if key in batch:
+                    mask = batch[key]
+                    (mask.values() if mask.is_nested else mask).zero_()
         local_supervised = sum(
             int(mask.bool().sum().item()) for mask in batch["response_mask"].unbind(0)
         )
@@ -347,7 +349,7 @@ def _placement(capture, runtime, expected_tokens):
         if dist.get_rank() == 0:
             print(
                 f"TPR_DP_EMPTY_AUDIT dp0_tokens=0 "
-                f"global_supervised={global_tokens} source_tokens={global_batch['response_mask'].bool().sum().item()}",
+                f"global_supervised={global_tokens} source_tokens={source_tokens}",
                 flush=True,
             )
     return batch, placement, global_tokens, global_sha
