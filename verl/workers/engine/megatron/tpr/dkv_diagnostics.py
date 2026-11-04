@@ -28,6 +28,10 @@ def _diagnostic_path() -> str | None:
     return path if path else None
 
 
+def dkv_diagnostics_enabled() -> bool:
+    return _diagnostic_path() is not None
+
+
 def _tensor_stats(tensor: Tensor) -> dict[str, Any]:
     detached = tensor.detach()
     result: dict[str, Any] = {
