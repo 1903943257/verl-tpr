@@ -48,32 +48,10 @@ def math_attention(query, key, value, *, softmax_scale=None, dropout_p=0.0):
 
 
 def tensor_difference(reference, candidate, *, atol=1e-5, rtol=1e-4):
-    if reference.shape != candidate.shape:
-        raise ValueError(f"Comparison shape mismatch: {reference.shape} / {candidate.shape}")
-    a, b = reference.detach().cpu().reshape(-1), candidate.detach().cpu().reshape(-1)
-    aa = bb = dd = dot = maximum = 0.0
-    close = True
-    for start in range(0, a.numel(), 262144):
-        x, y = a[start : start + 262144].double(), b[start : start + 262144].double()
-        if not bool(torch.isfinite(x).all() and torch.isfinite(y).all()):
-            raise FloatingPointError("Nonfinite attribution tensor")
-        delta = y - x
-        aa += float(x.square().sum())
-        bb += float(y.square().sum())
-        dd += float(delta.square().sum())
-        dot += float((x * y).sum())
-        maximum = max(maximum, float(delta.abs().max()))
-        close &= bool((delta.abs() <= atol + rtol * x.abs()).all())
-    return {
-        "elements": a.numel(),
-        "reference_norm": math.sqrt(aa),
-        "candidate_norm": math.sqrt(bb),
-        "difference_norm": math.sqrt(dd),
-        "relative_l2": math.sqrt(dd / aa) if aa else (0.0 if not dd else None),
-        "cosine": dot / math.sqrt(aa * bb) if aa and bb else (1.0 if aa == bb else None),
-        "max_abs": maximum,
-        "within_tolerance": close,
-    }
+    """CPU FP64 blockwise comparison, shared with the offline recovery path."""
+    from .fast_fp32_grad_compare import fast_fp32_tensor_difference
+
+    return fast_fp32_tensor_difference(reference, candidate, atol=atol, rtol=rtol)
 
 
 def _tensor(output):
