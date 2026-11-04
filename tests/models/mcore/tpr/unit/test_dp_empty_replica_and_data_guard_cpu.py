@@ -35,7 +35,8 @@ validate = _load_function(
 run_forest = _load_function(
     "verl/workers/engine/megatron/tpr/adapter.py",
     "run_forest",
-    {"Tensor": Tensor, "nullcontext": nullcontext, "Callable": Callable, "Any": Any},
+    {"Tensor": Tensor, "nullcontext": nullcontext, "Callable": Callable, "Any": Any,
+     "ForestExecutionPlan": object, "TreeExecutionPlan": object},
 )
 
 
