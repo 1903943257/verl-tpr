@@ -33,6 +33,41 @@ def test_offline_split_comparator_uses_persisted_grads_without_model(tmp_path):
     assert report["pairs"]["full_vs_split_replay"]["gradient_max_abs"] == 0
     assert report["arms"]["split_replay"]["logit_ranges"] == 1
 
+    checkpoint = tmp_path / ".offline_compare_progress.jsonl"
+    assert checkpoint.is_file()
+    initial = checkpoint.read_text()
+    assert len(initial.splitlines()) == 3
+    resumed = compare_saved(
+        tmp_path, prefix=32, suffix=32, output_name="report_resumed.json",
+    )
+    assert resumed["pairs"] == report["pairs"]
+    assert checkpoint.read_text() == initial  # no duplicate writes on resume
+
+
+def test_fast_fp32_grad_comparator_matches_independent_fp64_oracle():
+    import math
+
+    from tests.models.mcore.tpr.parallel.fast_fp32_grad_compare import fast_fp32_tensor_difference
+
+    reference = torch.linspace(-2, 2, 2048, dtype=torch.float32)
+    candidate = reference + torch.sin(reference) * 1e-5
+    candidate[500] += 0.01
+    progress = []
+    result = fast_fp32_tensor_difference(
+        reference, candidate, atol=1e-5, rtol=1e-4, block_elements=113,
+        progress=lambda done, total: progress.append((done, total)),
+    )
+    a, b = reference.double(), candidate.double()
+    delta = b - a
+    expected_rel = float(delta.norm() / a.norm())
+    expected_cosine = float((a * b).sum() / (a.norm() * b.norm()))
+    assert math.isclose(result["relative_l2"], expected_rel, rel_tol=1e-12)
+    assert math.isclose(result["cosine"], expected_cosine, rel_tol=1e-12)
+    assert math.isclose(result["max_abs"], float(delta.abs().max()), rel_tol=1e-12)
+    assert result["within_tolerance"] is False
+    assert progress[-1] == (2048, 2048)
+    assert progress[0][0] == 113
+
 
 def test_cp2_loss_preserves_prefix_last_query_and_gradient():
     torch.manual_seed(100)
