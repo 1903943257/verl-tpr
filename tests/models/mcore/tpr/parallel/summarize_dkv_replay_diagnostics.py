@@ -21,6 +21,12 @@ def _summarize_arm(arm: str, path: Path) -> dict:
     accumulation = [item for item in records if item["event"] == "dkv_accumulate"]
     replay_inputs = [item for item in records if item["event"] == "dkv_replay_input"]
     replay_hooks = [item for item in records if item["event"] == "dkv_replay_root_hook"]
+    if not accumulation or not replay_inputs or not replay_hooks:
+        raise RuntimeError(
+            f"{arm}: expected accumulation, Replay-input, and Replay-hook records; "
+            f"got accumulation={len(accumulation)}, replay_inputs={len(replay_inputs)}, "
+            f"replay_hooks={len(replay_hooks)}"
+        )
 
     groups: dict[tuple[str, int, str], list[dict]] = defaultdict(list)
     for item in accumulation:
