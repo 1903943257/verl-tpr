@@ -176,8 +176,8 @@ def test_explicit_cp_padding_must_satisfy_joint_tp_sp_alignment():
 @pytest.mark.parametrize("sp_enabled", [False, True])
 def test_engine_runtime_uses_model_tp_sp_alignment(monkeypatch, tp_size, cp_size, sp_enabled):
     """Adapter's runtime construction must match the standalone Executor."""
-    from megatron.core import parallel_state
     import torch.distributed as dist
+    from megatron.core import parallel_state
 
     from verl.workers.engine.megatron.tpr.ring import resolve_engine_cp_runtime
 
