@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
 from types import MappingProxyType
-import os
 
 import torch
 from torch import Tensor
