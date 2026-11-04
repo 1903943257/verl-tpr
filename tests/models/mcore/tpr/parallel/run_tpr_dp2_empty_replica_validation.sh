@@ -43,7 +43,7 @@ export TPR_DP2_SAVE_FULL_GRADS="${TPR_DP2_SAVE_FULL_GRADS:-0}"
 export TPR_EXEC_PROFILE=0
 export PYTHONUNBUFFERED=1
 
-echo "DP empty-replica audit: branch=$(git rev-parse --abbrev-ref HEAD) sha=$(git rev-parse --short HEAD)"
+echo "DP empty-replica audit: source=$ROOT (git worktree metadata not required)"
 echo "TP2 CP2 DP2; DP0 response_mask=0, DP1 active; manifest=$MANIFEST step=$STEP"
 set -o pipefail
 torchrun --nproc_per_node=8 --master_addr=127.0.0.1 \
