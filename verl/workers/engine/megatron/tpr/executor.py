@@ -654,7 +654,9 @@ class SegmentExecutor:
             prefix_length=segment.prefix_length,
             suffix_length=segment.length,
             batch_size=len(leaf_group) if leaf_group is not None else 1,
-            local_physical_suffix_length=shard.local_length,
+            local_physical_suffix_length=(
+                shard.local_length if not self.cp_enabled and self.sp_tp_size > 1 else None
+            ),
             past_key_values=past_key_values,
             suffix_rotary_pos_emb=build_sharded_rotary_pos_emb(
                 self.model.rotary_pos_emb,

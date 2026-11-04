@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SequenceShard layouts and physical padding for TPR Ring and CP1 SP."""
+"""Ring zigzag SequenceShard layout, padding and shape validation."""
 
 from __future__ import annotations
 

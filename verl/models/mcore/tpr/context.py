@@ -117,8 +117,7 @@ class TPRAttentionContext:
 
     compact_new_kv: bool = False
     batch_size: int = 1
-    # CP1 SP uses a padded local physical suffix while suffix_length remains
-    # the logical Segment length. For CP>1 this matches the backend shard.
+    # CP1 SP may pad the physical suffix; suffix_length stays logical.
     local_physical_suffix_length: int | None = None
     _new_key_values: dict[int, KVPair] = field(default_factory=dict, init=False, repr=False)
 
@@ -166,14 +165,6 @@ class TPRAttentionContext:
                 raise ValueError("attention backend Prefix/Suffix lengths must match TPRAttentionContext")
             if backend.local_suffix_length <= 0:
                 raise ValueError("attention backend local suffix length must be positive")
-            if (
-                self.local_physical_suffix_length is not None
-                and self.local_physical_suffix_length != backend.local_suffix_length
-            ):
-                raise ValueError(
-                    "local physical suffix length must match attention backend shard: "
-                    f"{self.local_physical_suffix_length} != {backend.local_suffix_length}"
-                )
 
         for layer, pair in self.past_key_values.items():
             _validate_layer_number(layer)

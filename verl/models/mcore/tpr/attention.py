@@ -105,8 +105,8 @@ class TPRSelfAttention(SelfAttention):
             gate = None
 
         # Megatron ColumnParallelLinear owns SP all-gather on the QKV input.
-        # Attention and KVStack see the complete physical Segment sequence
-        # (logical tokens plus trailing padding), never an SP-local KV fragment.
+        # The attention kernel and per-layer KVStack still see the *complete*
+        # logical segment sequence, never an SP-local KV fragment.
         if getattr(self.config, "sequence_parallel", False) and (
             getattr(self.config, "tensor_model_parallel_size", 1) > 1
         ) and query.shape[0] != context.local_suffix_length:
@@ -184,12 +184,12 @@ class TPRSelfAttention(SelfAttention):
             raise ValueError(f"invalid tensor_model_parallel_size={tp_size}")
         sp_enabled = tp_size > 1 and getattr(self.config, "sequence_parallel", False)
         # Attention receives sequence-sharded hidden activations under native
-        # Megatron SP. ColumnParallelLinear all-gathers them for full-physical-
-        # Segment QKV inside get_query_key_value_tensors(); do not shard KV or RoPE.
+        # Megatron SP. ColumnParallelLinear all-gathers them for full-segment
+        # QKV inside get_query_key_value_tensors(); do not shard KV or RoPE.
         if sp_enabled and context.local_suffix_length % tp_size:
             raise ValueError(
-                f"TPR local physical segment length {context.local_suffix_length} must be divisible "
-                f"by TP={tp_size} under native sequence parallelism"
+                f"TPR segment length {context.local_suffix_length} must be divisible "
+                f"by TP={tp_size} under native sequence parallelism (padding deferred)"
             )
         expected_input_len = (
             context.local_suffix_length // tp_size if sp_enabled
@@ -204,7 +204,7 @@ class TPRSelfAttention(SelfAttention):
             raise ValueError(
                 f"hidden suffix length ({hidden_states.shape[0]}) does not match "
                 f"expected {'SP-local' if sp_enabled else 'CP-local'} length "
-                f"({expected_input_len}) for local physical suffix {context.local_suffix_length}"
+                f"({expected_input_len}) for logical suffix {context.local_suffix_length}"
             )
         if context.suffix_rotary_pos_emb is None:
             raise ValueError("TPRAttentionContext.suffix_rotary_pos_emb is required in TPR mode")
