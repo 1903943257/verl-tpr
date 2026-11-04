@@ -336,7 +336,14 @@ def _prefix_blocks_by_layer(
 class RingCPBackend:
     backend_name = "ring"
 
-    def __init__(self, group: Any, *, parallel_size: int | None = None, parallel_rank: int | None = None):
+    def __init__(
+        self,
+        group: Any,
+        *,
+        parallel_size: int | None = None,
+        parallel_rank: int | None = None,
+        sp_tp_size: int = 1,
+    ):
         if (parallel_size is None) != (parallel_rank is None):
             raise ValueError("parallel_size and parallel_rank must be provided together")
         if parallel_size is None:
@@ -346,6 +353,13 @@ class RingCPBackend:
         self._cp_group = group
         self._parallel_size = parallel_size
         self._parallel_rank = parallel_rank
+        if not isinstance(sp_tp_size, int) or isinstance(sp_tp_size, bool) or sp_tp_size < 1:
+            raise ValueError(f"sp_tp_size must be a positive integer, got {sp_tp_size!r}")
+        self._sp_tp_size = sp_tp_size
+
+    @property
+    def sp_tp_size(self) -> int:
+        return self._sp_tp_size
 
     @property
     def parallel_size(self) -> int:
@@ -360,7 +374,10 @@ class RingCPBackend:
 
     def make_sequence_shard(self, global_length: int) -> SequenceShard:
         return make_ring_sequence_shard(
-            global_length, cp_rank=self.parallel_rank, cp_size=self.parallel_size,
+            global_length,
+            cp_rank=self.parallel_rank,
+            cp_size=self.parallel_size,
+            sp_tp_size=self.sp_tp_size,
         )
 
     def make_attention_backend(
@@ -419,9 +436,16 @@ def resolve_engine_cp_runtime(engine: Any, model_config: Any) -> TPREngineCPRunt
     size, rank = resolve_cp_group(group)
     if size != configured_size:
         raise RuntimeError(f"TPR CP topology mismatch: configured {configured_size}, actual {size}")
+    sp_tp_size = (
+        getattr(model_config, "tensor_model_parallel_size", 1)
+        if getattr(model_config, "sequence_parallel", False)
+        else 1
+    )
     return TPREngineCPRuntime(
         group=group,
-        backend=RingCPBackend(group, parallel_size=size, parallel_rank=rank),
+        backend=RingCPBackend(
+            group, parallel_size=size, parallel_rank=rank, sp_tp_size=sp_tp_size,
+        ),
         size=size, rank=rank,
     )
 

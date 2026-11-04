@@ -221,9 +221,9 @@ def validate_replay_plan(
 ) -> None:
     """Check native SP's divisibility before any model/CP collectives run.
 
-    Ring pads every segment to 2*CP equal global chunks. Each CP rank owns
-    two chunks; this *physical CP-local* sequence, not the unpadded logical
-    segment length, is what Megatron's TP sequence parallelism partitions.
+    Ring pads each segment to the joint 2*CP and CP*TP alignment when
+    native SP is enabled. Each CP rank owns two Zigzag chunks; the physical
+    CP-local sequence is subsequently partitioned by Megatron SP.
     """
     config = getattr(prepared_model.model, "config", None)
     tp_size = getattr(config, "tensor_model_parallel_size", 1)
@@ -234,7 +234,7 @@ def validate_replay_plan(
             continue
         physical_length = (
             make_ring_sequence_shard(
-                segment.length, cp_rank=0, cp_size=cp_size,
+                segment.length, cp_rank=0, cp_size=cp_size, sp_tp_size=tp_size,
             ).local_length
             if cp_size > 1 else segment.length
         )
@@ -305,6 +305,12 @@ class SegmentExecutor:
         self.kv_stack = KVStack() if kv_stack is None else kv_stack
         self.loss_scale_func = loss_scale_func
         self.cp_group = cp_group
+        config = getattr(prepared_model.model, "config", None)
+        sp_tp_size = (
+            getattr(config, "tensor_model_parallel_size", 1)
+            if getattr(config, "sequence_parallel", False)
+            else 1
+        )
         # Explicit opt-in: only this tree's actual Root may use ordinary
         # MindSpeed causal Ring. An empty Prefix on a non-root is not enough.
         self._native_root_ring = os.getenv("TPR_ROOT_NATIVE_RING", "0") == "1"
@@ -325,10 +331,16 @@ class SegmentExecutor:
             if isinstance(cp_backend, RingCPBackend):
                 if (cp_backend.parallel_size, cp_backend.parallel_rank) != (self.cp_size, self.cp_rank):
                     raise ValueError("RingCPBackend coordinates do not match initialized CP group")
+                if cp_backend.sp_tp_size != sp_tp_size:
+                    raise ValueError(
+                        "RingCPBackend TP/SP alignment does not match the prepared model: "
+                        f"expected {sp_tp_size}, got {cp_backend.sp_tp_size}"
+                    )
                 self.cp_backend = cp_backend
             elif cp_backend in (None, "ring", "megatron_cp_algo"):
                 self.cp_backend = RingCPBackend(
                     cp_group, parallel_size=self.cp_size, parallel_rank=self.cp_rank,
+                    sp_tp_size=sp_tp_size,
                 )
             else:
                 raise NotImplementedError("Production TPR only supports Ring CP")
