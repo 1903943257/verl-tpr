@@ -84,7 +84,9 @@ def _summarize_arm(arm: str, path: Path) -> dict:
         "buffer_dtype_counts": dict(Counter(item["buffer"]["dtype"] for item in accumulation)),
         "replay_input_records": len(replay_inputs),
         "replay_root_dtype_counts": dict(Counter(item["root"]["dtype"] for item in replay_inputs)),
-        "replay_seed_dtype_counts": dict(Counter(item["seed_gradient"]["dtype"] for item in replay_inputs)),
+        "replay_seed_dtype_counts": dict(
+            Counter(item["seed_gradient"]["dtype"] for item in replay_inputs)
+        ),
         "replay_hook_records": len(replay_hooks),
         "replay_actual_gradient_dtype_counts": dict(Counter(
             item["actual_gradient"]["dtype"] for item in replay_hooks
