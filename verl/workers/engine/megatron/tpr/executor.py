@@ -28,6 +28,7 @@ from torch import Tensor, nn
 
 from verl.models.mcore.tpr.context import KVPair, TPRAttentionContext, use_tpr_attention_context
 
+from .dkv_diagnostics import observe_dkv_replay_root
 from .ring import RingCPBackend, SequenceShard, make_ring_sequence_shard, resolve_cp_group
 from .state import KVStack, PastKVAnchors
 from .tree import SegmentId, SegmentPlan, SegmentSpec
@@ -579,8 +580,17 @@ class SegmentExecutor:
                 roots.append(loss_root)
                 gradients.append(None)
         for layer, gradient in relayed_gradients.items():
-            for root, grad in zip(context.new_key_values[layer], gradient, strict=True):
+            for kind, root, grad in zip(
+                ("key", "value"), context.new_key_values[layer], gradient, strict=True,
+            ):
                 if root.requires_grad:
+                    observe_dkv_replay_root(
+                        root,
+                        grad,
+                        segment_id=segment.segment_id,
+                        layer=layer,
+                        kind=kind,
+                    )
                     roots.append(root)
                     gradients.append(grad)
         if roots:
