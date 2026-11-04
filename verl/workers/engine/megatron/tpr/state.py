@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
 from types import MappingProxyType
+import os
 
 import torch
 from torch import Tensor
@@ -31,6 +32,21 @@ from .ring import SequenceShard
 from .tree import SegmentId, SegmentSpec, _validate_segment_id
 
 _generations = count()
+
+
+def _fp32_delayed_dkv_enabled() -> bool:
+    """Experimental precision A/B gate; native behavior remains the default."""
+    value = os.getenv("TPR_EXPERIMENT_DELAYED_DKV_FP32", "0")
+    if value not in ("0", "1"):
+        raise ValueError("TPR_EXPERIMENT_DELAYED_DKV_FP32 must be 0 or 1")
+    return value == "1"
+
+
+def _copy_delayed_gradient(gradient: Tensor) -> Tensor:
+    gradient = gradient.detach()
+    if _fp32_delayed_dkv_enabled() and gradient.dtype in (torch.bfloat16, torch.float16):
+        return gradient.to(dtype=torch.float32, copy=True, memory_format=torch.contiguous_format)
+    return gradient.clone(memory_format=torch.contiguous_format)
 
 
 def _validate_layer_number(layer_number: int) -> None:
@@ -180,12 +196,10 @@ class KVPrefixState:
             if (gradient.device, gradient.dtype) != (tensor.device, tensor.dtype):
                 raise ValueError(f"segment {self.segment_id} layer {layer_number} gradient device or dtype mismatch")
         if layer_number not in self._gradients:
-            self._gradients[layer_number] = tuple(
-                t.detach().clone(memory_format=torch.contiguous_format) for t in gradients
-            )
+            self._gradients[layer_number] = tuple(_copy_delayed_gradient(t) for t in gradients)
         else:
             for buffer, gradient in zip(self._gradients[layer_number], gradients, strict=True):
-                buffer.add_(gradient.detach())
+                buffer.add_(gradient.detach().to(dtype=buffer.dtype))
 
     def accumulate_anchor_gradients(self, anchors: KVPrefixAnchors, *, consume: bool = False) -> None:
         """Accumulate dKV, optionally taking ownership of executor-only grads."""
@@ -205,7 +219,11 @@ class KVPrefixState:
             if consume and layer not in self._gradients:
                 buffers = []
                 for gradient in (key.grad, value.grad):
-                    buffer = _compact_graph_free_tensor(gradient.detach())
+                    buffer = (
+                        _copy_delayed_gradient(gradient)
+                        if _fp32_delayed_dkv_enabled()
+                        else _compact_graph_free_tensor(gradient.detach())
+                    )
                     # Custom backward functions may reuse a buffer for K/V or
                     # multiple layers. Future accumulation needs separate owners.
                     if (buffer.device, buffer.untyped_storage().data_ptr()) in owned_storage:
