@@ -136,7 +136,7 @@ def main() -> None:
                 f"max_count={item['max_accumulation_count']}",
                 f"incoming={item['incoming_dtypes']}",
                 f"buffer={item['buffer_dtypes']}",
-                f"last_norm={item['last_buffer_norm']:.8g}",
+                f"last_norm={item['last_buffer_norm']}",
             )
 
     print(f"TPR_DKV_REPLAY_DIAG_SUMMARY saved={output}")
