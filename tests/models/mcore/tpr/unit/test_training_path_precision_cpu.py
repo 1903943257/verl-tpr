@@ -128,6 +128,38 @@ def test_reference_index_rejects_missing_saved_blocks(tmp_path):
     assert not (tmp_path / "index.json").exists()
 
 
+def test_gradient_serialization_uses_string_filenames_for_npu_mmap(tmp_path, monkeypatch):
+    original_load, original_save = torch.load, torch.save
+    calls = []
+
+    def npu_load(filename, *args, **kwargs):
+        if not isinstance(filename, str):
+            raise TypeError("f must be a string filename in order to use mmap argument")
+        calls.append(kwargs.get("mmap"))
+        return original_load(filename, *args, **kwargs)
+
+    def npu_save(value, filename, *args, **kwargs):
+        assert isinstance(filename, str)
+        return original_save(value, filename, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", npu_load)
+    monkeypatch.setattr(torch, "save", npu_save)
+    model = _Model([torch.arange(1, 6).float()])
+    owner = _Owner(model, [(0, 5)])
+    saved = io.observe_gradients(model, owner, tmp_path / "base", 0, {}, save_reference=True)
+    io.index_reference(tmp_path / "base", [saved])
+    observed = io.observe_gradients(
+        model,
+        owner,
+        tmp_path / "candidate",
+        0,
+        {"base": tmp_path / "base"},
+        save_reference=False,
+    )
+    assert calls == [True]
+    assert io.merge_stats([observed["stats"]["base"]], 5)["gradient_relative_l2"] == 0
+
+
 def test_native_fused_wgrad_requires_backward_completion_flags():
     module = nn.Linear(3, 2, bias=False)
     module.gradient_accumulation_fusion = True

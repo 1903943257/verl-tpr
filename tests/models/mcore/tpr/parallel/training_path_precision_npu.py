@@ -149,9 +149,9 @@ def main():
                     engine.forward_backward_batch(temporary, None, forward_only=True), temporary
                 )
             fixture = dict(tokens=tokens, old_log_probs=old_log_probs, advantages=advantages, weights=weights)
-            torch.save(fixture, fixture_path)
+            torch.save(fixture, str(fixture_path))
         else:
-            fixture = torch.load(fixture_path, map_location="cpu", weights_only=True)
+            fixture = torch.load(str(fixture_path), map_location="cpu", weights_only=True)
         if fixture["weights"] != weights:
             raise AssertionError("Four groups must load exactly the same initial weights")
         batch = actor_batch(fixture["tokens"], fixture["old_log_probs"], fixture["advantages"])

@@ -99,6 +99,33 @@ If a run failed the older function-name-only check, pull the fix and use a
 fresh output directory. The old failed directory is preserved; its gradients
 were not accepted as a reference. Retain the same checkpoint and seed.
 
+### Resume after a later mode fails
+
+If Base CP1 already has `result.json` and a complete `grads/index.json` with
+its blocks, keep the original checkpoint, seed and precision settings and run:
+
+```bash
+export TPR_TRAIN_OUTPUT=/workspace/tpr_experiments/p1024s1024_training3
+export TPR_TRAIN_RESUME=1
+bash tests/models/mcore/tpr/parallel/run_training_path_precision.sh
+```
+
+The preflight verifies the saved actor fixture, completed result metadata,
+precision controls and required reference-block coverage. Completed modes
+are skipped. Incomplete mode directories are renamed to
+`<mode>.failed-<UTC timestamp>-<id>` within the experiment folder, preserving
+their logs, audit and partial blocks; those modes are rerun. No incomplete
+gradient export is accepted as a reference. All checks precede archiving.
+Without `TPR_TRAIN_RESUME=1`, existing output directories remain protected.
+Archived partial blocks remain on disk in addition to the active references.
+Use resume for diagnostic/I/O fixes; a change to training arithmetic requires
+a fresh experiment directory.
+
+Gradient serialization passes string filenames to `torch.save/load` while
+retaining bounded `mmap=True` reads. Some torch_npu versions reject `Path`
+objects specifically when mmap is enabled, although upstream PyTorch accepts
+them; this affects diagnostic I/O after native finalize, not the training math.
+
 TPR currently requests `force_all_reduce=True` in its existing native
 finalizer. Base DistributedOptimizer ordinarily uses reduce-scatter.
 **Only native optimizer-owned parameter ranges are read** in either mode.

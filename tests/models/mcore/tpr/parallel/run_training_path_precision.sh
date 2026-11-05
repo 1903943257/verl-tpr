@@ -6,8 +6,11 @@ cd "$(dirname "$0")/../../../../.."
 : "${TPR_TRAIN_MODEL_PATH:?Set a local real Qwen3 checkpoint path (1.7B recommended)}"
 : "${TPR_TRAIN_OUTPUT:?Set a new experiment output directory}"
 : "${TPR_TRAIN_DEVICES:?Set two physical NPU IDs, e.g. 0,1}"
-[[ -d "$TPR_TRAIN_MODEL_PATH" && ! -e "$TPR_TRAIN_OUTPUT" ]] || {
-    echo 'ERROR: checkpoint missing or output already exists' >&2; exit 2;
+export TPR_TRAIN_RESUME="${TPR_TRAIN_RESUME:-0}"
+[[ "$TPR_TRAIN_RESUME" =~ ^[01]$ ]] || { echo 'ERROR: TPR_TRAIN_RESUME must be 0 or 1' >&2; exit 2; }
+[[ -d "$TPR_TRAIN_MODEL_PATH" ]] || { echo 'ERROR: checkpoint missing' >&2; exit 2; }
+[[ ! -e "$TPR_TRAIN_OUTPUT" || ( "$TPR_TRAIN_RESUME" == 1 && -d "$TPR_TRAIN_OUTPUT" ) ]] || {
+    echo 'ERROR: output already exists; set TPR_TRAIN_RESUME=1 only to continue validated controls' >&2; exit 2;
 }
 IFS=, read -r DEVICE0 DEVICE1 EXTRA <<< "$TPR_TRAIN_DEVICES"
 [[ -n "$DEVICE0" && -n "$DEVICE1" && -z "${EXTRA:-}" && "$DEVICE0" != "$DEVICE1" ]] || {
@@ -36,6 +39,9 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 unset TPR_DKV_REPLAY_DIAG_PATH TPR_MEM_TRACE TPR_EXEC_PROFILE TPR_FIRST_LEAF_DIAG TPR_FIRST_LEAF_DIAG_SYNC || true
 mkdir -p "$TPR_TRAIN_OUTPUT"
 export TPR_TRAIN_OUTPUT="$(cd "$TPR_TRAIN_OUTPUT" && pwd -P)"
+if [[ "$TPR_TRAIN_RESUME" == 1 ]]; then
+    "${PYTHON_BIN:-python}" -m tests.models.mcore.tpr.parallel.training_precision_resume
+fi
 
 echo "TRAIN_PRECISION setup=P1024+S1024 rows=2 shared_prefix=1024 output=$TPR_TRAIN_OUTPUT"
 echo 'All modes use the actual MindspeedEngineWithLMHead, DDP, PPO and native gradient finalize.'
@@ -44,6 +50,10 @@ echo 'Two FP32 temporary references: about 14 GB disk for 1.7B, 33 GB for 4B; re
 echo 'Stops before optimizer clipping/update. No dense FP32 attention; no parameter-gradient console dumps.'
 
 for mode in base_cp1 base_cp2 tpr_cp1 tpr_cp2; do
+    if [[ "$TPR_TRAIN_RESUME" == 1 && -s "$TPR_TRAIN_OUTPUT/$mode/result.json" ]]; then
+        echo "TRAIN_PRECISION_SKIP completed=$mode"
+        continue
+    fi
     export TPR_TRAIN_MODE="$mode"
     if [[ "$mode" == *_cp2 ]]; then
         export ASCEND_RT_VISIBLE_DEVICES="$DEVICE0,$DEVICE1"
@@ -62,4 +72,6 @@ for mode in base_cp1 base_cp2 tpr_cp1 tpr_cp2; do
         echo "ERROR: missing $mode result; references retained" >&2; exit 1;
     }
 done
-"${PYTHON_BIN:-python}" -m tests.models.mcore.tpr.parallel.training_precision_report
+if [[ ! -s "$TPR_TRAIN_OUTPUT/comparison.json" ]]; then
+    "${PYTHON_BIN:-python}" -m tests.models.mcore.tpr.parallel.training_precision_report
+fi

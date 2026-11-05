@@ -126,7 +126,9 @@ class GradientReference:
                 continue
             if lo != cursor:
                 raise AssertionError("Gap/overlap in saved reference")
-            value = torch.load(self.folder / part["file"], map_location="cpu", weights_only=True, mmap=True)
+            # torch_npu's mmap loader requires str, unlike upstream PyTorch's
+            # PathLike support. Keep mmap bounded; normalize at the API boundary.
+            value = torch.load(str(self.folder / part["file"]), map_location="cpu", weights_only=True, mmap=True)
             if value.dtype != torch.float32 or value.numel() != part["end"] - part["start"]:
                 raise AssertionError("Corrupt reference gradient block")
             pieces.append(value[lo - part["start"] : hi - part["start"]])
@@ -154,7 +156,7 @@ def observe_gradients(model, optimizer, folder, rank, references, *, save_refere
                 raise FloatingPointError(f"Nonfinite main_grad for {name}")
             if save_reference:
                 relative = f"rank{rank}/p{index:04d}_{lo:012d}_{hi:012d}.pt"
-                torch.save(block, folder / relative)
+                torch.save(block, str(folder / relative))
                 parts.append(dict(index=index, start=lo, end=hi, file=relative))
             for reference, reader in readers.items():
                 add_stats(stats[reference], reader.read(index, lo, hi), block)
