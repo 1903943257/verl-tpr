@@ -217,7 +217,7 @@ def test_fixture_is_reproducible_varied_and_hashes_frozen_actor_labels():
     assert fixture_digest(fixture) != before
 
 
-def write_route(root, mode, factor, controls):
+def write_route(root, mode, factor, controls, *, input_sha256="fixture"):
     folder = root / mode
     folder.mkdir()
     cp = 2 if mode.endswith("cp2") else 1
@@ -243,7 +243,7 @@ def write_route(root, mode, factor, controls):
             mode=mode,
             cp=cp,
             controls=controls,
-            input_sha256="fixture",
+            input_sha256=input_sha256,
             initial_weights_sha256="weights",
             packages={},
             source={},

@@ -1,5 +1,12 @@
 # 2K, ten-update production training comparison
 
+To reuse four completed routes and add Base CP1 repeat plus TPR CP2 QKV merge,
+see [the six-route supplement](TRAINING_SIXWAY.md).
+
+For one additional Base CP1 run against the saved historical control, see
+[the Base CP1 repeat](BASE_CP1_REPEAT.md). It reuses the original fixture and
+does not rerun the other three routes.
+
 Run after the single-backward production-path gate, using the same branch
 and normal Ascend training container. Pull on the host; Git is optional
 inside Docker.

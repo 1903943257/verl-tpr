@@ -5,6 +5,7 @@
 import math
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 from .training_path_precision_npu import _build_engine, _versions
@@ -46,23 +47,49 @@ def main():
     from .training_multistep_io import InitialWeights, audit_adam_updates
     from .training_multistep_report import complete_mode
     from .training_multistep_runtime import (
+        BASE_CP1_REPEAT,
         CHECKPOINTS,
         STEPS,
+        TPR_CP2_QKVMERGE,
         item_batch,
+        mode_topology,
         native_probe,
         native_update,
         prepare_fixture,
         timed_call,
     )
-    from .training_precision_contract import MODES, ExecutionWitness, audit_engine, audit_wgrad_completion
+    from .training_precision_contract import ExecutionWitness, audit_engine, audit_wgrad_completion
 
     mode = os.environ["TPR_TRAIN_MODE"]
-    if mode not in MODES:
-        raise ValueError(f"Unknown mode: {mode}")
-    cp, tpr = (2 if mode.endswith("cp2") else 1), mode.startswith("tpr")
+    repeating = mode in (BASE_CP1_REPEAT, TPR_CP2_QKVMERGE)
+    qkvmerge = mode == TPR_CP2_QKVMERGE
+    cp, tpr = mode_topology(mode)
     if int(os.environ["WORLD_SIZE"]) != cp:
         raise ValueError("Require TP=PP=DP=1, WORLD_SIZE=CP")
+    repeat_context = None
+    if repeating:
+        from .training_multistep_repeat import PRECISION_KEYS, check_source, complete_repeat, restore_controls
+
+        repeat_context = check_source(
+            os.environ["TPR_TRAIN10_REPEAT_SOURCE"],
+            output=os.environ["TPR_TRAIN10_OUTPUT"],
+            packages=_versions(),
+            mode=mode,
+        )
+        restore_controls(repeat_context["baseline"]["controls"])
     controls = controls_from_environment()
+    if repeating and controls != repeat_context["baseline"]["controls"]:
+        raise AssertionError("Cannot restore the historical training controls exactly")
+    merge_settings = {
+        name: "1" if qkvmerge else "0"
+        for name in (
+            "TPR_RING_COALESCE_PREFIX_FULL",
+            "TPR_RING_COALESCE_PREFIX_QUERY",
+            "TPR_RING_COALESCE_PREFIX_PADDED",
+        )
+    }
+    for name, value in merge_settings.items():
+        os.environ[name] = value
     fusion = controls["gradient_accumulation_fusion"]
     torch.npu.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group(backend="hccl")
@@ -96,6 +123,8 @@ def main():
             torch.npu.synchronize, _build_engine, cp, tpr, fusion, optimizer_config=optimizer_config
         )
         model, precision = audit_engine(engine, tpr=tpr, fusion=fusion)
+        if repeating and any(precision[key] != repeat_context["precision"][key] for key in PRECISION_KEYS):
+            raise AssertionError("Supplement precision/topology differs from its historical control")
         initial, initial_seconds = timed_call(torch.npu.synchronize, InitialWeights, model, engine.optimizer)
         fixture, fixture_seconds = timed_call(
             torch.npu.synchronize,
@@ -103,12 +132,13 @@ def main():
             engine,
             {**controls, "mode": mode},
             initial.digest,
-            root / "actor_fixture.pt",
+            (repeat_context["source"] if repeating else root) / "actor_fixture.pt",
             rank,
             broadcast,
             dist.barrier,
         )
         runtime_audit.update(status="initialized", precision=precision, packages=_versions(), controls=controls)
+        runtime_audit["ring_merge_settings"] = merge_settings
         write_json(audit_path, runtime_audit)
         torch.npu.reset_peak_memory_stats()
         probes, samples, steps, evaluations = {}, {}, [], []
@@ -133,22 +163,32 @@ def main():
                 if current_step == 1
                 else None
             )
+            merge_witness = None
+            if qkvmerge and current_step == 1:
+                from .training_qkvmerge_witness import QKVMergeWitness
 
-            def after_backward(witness=witness):
+                merge_witness = QKVMergeWitness()
+
+            def after_backward(witness=witness, merge_witness=merge_witness):
                 if witness is not None:
                     runtime_audit.update(status="backward_observed", **witness.snapshot())
+                    if merge_witness is not None:
+                        runtime_audit["qkv_merge_execution"] = merge_witness.snapshot()
                     write_json(audit_path, runtime_audit)
                     witness.validate(tpr=tpr, cp=cp, fusion=fusion)
+                    if merge_witness is not None:
+                        merge_witness.validate()
                 audit_wgrad_completion(model, fusion=fusion)
 
-            output, metrics = native_update(
-                engine,
-                item_batch(item),
-                loss_function,
-                torch.npu.synchronize,
-                witness=witness,
-                after_backward=after_backward,
-            )
+            with merge_witness if merge_witness is not None else nullcontext():
+                output, metrics = native_update(
+                    engine,
+                    item_batch(item),
+                    loss_function,
+                    torch.npu.synchronize,
+                    witness=witness,
+                    after_backward=after_backward,
+                )
             if tpr and (
                 output["metrics"]["tpr/physical_segments"] != [3.0] or output["metrics"]["tpr/forest_trees"] != [1.0]
             ):
@@ -184,18 +224,26 @@ def main():
         references = {name: root / name / "updates" for name in ("base_cp1", "base_cp2") if name != mode}
         if mode == "base_cp1":
             references = {}
-        if rank == 0:
-            print(f"TRAIN10_FINAL_SCAN mode={mode} all_parameters=true", flush=True)
-        update, update_seconds = timed_call(
-            torch.npu.synchronize,
-            initial.full_update,
-            model,
-            engine.optimizer,
-            folder / "updates",
-            rank,
-            references,
-            save_reference=mode.startswith("base"),
-        )
+        if repeating:
+            references = {"base_cp1": repeat_context["source"] / "base_cp1/updates"}
+        if repeating and not repeat_context["full_update_available"]:
+            update, update_seconds = None, 0.0
+            print(
+                f"TRAIN10_SUPPLEMENT_FINAL_SCAN mode={mode} skipped=historical_full_reference_unavailable", flush=True
+            )
+        else:
+            if rank == 0:
+                print(f"TRAIN10_FINAL_SCAN mode={mode} all_parameters=true", flush=True)
+            update, update_seconds = timed_call(
+                torch.npu.synchronize,
+                initial.full_update,
+                model,
+                engine.optimizer,
+                folder / "updates",
+                rank,
+                references,
+                save_reference=mode in ("base_cp1", "base_cp2"),
+            )
         torch.save(samples, str(folder / f"samples_rank{rank}.pt"))
         if rank == 0:
             torch.save(probes, str(folder / "probes.pt"))
@@ -204,6 +252,7 @@ def main():
             rank=rank,
             cp=cp,
             controls=controls,
+            ring_merge_settings=merge_settings,
             input_sha256=fixture["sha256"],
             initial_weights_sha256=initial.digest,
             packages=_versions(),
@@ -211,6 +260,7 @@ def main():
             steps=steps,
             evaluations=evaluations,
             full_update=update,
+            layout=initial.layout,
             timings=dict(
                 build_seconds=build_seconds,
                 initial_snapshot_seconds=initial_seconds,
@@ -222,7 +272,10 @@ def main():
         write_json(folder / f"rank{rank}.json", report)
         dist.barrier()
         if rank == 0:
-            complete_mode(root, mode, cp)
+            if repeating:
+                complete_repeat(root, repeat_context)
+            else:
+                complete_mode(root, mode, cp)
         dist.barrier()
     except Exception as error:
         runtime_audit.update(status="failed", step=current_step, error=f"{type(error).__name__}: {error}")

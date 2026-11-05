@@ -15,6 +15,16 @@ from .training_precision_contract import SUFFIX, actor_batch, input_digest, synt
 
 STEPS = 10
 CHECKPOINTS = (0, 1, 5, 10)
+BASE_CP1_REPEAT = "base_cp1_repeat"
+TPR_CP2_QKVMERGE = "tpr_cp2_qkvmerge"
+
+
+def mode_topology(mode):
+    from .training_precision_contract import MODES
+
+    if mode not in (*MODES, BASE_CP1_REPEAT, TPR_CP2_QKVMERGE):
+        raise ValueError(f"Unknown mode: {mode}")
+    return (2 if mode in ("base_cp2", "tpr_cp2", TPR_CP2_QKVMERGE) else 1), mode.startswith("tpr")
 
 
 def timed_call(synchronize, function, *args, **kwargs):
@@ -67,6 +77,16 @@ def prepare_fixture(engine, controls, initial_digest, path, rank, broadcast, bar
         raise AssertionError("Corrupt ten-step actor fixture")
     for item in [*fixture["batches"], fixture["probe"]]:
         validate_forest(item_batch(item))
+    if controls["mode"] == BASE_CP1_REPEAT:
+        # Match the original Base CP1's eleven native preparation forwards.
+        # Keep the historical PPO labels frozen even if these calls differ.
+        for ordinal, item in enumerate([*fixture["batches"], fixture["probe"]], 1):
+            temporary = actor_batch(item["tokens"], torch.zeros_like(item["advantages"]), item["advantages"])
+            with engine.eval_mode(), torch.no_grad():
+                output = engine.forward_backward_batch(temporary, None, forward_only=True)
+                _native_response_logprobs(output, temporary)
+            if rank == 0:
+                print(f"TRAIN10_FIXTURE_REPLAY item={ordinal}/{STEPS + 1} old_labels=reused", flush=True)
     digests = broadcast(initial_digest if rank == 0 else None)
     if initial_digest != digests:
         raise AssertionError("CP replicas loaded different initial weights")
