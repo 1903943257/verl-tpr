@@ -194,7 +194,6 @@ def _engine_with_dp_finalize(model, runtime):
     """Native DP-with-CP weight-gradient average; never sync Prefix KV."""
     from .grad_sync_precision import offline_grad_sync_dtype, reduce_average_weight_grad
     grad_dtype = offline_grad_sync_dtype()
-    zero_dp0 = os.getenv("TPR_DP2_EMPTY_REPLICA", "0") == "1"
     model.config.no_sync_func = None
     model.config.grad_scale_func = None
     model.config.calculate_per_token_loss = False
@@ -210,12 +209,7 @@ def _engine_with_dp_finalize(model, runtime):
         # switches per parameter.
         for name, param in model.named_parameters():
             if param.grad is None:
-                if zero_dp0 and runtime.dp_rank == 0:
-                    # Offline control uses plain .grad, unlike production
-                    # Megatron DDP's pre-zeroed contiguous main-grad buffers.
-                    param.grad = torch.zeros_like(param)
-                else:
-                    raise RuntimeError(f"Missing gradient before DP finalize: {name}")
+                raise RuntimeError(f"Missing gradient before DP finalize: {name}")
             try:
                 reduce_average_weight_grad(
                     param, runtime.dp_cp_group, name=name,
@@ -326,32 +320,6 @@ def _placement(capture, runtime, expected_tokens):
         raise AssertionError("Input fingerprint differs between ranks")
     if sum(next(x[2] for x in assignments if x[0] == d) for d in (0, 1)) != global_tokens:
         raise AssertionError("DP replicas do not cover exactly the global PPO tokens")
-    if os.getenv("TPR_DP2_EMPTY_REPLICA", "0") == "1":
-        # Synthetic DP-boundary audit only: preserve all prompt/trajectory
-        # tokens while removing supervision from exactly DP0's local forest.
-        source_tokens = global_tokens
-        if runtime.dp_rank == 0:
-            for key in ("response_mask", "loss_mask"):
-                if key in batch:
-                    mask = batch[key]
-                    (mask.values() if mask.is_nested else mask).zero_()
-        local_supervised = sum(
-            int(mask.bool().sum().item()) for mask in batch["response_mask"].unbind(0)
-        )
-        global_supervised = torch.tensor(
-            local_supervised, dtype=torch.int64, device=runtime.device
-        )
-        dist.all_reduce(global_supervised, group=runtime.dp_group)
-        global_tokens = int(global_supervised.item())
-        if global_tokens <= 0:
-            raise AssertionError("DP empty-replica audit requires nonempty DP1 supervision")
-        tu.assign_non_tensor(batch, batch_num_tokens=global_tokens)
-        if dist.get_rank() == 0:
-            print(
-                f"TPR_DP_EMPTY_AUDIT dp0_tokens=0 "
-                f"global_supervised={global_tokens} source_tokens={source_tokens}",
-                flush=True,
-            )
     return batch, placement, global_tokens, global_sha
 
 
@@ -360,9 +328,6 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
         raise ValueError("Offline DP2 adapter gate was not explicitly enabled")
     if os.getenv("TPR_OFFLINE_NATIVE_RECOMPUTE_LAYERS", "0") != "0":
         raise ValueError("Use the explicit KV-aware TPR checkpoint adapter, not native recompute")
-    if os.getenv("TPR_DP2_EMPTY_REPLICA", "0") not in ("0", "1"):
-        raise ValueError("TPR_DP2_EMPTY_REPLICA must be 0 or 1")
-    zero_dp0 = os.getenv("TPR_DP2_EMPTY_REPLICA", "0") == "1"
     setting = os.getenv("TPR_DP2_RECOMPUTE", "0")
     if setting not in ("0", "1"):
         raise ValueError("TPR_DP2_RECOMPUTE must be 0 or 1")
@@ -451,31 +416,6 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
                 engine, batch, partial(ppo_loss, config=_PPO()), forward_only=False,
             )
             torch.npu.synchronize()
-            if zero_dp0:
-                expected_empty = runtime.dp_rank == 0
-                actual_empty = bool(result["metrics"]["tpr/dp_empty_local"][0])
-                if actual_empty != expected_empty:
-                    raise AssertionError(
-                        f"DP empty-replica routing mismatch rank={dist.get_rank()} "
-                        f"expected={expected_empty} actual={actual_empty}"
-                    )
-                # The offline finalizer synchronizes EVERY parameter over
-                # DP-with-CP. Both replicas should now own identical synced
-                # gradients for a fixed TP shard, including the empty replica.
-                witness_param = next(
-                    param for name, param in model.named_parameters()
-                    if "linear_fc2.weight" in name and param.requires_grad
-                )
-                grad_witness = witness_param.grad.detach().float().flatten()[:256].contiguous()
-                peer_witnesses = [torch.empty_like(grad_witness) for _ in range(4)]
-                dist.all_gather(peer_witnesses, grad_witness, group=runtime.dp_cp_group)
-                if any(not torch.equal(peer, peer_witnesses[0]) for peer in peer_witnesses):
-                    raise AssertionError("DP-with-CP finalization produced unequal peer gradients")
-                if not bool(grad_witness.abs().sum().item() > 0):
-                    raise AssertionError("DP empty-replica witness gradient is unexpectedly zero")
-                if dist.get_rank() == 0:
-                    print("TPR_DP_EMPTY_FINALIZE_PASS dp0_empty=1 dp1_active=1 "
-                          "dp_cp_gradients_equal=1", flush=True)
             own_seconds = time.perf_counter() - start
             # Lightweight native SegmentEventProfiler: NPU Events and allocator
             # counters only. Materialize AFTER the existing synchronization;
@@ -636,15 +576,12 @@ def test_tpr_tp2cp2dp2_one_recorded_step():
         if dist.get_rank() == 0:
             output.mkdir(parents=True, exist_ok=True)
             suffix = "_recompute_on" if recompute_enabled else ""
-            if zero_dp0:
-                suffix += "_dp0_empty"
             target = output / f"step{step}_tpr_tp2cp2dp2{suffix}.json"
             if target.exists():
                 raise FileExistsError(target)
             times = [r["critical_fwd_bwd_s"] for r in runs if not r["warmup"]]
             data = {
                 "source_step": step, "mode": "tpr",
-                "dp0_supervision_masked_for_audit": zero_dp0,
                 "effective_sequence_cap": effective_sequence_cap,
                 "topology": {"tp": 2, "cp": 2, "dp": 2, "world": 8},
                 "source_capture": str(capture), "checkpoint": str(checkpoint),
