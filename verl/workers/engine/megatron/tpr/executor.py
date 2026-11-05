@@ -28,7 +28,13 @@ from torch import Tensor, nn
 
 from verl.models.mcore.tpr.context import KVPair, TPRAttentionContext, use_tpr_attention_context
 
-from .ring import RingCPBackend, SequenceShard, make_ring_sequence_shard, resolve_cp_group
+from .ring import (
+    RingCPBackend,
+    SequenceShard,
+    make_cp1_sp_sequence_shard,
+    make_ring_sequence_shard,
+    resolve_cp_group,
+)
 from .state import KVStack, PastKVAnchors
 from .tree import SegmentId, SegmentPlan, SegmentSpec
 
@@ -219,11 +225,10 @@ def validate_replay_plan(
     plan: SegmentPlan, prepared_model: PreparedReplayModel, *, cp_size: int = 1,
     active_segment_ids: frozenset[SegmentId] | None = None,
 ) -> None:
-    """Check native SP's divisibility before any model/CP collectives run.
+    """Validate each Segment's physical sequence alignment before collectives.
 
-    Ring pads every segment to 2*CP equal global chunks. Each CP rank owns
-    two chunks; this *physical CP-local* sequence, not the unpadded logical
-    segment length, is what Megatron's TP sequence parallelism partitions.
+    CP>1 uses the joint Zigzag Ring / native SP alignment. CP1 owns the full
+    Segment and uses contiguous trailing padding only when native SP is on.
     """
     config = getattr(prepared_model.model, "config", None)
     tp_size = getattr(config, "tensor_model_parallel_size", 1)
@@ -232,12 +237,14 @@ def validate_replay_plan(
     for segment in plan.segments.values():
         if active_segment_ids is not None and segment.segment_id not in active_segment_ids:
             continue
-        physical_length = (
-            make_ring_sequence_shard(
-                segment.length, cp_rank=0, cp_size=cp_size,
+        if cp_size > 1:
+            physical_length = make_ring_sequence_shard(
+                segment.length, cp_rank=0, cp_size=cp_size, sp_tp_size=tp_size,
             ).local_length
-            if cp_size > 1 else segment.length
-        )
+        else:
+            physical_length = make_cp1_sp_sequence_shard(
+                segment.length, sp_tp_size=tp_size,
+            ).local_length
         if physical_length % tp_size:
             raise ValueError(
                 f"segment {segment.segment_id} logical_length={segment.length} "
@@ -305,6 +312,13 @@ class SegmentExecutor:
         self.kv_stack = KVStack() if kv_stack is None else kv_stack
         self.loss_scale_func = loss_scale_func
         self.cp_group = cp_group
+        config = getattr(prepared_model.model, "config", None)
+        sp_tp_size = (
+            getattr(config, "tensor_model_parallel_size", 1)
+            if getattr(config, "sequence_parallel", False)
+            else 1
+        )
+        self.sp_tp_size = sp_tp_size
         # Explicit opt-in: only this tree's actual Root may use ordinary
         # MindSpeed causal Ring. An empty Prefix on a non-root is not enough.
         self._native_root_ring = os.getenv("TPR_ROOT_NATIVE_RING", "0") == "1"
@@ -325,10 +339,16 @@ class SegmentExecutor:
             if isinstance(cp_backend, RingCPBackend):
                 if (cp_backend.parallel_size, cp_backend.parallel_rank) != (self.cp_size, self.cp_rank):
                     raise ValueError("RingCPBackend coordinates do not match initialized CP group")
+                if cp_backend.sp_tp_size != sp_tp_size:
+                    raise ValueError(
+                        "RingCPBackend TP/SP alignment does not match the prepared model: "
+                        f"expected {sp_tp_size}, got {cp_backend.sp_tp_size}"
+                    )
                 self.cp_backend = cp_backend
             elif cp_backend in (None, "ring", "megatron_cp_algo"):
                 self.cp_backend = RingCPBackend(
                     cp_group, parallel_size=self.cp_size, parallel_rank=self.cp_rank,
+                    sp_tp_size=sp_tp_size,
                 )
             else:
                 raise NotImplementedError("Production TPR only supports Ring CP")
@@ -634,6 +654,9 @@ class SegmentExecutor:
             prefix_length=segment.prefix_length,
             suffix_length=segment.length,
             batch_size=len(leaf_group) if leaf_group is not None else 1,
+            local_physical_suffix_length=(
+                shard.local_length if not self.cp_enabled and self.sp_tp_size > 1 else None
+            ),
             past_key_values=past_key_values,
             suffix_rotary_pos_emb=build_sharded_rotary_pos_emb(
                 self.model.rotary_pos_emb,
@@ -689,6 +712,10 @@ class SegmentExecutor:
 
     def _segment_shard(self, segment: SegmentSpec) -> SequenceShard:
         if not self.cp_enabled:
+            if self.sp_tp_size > 1:
+                return make_cp1_sp_sequence_shard(
+                    segment.length, sp_tp_size=self.sp_tp_size,
+                )
             return SequenceShard.full(segment.length)
         if self.cp_backend is None:
             raise RuntimeError("CP execution is missing its backend")
