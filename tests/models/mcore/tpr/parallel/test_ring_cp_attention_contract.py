@@ -700,3 +700,17 @@ def test_native_root_masks_trailing_padding_output_and_upstream_gradient(monkeyp
         query.grad[:shard.valid_local_length],
         torch.full_like(query.grad[:shard.valid_local_length], 2),
     )
+
+
+def test_ring_merge_enabled_by_default_with_explicit_off_override(monkeypatch):
+    flags = (
+        "TPR_RING_COALESCE_PREFIX_FULL",
+        "TPR_RING_COALESCE_PREFIX_QUERY",
+        "TPR_RING_COALESCE_PREFIX_PADDED",
+    )
+    for flag in flags:
+        monkeypatch.delenv(flag, raising=False)
+    assert ring_layout.ring_merge_settings() == (True, True, True)
+    for flag in flags:
+        monkeypatch.setenv(flag, "0")
+    assert ring_layout.ring_merge_settings() == (False, False, False)

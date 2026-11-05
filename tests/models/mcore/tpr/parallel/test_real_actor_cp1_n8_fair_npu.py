@@ -439,9 +439,6 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
             )
         report = {
             "mode": mode, "configured_k": configured_k,
-            "experimental_delayed_dkv_accum_fp32": os.getenv("TPR_EXPERIMENT_DELAYED_DKV_FP32", "0") == "1",
-            "topology": {"tp": 1, "cp": 1, "dp": 1, "world": 1},
-            "tree_policy": "qwen_turn",
             "physical_full_micro_batch": (
                 1 if mode == "full_mb1" else 2 if mode == "full_mb2" else None
             ),
@@ -451,7 +448,6 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
             "logical_trajectories": 8, "input_lengths": input_lengths,
             "ppo_tokens": ppo_tokens,
             "logical_input_tokens": logical, "unique_tree_tokens": unique,
-            "reuse_ratio": logical / unique,
             "token_dedup_fraction": 1 - unique / logical,
             "forest_trees": len(forest.trees), "forest_segments": forest.segment_count,
             "root_prefix_tokens": root_length, "direct_child_segment_lengths": sibling_suffix_lengths,
@@ -469,8 +465,6 @@ def test_real_actor_cp1_n8_full_mb2_vs_tpr():
             ),
             "global_grad_norm": grad_norm, "gradient_witness": witness,
             "full_parameter_grad_dir": full_parameter_grad_dir,
-            "full_grad_dir": full_parameter_grad_dir,
-            "full_gradient_scope": "ALL_PARAMETERS_BF16_TP1_CP1" if full_parameter_grad_dir else None,
             "optimizer_step": False, "original_online_conditioning": False,
             "reference": (
                 f"physical_B{1 if mode == 'full_mb1' else 2}_square_CANN"

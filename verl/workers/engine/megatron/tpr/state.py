@@ -16,7 +16,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import count
@@ -28,26 +27,10 @@ from torch import Tensor
 from verl.models.mcore.tpr.context import KVPair
 from verl.models.mcore.tpr.context import _compact_kv_tensor as _compact_graph_free_tensor
 
-from .dkv_diagnostics import dkv_diagnostics_enabled, record_dkv_accumulation
 from .ring import SequenceShard
 from .tree import SegmentId, SegmentSpec, _validate_segment_id
 
 _generations = count()
-
-
-def _fp32_delayed_dkv_enabled() -> bool:
-    """Experimental precision A/B gate; native behavior remains the default."""
-    value = os.getenv("TPR_EXPERIMENT_DELAYED_DKV_FP32", "0")
-    if value not in ("0", "1"):
-        raise ValueError("TPR_EXPERIMENT_DELAYED_DKV_FP32 must be 0 or 1")
-    return value == "1"
-
-
-def _copy_delayed_gradient(gradient: Tensor) -> Tensor:
-    gradient = gradient.detach()
-    if _fp32_delayed_dkv_enabled() and gradient.dtype in (torch.bfloat16, torch.float16):
-        return gradient.to(dtype=torch.float32, copy=True, memory_format=torch.contiguous_format)
-    return gradient.clone(memory_format=torch.contiguous_format)
 
 
 def _validate_layer_number(layer_number: int) -> None:
@@ -115,14 +98,50 @@ class PastKVAnchors:
         return _concatenate_kv(tuple((entry.shard, entry.key_values) for entry in self.entries))
 
 
+def _logical_cp1_kv_tensor(tensor: Tensor, shard: SequenceShard) -> Tensor:
+    """Trim CP1's trailing physical padding without breaking autograd."""
+
+    if shard.cp_size != 1:
+        raise RuntimeError("logical CP1 KV trimming requires a size-one shard")
+    if shard.valid_local_length != shard.global_length:
+        raise RuntimeError(
+            "CP1 Prefix shard must own every logical token: "
+            f"valid={shard.valid_local_length}, logical={shard.global_length}"
+        )
+    if shard.local_length == shard.global_length:
+        return tensor
+    return tensor[:shard.global_length]
+
+
 def _concatenate_kv(entries: tuple[tuple[SequenceShard, Mapping[int, KVPair]], ...]) -> Mapping[int, KVPair]:
     if any(shard.cp_size != 1 for shard, _ in entries):
         raise RuntimeError("sharded KV must be consumed through a context-parallel attention backend")
-    if len(entries) <= 1:
-        return entries[0][1] if entries else MappingProxyType({})
+    if not entries:
+        return MappingProxyType({})
+    if len(entries) == 1:
+        shard, key_values = entries[0]
+        if shard.local_length == shard.global_length:
+            return key_values
+        return MappingProxyType(
+            {
+                layer: tuple(_logical_cp1_kv_tensor(tensor, shard) for tensor in pair)
+                for layer, pair in key_values.items()
+            }
+        )
+
+    # Trim each Segment's tail before concatenating its logical Prefix KV.
     return MappingProxyType(
         {
-            layer: tuple(torch.cat([kv[layer][index] for _, kv in entries], dim=0) for index in (0, 1))
+            layer: tuple(
+                torch.cat(
+                    [
+                        _logical_cp1_kv_tensor(key_values[layer][index], shard)
+                        for shard, key_values in entries
+                    ],
+                    dim=0,
+                )
+                for index in (0, 1)
+            )
             for layer in entries[0][1]
         }
     )
@@ -149,7 +168,6 @@ class KVPrefixState:
         self._key_values = _normalize_local_kv(key_values, local_length=self.local_length)
         self.layer_numbers = tuple(self._key_values)
         self._gradients: dict[int, KVPair] = {}
-        self._diagnostic_accumulation_counts: dict[int, int] = {}
         self.released = False
         self._generation = next(_generations)
 
@@ -198,26 +216,12 @@ class KVPrefixState:
             if (gradient.device, gradient.dtype) != (tensor.device, tensor.dtype):
                 raise ValueError(f"segment {self.segment_id} layer {layer_number} gradient device or dtype mismatch")
         if layer_number not in self._gradients:
-            self._gradients[layer_number] = tuple(_copy_delayed_gradient(t) for t in gradients)
+            self._gradients[layer_number] = tuple(
+                t.detach().clone(memory_format=torch.contiguous_format) for t in gradients
+            )
         else:
             for buffer, gradient in zip(self._gradients[layer_number], gradients, strict=True):
-                buffer.add_(gradient.detach().to(dtype=buffer.dtype))
-        self._record_layer_accumulation(layer_number, gradients)
-
-    def _record_layer_accumulation(self, layer_number: int, incoming: KVPair) -> None:
-        if not dkv_diagnostics_enabled():
-            return
-        count = self._diagnostic_accumulation_counts.get(layer_number, 0) + 1
-        self._diagnostic_accumulation_counts[layer_number] = count
-        record_dkv_accumulation(
-            segment_id=self.segment_id,
-            layer=layer_number,
-            accumulation_count=count,
-            incoming_key=incoming[0],
-            incoming_value=incoming[1],
-            buffer_key=self._gradients[layer_number][0],
-            buffer_value=self._gradients[layer_number][1],
-        )
+                buffer.add_(gradient.detach())
 
     def accumulate_anchor_gradients(self, anchors: KVPrefixAnchors, *, consume: bool = False) -> None:
         """Accumulate dKV, optionally taking ownership of executor-only grads."""
@@ -237,11 +241,7 @@ class KVPrefixState:
             if consume and layer not in self._gradients:
                 buffers = []
                 for gradient in (key.grad, value.grad):
-                    buffer = (
-                        _copy_delayed_gradient(gradient)
-                        if _fp32_delayed_dkv_enabled()
-                        else _compact_graph_free_tensor(gradient.detach())
-                    )
+                    buffer = _compact_graph_free_tensor(gradient.detach())
                     # Custom backward functions may reuse a buffer for K/V or
                     # multiple layers. Future accumulation needs separate owners.
                     if (buffer.device, buffer.untyped_storage().data_ptr()) in owned_storage:
@@ -249,7 +249,6 @@ class KVPrefixState:
                     owned_storage.add((buffer.device, buffer.untyped_storage().data_ptr()))
                     buffers.append(buffer)
                 self._gradients[layer] = tuple(buffers)
-                self._record_layer_accumulation(layer, (key.grad, value.grad))
             else:
                 self.accumulate_layer_gradients(layer, key.grad, value.grad)
             if consume:
@@ -260,14 +259,12 @@ class KVPrefixState:
         if self._gradients and set(self._gradients) != set(self.layer_numbers):
             raise RuntimeError(f"segment {self.segment_id} gradient layers must be {self.layer_numbers}")
         gradients, self._gradients = self._gradients, {}
-        self._diagnostic_accumulation_counts.clear()
         self._generation = next(_generations)
         return MappingProxyType(gradients)
 
     def release(self) -> None:
         self._key_values.clear()
         self._gradients.clear()
-        self._diagnostic_accumulation_counts.clear()
         self.released = True
         self._generation = next(_generations)
 
