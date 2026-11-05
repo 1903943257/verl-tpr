@@ -165,11 +165,28 @@ def main():
         with engine.train_mode():
             engine.optimizer_zero_grad()
             torch.npu.reset_peak_memory_stats()
-            with ExecutionWitness(model.config.finalize_model_grads_func) as witness:
-                output = engine.forward_backward_batch(batch, loss_function, forward_only=False)
-            torch.npu.synchronize()
-            witness.validate(tpr=tpr, cp=cp, fusion=fusion)
-            completion = audit_wgrad_completion(model, fusion=fusion)
+            witness = ExecutionWitness(
+                model.config.finalize_model_grads_func,
+                [layer.self_attention.core_attention for layer in model.decoder.layers],
+            )
+            runtime_audit = dict(mode=mode, rank=rank, precision=audit, packages=_versions(), status="initialized")
+            audit_path = folder / f"runtime_audit_rank{rank}.json"
+            write_json(audit_path, {**runtime_audit, **witness.snapshot()})
+            try:
+                with witness:
+                    output = engine.forward_backward_batch(batch, loss_function, forward_only=False)
+                torch.npu.synchronize()
+                runtime_audit["status"] = "forward_backward_complete_not_validated"
+                write_json(audit_path, {**runtime_audit, **witness.snapshot()})
+                witness.validate(tpr=tpr, cp=cp, fusion=fusion)
+                completion = audit_wgrad_completion(model, fusion=fusion)
+            except Exception as error:
+                runtime_audit.update(status="failed", error=f"{type(error).__name__}: {error}")
+                write_json(audit_path, {**runtime_audit, **witness.snapshot()})
+                print(f"TRAIN_PRECISION_AUDIT_FAILED mode={mode} rank={rank} report={audit_path}", flush=True)
+                raise
+            runtime_audit.update(status="validated", backward=completion)
+            write_json(audit_path, {**runtime_audit, **witness.snapshot()})
             peak = torch.npu.max_memory_allocated()
             if rank == 0:
                 print(f"TRAIN_PRECISION_FINALIZED mode={mode} main_grad=FP32 exporting_owned_slices", flush=True)

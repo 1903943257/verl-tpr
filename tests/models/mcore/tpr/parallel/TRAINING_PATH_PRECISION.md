@@ -76,13 +76,28 @@ round to BF16 before the DDP hook adds it to `main_grad`. Run this as a
 `TPR_EXPERIMENT_DELAYED_DKV_FP32=1` is also a separate explicit ablation.
 Neither option installs a replacement operator or gradient hook.
 
-Call profiling only observes existing Python/C entrypoints. Base CP1 must
-enter the MindSpeed attention wrapper; Base CP2 must additionally enter
-MindSpeed Ring through its own model. No adapter fallback is permitted if
-the installed training stack fails to support the requested route.
+Read-only hooks observe the actual core-attention instances registered in
+the model, including MindSpeed TE implementations whose entry is simply
+named `forward`. Profiling must also observe a native fused-attention call
+inside those native core modules; a similarly named function or an unrelated
+operator call elsewhere does not qualify an adapter as the Base path.
+Base CP2 must additionally enter MindSpeed Ring through its own core modules.
+No attention implementation is replaced and no adapter fallback is permitted.
 Backward may run on autograd threads outside Python's profiler; therefore
 native per-weight `grad_added_to_main_grad` flags and the actual FP32
 buffers, not a Python call count alone, validate fused wgrad completion.
+
+Every rank writes `<mode>/runtime_audit_rankN.json` before training and
+updates it immediately after forward/backward, **before route validation**.
+It includes the actual core classes, forward source files, input shapes,
+per-core call counts, observed native entrypoints, gradient configuration
+and package versions. A failed forward or route check records its error
+there and prints `TRAIN_PRECISION_AUDIT_FAILED` with the path. This report
+is available even when no gradient reference/result was produced.
+
+If a run failed the older function-name-only check, pull the fix and use a
+fresh output directory. The old failed directory is preserved; its gradients
+were not accepted as a reference. Retain the same checkpoint and seed.
 
 TPR currently requests `force_all_reduce=True` in its existing native
 finalizer. Base DistributedOptimizer ordinarily uses reduce-scatter.

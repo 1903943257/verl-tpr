@@ -3,11 +3,10 @@
 """Inputs and read-only execution witnesses for the production training gate."""
 
 import hashlib
-import inspect
-import sys
-from collections import Counter
 
 import torch
+
+from .training_execution_witness import ExecutionWitness, function_origin  # noqa: F401
 
 MODES = ("base_cp1", "base_cp2", "tpr_cp1", "tpr_cp2")
 PREFIX = SUFFIX = 1024
@@ -92,14 +91,6 @@ def validate_forest(batch):
     return {"trees": 1, "segments": 3, "lengths": [segment.length for segment in segments]}
 
 
-def function_origin(function):
-    return {
-        "module": getattr(function, "__module__", None),
-        "name": getattr(function, "__qualname__", type(function).__qualname__),
-        "file": inspect.getsourcefile(function),
-    }
-
-
 def audit_engine(engine, *, tpr, fusion):
     from megatron.core import parallel_state
     from megatron.core.distributed import DistributedDataParallel, finalize_model_grads
@@ -155,61 +146,6 @@ def audit_engine(engine, *, tpr, fusion):
         "core_forward": [function_origin(module.core_attention.forward) for module in attention[:1]],
         "transformer_config": {key: str(value) for key, value in vars(config).items() if not callable(value)},
     }
-
-
-class ExecutionWitness:
-    """Observe Python/C call entrypoints; do not replace any training function."""
-
-    def __init__(self, finalize):
-        self.finalize_code = finalize.__code__
-        self.counts = Counter()
-
-    def _profile(self, frame, event, argument):
-        if event == "call":
-            name, filename = frame.f_code.co_name, frame.f_code.co_filename.replace("\\", "/")
-            if frame.f_code is self.finalize_code:
-                self.counts["native_finalize"] += 1
-            if "/mindspeed/" in filename and name == "ringattn_context_parallel":
-                self.counts["native_ring"] += 1
-            if "/mindspeed/" in filename and name in ("dot_product_attention_forward", "flash_attention_forward"):
-                self.counts["native_attention"] += 1
-            if (
-                any(package in filename for package in ("/megatron/", "/mindspeed/"))
-                and name == "forward_backward_no_pipelining"
-            ):
-                self.counts["native_schedule"] += 1
-            if name == "run_tpr_forward_backward_batch" and filename.endswith("/tpr/adapter.py"):
-                self.counts["tpr_schedule"] += 1
-        elif event == "c_call":
-            name = getattr(argument, "__name__", "")
-        else:
-            return
-        if name in ("wgrad_gemm_accum_fp32", "npu_matmul_add_fp32"):
-            self.counts["wgrad_fp32"] += 1
-        if name in ("wgrad_gemm_accum_fp16", "npu_matmul_add_fp16"):
-            self.counts["wgrad_fp16"] += 1
-
-    def __enter__(self):
-        self.previous = sys.getprofile()
-        if self.previous is not None:
-            raise RuntimeError("Run the precision gate without another Python profiler")
-        sys.setprofile(self._profile)
-        return self
-
-    def __exit__(self, *_exc):
-        sys.setprofile(self.previous)
-
-    def validate(self, *, tpr, cp, fusion):
-        if self.counts["native_finalize"] != 1:
-            raise AssertionError(f"Expected exactly one native gradient finalize: {dict(self.counts)}")
-        if self.counts["tpr_schedule" if tpr else "native_schedule"] != 1:
-            raise AssertionError(f"Actual training schedule was not observed: {dict(self.counts)}")
-        if not tpr and not self.counts["native_attention"]:
-            raise AssertionError("Native MindSpeed attention wrapper was not observed; no adapter fallback is allowed")
-        if not tpr and cp == 2 and not self.counts["native_ring"]:
-            raise AssertionError("Base CP2 did not enter native MindSpeed Ring through the model")
-        if fusion and self.counts["wgrad_fp16"]:
-            raise AssertionError(f"Observed a low-precision fused wgrad destination: {dict(self.counts)}")
 
 
 def audit_wgrad_completion(model, *, fusion):
