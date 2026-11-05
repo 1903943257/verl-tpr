@@ -10,7 +10,7 @@ import torch
 
 from tests.models.mcore.tpr.parallel import training_gradient_repeat_io as repeat
 from tests.models.mcore.tpr.parallel import training_precision_io as io
-from tests.models.mcore.tpr.parallel.training_gradient_repeat_npu import native_norms
+from tests.models.mcore.tpr.parallel.training_gradient_repeat_npu import native_gradient_getters, native_norms
 from tests.models.mcore.tpr.unit.test_training_base_cp1_repeat_cpu import source_run
 from tests.models.mcore.tpr.unit.test_training_path_precision_cpu import _Model, _Owner
 
@@ -150,7 +150,9 @@ def test_historical_preflight_is_read_only_and_requires_space(tmp_path, monkeypa
         repeat.preflight(source, tmp_path / "output", {})
 
 
-def test_native_norm_calls_prepare_once_and_norm_twice_without_step():
+@pytest.mark.parametrize("getter_name", ["get_main_grads_for_grad_norm", "get_grads_for_grad_norm"])
+@pytest.mark.parametrize("chained", [False, True])
+def test_native_norm_calls_prepare_once_and_norm_twice_without_step(getter_name, chained):
     calls = []
 
     class Native:
@@ -165,9 +167,6 @@ def test_native_norm_calls_prepare_once_and_norm_twice_without_step():
             self.gradient = torch.tensor([3.0, 4.0])
             return False
 
-        def get_grads_for_grad_norm(self):
-            return [self.gradient]
-
         def get_grad_norm(self):
             calls.append("norm")
             return self.gradient.norm()
@@ -175,11 +174,37 @@ def test_native_norm_calls_prepare_once_and_norm_twice_without_step():
         def step(self):
             pytest.fail("No clipping or optimizer update is allowed")
 
+    setattr(Native, getter_name, lambda self: [self.gradient])
     native = Native()
-    result = native_norms(native, lambda: None)
+    optimizer = native
+    if chained:
+        optimizer = SimpleNamespace(
+            chained_optimizers=[native],
+            get_loss_scale=native.get_loss_scale,
+            prepare_grads=native.prepare_grads,
+            get_grad_norm=native.get_grad_norm,
+        )
+    # Resolving API names must not read gradients or run any optimizer methods.
+    assert native_gradient_getters(optimizer)[0].__self__ is native
+    assert calls == []
+    result = native_norms(optimizer, lambda: None)
     assert calls == ["prepare", "norm", "norm"]
     assert result["native_norms"] == [5.0, 5.0]
     assert result["native_norm_elements"] == 2
+    assert len(result["native_gradient_list_functions"]) == 1
     native.grad_scaler = object()
     with pytest.raises(AssertionError, match="no gradient scaler"):
-        native_norms(native, lambda: None)
+        native_norms(optimizer, lambda: None)
+
+
+@pytest.mark.parametrize("missing", ["get_loss_scale", "prepare_grads", "get_grad_norm", "gradient_getter"])
+def test_missing_native_norm_api_fails_before_preparation(missing):
+    def must_not_run():
+        pytest.fail("API validation must finish before any native computation")
+
+    methods = dict.fromkeys(
+        ("get_loss_scale", "prepare_grads", "get_grad_norm", "get_main_grads_for_grad_norm"), must_not_run
+    )
+    methods.pop("get_main_grads_for_grad_norm" if missing == "gradient_getter" else missing)
+    with pytest.raises(RuntimeError, match="missing|neither"):
+        native_norms(SimpleNamespace(**methods), lambda: None)

@@ -10,6 +10,9 @@
 要求 BF16 loss scale=1、无 grad scaler，随后读取全部优化器拥有的 FP32 main_grad。
 不执行梯度裁剪、Adam 更新、scheduler step，也不替换 attention、linear、finalize 或 norm 算子。
 优化器必须提供这些原生方法，缺失时直接报错，不使用自制范数替代原生结果。
+参数覆盖检查同时支持 Megatron 的 `get_main_grads_for_grad_norm()` 和
+`get_grads_for_grad_norm()` 两种接口名称，并在前向预热、反向之前检查所需方法是否可用。
+实际使用的梯度列表方法来源写入 `native_gradient_list_functions`，原生 norm 计算保持原样。
 CPU NumPy FP64 分块统计仅作旁路对照，覆盖全部参数元素。
 
 宿主机拉取当前分支后，在之前运行实验的容器内执行：

@@ -7,12 +7,37 @@ import os
 from pathlib import Path
 
 
+def native_gradient_getters(optimizer):
+    """Resolve native Megatron API names before running any preparation forwards."""
+    from .training_precision_io import _optimizers
+
+    for name in ("get_loss_scale", "prepare_grads", "get_grad_norm"):
+        if not callable(getattr(optimizer, name, None)):
+            raise RuntimeError(f"Native optimizer is missing {name}(); cannot run the gradient-norm check")
+    getters = []
+    for child in _optimizers(optimizer):
+        for name in ("get_main_grads_for_grad_norm", "get_grads_for_grad_norm"):
+            getter = getattr(child, name, None)
+            if callable(getter):
+                getters.append(getter)
+                break
+        else:
+            raise RuntimeError(
+                f"Native {type(child).__name__} provides neither get_main_grads_for_grad_norm() "
+                "nor get_grads_for_grad_norm(); cannot audit the norm's parameter coverage"
+            )
+    if not getters:
+        raise RuntimeError("Native optimizer has no gradient-norm providers")
+    return getters
+
+
 def native_norms(optimizer, synchronize):
     """Use the optimizer's own preparation/norm methods, without calling step."""
     from .training_execution_witness import function_origin
     from .training_multistep_runtime import timed_call
     from .training_precision_io import _optimizers
 
+    getters = native_gradient_getters(optimizer)
     for child in _optimizers(optimizer):
         if getattr(child, "grad_scaler", None) is not None:
             raise AssertionError("This BF16 check requires no gradient scaler")
@@ -25,7 +50,7 @@ def native_norms(optimizer, synchronize):
     found_inf, prepare_seconds = timed_call(synchronize, optimizer.prepare_grads)
     if found_inf:
         raise FloatingPointError("Native optimizer preparation found nonfinite gradients")
-    elements = sum(gradient.numel() for child in _optimizers(optimizer) for gradient in child.get_grads_for_grad_norm())
+    elements = sum(gradient.numel() for getter in getters for gradient in getter())
     norms = [float(timed_call(synchronize, optimizer.get_grad_norm)[0]) for _ in range(2)]
     if any(not math.isfinite(norm) or norm <= 0 for norm in norms):
         raise FloatingPointError("Invalid native gradient norm")
@@ -36,6 +61,7 @@ def native_norms(optimizer, synchronize):
         native_optimizer_functions={
             name: function_origin(getattr(optimizer, name)) for name in ("prepare_grads", "get_grad_norm")
         },
+        native_gradient_list_functions=[function_origin(getter) for getter in getters],
     )
 
 
@@ -100,6 +126,7 @@ def main():
         model, precision = audit_engine(engine, tpr=False, fusion=fusion)
         if any(precision[key] != context["precision"][key] for key in PRECISION_KEYS):
             raise AssertionError("Gradient repeat differs from historical Base CP1 precision")
+        native_gradient_getters(engine.optimizer)
         initial = InitialWeights(model, engine.optimizer)
         digest = initial.digest
         del initial
