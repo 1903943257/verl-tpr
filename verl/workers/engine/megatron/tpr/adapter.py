@@ -50,8 +50,15 @@ def run_forest(
     run_tree: Callable[[TreeExecutionPlan], Tensor],
     finalize_gradients: Callable[[], None],
     no_sync_context: Callable[[], Any] | None = None,
+    *,
+    empty_loss: Tensor | None = None,
 ) -> Tensor:
-    """Run all trees under one native no-sync scope and finalize once."""
+    """Run all trees and finalize once, including an empty DP replica.
+
+    The empty_loss argument is opt-in: only a replica with zero local supervised
+    tokens and a positive GLOBAL PPO denominator may skip local backward.
+    Megatron's already-zeroed main-grad buffers still join forced DP sync.
+    """
     if not forest.trees:
         raise ValueError("forest must contain at least one executable tree")
     total = None
@@ -66,8 +73,12 @@ def run_forest(
                 raise TypeError("run_tree must return a scalar Tensor")
             total = loss.detach() if total is None else total + loss.detach()
     if total is None:
-        raise ValueError("forest has no supervised logical response tokens")
-    # A failed tree never reaches native gradient finalization.
+        if empty_loss is None:
+            raise ValueError("forest has no supervised logical response tokens")
+        if not isinstance(empty_loss, Tensor) or empty_loss.numel() != 1 or empty_loss.requires_grad:
+            raise TypeError("empty_loss must be a detached scalar Tensor")
+        total = empty_loss
+    # Even a zero-local-loss DP replica joins native gradient synchronization.
     finalize_gradients()
     return total
 
@@ -361,8 +372,11 @@ def run_tpr_forward_backward_batch(
         tree_builder=tree_builder,
         min_shared_prefix_tokens=min_shared_prefix_tokens,
     )
-    if not forest.trees or not forest.logical_loss_tokens:
-        raise ValueError("TPR PPO mini-batch has no supervised response tokens")
+    if not forest.trees:
+        raise ValueError("TPR PPO mini-batch has no trajectory trees")
+    # A locally unsupervised forest is legal if a different DP replica has loss.
+    # The Engine has already checked the positive GLOBAL denominator above.
+    empty_local_forest = forest.logical_loss_tokens == 0
     record_stage("tree_build_cpu_ms", profile_origin)
     tp_check_start = time.perf_counter()
     if tp_size * sizes["CP"] > 1:
@@ -456,6 +470,10 @@ def run_tpr_forward_backward_batch(
         forest, run_one_tree,
         lambda: finalize(engine.module, None, force_all_reduce=True),
         no_sync_func,
+        empty_loss=(
+            torch.zeros((), device=prepared_model.device, dtype=torch.float32)
+            if empty_local_forest else None
+        ),
     )
     record_stage("tree_run_and_finalize_host_ms", run_start)
     if os.getenv("TPR_LEAF_BATCH_TRACE", "0") == "1":
