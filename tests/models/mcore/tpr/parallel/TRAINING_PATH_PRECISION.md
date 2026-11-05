@@ -1,5 +1,9 @@
 # 1K+1K production training precision controls
 
+For ten actual optimizer updates and cumulative master-weight drift, see
+[the 2K ten-update experiment](TRAINING_MULTISTEP.md). This gate deliberately
+stops before optimizer updates.
+
 This experiment uses the existing `MindspeedEngineWithLMHead` for **Base CP1,
 Base CP2, TPR CP1 and TPR CP2**, in four separate processes. It does not use
 `_qwen3_tp_checkpoint`, the square CANN reference adapter, the explicit native

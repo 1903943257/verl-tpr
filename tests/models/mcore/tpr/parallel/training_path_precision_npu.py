@@ -14,7 +14,7 @@ from pathlib import Path
 from .training_precision_io import write_json
 
 
-def _build_engine(cp, tpr, fusion):
+def _build_engine(cp, tpr, fusion, *, optimizer_config=None):
     from verl.trainer.config import CheckpointConfig
     from verl.workers.config import ActorConfig, HFModelConfig, McoreEngineConfig, McoreOptimizerConfig
     from verl.workers.engine.mindspeed import MindspeedEngineWithLMHead
@@ -59,7 +59,8 @@ def _build_engine(cp, tpr, fusion):
         seed=int(os.getenv("TPR_TRAIN_SEED", "261105")),
         override_transformer_config=overrides,
     )
-    optimizer_config = McoreOptimizerConfig(lr=1e-6, lr_decay_steps=1)
+    if optimizer_config is None:
+        optimizer_config = McoreOptimizerConfig(lr=1e-6, lr_decay_steps=1)
     engine = MindspeedEngineWithLMHead(model_config, engine_config, optimizer_config, CheckpointConfig())
     engine.initialize()
     actor_config = ActorConfig(
