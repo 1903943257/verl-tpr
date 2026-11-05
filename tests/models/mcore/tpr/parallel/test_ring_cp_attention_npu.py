@@ -339,9 +339,9 @@ def _check_ring_cp_attention(cp_runtime, prefix_lengths, current_length, query_h
 
     transport = calls.pop("transport")
     assert transport == {"forward": len(prefix_lengths) + 1, "backward": len(prefix_lengths) + 1}
-    coalesce = os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "0") == "1"
-    padded_merge = os.getenv("TPR_RING_COALESCE_PREFIX_PADDED", "0") == "1"
-    query_merge = (coalesce and os.getenv("TPR_RING_COALESCE_PREFIX_QUERY", "0") == "1"
+    coalesce = os.getenv("TPR_RING_COALESCE_PREFIX_FULL", "1") == "1"
+    padded_merge = os.getenv("TPR_RING_COALESCE_PREFIX_PADDED", "1") == "1"
+    query_merge = (coalesce and os.getenv("TPR_RING_COALESCE_PREFIX_QUERY", "1") == "1"
                    and bool(prefix_lengths) and not noncontiguous_query
                    and len(current_shard.global_ranges) == len(current_shard.ranges)
                    and (padded_merge or all(
