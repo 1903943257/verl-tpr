@@ -524,7 +524,6 @@ def run_tpr_forward_backward_batch(
         "tpr/forest_trees": len(forest.trees),
         "tpr/physical_segments": forest.segment_count,
         "tpr/logical_loss_tokens": forest.logical_loss_tokens,
-        "tpr/dp_empty_local": int(empty_local_forest),
         "tpr/logical_input_tokens": logical_input_tokens,
         "tpr/unique_tree_tokens": unique_tree_tokens,
         "tpr/topology_token_reuse_ratio": logical_input_tokens / unique_tree_tokens,
