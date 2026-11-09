@@ -1,0 +1,25 @@
+step	comparison	rel_l2	mae	max_abs
+1	Native Full-A vs Native Full-B	0	0	0
+1	Native Full-A vs TPR-CP-Ring	0.0520825	0.0370232	4.746
+1	Native Full-A vs TPR-CP-Ring+KV Merge	0.0503017	0.0363992	2.99729
+1	Native Full-A vs TPR-CP-Ring+QKV Merge	0.0515841	0.0373683	2.92519
+1	TPR-CP-Ring vs TPR-CP-Ring+KV Merge	0.0459599	0.0315048	2.24598
+1	TPR-CP-Ring+KV Merge vs TPR-CP-Ring+QKV Merge	0.0344344	0.0190543	2.99869
+2	Native Full-A vs Native Full-B	0.0355976	0.0237503	1.75007
+2	Native Full-A vs TPR-CP-Ring	0.213975	0.123119	16.9995
+2	Native Full-A vs TPR-CP-Ring+KV Merge	0.21294	0.124429	22.7309
+2	Native Full-A vs TPR-CP-Ring+QKV Merge	0.224417	0.128983	22.2309
+2	TPR-CP-Ring vs TPR-CP-Ring+KV Merge	0.225747	0.115066	22.7088
+2	TPR-CP-Ring+KV Merge vs TPR-CP-Ring+QKV Merge	0.122525	0.0655488	19.7491
+5	Native Full-A vs Native Full-B	0.195744	0.23749	24.4212
+5	Native Full-A vs TPR-CP-Ring	0.423646	0.595438	33.1077
+5	Native Full-A vs TPR-CP-Ring+KV Merge	0.387728	0.561936	38.435
+5	Native Full-A vs TPR-CP-Ring+QKV Merge	0.395738	0.584378	36.56
+5	TPR-CP-Ring vs TPR-CP-Ring+KV Merge	0.380857	0.577366	38.1803
+5	TPR-CP-Ring+KV Merge vs TPR-CP-Ring+QKV Merge	0.23219	0.368227	28.255
+10	Native Full-A vs Native Full-B	0.163479	0.745285	33.4381
+10	Native Full-A vs TPR-CP-Ring	0.271645	1.54099	33.4381
+10	Native Full-A vs TPR-CP-Ring+KV Merge	0.299173	1.53722	41.3601
+10	Native Full-A vs TPR-CP-Ring+QKV Merge	0.355028	1.98635	48.004
+10	TPR-CP-Ring vs TPR-CP-Ring+KV Merge	0.228578	1.273	47.6688
+10	TPR-CP-Ring+KV Merge vs TPR-CP-Ring+QKV Merge	0.202405	1.2162	35.5354

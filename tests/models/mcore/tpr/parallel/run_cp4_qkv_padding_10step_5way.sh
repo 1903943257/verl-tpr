@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Five-arm CP4 fixed-data PPO drift: Full-A / None / KV / QKV / Full-B.
+# Five-arm CP4 numerical replay: Native Full-A / TPR-CP-Ring / TPR-CP-Ring+KV Merge / TPR-CP-Ring+QKV Merge / Native Full-B.
 # Docker execution is intentionally independent of Git metadata.
 set -Eeuo pipefail
 
@@ -83,7 +83,7 @@ CAP_SHA256=$(sha256sum "$CAP" | awk '{print $1}')
   printf 'repo=%s\ncapture=%s\ncapture_sha256=%s\nmodel=%s\ndevices=%s\n' \
     "$REPO" "$CAP" "$CAP_SHA256" "$MODEL" "$DEVICES"
   printf 'steps=10\noptimizer=CPU_FP32_master_AdamW\n'
-  printf 'protocol=Full-A, None, KV, QKV, Full-B\n'
+  printf 'protocol=Native Full-A, TPR-CP-Ring, TPR-CP-Ring+KV-Merge, TPR-CP-Ring+QKV-Merge, Native Full-B\n'
   printf 'data=repeated_fixed_synthetic_PPO_capture_NOT_on_policy\n'
   printf 'note=all_five_arms_use_the_same_derived_non_aligned_capture\n'
 } > "$OUT/experiment.txt"
@@ -166,9 +166,9 @@ padded = sum(
     for item in forward
 )
 requested = all(
-    item.get("kv_merge_requested") is (arm in ("kv", "qkv"))
-    and item.get("query_merge_requested") is (arm == "qkv")
-    and item.get("padded_kv_merge_requested") is (arm in ("kv", "qkv"))
+    item.get("kv_merge_requested") is (arm in ("tpr_cp_ring_kv_merge", "tpr_cp_ring_qkv_merge"))
+    and item.get("query_merge_requested") is (arm == "tpr_cp_ring_qkv_merge")
+    and item.get("padded_kv_merge_requested") is (arm in ("tpr_cp_ring_kv_merge", "tpr_cp_ring_qkv_merge"))
     for item in forward
 )
 print(
@@ -179,25 +179,25 @@ print(
 )
 if not requested:
     raise SystemExit(f"FAIL: {arm}: requested Merge flags do not match arm")
-if arm == "none" and (kv or query or padded < 1):
-    raise SystemExit("FAIL: None must keep physical Padding but execute no Merge")
-if arm == "kv" and (kv < 1 or query != 0 or padded < 1):
-    raise SystemExit("FAIL: KV+Padding path did not execute")
-if arm == "qkv" and (query < 1 or padded < 1):
-    raise SystemExit("FAIL: QKV+Padding path did not execute")
+if arm == "tpr_cp_ring" and (kv or query or padded < 1):
+    raise SystemExit("FAIL: TPR-CP-Ring must keep physical Padding but execute no Merge")
+if arm == "tpr_cp_ring_kv_merge" and (kv < 1 or query != 0 or padded < 1):
+    raise SystemExit("FAIL: TPR-CP-Ring+KV Merge path did not execute")
+if arm == "tpr_cp_ring_qkv_merge" and (query < 1 or padded < 1):
+    raise SystemExit("FAIL: TPR-CP-Ring+QKV Merge path did not execute")
 PY
   fi
 }
 
 # Full at both ends measures repeatability/noise of the Native Full baseline.
 run_arm full_a full 0 0 0
-run_arm none tpr 0 0 0
-run_arm kv tpr 1 0 1
-run_arm qkv tpr 1 1 1
+run_arm tpr_cp_ring tpr 0 0 0
+run_arm tpr_cp_ring_kv_merge tpr 1 0 1
+run_arm tpr_cp_ring_qkv_merge tpr 1 1 1
 run_arm full_b full 0 0 0
 
 # Compare each TPR arm independently against BOTH Full endpoints.
-for arm in none kv qkv; do
+for arm in tpr_cp_ring tpr_cp_ring_kv_merge tpr_cp_ring_qkv_merge; do
   for baseline in full_a full_b; do
     target="$OUT/compare_${arm}_vs_${baseline}"
     mkdir "$target"
@@ -234,7 +234,7 @@ for item in repeat["milestones"]:
         item["replica_numerical_gate_ok"],
     ))
 
-for arm in ("none", "kv", "qkv"):
+for arm in ("tpr_cp_ring", "tpr_cp_ring_kv_merge", "tpr_cp_ring_qkv_merge"):
     for baseline in ("full_a", "full_b"):
         report = json.loads(
             (root / f"compare_{arm}_vs_{baseline}" / "multistep_comparison.json").read_text()
