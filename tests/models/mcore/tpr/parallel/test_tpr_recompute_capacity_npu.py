@@ -190,40 +190,86 @@ def test_tpr_recompute_capacity():
                 f"{hf.max_position_embeddings}"
             )
         engine = _engine(model, runtime, 1, cp, 1)
-        model.config.recompute_granularity = "full"
-        model.config.recompute_method = "uniform"
-        model.config.recompute_num_layers = 1
+        recompute_on = os.getenv("TPR_CAP_RECOMPUTE", "1") == "1"
+        if recompute_on:
+            model.config.recompute_granularity = "full"
+            model.config.recompute_method = "uniform"
+            model.config.recompute_num_layers = 1
+        else:
+            model.config.recompute_granularity = None
+            model.config.recompute_method = None
+            model.config.recompute_num_layers = None
 
         blocks = [
             m for m in model.modules()
             if isinstance(m, TransformerBlock)
         ]
-        installed = install_tpr_full_recompute(model, model.config)
-        if not blocks or installed != len(blocks):
-            raise AssertionError(
-                f"Recompute installed on {installed}/{len(blocks)} blocks"
-            )
-        assert_tpr_full_recompute_installed(model, model.config)
+        installed = 0
+        if recompute_on:
+            installed = install_tpr_full_recompute(model, model.config)
+            if not blocks or installed != len(blocks):
+                raise AssertionError(
+                    f"Recompute installed on {installed}/{len(blocks)} blocks"
+                )
+            assert_tpr_full_recompute_installed(model, model.config)
         if dist.get_rank() == 0:
             print("CAP_PREFLIGHT " + json.dumps({
                 "tp": 1, "cp": cp, "dp": 1,
                 "seq_len": length, "prefix": length - 1024,
                 "suffix": 1024, "branches": 2,
                 "logical_tokens": logical, "unique_tokens": unique,
-                "recompute": "full/uniform/1", "blocks": installed,
+                "recompute": "full/uniform/1" if recompute_on else "off",
+                "blocks": installed,
             }), flush=True)
 
         model.zero_grad(set_to_none=True)
         dist.barrier()
         torch.npu.synchronize()
+        baseline_allocated = torch.npu.memory_allocated()
         torch.npu.reset_peak_memory_stats()
-        begin = time.perf_counter()
-        result = run_tpr_forward_backward_batch(
-            engine, batch,
-            partial(ppo_loss, config=_PPO()),
-            forward_only=False,
+        # Verify actual Megatron checkpoint invocation AND backward replay.
+        # Merely setting full/uniform/1 or installing the TPR hook is insufficient.
+        from contextlib import nullcontext
+        from unittest.mock import patch
+        from megatron.core import tensor_parallel
+        counters = {"calls": 0, "initial_runs": 0, "replay_runs": 0}
+        original_checkpoint = tensor_parallel.checkpoint
+
+        def counted_checkpoint(run_function, *args, **kwargs):
+            counters["calls"] += 1
+
+            def counted_run_function(*run_args, **run_kwargs):
+                if torch.is_grad_enabled():
+                    counters["replay_runs"] += 1
+                else:
+                    counters["initial_runs"] += 1
+                return run_function(*run_args, **run_kwargs)
+
+            return original_checkpoint(
+                counted_run_function, *args, **kwargs
+            )
+
+        checkpoint_context = (
+            patch.object(tensor_parallel, "checkpoint", counted_checkpoint)
+            if recompute_on else nullcontext()
         )
+        begin = time.perf_counter()
+        with checkpoint_context:
+            result = run_tpr_forward_backward_batch(
+                engine, batch,
+                partial(ppo_loss, config=_PPO()),
+                forward_only=False,
+            )
         torch.npu.synchronize()
+        if recompute_on and (
+            counters["calls"] <= 0
+            or counters["initial_runs"] <= 0
+            or counters["replay_runs"] <= 0
+        ):
+            raise AssertionError(
+                "Recompute installed but real checkpoint replay not observed: "
+                f"{counters}"
+            )
 
         seconds = torch.tensor(
             time.perf_counter() - begin, device=runtime.device,
@@ -250,7 +296,14 @@ def test_tpr_recompute_capacity():
                 "status": "PASS",
                 "tp": 1, "cp": cp, "dp": 1,
                 "seq_len": length,
-                "recompute": "full/uniform/1",
+                "recompute": "full/uniform/1" if recompute_on else "off",
+                "checkpoint_calls_rank0": counters["calls"],
+                "checkpoint_initial_runs_rank0": counters["initial_runs"],
+                "checkpoint_backward_replays_rank0": counters["replay_runs"],
+                "baseline_allocated_gib_rank0": round(baseline_allocated / 2**30, 3),
+                "incremental_peak_gib_max_rank": round(
+                    (peaks[0].item() - baseline_allocated) / 2**30, 3
+                ),
                 "fb_seconds_max_rank": round(seconds.item(), 3),
                 "peak_allocated_gib_max_rank": round(peaks[0].item() / 2**30, 3),
                 "peak_reserved_gib_max_rank": round(peaks[1].item() / 2**30, 3),
