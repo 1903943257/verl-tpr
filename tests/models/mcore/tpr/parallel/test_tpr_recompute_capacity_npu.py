@@ -51,7 +51,8 @@ if __name__ == "__main__":
         env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(devices[:CP])
         cmd = [
             sys.executable, "-m", "torch.distributed.run",
-            "--standalone", f"--nproc_per_node={CP}",
+            "--master_addr=127.0.0.1", "--master_port=29683",
+            f"--nproc_per_node={CP}",
             str(Path(__file__).resolve()),
         ]
         print(
