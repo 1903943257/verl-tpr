@@ -49,6 +49,10 @@ if __name__ == "__main__":
         if len(devices) < CP or any(not v.strip().isdigit() for v in devices[:CP]):
             raise SystemExit(f"CP={CP} needs {CP} visible NPUs, got {devices}")
         env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(devices[:CP])
+        # Prefer this checkout over a separately pip-installed VERL package.
+        env["PYTHONPATH"] = os.pathsep.join(
+            filter(None, (str(root), env.get("PYTHONPATH", "")))
+        )
         cmd = [
             sys.executable, "-m", "torch.distributed.run",
             "--master_addr=127.0.0.1", "--master_port=29683",
@@ -63,6 +67,17 @@ if __name__ == "__main__":
 
     # MindSpeed reads sys.argv during imports; keep torchrun/pytest flags out.
     sys.argv[:] = [sys.argv[0]]
+    root = Path(__file__).resolve().parents[5]
+    sys.path.insert(0, str(root))
+    # Make a checkout mismatch fail clearly before collecting test modules.
+    import verl
+    import verl.workers.engine.megatron.tpr as tpr_package
+    expected = root / "verl" / "workers" / "engine" / "megatron" / "tpr"
+    if not Path(tpr_package.__file__).resolve().is_relative_to(expected):
+        raise RuntimeError(
+            f"Wrong VERL package: {verl.__file__}; "
+            f"TPR package: {tpr_package.__file__}; expected under {expected}"
+        )
     import pytest
     raise SystemExit(pytest.main(["-q", "-s", "-x", str(Path(__file__).resolve())]))
 
