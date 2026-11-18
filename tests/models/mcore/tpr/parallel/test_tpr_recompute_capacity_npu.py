@@ -1,18 +1,19 @@
 """Qwen3-4B-128K TPR + Recompute sequence-length capacity probe.
 
-Change ONLY CP and SEQ_LEN below. Run from any directory:
+Change TP/CP and PREFIX_LEN/SUFFIX_LEN below. Run from any directory:
     python tests/models/mcore/tpr/parallel/test_tpr_recompute_capacity_npu.py
 
-Synthetic shared-prefix 2-branch TPR, TP=DP=1, BF16, full/uniform/1
+Synthetic shared-prefix 2-branch TPR, DP=1, BF16, full/uniform/1
 activation recompute. Measures complete forward, PPO loss, backward, and
 gradient finalization, NOT optimizer/online PPO training. This is an
 experimental NPU capacity test and is not a correctness gate.
 """
 
-# ================= CHANGE ONLY THESE TWO =================
-CP = 1                 # 1 / 2 / 4 (number of NPUs)
-SEQ_LEN = 8192         # tokens in EACH logical trajectory; P + S
-# =========================================================
+# Experiment topology and logical sequence shape (no topology whitelist).
+TP = 2
+CP = 2
+PREFIX_LEN = 32768     # P32K/S32K; next try PREFIX_LEN=49152
+SUFFIX_LEN = 32768     # P32K/S32K; next try SUFFIX_LEN=49152
 
 if __name__ == "__main__":
     import os
@@ -22,16 +23,20 @@ if __name__ == "__main__":
     if os.getenv("TPR_CAP_WORKER") != "1":
         import subprocess
 
-        if CP not in (1, 2, 4):
-            raise SystemExit("CP must be 1, 2, or 4")
-        if SEQ_LEN <= 1024 or SEQ_LEN % 128 != 0:
-            raise SystemExit("SEQ_LEN must be > 1024 and divisible by 128")
+        if TP < 1 or CP < 1:
+            raise SystemExit("TP and CP must be positive")
+        if PREFIX_LEN < 1024 or SUFFIX_LEN < 1:
+            raise SystemExit("PREFIX_LEN must be >= 1024 and SUFFIX_LEN must be positive")
+        seq_len = PREFIX_LEN + SUFFIX_LEN
+        world_size = TP * CP
         root = Path(__file__).resolve().parents[5]
         env = os.environ.copy()
         env.update({
             "TPR_CAP_WORKER": "1",
+            "TPR_CAP_TP": str(TP),
             "TPR_CAP_CP": str(CP),
-            "TPR_CAP_LENGTH": str(SEQ_LEN),
+            "TPR_CAP_PREFIX": str(PREFIX_LEN),
+            "TPR_CAP_SUFFIX": str(SUFFIX_LEN),
             "TPR_TREE_POLICY": "token_lcp",
             "TPR_TREE_BUILDER": "lcp_sort",
             "TPR_MIN_SHARED_PREFIX_TOKENS": "1024",
@@ -43,12 +48,12 @@ if __name__ == "__main__":
             "TPR_EXEC_PROFILE": "0",
             "PYTHONUNBUFFERED": "1",
         })
-        # Preserve the user's physical-device selection, but use only CP ranks.
+        # Select TP*CP devices, retaining explicitly selected physical NPUs.
         configured = env.get("ASCEND_RT_VISIBLE_DEVICES", "").strip()
-        devices = configured.split(",") if configured else [str(i) for i in range(CP)]
-        if len(devices) < CP or any(not v.strip().isdigit() for v in devices[:CP]):
-            raise SystemExit(f"CP={CP} needs {CP} visible NPUs, got {devices}")
-        env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(devices[:CP])
+        devices = configured.split(",") if configured else [str(i) for i in range(world_size)]
+        if len(devices) < world_size or any(not v.strip().isdigit() for v in devices[:world_size]):
+            raise SystemExit(f"TP={TP} CP={CP} needs {world_size} visible NPUs, got {devices}")
+        env["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(devices[:world_size])
         # Prefer this checkout over a separately pip-installed VERL package.
         env["PYTHONPATH"] = os.pathsep.join(
             filter(None, (str(root), env.get("PYTHONPATH", "")))
@@ -56,11 +61,11 @@ if __name__ == "__main__":
         cmd = [
             sys.executable, "-m", "torch.distributed.run",
             "--master_addr=127.0.0.1", "--master_port=29683",
-            f"--nproc_per_node={CP}",
+            f"--nproc_per_node={world_size}",
             str(Path(__file__).resolve()),
         ]
         print(
-            f"CAP_START CP={CP} SEQ_LEN={SEQ_LEN} "
+            f"CAP_START TP={TP} CP={CP} P={PREFIX_LEN} S={SUFFIX_LEN} SEQ_LEN={seq_len} "
             f"NPUS={env['ASCEND_RT_VISIBLE_DEVICES']}", flush=True,
         )
         raise SystemExit(subprocess.call(cmd, env=env, cwd=root))
@@ -101,10 +106,10 @@ from .test_real_actor_tp2cp4_offline_ppo_npu import _PPO
 from .test_tpr_10k_parallel_parity_npu import _runtime, _engine
 
 
-def _make_batch(length: int, suffix: int = 1024):
+def _make_batch(prefix_length: int, suffix: int):
     """Two distinct synthetic responses sharing one token-exact prefix."""
     g = torch.Generator(device="cpu").manual_seed(20261118)
-    prefix = torch.randint(100, 8000, (length - suffix,), generator=g)
+    prefix = torch.randint(100, 8000, (prefix_length,), generator=g)
     suffixes = [
         torch.randint(100, 8000, (suffix,), generator=g)
         for _ in range(2)
@@ -142,15 +147,18 @@ def _make_batch(length: int, suffix: int = 1024):
 
 
 def test_tpr_recompute_capacity():
+    tp = int(os.environ["TPR_CAP_TP"])
     cp = int(os.environ["TPR_CAP_CP"])
-    length = int(os.environ["TPR_CAP_LENGTH"])
+    prefix_length = int(os.environ["TPR_CAP_PREFIX"])
+    suffix_length = int(os.environ["TPR_CAP_SUFFIX"])
+    length = prefix_length + suffix_length
     model_path = Path(os.getenv(
         "TPR_QWEN_4B_PATH", "/workspace/hf_models/Qwen3-4B-128K",
     ))
     if not model_path.is_dir():
         raise FileNotFoundError(f"Qwen3-4B-128K checkpoint missing: {model_path}")
 
-    runtime = _runtime(tp=1, cp=cp, dp=1)
+    runtime = _runtime(tp=tp, cp=cp, dp=1)
     try:
         from megatron.core.transformer.transformer_block import TransformerBlock
         from verl.workers.engine.megatron.tpr.recompute import (
@@ -159,7 +167,7 @@ def test_tpr_recompute_capacity():
         )
         from verl.workers.utils.losses import ppo_loss
 
-        batch, keys = _make_batch(length)
+        batch, keys = _make_batch(prefix_length, suffix_length)
         forest = build_tree_execution_plans(
             keys, batch,
             tree_policy="token_lcp",
@@ -181,7 +189,7 @@ def test_tpr_recompute_capacity():
 
         model, hf = make_real_qwen3_tp_model(
             runtime, model_path=model_path,
-            tp_size=1, cp_size=cp,
+            tp_size=tp, cp_size=cp,
             sequence_parallel=False, profile="4b", native_attention=False,
         )
         if length > int(hf.max_position_embeddings):
@@ -189,7 +197,7 @@ def test_tpr_recompute_capacity():
                 f"SEQ_LEN={length} exceeds model max_position_embeddings="
                 f"{hf.max_position_embeddings}"
             )
-        engine = _engine(model, runtime, 1, cp, 1)
+        engine = _engine(model, runtime, tp, cp, 1)
         recompute_on = os.getenv("TPR_CAP_RECOMPUTE", "1") == "1"
         if recompute_on:
             model.config.recompute_granularity = "full"
@@ -214,9 +222,9 @@ def test_tpr_recompute_capacity():
             assert_tpr_full_recompute_installed(model, model.config)
         if dist.get_rank() == 0:
             print("CAP_PREFLIGHT " + json.dumps({
-                "tp": 1, "cp": cp, "dp": 1,
-                "seq_len": length, "prefix": length - 1024,
-                "suffix": 1024, "branches": 2,
+                "tp": tp, "cp": cp, "dp": 1,
+                "seq_len": length, "prefix": prefix_length,
+                "suffix": suffix_length, "branches": 2,
                 "logical_tokens": logical, "unique_tokens": unique,
                 "recompute": "full/uniform/1" if recompute_on else "off",
                 "blocks": installed,
@@ -294,8 +302,9 @@ def test_tpr_recompute_capacity():
         if dist.get_rank() == 0:
             print("CAP_RESULT " + json.dumps({
                 "status": "PASS",
-                "tp": 1, "cp": cp, "dp": 1,
-                "seq_len": length,
+                "tp": tp, "cp": cp, "dp": 1,
+                "seq_len": length, "prefix": prefix_length,
+                "suffix": suffix_length,
                 "recompute": "full/uniform/1" if recompute_on else "off",
                 "checkpoint_calls_rank0": counters["calls"],
                 "checkpoint_initial_runs_rank0": counters["initial_runs"],
