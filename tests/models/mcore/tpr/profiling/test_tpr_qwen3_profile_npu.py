@@ -75,7 +75,22 @@ def test_real_qwen3_tpr_engine_profile(monkeypatch):
     monkeypatch.setattr(qwen_fixture, "QWEN_MODEL_PATH", target.path)
     _initialize_single_rank_megatron()
     monkeypatch.setattr(profile_harness, "_make_model", _make_qwen_model)
-    monkeypatch.setattr(profile_harness, "_PROFILE_CASES", _QWEN_PROFILE_CASES)
+    selected_cases = os.getenv("TPR_QWEN_PROFILE_CASES", "").strip()
+    if selected_cases:
+        # Semicolon-separated P:S:N; no hard-coded shape whitelist.
+        cases = tuple(
+            tuple(int(value) for value in item.strip().split(":"))
+            for item in selected_cases.split(";")
+            if item.strip()
+        )
+        if not cases or any(len(case) != 3 or any(v <= 0 for v in case) for case in cases):
+            raise ValueError(
+                "TPR_QWEN_PROFILE_CASES must contain positive P:S:N triples, "
+                'e.g. "8192:1024:8;8192:8192:8"'
+            )
+    else:
+        cases = _QWEN_PROFILE_CASES
+    monkeypatch.setattr(profile_harness, "_PROFILE_CASES", cases)
     monkeypatch.setattr(profile_harness, "_PROFILE_NUM_LAYERS", hf_config.num_hidden_layers)
     monkeypatch.setattr(profile_harness, "_PROFILE_VOCAB_SIZE", hf_config.vocab_size)
     monkeypatch.setattr(
