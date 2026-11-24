@@ -256,13 +256,34 @@ def _trajectory_keys_from_minibatch(data: Any) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _assert_dense_model(model: Any) -> None:
-    # Inspect the actual decoder slots, not just the presence of one supported
-    # module somewhere in a potentially mixed model. Native VERL is unchanged.
+def _assert_tpr_model(model: Any) -> tuple[int, ...]:
+    """Validate every decoder attention slot and return optional GDN layer IDs."""
     layers = getattr(getattr(model, "decoder", None), "layers", ())
-    if not layers or any(not isinstance(getattr(layer, "self_attention", None), TPRSelfAttention)
-                         for layer in layers):
-        raise TypeError("TPR PPO requires every decoder layer to use TPRSelfAttention")
+    if not layers:
+        raise TypeError("TPR PPO requires a non-empty model.decoder.layers")
+
+    gdn_layers = []
+    full_attention_layers = 0
+    for index, layer in enumerate(layers):
+        attention = getattr(layer, "self_attention", None)
+        if isinstance(attention, TPRSelfAttention):
+            full_attention_layers += 1
+            continue
+        if getattr(attention, "tpr_state_kind", None) == "gdn":
+            gdn_layers.append(attention.layer_number)
+            continue
+        raise TypeError(
+            f"TPR PPO decoder layer {index} must use TPRSelfAttention or "
+            "the opt-in TPRGatedDeltaNet adapter"
+        )
+
+    if not full_attention_layers:
+        raise NotImplementedError("The native TPR PPO adapter currently requires at least one Full Attention layer")
+    if gdn_layers and os.getenv("TPR_ENABLE_GDN", "0") != "1":
+        raise NotImplementedError("GDN TPR is experimental; set TPR_ENABLE_GDN=1 to opt in")
+    if len(set(gdn_layers)) != len(gdn_layers):
+        raise ValueError("TPR GDN layer numbers must be unique")
+    return tuple(sorted(gdn_layers))
 
 
 def run_tpr_forward_backward_batch(
@@ -334,7 +355,7 @@ def run_tpr_forward_backward_batch(
             "TPR PPO phase-4 does not support: "
             + ", ".join(k for k, enabled in unsupported.items() if enabled)
         )
-    _assert_dense_model(model)
+    _assert_tpr_model(model)
     prepared_model = prepare_replay_model(model)
 
     token_count = tu.get_non_tensor_data(data, key="batch_num_tokens", default=None)
@@ -600,13 +621,23 @@ def replace_self_attention_with_tpr(transformer_layer_spec: _SpecT) -> _SpecT:
             )
 
         attention_module = get_module(attention_spec)
-        if attention_module is TPRSelfAttention:
+        if attention_module is TPRSelfAttention or getattr(attention_module, "tpr_state_kind", None) == "gdn":
+            continue
+        if getattr(attention_module, "__name__", None) == "GatedDeltaNet":
+            if os.getenv("TPR_ENABLE_GDN", "0") != "1":
+                raise NotImplementedError("GDN TPR is experimental; set TPR_ENABLE_GDN=1 to opt in")
+            from mindspeed.core.ssm.gated_delta_net import GatedDeltaNet
+            from verl.experimental.tpr.gdn.model import TPRGatedDeltaNet
+
+            if attention_module is not GatedDeltaNet:
+                raise TypeError("TPR GDN requires the patched MindSpeed GatedDeltaNet spec")
+            layer_submodules.self_attention = replace(attention_spec, module=TPRGatedDeltaNet)
             continue
         if attention_module is not SelfAttention:
             module_name = getattr(attention_module, "__name__", repr(attention_module))
             raise TypeError(
                 f"layer_specs[{index}] uses unsupported attention module {module_name}; "
-                "TPR requires Megatron SelfAttention"
+                "TPR requires Megatron SelfAttention or opt-in MindSpeed GatedDeltaNet"
             )
 
         layer_submodules.self_attention = replace(attention_spec, module=TPRSelfAttention)
