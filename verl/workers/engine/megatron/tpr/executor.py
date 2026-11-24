@@ -309,6 +309,13 @@ class SegmentExecutor:
         self.model = model
         self.plan = plan
         self.expected_layer_numbers = prepared_model.layer_numbers
+        self.gdn_layer_numbers = tuple(sorted(
+            module.layer_number for module in model.modules()
+            if getattr(module, "tpr_state_kind", None) == "gdn"
+        ))
+        if self.gdn_layer_numbers and not self.expected_layer_numbers:
+            raise NotImplementedError("Hybrid TPR requires at least one Full Attention layer")
+        self.gdn_states: dict[SegmentId, Any] = {}
         self.kv_stack = KVStack() if kv_stack is None else kv_stack
         self.loss_scale_func = loss_scale_func
         self.cp_group = cp_group
@@ -359,6 +366,14 @@ class SegmentExecutor:
                     raise ValueError(
                         f"segment {segment.segment_id} {exc}"
                     ) from exc
+        if self.gdn_layer_numbers:
+            tensor_parallel_size = getattr(config, "tensor_model_parallel_size", 1)
+            if tensor_parallel_size != 1 or self.sp_tp_size != 1:
+                raise NotImplementedError("TPR GDN currently requires TP=SP=1")
+            if self.cp_size not in (1, 2):
+                raise NotImplementedError(f"TPR GDN supports CP=1/2, got CP={self.cp_size}")
+            if self.cp_size == 2 and any(segment.length % 4 for segment in plan.segments.values()):
+                raise NotImplementedError("TPR GDN CP2 requires Segment lengths divisible by 4")
         validate_replay_plan(plan, prepared_model, cp_size=self.cp_size,
                              active_segment_ids=active_segment_ids)
         # Opt-in experiment: group equal-length siblings only. CP Ring still
@@ -369,6 +384,8 @@ class SegmentExecutor:
             raise ValueError("TPR leaf batch size and token budget must be positive")
         if self.leaf_batch_size > 1 and self.cp_enabled:
             raise NotImplementedError("TPR leaf batching MVP supports CP=1 only")
+        if self.gdn_layer_numbers and self.leaf_batch_size > 1:
+            raise NotImplementedError("TPR GDN does not yet support grouped leaf execution")
         self.model_forward_calls = 0
         self.grouped_leaf_calls = 0
         self.grouped_leaf_segments = 0
@@ -399,6 +416,8 @@ class SegmentExecutor:
         with self._operation():
             self._ran = True
             self.kv_stack.assert_empty()
+            if self.gdn_states:
+                raise RuntimeError("GDN state stack is not empty before execution")
             if self.active_segment_ids == frozenset():
                 return torch.zeros((), device=self.prepared_model.device)
             pending = [(self.plan.root_id, False, 0)]
@@ -428,6 +447,8 @@ class SegmentExecutor:
                 if event_profiler is not None:
                     event_profiler.end(profile)
             self.kv_stack.assert_empty()
+            if self.gdn_states:
+                raise RuntimeError(f"GDN states remain after DFS execution: {sorted(self.gdn_states)}")
             total = losses[0]
             for loss in losses[1:]:
                 total = total + loss
@@ -476,6 +497,12 @@ class SegmentExecutor:
             )
             del logits
             self._assert_collected_layers(context)
+            if self.gdn_layer_numbers:
+                from verl.experimental.tpr.gdn.prefix_state import GDNPrefixState
+
+                self.gdn_states[segment_id] = GDNPrefixState.save(
+                    segment_id, segment.length, context.new_gdn_states
+                )
             # The Push context already detaches and compacts each layer's KV.
             self.kv_stack.push(segment, context.new_key_values, shard=self._segment_shard(segment))
 
@@ -495,6 +522,8 @@ class SegmentExecutor:
                 )
             popped_entry = self.kv_stack.pop(segment_id)
             segment = popped_entry.segment
+            gdn_state = self.gdn_states.pop(segment_id) if self.gdn_layer_numbers else None
+            relayed_gdn_gradients = {} if gdn_state is None else gdn_state.consume_gradients()
             del entry
             # The popped segment's cached KV is dead before recompute: its
             # relayed gradients and metadata were copied above, while the
@@ -502,7 +531,14 @@ class SegmentExecutor:
             # Release it for CP=1 as well as CP>1 so cached current KV does not
             # overlap with the graph-connected KV recreated by this forward.
             popped_entry.kv.release()
-            return self._backward_segment(segment, relayed_gradients)
+            try:
+                return self._backward_segment(
+                    segment, relayed_gradients,
+                    relayed_gdn_gradients=relayed_gdn_gradients,
+                )
+            finally:
+                if gdn_state is not None:
+                    gdn_state.release()
 
     def visit_leaf(self, segment_id: SegmentId) -> Tensor:
         """Forward/backward one leaf without writing its new KV to the path stack."""
@@ -529,6 +565,8 @@ class SegmentExecutor:
     def visit_leaf_group(self, segment_ids: tuple[SegmentId, ...]) -> Tensor:
         """One CP1 model forward/backward for same-parent, equal-length leaves."""
         with self._operation():
+            if self.gdn_layer_numbers:
+                raise NotImplementedError("TPR GDN does not yet support grouped leaf execution")
             if self.cp_enabled or len(segment_ids) < 2:
                 raise ValueError("leaf group needs at least two CP1 leaves")
             segments = tuple(self.plan.get(segment_id) for segment_id in segment_ids)
@@ -571,19 +609,22 @@ class SegmentExecutor:
 
     def _backward_segment(
         self, segment: SegmentSpec, relayed_gradients: Mapping[int, KVPair] | None = None,
-        *, leaf: bool = False,
+        *, relayed_gdn_gradients: Mapping[int, Any] | None = None, leaf: bool = False,
     ) -> Tensor:
-        """Replay against independent ancestor anchors, then return their dKV."""
+        """Replay against independent KV/GDN anchors, then relay both gradients."""
         relayed_gradients = relayed_gradients or {}
+        relayed_gdn_gradients = relayed_gdn_gradients or {}
         if leaf:
             self.leaf_forward_tokens += segment.length
         else:
             self.pop_forward_tokens += segment.length
         anchors = self.kv_stack.build_past_anchors()
+        gdn_parent, gdn_anchors = self._gdn_parent_anchors()
         context, logits = self._forward(
             segment, no_grad=False,
             past_key_values={} if self.cp_enabled else anchors.key_values,
             sharded_past_anchors=anchors if self.cp_enabled else None,
+            initial_gdn_states={} if gdn_anchors is None else gdn_anchors.layer_states,
         )
         self._assert_collected_layers(context)
         normalized_loss = self._compute_loss(segment, logits)
@@ -603,9 +644,17 @@ class SegmentExecutor:
                 if root.requires_grad:
                     roots.append(root)
                     gradients.append(grad)
+        for layer, gradient in relayed_gdn_gradients.items():
+            new_state = context.new_gdn_states[layer]
+            roots.extend((new_state.conv_state, new_state.recurrent_state))
+            gradients.extend((gradient.conv_state, gradient.recurrent_state))
         if roots:
             torch.autograd.backward(roots, grad_tensors=gradients)
             self.kv_stack.accumulate_anchor_gradients(anchors, consume=True)
+            if gdn_anchors is not None:
+                gdn_parent.accumulate_anchor_gradients(gdn_anchors)
+        elif gdn_anchors is not None:
+            raise RuntimeError("GDN parent anchors were not connected to a backward root")
         return normalized_loss.detach()
 
     def _forward(
@@ -616,6 +665,7 @@ class SegmentExecutor:
         no_grad: bool,
         sharded_past_anchors: PastKVAnchors | None = None,
         leaf_group: tuple[SegmentSpec, ...] | None = None,
+        initial_gdn_states: Mapping[int, Any] | None = None,
     ) -> tuple[TPRAttentionContext, Tensor]:
         device = self.prepared_model.device
         shard = self._segment_shard(segment)
@@ -650,7 +700,7 @@ class SegmentExecutor:
                     )
                 ),
             )
-        context = TPRAttentionContext(
+        context_kwargs = dict(
             prefix_length=segment.prefix_length,
             suffix_length=segment.length,
             batch_size=len(leaf_group) if leaf_group is not None else 1,
@@ -667,6 +717,25 @@ class SegmentExecutor:
             attention_backend=attention_backend,
             compact_new_kv=no_grad,
         )
+        if self.gdn_layer_numbers:
+            from verl.experimental.tpr.gdn.context import GDNTPRAttentionContext
+
+            if initial_gdn_states is None:
+                if len(self.kv_stack):
+                    parent_id = self.kv_stack.top().segment.segment_id
+                    try:
+                        initial_gdn_states = self.gdn_states[parent_id].layer_states
+                    except KeyError as exc:
+                        raise RuntimeError(f"missing GDN state for parent Segment {parent_id}") from exc
+                else:
+                    initial_gdn_states = {}
+            context = GDNTPRAttentionContext(
+                **context_kwargs,
+                initial_gdn_states=initial_gdn_states,
+                capture_gdn_final_state=True,
+            )
+        else:
+            context = TPRAttentionContext(**context_kwargs)
         rope_context = (
             disable_bound_context_parallel_sharding(self.model.rotary_pos_emb)
             if self.cp_enabled else nullcontext()
@@ -749,12 +818,29 @@ class SegmentExecutor:
             self._failed = True
             if outermost:
                 self.kv_stack.clear()
+                for state in self.gdn_states.values():
+                    state.release()
+                self.gdn_states.clear()
             raise
         finally:
             self._operation_depth -= 1
 
     def _assert_collected_layers(self, context: TPRAttentionContext) -> None:
         context.assert_new_kv_layers(self.expected_layer_numbers)
+        if self.gdn_layer_numbers:
+            if not hasattr(context, "assert_new_gdn_layers"):
+                raise TypeError("Hybrid TPR forward did not create a GDN-aware context")
+            context.assert_new_gdn_layers(self.gdn_layer_numbers)
+
+    def _gdn_parent_anchors(self):
+        if not self.gdn_layer_numbers or not len(self.kv_stack):
+            return None, None
+        parent_id = self.kv_stack.top().segment.segment_id
+        try:
+            parent = self.gdn_states[parent_id]
+        except KeyError as exc:
+            raise RuntimeError(f"missing GDN PrefixState for parent Segment {parent_id}") from exc
+        return parent, parent.make_anchors()
 
 
 
@@ -806,8 +892,8 @@ def _infer_layer_numbers(model: nn.Module) -> tuple[int, ...]:
     result = []
     for layer in layers:
         attention = getattr(layer, "self_attention", None)
-        if getattr(attention, "tpr_state_kind", "kv") != "kv":
-            raise NotImplementedError("Production TPR only supports Dense KV attention")
+        if getattr(attention, "tpr_state_kind", None) == "gdn":
+            continue
         layer_number = getattr(attention, "layer_number", None)
         if layer_number is None:
             raise ValueError("cannot infer layer_number from model.decoder.layers")
