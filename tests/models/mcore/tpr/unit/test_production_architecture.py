@@ -32,28 +32,42 @@ def test_production_modules_parse() -> None:
         ast.parse(_source(name), filename=str(ENGINE / f"{name}.py"))
 
 
-def test_no_experimental_backend_in_production_imports() -> None:
+def test_optional_gdn_imports_are_narrowly_scoped() -> None:
     forbidden = (
-        "verl.experimental.tpr",
+        "verl.experimental.tpr.allgather",
+        "verl.experimental.tpr.ulysses",
+        "verl.experimental.tpr.hybrid",
         "verl.models.mcore.tpr.parallel.backend",
         "verl.models.mcore.tpr.parallel.allgather_attention",
         "verl.models.mcore.tpr.parallel.hybrid_attention",
         "verl.models.mcore.tpr.parallel.ulysses_attention",
     )
+    allowed_gdn_callers = {"adapter.py", "executor.py"}
     files = [ENGINE / f"{name}.py" for name in PRODUCTION] + list(MODEL.glob("*.py"))
     for path in files:
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
+            names = []
             if isinstance(node, ast.ImportFrom) and node.module:
-                assert not any(node.module.startswith(v) for v in forbidden), (path, node.module)
+                names.append(node.module)
             elif isinstance(node, ast.Import):
-                assert not any(alias.name.startswith(v) for alias in node.names for v in forbidden), path
+                names.extend(alias.name for alias in node.names)
+            for name in names:
+                assert not any(name.startswith(v) for v in forbidden), (path, name)
+                if name.startswith("verl.experimental.tpr.gdn"):
+                    assert path.name in allowed_gdn_callers, (path, name)
 
 
-def test_production_has_no_recurrent_state_implementation_or_dispatch() -> None:
-    for base in (ENGINE, MODEL):
-        for path in base.glob("*.py"):
-            assert "gdn" not in path.read_text(encoding="utf-8").lower(), path
+def test_gdn_implementation_remains_an_optional_model_adapter() -> None:
+    gdn = ROOT / "verl/experimental/tpr/gdn"
+    assert (gdn / "model.py").is_file()
+    assert (gdn / "context.py").is_file()
+    assert (gdn / "prefix_state.py").is_file()
+    assert "class TPRGatedDeltaNet" in (gdn / "model.py").read_text(encoding="utf-8")
+    assert "class GDNPrefixState" in (gdn / "prefix_state.py").read_text(encoding="utf-8")
+    assert "self.gdn_states" in _source("executor")
+    assert "GDNPrefixState.save" in _source("executor")
+    assert "GDNPrefixState" not in _source("state")
 
 
 def _expect_type_error(func, argument, message: str) -> None:
@@ -66,23 +80,48 @@ def _expect_type_error(func, argument, message: str) -> None:
         raise AssertionError(f"expected TypeError containing {message!r}")
 
 
-def test_ppo_dense_guard_checks_every_decoder_slot() -> None:
+def test_ppo_model_guard_accepts_only_dense_and_opt_in_gdn_slots() -> None:
     tree = ast.parse(_source("adapter"))
     definition = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
-                      and node.name == "_assert_dense_model")
+                      and node.name == "_assert_tpr_model")
 
     class Attention:
         pass
 
-    namespace = {"Any": object, "TPRSelfAttention": Attention}
-    exec(compile(ast.Module(body=[definition], type_ignores=[]), "<adapter dense guard>", "exec"), namespace)
-    guard = namespace["_assert_dense_model"]
+    class GDN:
+        tpr_state_kind = "gdn"
+        layer_number = 7
+
+    environment = {"TPR_ENABLE_GDN": "0"}
+    namespace = {
+        "Any": object,
+        "TPRSelfAttention": Attention,
+        "os": SimpleNamespace(getenv=lambda key, default=None: environment.get(key, default)),
+    }
+    exec(compile(ast.Module(body=[definition], type_ignores=[]), "<adapter TPR guard>", "exec"), namespace)
+    guard = namespace["_assert_tpr_model"]
     dense = SimpleNamespace(self_attention=Attention())
+    gdn = SimpleNamespace(self_attention=GDN())
     unsupported = SimpleNamespace(self_attention=object())
-    guard(SimpleNamespace(decoder=SimpleNamespace(layers=[dense, dense])))
-    for layers in ([], [unsupported], [dense, unsupported], [dense, SimpleNamespace()]):
-        _expect_type_error(guard, SimpleNamespace(decoder=SimpleNamespace(layers=layers)), "every decoder layer")
-    _expect_type_error(guard, SimpleNamespace(incidental_attention=Attention()), "every decoder layer")
+    assert guard(SimpleNamespace(decoder=SimpleNamespace(layers=[dense, dense]))) == ()
+    _expect_type_error(
+        guard, SimpleNamespace(decoder=SimpleNamespace(layers=[dense, unsupported])),
+        "decoder layer",
+    )
+    try:
+        guard(SimpleNamespace(decoder=SimpleNamespace(layers=[dense, gdn])))
+    except NotImplementedError as exc:
+        assert "TPR_ENABLE_GDN=1" in str(exc)
+    else:
+        raise AssertionError("GDN must be explicitly opted in")
+    environment["TPR_ENABLE_GDN"] = "1"
+    assert guard(SimpleNamespace(decoder=SimpleNamespace(layers=[dense, gdn]))) == (7,)
+    try:
+        guard(SimpleNamespace(decoder=SimpleNamespace(layers=[gdn])))
+    except NotImplementedError as exc:
+        assert "at least one Full Attention" in str(exc)
+    else:
+        raise AssertionError("the current PPO adapter must reject pure-GDN models")
 
 
 def test_module_spec_rejects_mixed_attention_without_model_mutation() -> None:
@@ -132,7 +171,7 @@ def test_token_lcp_is_default_production_builder() -> None:
     assert "def tree(self)" not in source
 
 
-def test_ppo_executor_no_legacy_ce_gdn_paths() -> None:
+def test_ppo_executor_keeps_one_dfs_and_optional_gdn_state_path() -> None:
     source = _source("executor")
     assert "class SegmentExecutor:" in source
     assert "class FixedTopologyScheduler:" not in source
@@ -142,7 +181,9 @@ def test_ppo_executor_no_legacy_ce_gdn_paths() -> None:
     assert "_ChunkedLanguageModelOutput" not in source
     assert "SegmentLossTerm" not in source
     assert "with_activation_offload" not in source
-    assert "self.gdn_states" not in source
+    assert "self.gdn_states" in source
+    assert "relayed_gdn_gradients" in source
+    assert "gdn_parent.accumulate_anchor_gradients" in source
 
 
 def test_model_dir_is_only_attention_context_cann() -> None:
