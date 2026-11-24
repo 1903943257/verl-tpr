@@ -1,6 +1,8 @@
-"""Optional GDN Prefix continuation and gradient buffers.
+"""Optional GDN Prefix continuation states and delayed state gradients.
 
-The production Dense TPR KV path never imports this implementation.
+The Dense-only path does not import this module. The opt-in Hybrid TPR
+executor owns one graph-free instance per active Segment and relays Conv /
+Recurrent state VJPs during DFS Pop.
 """
 from __future__ import annotations
 
