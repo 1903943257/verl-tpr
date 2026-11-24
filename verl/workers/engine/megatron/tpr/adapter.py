@@ -591,8 +591,10 @@ _SpecT = TypeVar("_SpecT")
 
 
 def replace_self_attention_with_tpr(transformer_layer_spec: _SpecT) -> _SpecT:
-    """Copy a dense attention spec while preserving its configuration.
+    """Copy a Transformer spec and install the Dense/GDN TPR adapters.
 
+    Dense SelfAttention is always replaced. MindSpeed GatedDeltaNet is replaced
+    only when TPR_ENABLE_GDN=1; its adapter remains lazily imported.
     Both forms used by the local verl model builders are accepted: a single
     TransformerLayer ``ModuleSpec`` and a TransformerBlock submodule object
     containing ``layer_specs``.  Only the nested attention module class is
@@ -668,7 +670,7 @@ def install_tpr_vanilla_mbridge_spec(bridge: Any) -> None:
     """Patch only this vanilla MBridge instance's lazy TransformerLayer spec.
 
     mbridge 0.15.1 resolves the spec inside _model_provider; install before
-    bridge.get_model() so the constructed model uses TPRSelfAttention.
+    bridge.get_model() so the constructed model uses the selected TPR adapters.
     """
     original = getattr(bridge, "_get_transformer_layer_spec", None)
     if not callable(original):
