@@ -335,6 +335,9 @@ def run_tpr_forward_backward_batch(
     config = get_model_config(wrapped_model)
     if not model.training:
         raise RuntimeError("TPR PPO requires model.train()")
+    gdn_layer_numbers = _assert_tpr_model(model)
+    if gdn_layer_numbers and getattr(config, "recompute_granularity", None) is not None:
+        raise NotImplementedError("TPR GDN does not yet support activation recomputation")
     # Native Full Checkpoint cannot export TPR KV autograd roots by itself.
     # Only allow the isolated experimental adapter after installation checks.
     # Preserve PR7's default OFF behavior; only installed full/uniform/1 is opt-in.
@@ -355,7 +358,6 @@ def run_tpr_forward_backward_batch(
             "TPR PPO phase-4 does not support: "
             + ", ".join(k for k, enabled in unsupported.items() if enabled)
         )
-    _assert_tpr_model(model)
     prepared_model = prepare_replay_model(model)
 
     token_count = tu.get_non_tensor_data(data, key="batch_num_tokens", default=None)
