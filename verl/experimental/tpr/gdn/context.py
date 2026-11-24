@@ -1,6 +1,6 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 # SPDX-License-Identifier: Apache-2.0
-"""Experimental recurrent-state extension; the Dense runtime has no GDN state."""
+"""Opt-in recurrent-state context for Hybrid TPR; Dense-only runs use the base context."""
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
