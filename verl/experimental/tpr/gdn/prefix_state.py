@@ -11,17 +11,10 @@ from types import MappingProxyType
 import torch
 from torch import Tensor
 
-from verl.workers.engine.megatron.tpr.tree import SegmentId
-from verl.experimental.tpr.legacy.state import (
-    PrefixState,
-    KVPrefixAnchors,
-    KVPrefixState,
-    PrefixStateEntry,
-    PrefixStateStack,
-    _normalize_local_kv,
-    _validate_segment_id,
-    _validate_layer_number,
+from verl.workers.engine.megatron.tpr.tree import SegmentId, _validate_segment_id
+from verl.workers.engine.megatron.tpr.state import (
     _compact_graph_free_tensor,
+    _validate_layer_number,
 )
 
 @dataclass(frozen=True, slots=True)
