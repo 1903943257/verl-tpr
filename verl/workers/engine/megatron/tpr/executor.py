@@ -256,8 +256,8 @@ def validate_replay_plan(
 class SegmentExecutor:
     """Execute graph-free Push and gradient-carrying Pop for a SegmentPlan.
 
-    One iterative DFS owns the traversal and KV lifetime. The engine adapter
-    owns gradient synchronization and optimizer steps across the forest.
+    One iterative DFS owns traversal plus FA KV/GDN state lifetimes. The
+    engine adapter owns gradient synchronization and optimizer steps.
     """
 
     def __init__(
@@ -489,7 +489,7 @@ class SegmentExecutor:
         return scheduled
 
     def push(self, segment_id: SegmentId) -> None:
-        """Save graph-free per-layer Prefix KV without owning loss."""
+        """Save graph-free FA KV and optional GDN final states without owning loss."""
 
         with self._operation():
             segment = self.plan.get(segment_id)
@@ -511,7 +511,7 @@ class SegmentExecutor:
             self.kv_stack.push(segment, context.new_key_values, shard=self._segment_shard(segment))
 
     def pop(self, segment_id: SegmentId) -> Tensor:
-        """Recompute current KV and relay gradients from descendant Segments."""
+        """Recompute the Segment and relay descendant KV/GDN state gradients."""
 
         with self._operation():
             entry = self.kv_stack.top()
@@ -545,7 +545,7 @@ class SegmentExecutor:
                     gdn_state.release()
 
     def visit_leaf(self, segment_id: SegmentId) -> Tensor:
-        """Forward/backward one leaf without writing its new KV to the path stack."""
+        """Forward/backward one leaf without saving its new KV or GDN state."""
 
         with self._operation():
             segment = self.plan.get(segment_id)
