@@ -315,6 +315,10 @@ class SegmentExecutor:
         ))
         if self.gdn_layer_numbers and not self.expected_layer_numbers:
             raise NotImplementedError("Hybrid TPR requires at least one Full Attention layer")
+        if len(set(self.gdn_layer_numbers)) != len(self.gdn_layer_numbers):
+            raise ValueError("GDN layer numbers must be unique")
+        if set(self.gdn_layer_numbers).intersection(self.expected_layer_numbers):
+            raise ValueError("Full Attention and GDN layer numbers must be disjoint")
         self.gdn_states: dict[SegmentId, Any] = {}
         self.kv_stack = KVStack() if kv_stack is None else kv_stack
         self.loss_scale_func = loss_scale_func
@@ -523,15 +527,15 @@ class SegmentExecutor:
             popped_entry = self.kv_stack.pop(segment_id)
             segment = popped_entry.segment
             gdn_state = self.gdn_states.pop(segment_id) if self.gdn_layer_numbers else None
-            relayed_gdn_gradients = {} if gdn_state is None else gdn_state.consume_gradients()
-            del entry
-            # The popped segment's cached KV is dead before recompute: its
-            # relayed gradients and metadata were copied above, while the
-            # replay consumes only the remaining ancestor path as past KV.
-            # Release it for CP=1 as well as CP>1 so cached current KV does not
-            # overlap with the graph-connected KV recreated by this forward.
-            popped_entry.kv.release()
             try:
+                relayed_gdn_gradients = {} if gdn_state is None else gdn_state.consume_gradients()
+                del entry
+                # The popped segment's cached KV is dead before recompute: its
+                # relayed gradients and metadata were copied above, while the
+                # replay consumes only the remaining ancestor path as past KV.
+                # Release it for CP=1 as well as CP>1 so cached current KV does not
+                # overlap with the graph-connected KV recreated by this forward.
+                popped_entry.kv.release()
                 return self._backward_segment(
                     segment, relayed_gradients,
                     relayed_gdn_gradients=relayed_gdn_gradients,
