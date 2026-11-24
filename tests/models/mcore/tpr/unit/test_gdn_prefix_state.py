@@ -90,3 +90,19 @@ def test_released_gdn_state_rejects_future_access() -> None:
     state.release()
     with pytest.raises(RuntimeError, match="released"):
         state.make_anchors()
+
+
+def test_gdn_checkpoint_collector_preserves_initial_state() -> None:
+    from verl.experimental.tpr.gdn.context import GDNTPRAttentionContext
+
+    state = _layer_state()
+    context = GDNTPRAttentionContext(
+        prefix_length=8,
+        suffix_length=4,
+        initial_gdn_states={1: state},
+    )
+    collector = context.new_collector()
+
+    assert collector.initial_gdn_states[1] is state
+    assert collector.capture_gdn_final_state
+    assert not collector.compact_new_kv
