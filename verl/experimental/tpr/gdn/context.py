@@ -43,6 +43,21 @@ class GDNTPRAttentionContext(TPRAttentionContext):
             _validate_gdn_layer_state(layer, state)
         self.initial_gdn_states = MappingProxyType(dict(sorted(self.initial_gdn_states.items())))
 
+    def new_collector(self) -> GDNTPRAttentionContext:
+        """Create a checkpoint collector without dropping recurrent-state inputs."""
+        return GDNTPRAttentionContext(
+            prefix_length=self.prefix_length,
+            suffix_length=self.suffix_length,
+            batch_size=self.batch_size,
+            past_key_values=self.past_key_values,
+            suffix_rotary_pos_emb=self.suffix_rotary_pos_emb,
+            attention_backend=self.attention_backend,
+            compact_new_kv=False,
+            local_physical_suffix_length=self.local_physical_suffix_length,
+            initial_gdn_states=self.initial_gdn_states,
+            capture_gdn_final_state=self.capture_gdn_final_state,
+        )
+
     @property
     def new_gdn_states(self) -> Mapping[int, GDNLayerState]:
         return MappingProxyType(self._new_gdn_states)
