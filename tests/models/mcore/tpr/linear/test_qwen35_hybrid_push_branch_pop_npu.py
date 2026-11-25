@@ -30,7 +30,6 @@ from ._gdn_npu_test_utils import (
     VOCAB_SIZE,
     assert_gradient_maps_close,
     assert_hybrid_architecture,
-    gradient_map_diagnostics,
     make_qwen35_model,
 )
 
