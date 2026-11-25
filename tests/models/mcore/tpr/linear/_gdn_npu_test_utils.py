@@ -232,6 +232,7 @@ def make_qwen35_model(runtime, *, cp_size: int, tpr: bool = False, num_layers: i
     if tpr:
         if cp_size not in (1, 2):
             raise NotImplementedError("Hybrid TPR test helper requires CP=1/2")
+        os.environ.setdefault("TPR_ENABLE_GDN", "1")
         from verl.workers.engine.megatron.tpr.adapter import replace_self_attention_with_tpr
 
         spec = replace_self_attention_with_tpr(spec)
