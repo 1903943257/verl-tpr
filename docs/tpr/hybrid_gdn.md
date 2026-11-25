@@ -90,8 +90,9 @@ The migrated tests live under `tests/models/mcore/tpr/linear/`:
 - `test_qwen35_hybrid_push_branch_pop_npu.py`: Qwen3.5-0.8B language-model
   layout (18 GDN + 6 Full Attention), native materialized reference versus the
   current production `SegmentExecutor`, plus a connected-split boundary-VJP
-  reference. The old bridge Engine request hook was removed because the
-  current branch uses the production PPO adapter and SegmentExecutor APIs.
+  reference. The old bridge `TPRForwardBackwardRequest` Engine hook no longer
+  exists in this branch, so this migrated test drives `SegmentExecutor`
+  directly. Full MegatronEngine / VERL PPO-adapter E2E remains a separate gate.
 
 Run both in one process so the session fixture applies MindSpeed patches once:
 
