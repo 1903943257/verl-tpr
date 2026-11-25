@@ -39,8 +39,7 @@ from torch import Tensor, nn
 
 from verl.utils.device import is_torch_npu_available
 
-# pytest imports this file as tpr.linear.* and adds tests/models/mcore to
-# sys.path: baseline is a sibling top-level package, not a parent of tpr.
+# Shared model/runtime helpers live beside the migrated NPU tests.
 from ._gdn_npu_test_utils import (
     DTYPE,
     HIDDEN_SIZE,
