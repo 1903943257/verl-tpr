@@ -78,3 +78,31 @@ comes from the fixed MindSpeed-Ops checkout, rerun the Stateful Causal Conv1D
 and Gated Delta Rule tests, then run the current branch's Hybrid Qwen3.5
 Push/Branch/Pop and PPO replay gates. CP2 A2A equivalence must be validated
 separately from the CP1 path.
+
+
+## Ascend CP1 test gates
+
+The migrated tests live under `tests/models/mcore/tpr/linear/`:
+
+- `test_gdn_push_branch_pop_npu.py`: one GDN layer, materialized full-sequence
+  reference versus PrefixState Push / two sibling Branches / Pop, including
+  Conv/Recurrent state VJPs and operator-boundary diagnostics.
+- `test_qwen35_hybrid_push_branch_pop_npu.py`: Qwen3.5-0.8B language-model
+  layout (18 GDN + 6 Full Attention), native materialized reference versus the
+  current production `SegmentExecutor`, plus a connected-split boundary-VJP
+  reference. The old bridge Engine request hook was removed because the
+  current branch uses the production PPO adapter and SegmentExecutor APIs.
+
+Run both in one process so the session fixture applies MindSpeed patches once:
+
+```bash
+export TPR_ENABLE_GDN=1
+python /tmp/_mindspeed_first_pytest.py -q -s \\
+  tests/models/mcore/tpr/linear/test_gdn_push_branch_pop_npu.py \\
+  tests/models/mcore/tpr/linear/test_qwen35_hybrid_push_branch_pop_npu.py
+```
+
+The tests instantiate the Qwen3.5 architecture with deterministic random
+weights; they do not load an HF checkpoint. The checkpoint is needed for a
+separate real-weight PPO/E2E run, not for these operator and gradient-equivalence
+gates.
