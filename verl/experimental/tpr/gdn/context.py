@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Opt-in recurrent-state context for Hybrid TPR; Dense-only runs use the base context."""
 
+from __future__ import annotations
+
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
