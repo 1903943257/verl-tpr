@@ -110,7 +110,7 @@ def initialize_npu_runtime(*, world_size: int = 1):
             f"\n  MindSpeed-Ops: {mindspeed_ops.__file__} ({git_head(mindspeed_ops)})"
             f"\n  Megatron-Core: {megatron_core.__file__} ({git_head(megatron_core)})"
             f"\n  PyTorch: {torch.__version__}"
-            f"\n  torch_npu: {torch_npu.__version__}"
+            f"\n  torch_npu: {getattr(torch_npu, '__version__', 'unknown')}"
             f"\n  device: {torch.npu.get_device_name(local_rank)}",
             flush=True,
         )
