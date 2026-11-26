@@ -51,7 +51,7 @@ def patch_gdr_gate(path: Path, text: str) -> tuple[str, str]:
         raise PatchError(f"{path}: found {len(matches)} active initial_state gates")
 
     any_active_initial_state_gate = re.search(
-        r'(?m)^[ \\t]*if initial_state is not None:\\n[ \\t]+raise ValueError\\(',
+        r'(?m)^[ \t]*if initial_state is not None:\n[ \t]+raise ValueError\\(',
         text,
     )
     if any_active_initial_state_gate:
@@ -61,10 +61,6 @@ def patch_gdr_gate(path: Path, text: str) -> tuple[str, str]:
         )
     return text, "already-open"
 
-    raise PatchError(
-        f"{path}: found the historical gate in an unsupported layout; "
-        "inspect this file instead of applying a fuzzy edit"
-    )
 
 
 def _remove_weight_initial_state_block(lines: list[str], path: Path) -> list[str]:
@@ -107,7 +103,7 @@ def _replace_dh0_kernel_block(lines: list[str], path: Path) -> list[str]:
     start = starts[0]
     ends = [
         i for i in range(start + 1, len(lines))
-        if lines[i].rstrip("\\r\\n") == "        if HAS_BIAS:"
+        if lines[i].rstrip("\r\n") == "        if HAS_BIAS:"
     ]
     if not ends:
         raise PatchError(
