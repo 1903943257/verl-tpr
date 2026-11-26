@@ -38,7 +38,7 @@ def main() -> int:
 
     active_gate = re.compile(
         r'(?m)^[ \t]*if initial_state is not None:\n'
-        r'[ \t]+raise ValueError\(' + re.escape(repr(GDR_ERROR)) + r'\)'
+        r'[ \t]+raise ValueError\(["\']' + re.escape(GDR_ERROR) + r'["\']\)'
     )
     for relative, text in zip(FILES[:2], (public, fwd_h)):
         if active_gate.search(text):
