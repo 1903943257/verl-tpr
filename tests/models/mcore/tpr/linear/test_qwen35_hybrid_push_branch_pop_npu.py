@@ -2,8 +2,9 @@
 
 This test runs the native materialized P+S1 / P+S2 reference, the current
 production SegmentExecutor, and a connected split reference. It checks the
-full 18-GDN + 6-Full-Attention model, parameter gradients, and the external
-KV / Conv / Recurrent boundary VJPs.
+4-layer (3 GDN + 1 Full Attention) and 24-layer (18 GDN + 6 Full Attention)
+models, parameter gradients, and the external KV / Conv / Recurrent boundary
+VJPs. All three pairwise diagnostics are reported before failing the test.
 
 Run from the verl repository root with the shared MindSpeed-first pytest
 bootstrap (one process, CP=1)::
@@ -28,8 +29,8 @@ from verl.utils.device import is_torch_npu_available
 from ._gdn_npu_test_utils import (
     AllToAllProbe,
     VOCAB_SIZE,
-    assert_gradient_maps_close,
     assert_hybrid_architecture,
+    gradient_map_diagnostics,
     make_qwen35_model,
 )
 
@@ -284,18 +285,27 @@ def _connected_split_reference(model, plan: _HybridPlan):
     return _parameter_grads(model), boundary_gradients, loss.detach().cpu(), logprobs
 
 
-def test_full_qwen35_hybrid_push_branch_pop_matches_materialized_paths(runtime, monkeypatch):
+def _assert_matching_boundary_keys(reference, actual):
+    assert reference.keys() == actual.keys(), (
+        f"boundary keys differ: missing={reference.keys() - actual.keys()}, "
+        f"unexpected={actual.keys() - reference.keys()}"
+    )
+
+
+@pytest.mark.parametrize("num_layers", (4, 24), ids=("hybrid4", "hybrid24"))
+def test_full_qwen35_hybrid_push_branch_pop_matches_materialized_paths(runtime, monkeypatch, num_layers):
     from verl.models.mcore.tpr.attention import TPRSelfAttention
     from verl.experimental.tpr.gdn.model import TPRGatedDeltaNet
 
     torch.manual_seed(353301)
-    reference_model = make_qwen35_model(runtime, cp_size=1, tpr=False)
+    reference_model = make_qwen35_model(runtime, cp_size=1, tpr=False, num_layers=num_layers)
     torch.manual_seed(353302)
-    tpr_model = make_qwen35_model(runtime, cp_size=1, tpr=True)
+    tpr_model = make_qwen35_model(runtime, cp_size=1, tpr=True, num_layers=num_layers)
     tpr_model.load_state_dict(reference_model.state_dict(), strict=True)
 
     gdn_layers, fa_layers = assert_hybrid_architecture(tpr_model)
-    assert len(gdn_layers) == 18 and len(fa_layers) == 6
+    assert len(gdn_layers) == 3 * num_layers // 4 and len(fa_layers) == num_layers // 4
+    assert tuple(layer.layer_number for layer in fa_layers) == tuple(range(4, num_layers + 1, 4))
     assert all(isinstance(layer.self_attention, TPRGatedDeltaNet) for layer in gdn_layers)
     assert all(isinstance(layer.self_attention, TPRSelfAttention) for layer in fa_layers)
     assert tpr_model.config.attention_dropout == tpr_model.config.hidden_dropout == 0
@@ -308,38 +318,115 @@ def test_full_qwen35_hybrid_push_branch_pop_matches_materialized_paths(runtime, 
     with _no_cp_probe(monkeypatch):
         tpr_loss, tpr_logprobs, tpr_grads, tpr_boundary = _run_tpr_executor(tpr_model, plan)
 
-    connected_model = make_qwen35_model(runtime, cp_size=1, tpr=True)
+    connected_model = make_qwen35_model(runtime, cp_size=1, tpr=True, num_layers=num_layers)
     connected_model.load_state_dict(reference_model.state_dict(), strict=True)
     with _no_cp_probe(monkeypatch):
         connected_grads, connected_boundary, connected_loss, connected_logprobs = (
             _connected_split_reference(connected_model, plan)
         )
 
-    torch.testing.assert_close(tpr_loss, reference_loss, atol=2e-2, rtol=2e-2)
+    # Do not stop on the first logprob mismatch: the state and parameter
+    # gradients have already been collected, and identify a different seam.
+    # Preserve all original acceptance thresholds.
+    failures = []
+
+    def check(label, fn):
+        try:
+            fn()
+        except AssertionError as exc:
+            failures.append(f"{label}: {exc}")
+            print(f"GATE FAIL {label}: {exc}", flush=True)
+        else:
+            print(f"GATE PASS {label}", flush=True)
+
+    def report_gradient(label, ref, actual, *, rtol=None, cosine_min=None):
+        diagnostic = gradient_map_diagnostics(ref, actual)
+        metrics = diagnostic.aggregate
+        print(
+            f"{label}: ref_norm={metrics.reference_norm:.9e}, "
+            f"actual_norm={metrics.actual_norm:.9e}, norm_ratio={metrics.norm_ratio:.9f}, "
+            f"absolute_l2={metrics.absolute_l2:.9e}, relative_l2={metrics.relative_l2:.9e}, "
+            f"cosine={metrics.cosine:.9f}, "
+            f"worst={diagnostic.worst_name}:{diagnostic.worst.relative_l2:.9e}",
+            flush=True,
+        )
+        if rtol is not None and cosine_min is not None:
+            if metrics.relative_l2 > rtol or metrics.cosine < cosine_min:
+                message = (
+                    f"{label}: relative_l2={metrics.relative_l2:.9e} (limit {rtol:.9e}), "
+                    f"cosine={metrics.cosine:.9f} (minimum {cosine_min:.9f})"
+                )
+                failures.append(message)
+                print(f"GATE FAIL {message}", flush=True)
+            else:
+                print(f"GATE PASS {label}", flush=True)
+
+    print(f"\n===== HYBRID CP1 layers={num_layers} GDN={len(gdn_layers)} FA={len(fa_layers)} =====", flush=True)
+    print("===== LOSS =====", flush=True)
+    print(f"Native:    {reference_loss.item():.9f}", flush=True)
+    print(f"Connected: {connected_loss.item():.9f}", flush=True)
+    print(f"TPR:       {tpr_loss.item():.9f}", flush=True)
+    check(
+        "Native vs TPR/loss",
+        lambda: torch.testing.assert_close(tpr_loss, reference_loss, atol=2e-2, rtol=2e-2),
+    )
+
+    pairs = (
+        ("Native vs Connected", reference_logprobs, connected_logprobs, reference_grads, connected_grads),
+        ("Connected vs TPR", connected_logprobs, tpr_logprobs, connected_grads, tpr_grads),
+        ("Native vs TPR", reference_logprobs, tpr_logprobs, reference_grads, tpr_grads),
+    )
+    print("===== LOGPROB DIAGNOSTICS =====", flush=True)
     for segment_id in (0, 1, 2):
-        torch.testing.assert_close(
-            tpr_logprobs[segment_id],
-            reference_logprobs[segment_id],
-            atol=8e-2,
-            rtol=2e-2,
-        )
-    assert_gradient_maps_close(reference_grads, tpr_grads, rtol=0.10, cosine_min=0.995)
-    assert_gradient_maps_close(connected_grads, tpr_grads, rtol=0.02, cosine_min=0.999)
-    assert tpr_boundary.keys() == connected_boundary.keys()
-    for name in tpr_boundary:
-        assert_gradient_maps_close(
-            {name: connected_boundary[name]},
-            {name: tpr_boundary[name]},
-            rtol=0.02,
-            cosine_min=0.999,
-        )
-    for segment_id in (0, 1, 2):
-        torch.testing.assert_close(
-            tpr_logprobs[segment_id],
-            connected_logprobs[segment_id],
-            atol=8e-2,
-            rtol=2e-2,
-        )
+        for label, ref_logprobs, actual_logprobs, _, _ in pairs:
+            ref = ref_logprobs[segment_id].detach().float()
+            actual = actual_logprobs[segment_id].detach().float()
+            diff = (actual - ref).abs()
+            relative_l2 = (diff.norm() / ref.norm().clamp_min(1e-12)).item()
+            mismatch = ~torch.isclose(actual, ref, atol=8e-2, rtol=2e-2)
+            print(
+                f"seg={segment_id} {label}: max_abs={diff.max().item():.8f}, "
+                f"rel_l2={relative_l2:.8f}, mismatch={mismatch.sum().item()}/{ref.numel()}",
+                flush=True,
+            )
+            if label != "Native vs Connected":
+                check(
+                    f"{label}/logprob/seg={segment_id}",
+                    lambda: torch.testing.assert_close(actual, ref, atol=8e-2, rtol=2e-2),
+                )
+
+    print("===== PARAMETER GRADIENTS =====", flush=True)
+    for label, _, _, ref_grads, actual_grads in pairs:
+        # Native/Connected is a diagnostic, not an additional acceptance gate.
+        thresholds = {
+            "Native vs TPR": (0.10, 0.995),
+            "Connected vs TPR": (0.02, 0.999),
+        }
+        rtol, cosine_min = thresholds.get(label, (None, None))
+        report_gradient(f"{label}/parameters", ref_grads, actual_grads, rtol=rtol, cosine_min=cosine_min)
+
+    print("===== STATE GRADIENTS (Connected vs TPR) =====", flush=True)
+    check("boundary keys", lambda: _assert_matching_boundary_keys(connected_boundary, tpr_boundary))
+    if tpr_boundary.keys() == connected_boundary.keys():
+        for kind in ("gdn.", "fa."):
+            names = tuple(name for name in tpr_boundary if name.startswith(kind))
+            if names:
+                report_gradient(
+                    f"Connected vs TPR/{kind[:-1]}-states",
+                    {name: connected_boundary[name] for name in names},
+                    {name: tpr_boundary[name] for name in names},
+                )
+        for name in tpr_boundary:
+            report_gradient(
+                name,
+                {name: connected_boundary[name]},
+                {name: tpr_boundary[name]},
+                rtol=0.02,
+                cosine_min=0.999,
+            )
+
+    if failures:
+        pytest.fail("Hybrid correctness gates failed (all gates evaluated):\n" + "\n".join(failures))
 
     print(
         "QWEN35_HYBRID_TPR_CP1_PASS "
