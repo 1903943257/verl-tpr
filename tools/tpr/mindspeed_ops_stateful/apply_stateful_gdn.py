@@ -51,7 +51,7 @@ def patch_gdr_gate(path: Path, text: str) -> tuple[str, str]:
         raise PatchError(f"{path}: found {len(matches)} active initial_state gates")
 
     any_active_initial_state_gate = re.search(
-        r'(?m)^[ \t]*if initial_state is not None:\n[ \t]+raise ValueError\\(',
+        r'(?m)^[ \t]*if initial_state is not None:\n[ \t]+raise ValueError\(',
         text,
     )
     if any_active_initial_state_gate:
