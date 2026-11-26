@@ -29,7 +29,7 @@ def _active_gate_pattern() -> re.Pattern[str]:
     return re.compile(
         r'(?m)^(?P<indent>[ \t]*)if initial_state is not None:\n'
         r'(?P=indent)[ \t]+raise ValueError\('
-        + re.escape(repr(GDR_ERROR))
+        + r'["\']' + re.escape(GDR_ERROR) + r'["\']'
         + r'\)\n'
     )
 
