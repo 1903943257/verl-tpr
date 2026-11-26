@@ -37,8 +37,8 @@ def main() -> int:
     public, fwd_h, conv = [(root / p).read_text(encoding="utf-8") for p in FILES]
 
     active_gate = re.compile(
-        r'(?m)^[ \\t]*if initial_state is not None:\\n'
-        r'[ \\t]+raise ValueError\\('
+        r'(?m)^[ \t]*if initial_state is not None:\n'
+        r'[ \t]+raise ValueError\\('
     )
     for relative, text in zip(FILES[:2], (public, fwd_h)):
         if active_gate.search(text):
