@@ -12,6 +12,7 @@
 
 - [TPR Ring CP 方案](ring_design.md)：通信、Shard/Padding、块可见性和 dKV 返回
 - [TPR Recompute 方案](recompute_design.md)：Tree Pop 与层级 checkpoint、KV 梯度及显存管理
+- [TPR × GDN 技术方案与工作交接](hybrid_gdn_handover.md)：Stateful 算子、树形状态复用、A2A CP、正确性验证及后续工作
 
 已有专项资料（实验记录和协议性补充，不替代主文档）：
 
