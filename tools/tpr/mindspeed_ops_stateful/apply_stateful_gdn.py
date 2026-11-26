@@ -50,11 +50,16 @@ def patch_gdr_gate(path: Path, text: str) -> tuple[str, str]:
     if len(matches) > 1:
         raise PatchError(f"{path}: found {len(matches)} active initial_state gates")
 
-    if GDR_ERROR not in text or re.search(
-        r'(?m)^[ \t]*raise ValueError\(' + re.escape(repr(GDR_ERROR)) + r'\)',
+    any_active_initial_state_gate = re.search(
+        r'(?m)^[ \\t]*if initial_state is not None:\\n[ \\t]+raise ValueError\\(',
         text,
-    ) is None:
-        return text, "already-open"
+    )
+    if any_active_initial_state_gate:
+        raise PatchError(
+            f"{path}: an initial_state ValueError gate exists but its source "
+            "does not match the known historical guard"
+        )
+    return text, "already-open"
 
     raise PatchError(
         f"{path}: found the historical gate in an unsupported layout; "
@@ -102,11 +107,11 @@ def _replace_dh0_kernel_block(lines: list[str], path: Path) -> list[str]:
     start = starts[0]
     ends = [
         i for i in range(start + 1, len(lines))
-        if lines[i].rstrip("\r\n") == "        if HAS_BIAS:"
+        if lines[i].rstrip("\\r\\n") == "        if HAS_BIAS:"
     ]
-    if len(ends) != 1:
+    if not ends:
         raise PatchError(
-            f"{path}: could not uniquely locate the end of the legacy dh0 block"
+            f"{path}: could not locate the end of the legacy dh0 block"
         )
     end = ends[0]
 
