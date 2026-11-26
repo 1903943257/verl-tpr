@@ -19,8 +19,9 @@ Run from the verl repository root::
     torchrun --master_addr=127.0.0.1 --master_port=29561 --nproc_per_node=1 \
       -m pytest -s -v tests/models/mcore/tpr/linear/test_gdn_push_branch_pop_npu.py
 
-The materialized reference executes ``P+S1`` and ``P+S2`` independently. The
-TPR path saves graph-free state for P, visits both siblings from independent
+The materialized reference executes ``P+S1`` and ``P+S2`` independently using the
+same TPR-context stateful GDN operators, not the native MindSpeed GDN forward.
+The TPR path saves graph-free state for P, visits both siblings from independent
 anchors, sums dConv/dRecurrent, then recomputes P and applies the summed VJP.
 Diagnostics also compare full repeat, shared-prefix connected splitting, and
 independent connected splitting (a fresh P graph and backward per branch).
@@ -264,10 +265,11 @@ def _operator_boundary_probe(model):
         capture("conv.output", output, 1)
         return output, state
 
-    def gdr(query, key, value, *, g, beta, initial_state):
+    def gdr(query, key, value, *args, **kwargs):
+        g, beta = kwargs["g"], kwargs["beta"]
         for name, tensor in (("q", query), ("k", key), ("v", value), ("g", g), ("beta", beta)):
             capture(f"gdr.{name}", tensor, 1)
-        output, state = original_gdr(query, key, value, g=g, beta=beta, initial_state=initial_state)
+        output, state = original_gdr(query, key, value, *args, **kwargs)
         capture("gdr.output", output, 1)
         return output, state
 
