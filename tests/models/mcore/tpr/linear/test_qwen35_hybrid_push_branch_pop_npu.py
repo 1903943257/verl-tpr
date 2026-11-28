@@ -405,6 +405,79 @@ def test_full_qwen35_hybrid_push_branch_pop_matches_materialized_paths(runtime, 
         rtol, cosine_min = thresholds.get(label, (None, None))
         report_gradient(f"{label}/parameters", ref_grads, actual_grads, rtol=rtol, cosine_min=cosine_min)
 
+    # Native vs Connected is the current numerical-difference investigation.
+    # Aggregate all parameter tensors belonging to each decoder layer so the
+    # first layer where the discrepancy grows is visible without changing any
+    # correctness threshold.
+    print("===== NATIVE vs CONNECTED: PER-LAYER PARAMETER GRADIENTS =====", flush=True)
+    fa_layer_numbers = {layer.layer_number for layer in fa_layers}
+    covered_parameter_names = set()
+    for layer_index in range(num_layers):
+        layer_prefix = f"decoder.layers.{layer_index}."
+        layer_reference = {
+            name: tensor for name, tensor in reference_grads.items()
+            if name.startswith(layer_prefix)
+        }
+        layer_connected = {
+            name: tensor for name, tensor in connected_grads.items()
+            if name.startswith(layer_prefix)
+        }
+        if not layer_reference:
+            print(
+                f"layer={layer_index + 1:02d} "
+                f"type={'FA' if layer_index + 1 in fa_layer_numbers else 'GDN'} "
+                "NO_PARAMETER_GRADIENTS",
+                flush=True,
+            )
+            continue
+
+        covered_parameter_names.update(layer_reference)
+        layer_diagnostic = gradient_map_diagnostics(layer_reference, layer_connected)
+        layer_metrics = layer_diagnostic.aggregate
+        layer_type = "FA" if layer_index + 1 in fa_layer_numbers else "GDN"
+        print(
+            f"layer={layer_index + 1:02d} type={layer_type} "
+            f"tensors={len(layer_reference)} "
+            f"ref_norm={layer_metrics.reference_norm:.9e} "
+            f"connected_norm={layer_metrics.actual_norm:.9e} "
+            f"norm_ratio={layer_metrics.norm_ratio:.9f} "
+            f"absolute_l2={layer_metrics.absolute_l2:.9e} "
+            f"relative_l2={layer_metrics.relative_l2:.9e} "
+            f"cosine={layer_metrics.cosine:.9f} "
+            f"worst={layer_diagnostic.worst_name}:"
+            f"{layer_diagnostic.worst.relative_l2:.9e}",
+            flush=True,
+        )
+
+    # Embedding / output parameters are outside decoder.layers.*. Print them
+    # separately so the per-layer breakdown can be reconciled with the
+    # all-parameter aggregate above.
+    non_layer_reference = {
+        name: tensor for name, tensor in reference_grads.items()
+        if name not in covered_parameter_names
+    }
+    non_layer_connected = {
+        name: tensor for name, tensor in connected_grads.items()
+        if name not in covered_parameter_names
+    }
+    if non_layer_reference:
+        non_layer_diagnostic = gradient_map_diagnostics(
+            non_layer_reference, non_layer_connected
+        )
+        non_layer_metrics = non_layer_diagnostic.aggregate
+        print(
+            f"non_decoder_parameters tensors={len(non_layer_reference)} "
+            f"ref_norm={non_layer_metrics.reference_norm:.9e} "
+            f"connected_norm={non_layer_metrics.actual_norm:.9e} "
+            f"norm_ratio={non_layer_metrics.norm_ratio:.9f} "
+            f"absolute_l2={non_layer_metrics.absolute_l2:.9e} "
+            f"relative_l2={non_layer_metrics.relative_l2:.9e} "
+            f"cosine={non_layer_metrics.cosine:.9f} "
+            f"worst={non_layer_diagnostic.worst_name}:"
+            f"{non_layer_diagnostic.worst.relative_l2:.9e}",
+            flush=True,
+        )
+
     print("===== STATE GRADIENTS (Connected vs TPR) =====", flush=True)
     check("boundary keys", lambda: _assert_matching_boundary_keys(connected_boundary, tpr_boundary))
     if tpr_boundary.keys() == connected_boundary.keys():
